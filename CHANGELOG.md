@@ -77,3 +77,13 @@
 - 控制流：`while` / `if`(含 else) / 局部变量声明与赋值，字节码含 **StackMapTable**（full_frame）
 - 跳转偏移按 JVM 规范相对**操作码地址**计算（此前按操作数地址，导致 VerifyError）
 - 端到端：`Loop.java`（`sum(5)` 用 while 累加、`max(7,3)` 用 if）→ Rust 编译 527 字节 → 官方 JDK 输出 `10` `7`
+
+## 0.12.0 — 2026-11-14 · 闭环打通
+
+- 新增 `vm.rs`：**不依赖任何 JVM 的字节码解释器**
+  （int 常量/局部变量/算术/比较跳转/goto/pop/invokestatic/println(int|String)/return）
+- 新增 `src/bin/rustjava.rs`：`rustjava <class 文件>` 直接执行 main，产物 0.2 MB
+- 编译器补齐：`for` 循环（降级为 while）、字符串常量、`println(String)` 的描述符选择
+- **端到端闭环**：`Demo.java` →（rustjavac）→ 509 字节 class →（rustjava）→
+  `rustjavac + rustjava` / `45`；官方 `java` 执行同一份 class 输出**逐行一致**
+- 测试 26 条全绿（含解释器 4 条：算术、while、if-else、描述符参数计数）

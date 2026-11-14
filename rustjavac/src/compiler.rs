@@ -266,6 +266,12 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             em.const_int(v);
             Ok(())
         }
+        Expr::StrLit(s) => {
+            let idx = cp.string(s);
+            em.op_u2(0x13, idx);
+            em.push(1);
+            Ok(())
+        }
         Expr::Ident(name) => {
             let slot = ctx
                 .lookup(name)
@@ -285,7 +291,12 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
                             return err("println 目前只支持一个参数");
                         }
                         compile_expr(&args[0], em, ctx, cp)?;
-                        let println = cp.method_ref("java/io/PrintStream", "println", "(I)V");
+                        let desc = if matches!(&args[0], Expr::StrLit(_)) {
+                            "(Ljava/lang/String;)V"
+                        } else {
+                            "(I)V"
+                        };
+                        let println = cp.method_ref("java/io/PrintStream", "println", desc);
                         em.op_u2(0xB6, println);
                         em.pop(2);
                         return Ok(());
@@ -428,6 +439,25 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
                 .ok_or_else(|| CompileError { msg: format!("未定义的变量 `{name}`") })?;
             compile_expr(rhs, em, ctx, cp)?;
             em.istore(slot)?;
+            Ok(false)
+        }
+        Stmt::For { init, cond, update, body } => {
+            for s in init {
+                compile_stmt(s, em, ctx, cp)?;
+            }
+            let start = em.new_label();
+            let end = em.new_label();
+            em.bind(start);
+            if let Some(c) = cond {
+                compile_cond_false(c, em, ctx, cp, end)?;
+            }
+            compile_stmt(body, em, ctx, cp)?;
+            for u in update {
+                // 更新表达式可能是赋值，交给语句编译器处理
+                compile_stmt(&Stmt::Expr(u.clone()), em, ctx, cp)?;
+            }
+            em.goto(start);
+            em.bind(end);
             Ok(false)
         }
         Stmt::While { cond, body } => {
