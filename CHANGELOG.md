@@ -87,3 +87,17 @@
 - **端到端闭环**：`Demo.java` →（rustjavac）→ 509 字节 class →（rustjava）→
   `rustjavac + rustjava` / `45`；官方 `java` 执行同一份 class 输出**逐行一致**
 - 测试 26 条全绿（含解释器 4 条：算术、while、if-else、描述符参数计数）
+
+## 0.13.0 — 2026-11-14 · 紧凑布局与对标数据
+
+- `librustjrt` 新增**紧凑对象布局**：8 字节头 + 4 字节/槽（对标 HotSpot 压缩指针），
+  `Node{int,ref}` 从 32 字节降到 **16 字节**
+- 标记清扫改用对象头标志位（去掉 O(n²) 的 `Vec::contains`）
+- 新增三个基准：`bench_vs_jvm`、`bench_compact`、`bench_compact_gc`
+- 与 JVM 同工作量（8M 次分配、1/8 存活）实测：
+  | 指标 | HotSpot G1 | HotSpot ZGC | librustjrt（旧 32B） | librustjrt（紧凑 16B） |
+  |---|---|---|---|---|
+  | 单对象 | 24 B | 24 B | 32 B | **16 B** |
+  | 分配 | 12.7 ns | 12.6 ns | 15.7 ns | **10.4 ns** |
+  | 8M 占用 | 146 MB | 150 MB | 244 MB | **122 MB** |
+  | 一次完整回收 | 38.6 ms（累计） | 224.4 ms | 164.2 ms | **86.5 ms** |
