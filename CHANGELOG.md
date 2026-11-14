@@ -110,3 +110,11 @@
 - 端到端：`Point{int x; Point(int v){this.x=v;} static int twice(Point p){return p.x+p.x;}}`
   → rustjava 与官方 java 都输出 **42**
 - 测试 27 条全绿（新增 `runs_objects_and_fields`）
+
+## 0.15.0 — 2026-11-14 · 内存层 v2 + 启动速度
+
+- 对象按 **4 字节对齐**：单字段对象 16 → **12 字节**，双字段 16 字节
+- 空闲表改为**尺寸分桶**（线性扫描，不用 HashMap）+ 新建桶按轮次 live 数预留容量
+- 增速：混合尺寸分配 **9.8 ns/对象（101.6 M/s）**；**复用分配 5.9 ns（168.3 M/s）**
+- 全量回收 43.6 ms，**最大单步 0.088 ms**（v1 是 11.2 ms → 127 倍）
+- 启动速度（减去 50 ms 进程创建基线）：`rustjava` **≈2 ms** vs `java` **≈96 ms**

@@ -339,9 +339,9 @@ pub struct CompactMeta {
 
 impl CompactMeta {
     pub fn size(&self) -> usize {
-        // 8 字节对齐
+        // 4 字节对齐：1 个字段的对象只要 12 字节（8 头 + 4）
         let raw = COMPACT_HEADER + self.fields.len() * 4;
-        (raw + 7) & !7
+        (raw + 3) & !3
     }
     pub fn field_len(&self) -> u32 {
         self.fields.len() as u32
@@ -357,7 +357,10 @@ pub struct CompactHeap {
     used: usize,
     /// 存活对象偏移
     live: Vec<usize>,
-    free: Vec<usize>,
+    /// 按尺寸分桶的空闲表（线性扫描几个尺寸，比 HashMap 快得多）
+    free: Vec<(usize, Vec<usize>)>,
+    /// 新建空闲桶时的预留容量（= 本轮 live 数），避免清扫中扩容尖峰
+    free_hint: usize,
     pub collected: usize,
     metas: Vec<usize>, // 对象偏移 -> meta 下标（简化：同尺寸复用）
 }
@@ -369,13 +372,22 @@ impl CompactHeap {
         let layout = std::alloc::Layout::from_size_align(cap, 8).expect("layout");
         let base = unsafe { std::alloc::alloc(layout) };
         assert!(!base.is_null(), "compact heap alloc failed");
-        CompactHeap { base, cap, used: 0, live: Vec::new(), free: Vec::new(), collected: 0, metas: Vec::new() }
+        CompactHeap {
+            base,
+            cap,
+            used: 0,
+            live: Vec::new(),
+            free: Vec::new(),
+            free_hint: 0,
+            collected: 0,
+            metas: Vec::new(),
+        }
     }
 
     pub fn alloc(&mut self, meta: &CompactMeta) -> *mut CompactObject {
         let size = meta.size();
-        let off = if let Some(pos) = self.free.iter().position(|&o| self.size_at(o) == size) {
-            self.free.swap_remove(pos)
+        let off = if let Some(b) = self.free.iter_mut().find(|(s, v)| *s == size && !v.is_empty()) {
+            b.1.pop().unwrap()
         } else {
             let off = self.used;
             self.used += size;
@@ -466,7 +478,7 @@ impl CompactHeap {
                 unsafe { (*p).flags &= !MARK };
                 kept.push(off);
             } else {
-                self.free.push(off);
+                push_free(&mut self.free, meta.size(), off, self.free_hint);
                 self.collected += 1;
             }
         }
@@ -519,7 +531,10 @@ impl CompactHeap {
         state.steps = 0;
         state.max_step_ns = 0;
         // 预分配空闲表，避免清扫过程中 Vec 扩容带来的毫秒级尖峰
-        self.free.reserve(self.live.len());
+        self.free_hint = self.live.len();
+        for b in &mut self.free {
+            b.1.reserve(self.free_hint);
+        }
         let _ = MARK;
     }
 
@@ -571,7 +586,7 @@ impl CompactHeap {
                         self.live[state.write_cursor] = off;
                         state.write_cursor += 1;
                     } else {
-                        self.free.push(off);
+                        push_free(&mut self.free, meta.size(), off, self.free_hint);
                         self.collected += 1;
                     }
                 }
@@ -588,5 +603,16 @@ impl CompactHeap {
             }
             GcPhase::Idle => false,
         }
+    }
+}
+
+/// 往对应尺寸的空闲桶里放一个偏移；桶不存在就新建。
+fn push_free(free: &mut Vec<(usize, Vec<usize>)>, size: usize, off: usize, hint: usize) {
+    if let Some(b) = free.iter_mut().find(|(s, _)| *s == size) {
+        b.1.push(off);
+    } else {
+        let mut v = Vec::with_capacity(hint.max(8));
+        v.push(off);
+        free.push((size, v));
     }
 }
