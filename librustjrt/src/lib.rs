@@ -473,3 +473,120 @@ impl CompactHeap {
         self.live = kept;
     }
 }
+
+// ===================== 增量（切片）标记清扫 =====================
+
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum GcPhase {
+    Idle,
+    Mark,
+    Sweep,
+}
+
+/// 增量 GC：把标记与清扫切成小片，每片只处理 budget 个对象。
+/// 这样最大停顿可控，不像一次性全量回收那样卡住几十毫秒。
+pub struct IncrementalState {
+    pub phase: GcPhase,
+    stack: Vec<u32>,
+    sweep_cursor: usize,
+    write_cursor: usize,
+    pub steps: usize,
+    pub max_step_ns: u128,
+}
+
+impl Default for IncrementalState {
+    fn default() -> Self {
+        IncrementalState {
+            phase: GcPhase::Idle,
+            stack: Vec::new(),
+            sweep_cursor: 0,
+            write_cursor: 0,
+            steps: 0,
+            max_step_ns: 0,
+        }
+    }
+}
+
+impl CompactHeap {
+    /// 开始一轮回收；roots 是相对 base 的偏移。
+    pub fn begin_cycle(&mut self, state: &mut IncrementalState, roots: &[u32]) {
+        const MARK: u32 = 1;
+        state.stack.clear();
+        state.stack.extend_from_slice(roots);
+        state.sweep_cursor = 0;
+        state.write_cursor = 0;
+        state.phase = GcPhase::Mark;
+        state.steps = 0;
+        state.max_step_ns = 0;
+        // 预分配空闲表，避免清扫过程中 Vec 扩容带来的毫秒级尖峰
+        self.free.reserve(self.live.len());
+        let _ = MARK;
+    }
+
+    /// 推进一步：处理至多 budget 个对象。返回 true 表示本轮还没结束。
+    pub fn step(&mut self, state: &mut IncrementalState, meta: &CompactMeta, budget: usize) -> bool {
+        const MARK: u32 = 1;
+        let t = std::time::Instant::now();
+        match state.phase {
+            GcPhase::Mark => {
+                let mut done = 0;
+                while done < budget {
+                    let Some(off) = state.stack.pop() else { break };
+                    if off == 0 {
+                        continue;
+                    }
+                    let p = unsafe { self.base.add(off as usize) } as *mut CompactObject;
+                    unsafe {
+                        if (*p).flags & MARK != 0 {
+                            continue;
+                        }
+                        (*p).flags |= MARK;
+                    }
+                    for i in 0..meta.field_len() as usize {
+                        if meta.is_ref(i) {
+                            let v = self.get_slot(p, i);
+                            if v != 0 {
+                                state.stack.push(v);
+                            }
+                        }
+                    }
+                    done += 1;
+                }
+                if state.stack.is_empty() {
+                    state.phase = GcPhase::Sweep;
+                }
+                let ns = t.elapsed().as_nanos();
+                state.steps += 1;
+                state.max_step_ns = state.max_step_ns.max(ns);
+                true
+            }
+            GcPhase::Sweep => {
+                let end = (state.sweep_cursor + budget).min(self.live.len());
+                for idx in state.sweep_cursor..end {
+                    let off = self.live[idx];
+                    let p = unsafe { self.base.add(off) } as *mut CompactObject;
+                    let marked = unsafe { (*p).flags & MARK != 0 };
+                    if marked {
+                        unsafe { (*p).flags &= !MARK };
+                        self.live[state.write_cursor] = off;
+                        state.write_cursor += 1;
+                    } else {
+                        self.free.push(off);
+                        self.collected += 1;
+                    }
+                }
+                state.sweep_cursor = end;
+                let ns = t.elapsed().as_nanos();
+                state.steps += 1;
+                state.max_step_ns = state.max_step_ns.max(ns);
+                if state.sweep_cursor >= self.live.len() {
+                    self.live.truncate(state.write_cursor);
+                    state.phase = GcPhase::Idle;
+                    return false;
+                }
+                true
+            }
+            GcPhase::Idle => false,
+        }
+    }
+}
