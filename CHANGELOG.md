@@ -63,3 +63,11 @@
 - `examples/gen_hello.rs` 产出 344 字节的 `Hello.class`，**官方 JDK 25 能直接加载执行**：
   `java -cp out Hello` → `hello from rustjavac`；`javap -c` 反汇编结构与 javac 产物一致
 - 常量池索引一致性由"单一 CpBuilder 贯穿"保证（先算索引、后组装），并有去重测试
+
+## 0.10.0 — 2026-11-14
+
+- 新增 `compiler.rs`：AST → 字节码（静态/实例方法、int 参数与局部变量、算术表达式、return、`System.out.println`）
+- 类型描述符补全：`java.lang` 简写（`String` → `java/lang/String`）、数组、8 种原始类型
+- 端到端：`Calc.java`（`static int add(int,int){return a+b;}` + `main` 打印 `add(2,3)`）
+  → Rust 编译出 379 字节 `Calc.class` → **官方 JDK 25 执行输出 `5`**
+- `javap -c` 反汇编与 javac 产物同构（`iload_0/iload_1/iadd/ireturn`、`invokestatic Calc.add:(II)I`）
