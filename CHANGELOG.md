@@ -11,3 +11,10 @@
 
 - 新增 `librustjrt`：Java 对象布局（16 字节头 + 字段槽）+ bump arena + 标记清扫骨架
 - 基准：bump 19.1 ns/对象 vs Box 69.9 ns/对象（10M 个对象，4 字段）
+
+## 0.3.0 — 2026-11-14
+
+- `ByteBuffer` 支持 Rust arena 存储：`useArena()` 后字节改由原生内存承载，增长只做"新块 + 拷贝"
+- `ClassWriter` / `PoolWriter` 的常量池与类数据缓冲切到 arena 模式
+- 验证：5 个 class 文件 sha256 与官方 javac 完全一致；运行日志显示 `arena buffer flushed: N bytes`
+- `librustjrt`：新增 `ClassMeta`（字段类别位图）+ `Heap`（size-class 空闲链表 + 标记清扫），5 个测试通过

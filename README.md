@@ -62,3 +62,21 @@ cargo run --release --example bench
 bump   :     19.1 ns/对象   10M 个对象 191 ms，458 MB
 Box    :     69.9 ns/对象   10M 个对象 699 ms
 ```
+
+## 内存层进度
+
+| 缓冲 | 位置 | 状态 |
+|---|---|---|
+| javac 名字池 | `SharedNameTable` | ✅ Rust arena |
+| 类文件常量池 / 类数据 | `ByteBuffer` + `ClassWriter` / `PoolWriter` | ✅ Rust arena（产物 sha256 与官方一致） |
+| 源码文本镜像 | 驱动层 `vjavac` | ✅ |
+| jar 条目内容 | 驱动层 `vjar` | ✅ |
+
+运行验证：
+
+```
+javac -J-Dvmless.rust=<rustcore.dll> -J-Dvmless.debug=true -d out src/Complex.java
+[vmless] name pool -> Rust arena, initial=131072
+[vmless] arena buffer flushed: 826 bytes
+...
+```
