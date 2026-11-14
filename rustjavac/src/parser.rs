@@ -1232,7 +1232,8 @@ impl Parser {
         match self.cur() {
             Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Semi
             | Tok::RParen | Tok::Comma | Tok::Dot | Tok::LBracket | Tok::EqEq | Tok::AndAnd
-            | Tok::OrOr | Tok::Question => {
+            | Tok::OrOr | Tok::Question | Tok::Shl | Tok::Shr | Tok::Ushr
+            | Tok::Star | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Bar | Tok::Caret => {
                 self.pos = save_pos;
                 self.pending = save_pending;
                 return Ok(None);
