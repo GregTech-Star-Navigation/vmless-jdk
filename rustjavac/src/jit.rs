@@ -15,7 +15,8 @@ use cranelift_module::{default_libcall_names, Linkage, Module};
 
 pub struct Jit {
     module: JITModule,
-    builder_ctx: FunctionBuilderContext,
+    /// (方法名, 描述符) → 已声明/已编译的函数 id
+    compiled: std::collections::HashMap<(String, String), (cranelift_module::FuncId, usize, i32)>,
 }
 
 #[derive(Debug)]
@@ -41,11 +42,19 @@ impl Jit {
             .expect("isa");
         let builder = JITBuilder::with_isa(isa, default_libcall_names());
         let module = JITModule::new(builder);
-        Jit { module, builder_ctx: FunctionBuilderContext::new() }
+        Jit { module, compiled: std::collections::HashMap::new() }
     }
 
-    /// 编译一个静态方法（签名必须是 (...)I，参数全是 int）
-    pub fn compile_static(&mut self, cf: &ClassFile, name: &str, desc: &str) -> Result<CompiledMethod, JitError> {
+    /// 编译（或复用）一个静态方法，返回 (函数 id, max_locals, 参数个数)
+    pub fn compile_into(
+        &mut self,
+        cf: &ClassFile,
+        name: &str,
+        desc: &str,
+    ) -> Result<(cranelift_module::FuncId, usize, i32), JitError> {
+        if let Some(v) = self.compiled.get(&(name.to_string(), desc.to_string())) {
+            return Ok(*v);
+        }
         let m = cf
             .methods
             .iter()
@@ -66,10 +75,16 @@ impl Jit {
             .module
             .declare_function(&format!("{name}_{}", desc.replace(['(', ')'], "")), Linkage::Export, &sig)
             .map_err(|e| JitError(e.to_string()))?;
+        // 先登记，递归调用（fib 调 fib）才能命中缓存而不是无限递归
+        self.compiled.insert(
+            (name.to_string(), desc.to_string()),
+            (func_id, max_locals, argc_of(desc)),
+        );
 
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig.clone();
-        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut self.builder_ctx);
+        let mut bctx = FunctionBuilderContext::new();
+        let mut fb = FunctionBuilder::new(&mut ctx.func, &mut bctx);
 
         let entry = fb.create_block();
         fb.append_block_params_for_function_params(entry);
@@ -117,6 +132,33 @@ impl Jit {
             let addr = fb.ins().iadd_imm(ptr, (slot * 4) as i64);
             fb.ins().store(MemFlags::new(), v, addr, 0);
         };
+
+        // 先把本方法里所有 invokestatic 目标编译好，得到 FuncId 映射
+        let mut call_targets: std::collections::HashMap<u16, (cranelift_module::FuncId, usize, i32)> =
+            std::collections::HashMap::new();
+        {
+            let mut q = 0usize;
+            while q < body.len() {
+                let op = body[q];
+                let len = match op {
+                    0x10 => 2,
+                    0x11 | 0x13 | 0x84 | 0xb2 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => 3,
+                    0x12 => 2,
+                    0x15 | 0x36 => 2,
+                    0xbc | 0x19 | 0x59 => 2,
+                    0x99..=0xa4 | 0xa7 => 3,
+                    _ => 1,
+                };
+                if op == 0xb8 && len == 3 {
+                    let idx = u16::from_be_bytes([body[q + 1], body[q + 2]]);
+                    if let Ok(info) = method_ref_of(cf, idx) {
+                        let (fid, ml, argc) = self.compile_into(cf, &info.1, &info.2)?;
+                        call_targets.insert(idx, (fid, ml, argc));
+                    }
+                }
+                q += len;
+            }
+        }
 
         let mut stack: Vec<Value> = Vec::new();
         // 记录尚未写终结指令的块（收尾时统一补 return）
@@ -325,6 +367,33 @@ impl Jit {
                     fb.switch_to_block(dead);
                     stack.clear();
                 }
+                0xb8 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let (fid, callee_max_locals, argc) = *call_targets
+                        .get(&idx)
+                        .ok_or_else(|| JitError("调用目标未编译".into()))?;
+                    // 参数出栈（逆序），写进为被调方法准备的栈槽
+                    let mut args = Vec::new();
+                    for _ in 0..argc {
+                        args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                    }
+                    args.reverse();
+                    let slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (callee_max_locals.max(1) * 4) as u32,
+                        2,
+                    ));
+                    for (i, v) in args.iter().enumerate() {
+                        let addr = fb.ins().stack_addr(types::I64, slot, (i * 4) as i32);
+                        fb.ins().store(MemFlags::new(), *v, addr, 0);
+                    }
+                    let ptr = fb.ins().stack_addr(types::I64, slot, 0);
+                    let fref = self.module.declare_func_in_func(fid, fb.func);
+                    let call = fb.ins().call(fref, &[ptr]);
+                    let res = fb.inst_results(call)[0];
+                    stack.push(res);
+                }
                 other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
             }
         }
@@ -349,11 +418,31 @@ impl Jit {
             .define_function(func_id, &mut ctx)
             .map_err(|e| JitError(format!("{e:?}")))?;
         self.module.clear_context(&mut ctx);
-        self.module.finalize_definitions().map_err(|e| JitError(e.to_string()))?;
+        let argc = argc_of(desc);
+        self.compiled
+            .insert((name.to_string(), desc.to_string()), (func_id, max_locals, argc));
+        Ok((func_id, max_locals, argc))
+    }
 
+    /// 编译一个静态方法并拿到可调用的函数指针
+    pub fn compile_static(
+        &mut self,
+        cf: &ClassFile,
+        name: &str,
+        desc: &str,
+    ) -> Result<CompiledMethod, JitError> {
+        let (func_id, max_locals, _) = self.compile_into(cf, name, desc)?;
+        self.module
+            .finalize_definitions()
+            .map_err(|e| JitError(e.to_string()))?;
         let ptr = self.module.get_finalized_function(func_id);
         let code: JitFn = unsafe { std::mem::transmute(ptr) };
-        Ok(CompiledMethod { name: name.to_string(), desc: desc.to_string(), code, max_locals })
+        Ok(CompiledMethod {
+            name: name.to_string(),
+            desc: desc.to_string(),
+            code,
+            max_locals,
+        })
     }
 }
 
@@ -413,4 +502,66 @@ pub fn compile_file(path: &str, name: &str, desc: &str) -> Result<(Jit, Compiled
     let mut jit = Jit::new();
     let m = jit.compile_static(&cf, name, desc)?;
     Ok((jit, m))
+}
+
+/// 解析常量池里的方法引用 → (类名, 方法名, 描述符)
+fn method_ref_of(cf: &ClassFile, index: u16) -> Result<(String, String, String), JitError> {
+    let e = cf
+        .constant_pool
+        .get(index as usize)
+        .and_then(|e| e.as_ref())
+        .ok_or_else(|| JitError(format!("常量池索引 {index} 为空")))?;
+    let (c, nt) = match e {
+        CpEntry::MethodRef(c, n) => (*c, *n),
+        CpEntry::InterfaceMethodRef(c, n) => (*c, *n),
+        other => return Err(JitError(format!("不是方法引用: {other:?}"))),
+    };
+    let class = match cf.constant_pool.get(c as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::Class(n)) => String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned(),
+        _ => return Err(JitError("类名解析失败".into())),
+    };
+    let (name, desc) = match cf.constant_pool.get(nt as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::NameAndType(n, d)) => (
+            String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned(),
+            String::from_utf8_lossy(cf.utf8(*d).unwrap_or_default()).into_owned(),
+        ),
+        _ => return Err(JitError("NameAndType 解析失败".into())),
+    };
+    Ok((class, name, desc))
+}
+
+/// 描述符里的**参数**个数（只数到 `)`，不数返回值）
+fn argc_of(desc: &str) -> i32 {
+    let b = desc.as_bytes();
+    let mut i = 1usize;
+    let mut n = 0i32;
+    while i < b.len() && b[i] != b')' {
+        match b[i] {
+            b'[' => {
+                i += 1;
+                while i < b.len() && (b[i] == b'[') {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                }
+                i += 1;
+                n += 1;
+            }
+            b'L' => {
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+                n += 1;
+            }
+            _ => {
+                i += 1;
+                n += 1;
+            }
+        }
+    }
+    n
 }
