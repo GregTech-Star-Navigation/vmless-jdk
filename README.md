@@ -80,3 +80,15 @@ javac -J-Dvmless.rust=<rustcore.dll> -J-Dvmless.debug=true -d out src/Complex.ja
 [vmless] arena buffer flushed: 826 bytes
 ...
 ```
+
+## Rust 版编译器地基（`rustjavac`）
+
+```
+cargo run --release --example roundtrip_dir -- <含 .class 的目录>
+```
+
+对 JDK 25 自身模块实测：
+
+```
+文件 33191 个：一致 33191，不一致 0，解析失败 0，用时 3.14s
+```

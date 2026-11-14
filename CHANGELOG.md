@@ -18,3 +18,9 @@
 - `ClassWriter` / `PoolWriter` 的常量池与类数据缓冲切到 arena 模式
 - 验证：5 个 class 文件 sha256 与官方 javac 完全一致；运行日志显示 `arena buffer flushed: N bytes`
 - `librustjrt`：新增 `ClassMeta`（字段类别位图）+ `Heap`（size-class 空闲链表 + 标记清扫），5 个测试通过
+
+## 0.4.0 — 2026-11-14
+
+- 新增 `rustjavac` crate（库名 `classfile`）：class 文件解析 + 原样写回
+- 覆盖常量池全部 17 种 tag、long/double 双槽、属性以原始字节保存
+- 验证：JDK 自身模块的 **33,191 个 class** 全部"读入→写出"逐字节一致，用时 3.1 秒
