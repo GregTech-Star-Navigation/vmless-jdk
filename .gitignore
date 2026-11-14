@@ -1,0 +1,28 @@
+# 二进制与构建产物
+*.exe
+*.dll
+*.lib
+*.obj
+*.pdb
+*.jar
+*.class
+*.zip
+target/
+build/
+out/
+images/
+tmp*/
+*.log
+*.aot.config
+
+# 本机相关（不公开）
+cfg*/
+*.cmd
+*.bat
+*.ps1
+*.md.bak
+方案*.md
+RUST-JAVAC-方案.md
+PLAN.md
+*.png
+*.jpg
