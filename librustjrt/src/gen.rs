@@ -250,3 +250,53 @@ mod tests {
         assert_eq!(h.promoted, 1);
     }
 }
+
+// ===================== 老年代回收（标记清扫） =====================
+
+impl GenerationalHeap {
+    /// 老年代标记清扫：从 roots 出发标记，未标记的进空闲表。
+    /// roots 里的偏移可能指向年轻代（不在老年代范围内），会被忽略。
+    pub fn major(&mut self, roots: &[u32], meta: &CompactMeta) -> usize {
+        const MARK: u32 = 1;
+        let old_lo = self.old_start as u32;
+        let mut work: Vec<u32> = Vec::new();
+        for r in roots {
+            if *r as usize >= self.old_start {
+                work.push(*r);
+            }
+        }
+        while let Some(off) = work.pop() {
+            let p = self.ptr(off);
+            unsafe {
+                if (*p).flags & MARK != 0 {
+                    continue;
+                }
+                (*p).flags |= MARK;
+            }
+            for i in 0..meta.field_len() as usize {
+                if meta.is_ref(i) {
+                    let v = self.get_slot(off, i);
+                    if v >= old_lo {
+                        work.push(v);
+                    }
+                }
+            }
+        }
+        let mut kept = Vec::with_capacity(self.old_live.len());
+        let mut freed = 0usize;
+        for &off in &self.old_live {
+            let p = self.ptr(off as u32);
+            let marked = unsafe { (*p).flags & MARK != 0 };
+            if marked {
+                unsafe { (*p).flags &= !MARK };
+                kept.push(off);
+            } else {
+                self.old_free.push(off);
+                freed += 1;
+            }
+        }
+        self.old_live = kept;
+        self.collected += freed;
+        freed
+    }
+}

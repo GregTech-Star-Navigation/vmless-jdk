@@ -147,10 +147,11 @@ impl<'a> Vm<'a> {
             frame.locals[i] = *a;
         }
 
+        let trace = std::env::var_os("VMLESS_TRACE").is_some();
         let mut pc = 0usize;
         while pc < body.len() {
             let op = body[pc];
-            if std::env::var("VMLESS_TRACE").is_ok() {
+            if trace {
                 eprintln!("  pc={pc} op={op:02x} stack={:?} locals={:?}", frame.stack, frame.locals);
             }
             pc += 1;

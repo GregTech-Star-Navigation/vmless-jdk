@@ -311,7 +311,14 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
     match e {
         Expr::IntLit(s) => {
             let v: i32 = s.parse().map_err(|_| CompileError { msg: format!("整数字面量 `{s}` 解析失败") })?;
-            em.const_int(v);
+            if (-32768..=32767).contains(&v) {
+                em.const_int(v);
+            } else {
+                // 超出 sipush 范围，走常量池 ldc_w
+                let idx = cp.int(v);
+                em.op_u2(0x13, idx);
+                em.push(1);
+            }
             Ok(())
         }
         Expr::This => {
