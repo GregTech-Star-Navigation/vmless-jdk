@@ -56,3 +56,10 @@
 - `librustjrt::ClassMeta` 改为拥有 `Vec<FieldKind>`；`Heap` 暴露 `arena_used()` 以便验证槽位复用
 - 端到端示例 `e2e_gc`：`.java` → 解析 → 符号表 → 类元数据 → Rust 堆分配 → 标记清扫 → 空闲槽复用
   实测输出：Node 位图 `[Prim, Ref]`、Holder 位图 `[Ref, Ref]`；断开引用后 3 个 Node 全部回收，存活 1；再分配不新增 arena 用量
+
+## 0.9.0 — 2026-11-14
+
+- 新增 `codegen.rs`：常量池构建器（自动去重）+ 字节码发射 + class 文件组装
+- `examples/gen_hello.rs` 产出 344 字节的 `Hello.class`，**官方 JDK 25 能直接加载执行**：
+  `java -cp out Hello` → `hello from rustjavac`；`javap -c` 反汇编结构与 javac 产物一致
+- 常量池索引一致性由"单一 CpBuilder 贯穿"保证（先算索引、后组装），并有去重测试

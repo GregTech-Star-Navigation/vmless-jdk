@@ -6,6 +6,7 @@
 pub mod ast;
 pub mod sema;
 pub mod lower;
+pub mod codegen;
 pub mod lexer;
 pub mod parser;
 
