@@ -631,6 +631,11 @@ impl Parser {
             }));
         }
 
+        // 字段的 C 风格数组声明 `int fields[]`
+        while matches!(self.cur(), Tok::LBracket) {
+            self.advance();
+            self.expect(&Tok::RBracket)?;
+        }
         // 字段（可能有多个声明符）
         let mut init = None;
         if self.eat(&Tok::Assign) {
@@ -675,8 +680,8 @@ impl Parser {
                 }
                 break;
             }
-            let name = self.expect_ident()?;
             let varargs = self.eat(&Tok::Ellipsis);
+            let name = self.expect_ident()?;
             while matches!(self.cur(), Tok::LBracket) {
                 self.advance();
                 self.expect(&Tok::RBracket)?;
@@ -789,6 +794,10 @@ impl Parser {
             self.expect(&Tok::Semi)?;
             return Ok(Stmt::Continue(label));
         }
+        if self.is_kw("class") || self.is_kw("interface") || self.is_kw("enum") || self.is_ctx("record") {
+            let _ = self.parse_type_decl()?;
+            return Ok(Stmt::Empty);
+        }
         if self.is_kw("try") {
             return self.parse_try();
         }
@@ -854,6 +863,14 @@ impl Parser {
                 return Ok(None);
             }
         };
+        // 交叉类型 (A & B)
+        while self.eat(&Tok::Amp) {
+            if self.parse_type().is_err() {
+                self.pos = save_pos;
+                self.pending = save_pending;
+                return Ok(None);
+            }
+        }
         // 类型后面必须是标识符
         if matches!(self.cur(), Tok::Ident(_)) {
             Ok(Some(ty))
@@ -1199,6 +1216,13 @@ impl Parser {
                 return Ok(None);
             }
         };
+        while self.eat(&Tok::Amp) {
+            if self.parse_type().is_err() {
+                self.pos = save_pos;
+                self.pending = save_pending;
+                return Ok(None);
+            }
+        }
         if !self.eat(&Tok::RParen) {
             self.pos = save_pos;
             self.pending = save_pending;
@@ -1208,14 +1232,22 @@ impl Parser {
         match self.cur() {
             Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Semi
             | Tok::RParen | Tok::Comma | Tok::Dot | Tok::LBracket | Tok::EqEq | Tok::AndAnd
-            | Tok::OrOr => {
+            | Tok::OrOr | Tok::Question => {
                 self.pos = save_pos;
                 self.pending = save_pending;
                 return Ok(None);
             }
             _ => {}
         }
-        let expr = self.parse_unary()?;
+        // cast 后面可能是 lambda: (Comparator<T> & Serializable) (a, b) -> ...
+        let expr = if matches!(self.cur(), Tok::LParen) {
+            match self.try_parse_lambda()? {
+                Some(l) => l,
+                None => self.parse_unary()?,
+            }
+        } else {
+            self.parse_unary()?
+        };
         Ok(Some(Expr::Cast { ty, expr: Box::new(expr) }))
     }
 
@@ -1254,14 +1286,12 @@ impl Parser {
                         }
                         continue;
                     }
-                    let mut name = self.expect_ident()?;
-                    // 泛型方法调用
+                    // 显式类型实参：obj.<T>method(...)
                     let mut type_args = Vec::new();
                     if matches!(self.cur(), Tok::Lt) {
-                        if let Ok(args) = self.parse_type_args() {
-                            type_args = args;
-                        }
+                        type_args = self.parse_type_args()?;
                     }
+                    let mut name = self.expect_ident()?;
                     if matches!(self.cur(), Tok::LParen) {
                         let args = self.parse_args()?;
                         e = Expr::Call { recv: Some(Box::new(e)), name, args, type_args };

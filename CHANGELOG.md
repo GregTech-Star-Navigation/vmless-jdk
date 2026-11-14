@@ -31,3 +31,15 @@
 - 新增语法分析（`parser.rs` + `ast.rs`）：类型声明（class/interface/enum/record/注解）、成员、语句、表达式全优先级、lambda、方法引用、cast、instanceof 模式、switch 箭头
 - 实测：JDK 25 `java.util` 的 **369 个源文件**语法分析成功率 **78.9%**（291 成功），用时 0.46 秒
 - 已知未覆盖：交叉类型 cast（`(A & B)x`）、部分 varargs 与泛型方法引用、`new T[]` 的少数形态
+
+## 0.6.0 — 2026-11-14
+
+解析器补全（java.util 78.9% → 90.2%，整个 java.base 90.5%）：
+
+- varargs 参数顺序修正（`T... a`）
+- 方法体内的局部类声明
+- 字段的 C 风格数组声明 `int fields[]`
+- 交叉类型 cast `(A & B) x`
+- cast 后接 lambda：`(Comparator<T> & Serializable) (a, b) -> ...`
+- 三元运算符参与 cast 回退判定
+- 显式类型实参调用：`obj.<T>method(...)`
