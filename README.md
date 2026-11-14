@@ -51,3 +51,14 @@ Java 侧 javac  ──SharedNameTable──►  RustNameArena (FFM downcall)
 ## 许可
 
 `patches/` 下的文件源自 OpenJDK（GPLv2 + Classpath Exception），沿用同一许可。
+
+## 运行时（线 B，进行中）
+
+`librustjrt/` 是 Rust 版的 Java 运行时子集：Java 对象 = Rust 结构体（16 字节头 + 8 字节字段槽），
+由 bump arena 分配，一次释放整块。
+
+```
+cargo run --release --example bench
+bump   :     19.1 ns/对象   10M 个对象 191 ms，458 MB
+Box    :     69.9 ns/对象   10M 个对象 699 ms
+```
