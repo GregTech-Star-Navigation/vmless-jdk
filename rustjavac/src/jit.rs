@@ -22,7 +22,7 @@ pub struct Jit {
 #[derive(Debug)]
 pub struct JitError(pub String);
 
-type JitFn = unsafe extern "C" fn(*mut i32) -> i32;
+type JitFn = unsafe extern "C" fn(*mut i64) -> i32;
 
 pub struct CompiledMethod {
     pub name: String,
@@ -40,7 +40,9 @@ impl Jit {
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
             .expect("isa");
-        let builder = JITBuilder::with_isa(isa, default_libcall_names());
+        let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
+        builder.symbol("vmless_new_object", rt::new_object as *const u8);
+        builder.symbol("vmless_new_array", rt::new_array as *const u8);
         let module = JITModule::new(builder);
         Jit { module, compiled: std::collections::HashMap::new() }
     }
@@ -65,6 +67,19 @@ impl Jit {
             })
             .ok_or_else(|| JitError(format!("找不到方法 {name}{desc}")))?;
         let (max_locals, body) = code_of(cf, m)?;
+        let self_class_name = cf.this_class_name().unwrap_or_default();
+
+        // 实例字段名 → 下标
+        let mut fields: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
+        let mut field_count = 0usize;
+        for f in &cf.fields {
+            if f.access_flags & 0x0008 != 0 {
+                continue;
+            }
+            let n = String::from_utf8_lossy(cf.utf8(f.name_index).unwrap_or_default()).into_owned();
+            fields.insert(n, field_count);
+            field_count += 1;
+        }
 
         // 方法签名：(locals_ptr: i64) -> i32
         let mut sig = self.module.make_signature();
@@ -83,6 +98,22 @@ impl Jit {
 
         let mut ctx = self.module.make_context();
         ctx.func.signature = sig.clone();
+        // 声明运行时辅助函数
+        let mut sig_new_obj = self.module.make_signature();
+        sig_new_obj.params.push(AbiParam::new(types::I32));
+        sig_new_obj.returns.push(AbiParam::new(types::I64));
+        let new_obj_id = self
+            .module
+            .declare_function("vmless_new_object", Linkage::Import, &sig_new_obj)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_new_arr = self.module.make_signature();
+        sig_new_arr.params.push(AbiParam::new(types::I32));
+        sig_new_arr.returns.push(AbiParam::new(types::I64));
+        let new_arr_id = self
+            .module
+            .declare_function("vmless_new_array", Linkage::Import, &sig_new_arr)
+            .map_err(|e| JitError(e.to_string()))?;
+
         let mut bctx = FunctionBuilderContext::new();
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut bctx);
 
@@ -125,11 +156,11 @@ impl Jit {
 
         // 局部变量在内存里：locals_ptr + i*4
         let load_local = |fb: &mut FunctionBuilder, ptr: Value, slot: usize| -> Value {
-            let addr = fb.ins().iadd_imm(ptr, (slot * 4) as i64);
+            let addr = fb.ins().iadd_imm(ptr, (slot * 8) as i64);
             fb.ins().load(types::I32, MemFlags::new(), addr, 0)
         };
         let store_local = |fb: &mut FunctionBuilder, ptr: Value, slot: usize, v: Value| {
-            let addr = fb.ins().iadd_imm(ptr, (slot * 4) as i64);
+            let addr = fb.ins().iadd_imm(ptr, (slot * 8) as i64);
             fb.ins().store(MemFlags::new(), v, addr, 0);
         };
 
@@ -144,16 +175,22 @@ impl Jit {
                     0x10 => 2,
                     0x11 | 0x13 | 0x84 | 0xb2 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => 3,
                     0x12 => 2,
-                    0x15 | 0x36 => 2,
+                    0x15 | 0x36 | 0x19 | 0x3a => 2,
                     0xbc | 0x19 | 0x59 => 2,
                     0x99..=0xa4 | 0xa7 => 3,
                     _ => 1,
                 };
-                if op == 0xb8 && len == 3 {
+                if (op == 0xb8 || op == 0xb7) && len == 3 {
                     let idx = u16::from_be_bytes([body[q + 1], body[q + 2]]);
                     if let Ok(info) = method_ref_of(cf, idx) {
+                        // 外部类（如 Object.<init>）不编译，调用时当空操作
+                        if info.0 != self_class_name {
+                            q += len;
+                            continue;
+                        }
                         let (fid, ml, argc) = self.compile_into(cf, &info.1, &info.2)?;
-                        call_targets.insert(idx, (fid, ml, argc));
+                        let extra = if op == 0xb7 { 1 } else { 0 };
+                        call_targets.insert(idx, (fid, ml, argc + extra));
                     }
                 }
                 q += len;
@@ -381,11 +418,11 @@ impl Jit {
                     args.reverse();
                     let slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                         cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
-                        (callee_max_locals.max(1) * 4) as u32,
+                        (callee_max_locals.max(1) * 8) as u32,
                         2,
                     ));
                     for (i, v) in args.iter().enumerate() {
-                        let addr = fb.ins().stack_addr(types::I64, slot, (i * 4) as i32);
+                        let addr = fb.ins().stack_addr(types::I64, slot, (i * 8) as i32);
                         fb.ins().store(MemFlags::new(), *v, addr, 0);
                     }
                     let ptr = fb.ins().stack_addr(types::I64, slot, 0);
@@ -393,6 +430,139 @@ impl Jit {
                     let call = fb.ins().call(fref, &[ptr]);
                     let res = fb.inst_results(call)[0];
                     stack.push(res);
+                }
+                // 引用类型局部变量（8 字节槽）
+                0x2a..=0x2d => {
+                    let slot = (op - 0x2a) as usize;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    stack.push(v);
+                }
+                0x19 => {
+                    let slot = body[pc] as usize;
+                    pc += 1;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    stack.push(v);
+                }
+                0x4b..=0x4e => {
+                    let slot = (op - 0x4b) as usize;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                }
+                0x3a => {
+                    let slot = body[pc] as usize;
+                    pc += 1;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                }
+                0x59 => {
+                    let v = *stack.last().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(v);
+                }
+                0xb7 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let Some(&(fid, callee_max_locals, argc)) = call_targets.get(&idx) else {
+                        // 外部构造器（如 Object.<init>）：只把接收者和参数丢掉
+                        let desc = method_ref_of(cf, idx)?.2;
+                        for _ in 0..(argc_of(&desc) + 1) {
+                            stack.pop();
+                        }
+                        continue;
+                    };
+                    let mut args = Vec::new();
+                    for _ in 0..argc {
+                        args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                    }
+                    args.reverse();
+                    let slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                        cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                        (callee_max_locals.max(1) * 8) as u32,
+                        3,
+                    ));
+                    for (i, v) in args.iter().enumerate() {
+                        let addr = fb.ins().stack_addr(types::I64, slot, (i * 8) as i32);
+                        fb.ins().store(MemFlags::new(), *v, addr, 0);
+                    }
+                    let ptr = fb.ins().stack_addr(types::I64, slot, 0);
+                    let fref = self.module.declare_func_in_func(fid, fb.func);
+                    let c = fb.ins().call(fref, &[ptr]);
+                    let _ = c;
+                }
+                // new：分配对象（字段数来自本类）
+                0xbb => {
+                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let nf = fb.ins().iconst(types::I32, field_count as i64);
+                    let fref = self.module.declare_func_in_func(new_obj_id, fb.func);
+                    let c = fb.ins().call(fref, &[nf]);
+                    let p = fb.inst_results(c)[0];
+                    stack.push(p);
+                }
+                // getfield（偏移 = 8 + 4*下标）
+                0xb4 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let name = field_ref_of(cf, idx)?.1;
+                    let f = *fields.get(&name).ok_or_else(|| JitError(format!("未知字段 {name}")))?;
+                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = fb.ins().load(types::I32, MemFlags::new(), p, (8 + 4 * f) as i32);
+                    stack.push(v);
+                }
+                // putfield
+                0xb5 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let name = field_ref_of(cf, idx)?.1;
+                    let f = *fields.get(&name).ok_or_else(|| JitError(format!("未知字段 {name}")))?;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    fb.ins().store(MemFlags::new(), v, p, (8 + 4 * f) as i32);
+                }
+                // newarray
+                0xbc => {
+                    let _atype = body[pc];
+                    pc += 1;
+                    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let fref = self.module.declare_func_in_func(new_arr_id, fb.func);
+                    let c = fb.ins().call(fref, &[n]);
+                    let p = fb.inst_results(c)[0];
+                    stack.push(p);
+                }
+                // arraylength
+                0xbe => {
+                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = fb.ins().load(types::I32, MemFlags::new(), p, 0);
+                    stack.push(v);
+                }
+                // iaload
+                0x2e => {
+                    let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let off = fb.ins().uextend(types::I64, idx);
+                    let four = fb.ins().iconst(types::I64, 4);
+                    let byte_off = fb.ins().imul(off, four);
+                    let eight = fb.ins().iconst(types::I64, 8);
+                    let addr = fb.ins().iadd(p, byte_off);
+                    let addr = fb.ins().iadd(addr, eight);
+                    let v = fb.ins().load(types::I32, MemFlags::new(), addr, 0);
+                    stack.push(v);
+                }
+                // iastore
+                0x4f => {
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let off = fb.ins().uextend(types::I64, idx);
+                    let four = fb.ins().iconst(types::I64, 4);
+                    let byte_off = fb.ins().imul(off, four);
+                    let eight = fb.ins().iconst(types::I64, 8);
+                    let addr = fb.ins().iadd(p, byte_off);
+                    let addr = fb.ins().iadd(addr, eight);
+                    fb.ins().store(MemFlags::new(), v, addr, 0);
                 }
                 other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
             }
@@ -448,8 +618,8 @@ impl Jit {
 
 impl CompiledMethod {
     /// 调用：args 依次写入 locals[0..]，返回值即方法返回值
-    pub fn call(&self, args: &[i32]) -> i32 {
-        let mut locals = vec![0i32; self.max_locals.max(args.len())];
+    pub fn call(&self, args: &[i64]) -> i32 {
+        let mut locals = vec![0i64; self.max_locals.max(args.len())];
         locals[..args.len()].copy_from_slice(args);
         unsafe { (self.code)(locals.as_mut_ptr()) }
     }
@@ -564,4 +734,69 @@ fn argc_of(desc: &str) -> i32 {
         }
     }
     n
+}
+
+/// JIT 运行时辅助函数（被生成的机器码直接调用）
+pub mod rt {
+    use std::sync::Mutex;
+
+    const CAP: usize = 256 << 20;
+    struct State {
+        base: *mut u8,
+        used: usize,
+    }
+    unsafe impl Send for State {}
+
+    static STATE: Mutex<Option<State>> = Mutex::new(None);
+
+    /// 分配一个对象：头部 8 字节（class_id + flags），后面 fields 个 4 字节槽
+    pub extern "C" fn new_object(fields: u32) -> *mut u8 {
+        unsafe { alloc_zeroed(8 + fields as usize * 4) }
+    }
+
+    /// 分配一个数组：前 8 字节存长度，之后 len 个 4 字节元素
+    pub extern "C" fn new_array(len: u32) -> *mut u8 {
+        unsafe { alloc_zeroed(8 + len as usize * 4) }
+    }
+
+    unsafe fn alloc_zeroed(size: usize) -> *mut u8 {
+        let mut g = STATE.lock().unwrap();
+        if g.is_none() {
+            let layout = std::alloc::Layout::from_size_align(CAP, 8).unwrap();
+            let p = std::alloc::alloc_zeroed(layout);
+            *g = Some(State { base: p, used: 0 });
+        }
+        let s = g.as_mut().unwrap();
+        let off = s.used;
+        s.used += (size + 7) & !7;
+        assert!(s.used <= CAP, "JIT heap full");
+        let p = s.base.add(off);
+        std::ptr::write_bytes(p, 0, size);
+        p
+    }
+}
+
+/// 解析常量池里的**字段**引用 → (类名, 字段名, 描述符)
+fn field_ref_of(cf: &ClassFile, index: u16) -> Result<(String, String, String), JitError> {
+    let e = cf
+        .constant_pool
+        .get(index as usize)
+        .and_then(|e| e.as_ref())
+        .ok_or_else(|| JitError(format!("常量池索引 {index} 为空")))?;
+    let (c, nt) = match e {
+        CpEntry::FieldRef(c, n) => (*c, *n),
+        other => return Err(JitError(format!("不是字段引用: {other:?}"))),
+    };
+    let class = match cf.constant_pool.get(c as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::Class(n)) => String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned(),
+        _ => return Err(JitError("类名解析失败".into())),
+    };
+    let (name, desc) = match cf.constant_pool.get(nt as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::NameAndType(n, d)) => (
+            String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned(),
+            String::from_utf8_lossy(cf.utf8(*d).unwrap_or_default()).into_owned(),
+        ),
+        _ => return Err(JitError("NameAndType 解析失败".into())),
+    };
+    Ok((class, name, desc))
 }

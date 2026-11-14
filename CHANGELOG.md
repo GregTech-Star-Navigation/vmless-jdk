@@ -189,3 +189,13 @@
   |---|---|---|---|
   | `work(50M)`（每轮一次方法调用） | 61.8 s | **206 ms** | — |
   | `fib(30)`（270 万次调用） | — | **8.1 ms** | 247 ms |
+
+## 0.22.0 — 2026-11-14 · JIT 支持对象与数组
+
+- JIT 新增：`new` / `getfield` / `putfield` / `newarray` / `iaload` / `iastore` / `arraylength` /
+  引用局部变量（`aload`-`astore`）/ 构造器调用（`invokespecial`）
+- 运行时辅助：`vmless_new_object` / `vmless_new_array`（bump 分配 + 清零），经 JITBuilder 注册为符号
+- 局部变量槽从 4 字节改为 **8 字节**（引用是 64 位指针），int 仍读写低半
+- 编译器放开局部变量槽上限（>3 用 `iload/istore` 通用形式）
+- 端到端一致：`ObjArr.run(100)` 三个引擎都输出 **29850**（java / rustjava 解释器 / JIT）
+- 同一方法 JIT 调用 1000 次共 0.9 ms

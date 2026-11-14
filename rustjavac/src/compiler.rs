@@ -74,9 +74,11 @@ impl Emit {
     }
 
     fn iload(&mut self, slot: u8) -> Result<(), CompileError> {
-        match slot {
-            0..=3 => self.op(0x1A + slot),
-            _ => return err(format!("局部变量槽 {slot} 超出当前支持范围")),
+        if slot <= 3 {
+            self.op(0x1A + slot);
+        } else {
+            self.op(0x15);
+            self.bytes.push(slot);
         }
         self.push(1);
         Ok(())
@@ -103,9 +105,11 @@ impl Emit {
     }
 
     fn istore(&mut self, slot: u8) -> Result<(), CompileError> {
-        match slot {
-            0..=3 => self.op(0x3B + slot),
-            _ => return err(format!("局部变量槽 {slot} 超出当前支持范围")),
+        if slot <= 3 {
+            self.op(0x3B + slot);
+        } else {
+            self.op(0x36);
+            self.bytes.push(slot);
         }
         self.pop(1);
         Ok(())
@@ -113,9 +117,11 @@ impl Emit {
 
     /// 引用类型的存储（astore）
     fn astore(&mut self, slot: u8) -> Result<(), CompileError> {
-        match slot {
-            0..=3 => self.op(0x4B + slot),
-            _ => return err(format!("局部变量槽 {slot} 超出当前支持范围")),
+        if slot <= 3 {
+            self.op(0x4B + slot);
+        } else {
+            self.op(0x3A);
+            self.bytes.push(slot);
         }
         self.pop(1);
         Ok(())
@@ -123,9 +129,11 @@ impl Emit {
 
     /// 引用类型的读取（aload）
     fn aload(&mut self, slot: u8) -> Result<(), CompileError> {
-        match slot {
-            0..=3 => self.op(0x2A + slot),
-            _ => return err(format!("局部变量槽 {slot} 超出当前支持范围")),
+        if slot <= 3 {
+            self.op(0x2A + slot);
+        } else {
+            self.op(0x19);
+            self.bytes.push(slot);
         }
         self.push(1);
         Ok(())
@@ -551,9 +559,6 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
         Stmt::LocalVar { ty, name, init } => {
             let slot = ctx.next_slot;
             ctx.next_slot += 1;
-            if slot >= 4 {
-                return err("局部变量超过 4 个，暂不支持");
-            }
             if em.max_locals < ctx.next_slot as u16 {
                 em.max_locals = ctx.next_slot as u16;
             }
