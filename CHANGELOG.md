@@ -210,3 +210,11 @@
 - **四个程序整体 JIT 执行，与官方 java 输出全部一致**：
   `Arr`→20、`Loop`→10/7、`Perf2`→1283106752、`ObjArr`→29850
 - JIT 编译一个 main 约 1.4 ms，之后执行 0.02 ms
+
+## 0.24.0 — 2026-11-14 · JIT 支持字符串常量
+
+- 新增 `strtab` 运行时表：JIT 编译期登记常量池里的字符串，运行期 `vmless_str_const(idx)`
+  返回「长度 + UTF-8 内容」缓冲指针
+- `ldc`/`ldc_w` 遇到 String 常量走该表；`invokevirtual println(String)` 调 `vmless_println_obj`
+- **五个程序整体 JIT 执行，与官方 java 输出全部一致**：
+  `Demo`→`rustjavac + rustjava` / `45`、`Arr`→20、`Loop`→10/7、`Perf2`→1283106752、`ObjArr`→29850

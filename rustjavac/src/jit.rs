@@ -45,6 +45,8 @@ impl Jit {
         builder.symbol("vmless_new_array", rt::new_array as *const u8);
         builder.symbol("vmless_println_int", rt::println_int as *const u8);
         builder.symbol("vmless_println_str", rt::println_str as *const u8);
+        builder.symbol("vmless_str_const", strtab::str_const as *const u8);
+        builder.symbol("vmless_println_obj", strtab::println_str as *const u8);
         let module = JITModule::new(builder);
         Jit { module, compiled: std::collections::HashMap::new() }
     }
@@ -121,6 +123,29 @@ impl Jit {
         let println_int_id = self
             .module
             .declare_function("vmless_println_int", Linkage::Import, &sig_pi)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        // 登记常量池里的字符串常量（ldc 用）
+        let mut str_ids: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
+        for (i, e) in cf.constant_pool.iter().enumerate() {
+            if let Some(CpEntry::String(u)) = e {
+                if let Some(b) = cf.utf8(*u) {
+                    str_ids.insert(i as u16, strtab::register(&String::from_utf8_lossy(b)));
+                }
+            }
+        }
+        let mut sig_sc = self.module.make_signature();
+        sig_sc.params.push(AbiParam::new(types::I32));
+        sig_sc.returns.push(AbiParam::new(types::I64));
+        let str_const_id = self
+            .module
+            .declare_function("vmless_str_const", Linkage::Import, &sig_sc)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_ps = self.module.make_signature();
+        sig_ps.params.push(AbiParam::new(types::I64));
+        let println_obj_id = self
+            .module
+            .declare_function("vmless_println_obj", Linkage::Import, &sig_ps)
             .map_err(|e| JitError(e.to_string()))?;
 
         let mut bctx = FunctionBuilderContext::new();
@@ -272,12 +297,28 @@ impl Jit {
                 0x12 => {
                     let idx = body[pc] as u16;
                     pc += 1;
-                    stack.push(fb.ins().iconst(types::I32, const_int(cf, idx)));
+                    if let Some(&sid) = str_ids.get(&idx) {
+                        let c = fb.ins().iconst(types::I32, sid as i64);
+                        let fref = self.module.declare_func_in_func(str_const_id, fb.func);
+                        let call = fb.ins().call(fref, &[c]);
+                        let p = fb.inst_results(call)[0];
+                        stack.push(p);
+                    } else {
+                        stack.push(fb.ins().iconst(types::I32, const_int(cf, idx)));
+                    }
                 }
                 0x13 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    stack.push(fb.ins().iconst(types::I32, const_int(cf, idx)));
+                    if let Some(&sid) = str_ids.get(&idx) {
+                        let c = fb.ins().iconst(types::I32, sid as i64);
+                        let fref = self.module.declare_func_in_func(str_const_id, fb.func);
+                        let call = fb.ins().call(fref, &[c]);
+                        let p = fb.inst_results(call)[0];
+                        stack.push(p);
+                    } else {
+                        stack.push(fb.ins().iconst(types::I32, const_int(cf, idx)));
+                    }
                 }
                 0x15 => {
                     let slot = body[pc] as usize;
@@ -518,8 +559,9 @@ impl Jit {
                         let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                         let _recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                         if desc.contains("String") {
-                            // 暂不支持字符串实参
-                            return Err(JitError("JIT 暂不支持 println(String)".into()));
+                            let fref = self.module.declare_func_in_func(println_obj_id, fb.func);
+                            fb.ins().call(fref, &[v]);
+                            continue;
                         }
                         let fref = self.module.declare_func_in_func(println_int_id, fb.func);
                         fb.ins().call(fref, &[v]);
@@ -871,4 +913,57 @@ fn field_ref_of(cf: &ClassFile, index: u16) -> Result<(String, String, String), 
         _ => return Err(JitError("NameAndType 解析失败".into())),
     };
     Ok((class, name, desc))
+}
+
+/// 字符串常量表：JIT 编译期登记，运行期按序号取指针。
+pub mod strtab {
+    use std::sync::Mutex;
+
+    struct Entry {
+        len: u32,
+        bytes: Box<[u8]>,
+    }
+    // 每个条目前面 4 字节是长度，后面是 UTF-8 字节
+    static TABLE: Mutex<Vec<Box<[u8]>>> = Mutex::new(Vec::new());
+
+    /// 登记一个字符串，返回序号
+    pub fn register(s: &str) -> u32 {
+        let mut t = TABLE.lock().unwrap();
+        t.push(s.as_bytes().to_vec().into_boxed_slice());
+        (t.len() - 1) as u32
+    }
+
+    /// 运行时辅助：返回指向「长度 + 内容」缓冲的指针
+    pub extern "C" fn str_const(idx: u32) -> *const u8 {
+        let t = TABLE.lock().unwrap();
+        match t.get(idx as usize) {
+            Some(b) => {
+                let _ = Entry { len: b.len() as u32, bytes: Box::new([]) };
+                // 用 Vec 布局：先写长度再写内容
+                let mut buf = Vec::with_capacity(4 + b.len());
+                buf.extend_from_slice(&(b.len() as u32).to_ne_bytes());
+                buf.extend_from_slice(b);
+                let boxed = buf.into_boxed_slice();
+                let p = boxed.as_ptr();
+                std::mem::forget(boxed);
+                p
+            }
+            None => std::ptr::null(),
+        }
+    }
+
+    /// 运行时辅助：打印一个「长度 + 内容」的字符串
+    pub extern "C" fn println_str(s: *const u8) {
+        if s.is_null() {
+            println!();
+            return;
+        }
+        unsafe {
+            let mut lb = [0u8; 4];
+            std::ptr::copy_nonoverlapping(s, lb.as_mut_ptr(), 4);
+            let len = u32::from_ne_bytes(lb) as usize;
+            let bytes = std::slice::from_raw_parts(s.add(4), len);
+            println!("{}", String::from_utf8_lossy(bytes));
+        }
+    }
 }
