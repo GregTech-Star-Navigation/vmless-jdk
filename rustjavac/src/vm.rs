@@ -101,19 +101,40 @@ struct MethodRefInfo {
     desc: String,
 }
 
+/// 字符串句柄的基址：`handle >= STR_BASE` 就是字符串堆里的下标。
+/// 对象句柄是正数（1 起）、数组句柄是负数、0 是 null，四者不重叠。
+const STR_BASE: i32 = 1 << 24;
+
+/// 一个引用句柄的运行时类型
+enum RefKind {
+    Null,
+    Str,
+    Obj(String),
+    Arr(String),
+}
+
 pub struct Vm<'a> {
     class: &'a ClassFile,
     methods: HashMap<(String, String), &'a crate::Member>,
     output: Vec<String>,
     depth: usize,
-    /// 对象堆：每个对象就是一组 int 字段；引用 = 下标 + 1（0 表示 null）
-    objects: Vec<Vec<i32>>,
+    /// 对象堆：每个对象是一组字段槽（Slot 自带宽度，long/double 不会被截断）；
+    /// 引用 = 下标 + 1（0 表示 null）
+    objects: Vec<Vec<Slot>>,
+    /// 对象堆的运行时类型名（instanceof / checkcast 用）
+    object_class: Vec<String>,
     /// 实例字段名 → 下标
     field_index: HashMap<String, usize>,
     /// 本类实例字段个数
     field_count: usize,
-    /// 数组堆：每个数组是一组 int；句柄 = -(下标 + 1)
-    arrays: Vec<Vec<i32>>,
+    /// 数组堆：每个数组是一组元素槽；句柄 = -(下标 + 1)
+    arrays: Vec<Vec<Slot>>,
+    /// 数组堆的类描述符，如 `[I` / `[Ljava/lang/String;`
+    array_class: Vec<String>,
+    /// 字符串常量堆；句柄 = STR_BASE + 下标
+    strings: Vec<String>,
+    /// 常量池索引 → 字符串句柄（同一常量必须拿到同一句柄，否则引用相等会错）
+    string_handles: HashMap<u16, i32>,
 }
 
 impl<'a> Vm<'a> {
@@ -136,7 +157,20 @@ impl<'a> Vm<'a> {
             }
         }
         let n_fields = idx;
-        Vm { class, methods, output: Vec::new(), depth: 0, objects: Vec::new(), field_index, field_count: n_fields, arrays: Vec::new() }
+        Vm {
+            class,
+            methods,
+            output: Vec::new(),
+            depth: 0,
+            objects: Vec::new(),
+            object_class: Vec::new(),
+            field_index,
+            field_count: n_fields,
+            arrays: Vec::new(),
+            array_class: Vec::new(),
+            strings: Vec::new(),
+            string_handles: HashMap::new(),
+        }
     }
 
     fn method_ref(&self, index: u16) -> Result<MethodRefInfo, VmError> {
@@ -167,10 +201,10 @@ impl<'a> Vm<'a> {
         Ok(MethodRefInfo { class: class_name, name, desc })
     }
 
-    fn ldc_int(&self, index: u16) -> Result<i32, VmError> {
+    fn ldc_int(&mut self, index: u16) -> Result<i32, VmError> {
         match self.class.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
             Some(CpEntry::Integer(v)) => Ok(*v as i32),
-            Some(CpEntry::String(_)) => Ok(index as i32), // 句柄就是常量池索引
+            Some(CpEntry::String(_)) => Ok(self.string_handle(index)), // 句柄进字符串堆
             other => err(format!("ldc 不支持的类型: {other:?}")),
         }
     }
@@ -184,12 +218,69 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// 本类常量池里某个 Class 项的类名（instanceof / checkcast / anewarray 用）
+    fn class_name_of(&self, index: u16) -> Result<String, VmError> {
+        match self.class.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
+            Some(CpEntry::Class(n)) => Ok(String::from_utf8_lossy(self.class.utf8(*n).unwrap_or_default()).into_owned()),
+            other => err(format!("索引 {index} 不是 Class 项: {other:?}")),
+        }
+    }
+
+    /// 字符串常量 → 句柄（同一常量池项复用同一句柄）
+    fn string_handle(&mut self, cp_index: u16) -> i32 {
+        if let Some(h) = self.string_handles.get(&cp_index) {
+            return *h;
+        }
+        let text = self.string_at(cp_index).unwrap_or_default();
+        self.strings.push(text);
+        let h = STR_BASE + self.strings.len() as i32 - 1;
+        self.string_handles.insert(cp_index, h);
+        h
+    }
+
+    fn string_text(&self, handle: i32) -> String {
+        self.strings.get((handle - STR_BASE) as usize).cloned().unwrap_or_default()
+    }
+
+    fn ref_kind(&self, handle: i32) -> RefKind {
+        if handle == 0 {
+            RefKind::Null
+        } else if handle >= STR_BASE {
+            RefKind::Str
+        } else if handle > 0 {
+            RefKind::Obj(self.object_class.get(handle as usize - 1).cloned().unwrap_or_default())
+        } else {
+            RefKind::Arr(self.array_class.get((-handle - 1) as usize).cloned().unwrap_or_default())
+        }
+    }
+
+    /// `instanceof` 的判定：null 对任何类型都是 false（含 Object）
+    fn is_instance(&self, handle: i32, target: &str) -> bool {
+        match self.ref_kind(handle) {
+            RefKind::Null => false,
+            _ if target == "java/lang/Object" => true,
+            RefKind::Str => target == "java/lang/String",
+            RefKind::Obj(c) => c == target,
+            RefKind::Arr(d) => d == target,
+        }
+    }
+
+    /// 出错信息里用的可读类型名
+    fn type_name(&self, handle: i32) -> String {
+        match self.ref_kind(handle) {
+            RefKind::Null => "null".into(),
+            RefKind::Str => "java.lang.String".into(),
+            RefKind::Obj(c) => c.replace('/', "."),
+            RefKind::Arr(d) => d.replace('/', "."),
+        }
+    }
+
+
     fn string_at(&self, index: u16) -> Option<String> {
         match self.class.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
-            Some(CpEntry::String(u)) => self
-                .class
-                .utf8(*u)
-                .map(|b| String::from_utf8_lossy(b).into_owned()),
+            Some(CpEntry::String(u)) => {
+                self.class.utf8(*u).map(|b| String::from_utf8_lossy(b).into_owned())
+            }
             _ => None,
         }
     }
@@ -199,13 +290,29 @@ impl<'a> Vm<'a> {
         match desc {
             "(J)V" => v.as_i64().to_string(),
             "(D)V" | "(F)V" => java_double_to_string(v.as_f64()),
-            "(Ljava/lang/String;)V" => self.string_at(v.as_i32() as u16).unwrap_or_default(),
+            "(Z)V" => (if v.as_i32() != 0 { "true" } else { "false" }).to_string(),
+            "(Ljava/lang/String;)V" | "(Ljava/lang/Object;)V" => {
+                let h = v.as_i32();
+                if h == 0 {
+                    "null".to_string() // Java 打 println((String) null) 也是 "null"
+                } else if h >= STR_BASE {
+                    self.string_text(h)
+                } else {
+                    self.type_name(h) // 对象/数组：给个类型名，别静默打成空
+                }
+            }
             _ => v.as_i32().to_string(),
         }
     }
 
-    /// 执行一个方法：desc 形如 `(II)I`
-    fn execute(&mut self, m: &'a crate::Member, desc: &str, args: &[Slot]) -> Result<Slot, VmError> {
+    /// 执行一个方法：desc 形如 `(II)I`；`receiver` 表示 args[0] 是 this（实例方法）
+    fn execute(
+        &mut self,
+        m: &'a crate::Member,
+        desc: &str,
+        args: &[Slot],
+        receiver: bool,
+    ) -> Result<Slot, VmError> {
         if self.depth > 64 {
             return err("调用深度超限（可能递归过深）");
         }
@@ -213,10 +320,15 @@ impl<'a> Vm<'a> {
         let (max_locals, body) = code;
 
         let mut frame = Frame::new(max_locals);
-        // 参数按 JVM 槽位落位：long/double 占两槽，后面的参数要跳过一槽
+        // 参数按 JVM 槽位落位：this 在 0，long/double 占两槽，后面的参数要跳过一槽
         let arg_slots = param_slots(desc);
+        let offset = usize::from(receiver);
         for (i, a) in args.iter().enumerate() {
-            let slot = arg_slots.get(i).copied().unwrap_or(i);
+            let slot = if i < offset {
+                0
+            } else {
+                arg_slots.get(i - offset).copied().unwrap_or(i - offset) + offset
+            };
             frame.store(slot, *a);
         }
 
@@ -544,25 +656,38 @@ impl<'a> Vm<'a> {
                 0xaf => return Ok(Slot::F(frame.pop()?.as_f64())),
                 0xb0 => return Ok(Slot::I(frame.pop_i()?)),
                 0xb1 => return Ok(Slot::I(0)),
-                // iaload
-                0x2e => {
+                // iaload / laload / faload / daload / aaload：按指令宽度取元素
+                // （元素槽本身带宽度，读出来再按指令语义归一）
+                0x2e | 0x2f | 0x30 | 0x31 | 0x32 => {
                     let idx = frame.pop_i()?;
                     let arr = frame.pop_i()?;
                     let v = if arr < 0 {
                         let a = &self.arrays[(-arr - 1) as usize];
-                        *a.get(idx as usize).unwrap_or(&0)
-                    } else { 0 };
-                    frame.push(Slot::I(v));
+                        *a.get(idx as usize).unwrap_or(&Slot::I(0))
+                    } else {
+                        Slot::I(0)
+                    };
+                    frame.push(match op {
+                        0x2f => Slot::L(v.as_i64()),   // laload
+                        0x31 => Slot::F(v.as_f64()),   // daload
+                        0x30 => Slot::F(v.as_f64()),   // faload
+                        _ => Slot::I(v.as_i32()),      // iaload / aaload
+                    });
                 }
-                // iastore
-                0x4f => {
-                    let v = frame.pop_i()?;
+                // iastore / lastore / fastore / dastore / aastore
+                0x4f | 0x50 | 0x51 | 0x52 | 0x53 => {
+                    let v = frame.pop()?;
                     let idx = frame.pop_i()?;
                     let arr = frame.pop_i()?;
                     if arr < 0 && idx >= 0 {
                         let a = &mut self.arrays[(-arr - 1) as usize];
                         if (idx as usize) < a.len() {
-                            a[idx as usize] = v;
+                            a[idx as usize] = match op {
+                                0x50 => Slot::L(v.as_i64()),  // lastore
+                                0x52 => Slot::F(v.as_f64()),  // dastore
+                                0x51 => Slot::F(v.as_f64()),  // fastore
+                                _ => Slot::I(v.as_i32()),     // iastore / aastore
+                            };
                         }
                     }
                 }
@@ -572,47 +697,157 @@ impl<'a> Vm<'a> {
                     let n = if arr < 0 { self.arrays[(-arr - 1) as usize].len() as i32 } else { 0 };
                     frame.push(Slot::I(n));
                 }
-                // newarray：操作数是元素类型码（10 = int）
+                // newarray：操作数是元素类型码（10 = int / 11 = long / 7 = double ...）
                 0xbc => {
-                    let _atype = body[pc];
+                    let atype = body[pc];
                     pc += 1;
                     let n = frame.pop_i()?;
                     if n < 0 {
                         return err("数组长度为负");
                     }
-                    self.arrays.push(vec![0; n as usize]);
+                    let (desc, zero) = match atype {
+                        11 => ("[J", Slot::L(0)),
+                        7 => ("[D", Slot::F(0.0)),
+                        6 => ("[F", Slot::F(0.0)),
+                        _ => ("[I", Slot::I(0)),
+                    };
+                    self.arrays.push(vec![zero; n as usize]);
+                    self.array_class.push(desc.to_string());
                     let handle = -((self.arrays.len() as i32));
                     frame.push(Slot::I(handle));
                 }
-                // new
-                0xbb => {
-                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                // anewarray：操作数是**元素类**的常量池索引
+                0xbd => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    self.objects.push(vec![0; self.field_count.max(1)]);
+                    let comp = self.class_name_of(idx)?;
+                    let desc = if comp.starts_with('[') {
+                        format!("[{comp}") // 元素本身是数组：[[I 之类
+                    } else {
+                        format!("[L{comp};")
+                    };
+                    let n = frame.pop_i()?;
+                    if n < 0 {
+                        return err("数组长度为负");
+                    }
+                    self.arrays.push(vec![Slot::I(0); n as usize]); // 引用元素默认 null
+                    self.array_class.push(desc);
+                    let handle = -((self.arrays.len() as i32));
+                    frame.push(Slot::I(handle));
+                }
+                // new：按本类字段个数分配，并记下运行时类型名
+                0xbb => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    self.objects.push(vec![Slot::I(0); self.field_count.max(1)]);
+                    self.object_class.push(self.class_name_of(idx)?);
                     let handle = self.objects.len() as i32;
                     frame.push(Slot::I(handle));
                 }
-                // getfield
+                // getfield：字段槽自带宽度，直接按槽取
                 0xb4 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let info = self.method_ref(idx)?;
                     let obj = frame.pop_i()?;
                     let f = *self.field_index.get(&info.name).unwrap_or(&0);
-                    let v = if obj > 0 { self.objects[obj as usize - 1][f] } else { 0 };
-                    frame.push(Slot::I(v));
+                    let v = if obj > 0 {
+                        *self.objects[obj as usize - 1].get(f).unwrap_or(&Slot::I(0))
+                    } else {
+                        Slot::I(0)
+                    };
+                    frame.push(v);
                 }
                 // putfield
                 0xb5 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let info = self.method_ref(idx)?;
-                    let value = frame.pop_i()?;
+                    let value = frame.pop()?;
                     let obj = frame.pop_i()?;
                     let f = *self.field_index.get(&info.name).unwrap_or(&0);
                     if obj > 0 {
-                        self.objects[obj as usize - 1][f] = value;
+                        let slots = &mut self.objects[obj as usize - 1];
+                        if f < slots.len() {
+                            slots[f] = value;
+                        }
                     }
+                }
+                // instanceof：压 0/1
+                0xc1 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let target = self.class_name_of(idx)?;
+                    let v = frame.pop_i()?;
+                    frame.push(Slot::I(if self.is_instance(v, &target) { 1 } else { 0 }));
+                }
+                // checkcast：不匹配就按 ClassCastException 退出（本 VM 还没有异常机制）
+                0xc0 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let target = self.class_name_of(idx)?;
+                    let v = frame.pop_i()?;
+                    if v != 0 && !self.is_instance(v, &target) {
+                        return err(format!(
+                            "ClassCastException: {} cannot be cast to {}",
+                            self.type_name(v),
+                            target.replace('/', ".")
+                        ));
+                    }
+                    frame.push(Slot::I(v));
+                }
+                // ifnull / ifnonnull
+                0xc6 | 0xc7 => {
+                    let op_pc = pc - 1;
+                    let off = i16::from_be_bytes([body[pc], body[pc + 1]]) as isize;
+                    pc += 2;
+                    let v = frame.pop_i()?;
+                    let take = if op == 0xc6 { v == 0 } else { v != 0 };
+                    if take {
+                        pc = (op_pc as isize + off) as usize;
+                    }
+                }
+                // 移位：int 版本右操作数取低 5 位、long 版本取低 6 位（与 JVM 一致）
+                0x78 | 0x7a | 0x7c => {
+                    let n = frame.pop_i()? & 31;
+                    let a = frame.pop_i()?;
+                    let r = match op {
+                        0x78 => a.wrapping_shl(n as u32),                  // ishl
+                        0x7a => a.wrapping_shr(n as u32),                  // ishr
+                        _ => ((a as u32) >> n) as i32,                     // iushr
+                    };
+                    frame.push(Slot::I(r));
+                }
+                0x79 | 0x7b | 0x7d => {
+                    let n = frame.pop_i()? & 63;
+                    let a = frame.pop()?.as_i64();
+                    let r = match op {
+                        0x79 => a.wrapping_shl(n as u32),                  // lshl
+                        0x7b => a.wrapping_shr(n as u32),                  // lshr
+                        _ => ((a as u64) >> n) as i64,                     // lushr
+                    };
+                    frame.push(Slot::L(r));
+                }
+                // 位运算
+                0x7e | 0x80 | 0x82 => {
+                    let b = frame.pop_i()?;
+                    let a = frame.pop_i()?;
+                    let r = match op {
+                        0x7e => a & b, // iand
+                        0x80 => a | b, // ior
+                        _ => a ^ b,    // ixor
+                    };
+                    frame.push(Slot::I(r));
+                }
+                0x7f | 0x81 | 0x83 => {
+                    let b = frame.pop()?.as_i64();
+                    let a = frame.pop()?.as_i64();
+                    let r = match op {
+                        0x7f => a & b, // land
+                        0x81 => a | b, // lor
+                        _ => a ^ b,    // lxor
+                    };
+                    frame.push(Slot::L(r));
                 }
                 // getstatic：目前只支持 System.out
                 0xb2 => {
@@ -646,7 +881,7 @@ impl<'a> Vm<'a> {
                         let mut all = vec![recv];
                         all.extend(args);
                         self.depth += 1;
-                        let r = self.execute(target, &info.desc, &all)?;
+                        let r = self.execute(target, &info.desc, &all, true)?;
                         self.depth -= 1;
                         if !info.desc.ends_with(")V") {
                             frame.push(r);
@@ -672,7 +907,7 @@ impl<'a> Vm<'a> {
                         all.extend(args);
                         if let Some(target) = self.methods.get(&(info.name.clone(), info.desc.clone())).copied() {
                             self.depth += 1;
-                            let _ = self.execute(target, &info.desc, &all);
+                            let _ = self.execute(target, &info.desc, &all, true);
                             self.depth -= 1;
                         }
                     } else {
@@ -699,7 +934,7 @@ impl<'a> Vm<'a> {
                         .copied()
                         .ok_or_else(|| VmError { msg: format!("找不到方法 {}{}", info.name, info.desc) })?;
                     self.depth += 1;
-                    let r = self.execute(target, &info.desc, &args)?;
+                    let r = self.execute(target, &info.desc, &args, false)?;
                     self.depth -= 1;
                     if !info.desc.ends_with(")V") {
                         frame.push(r);
@@ -740,7 +975,7 @@ impl<'a> Vm<'a> {
             .methods
             .get(&("main".to_string(), "([Ljava/lang/String;)V".to_string()))
             .ok_or_else(|| VmError { msg: "找不到 main([Ljava/lang/String;)V".into() })?;
-        let r = self.execute(m, "([Ljava/lang/String;)V", &[Slot::I(0)])?;
+        let r = self.execute(m, "([Ljava/lang/String;)V", &[Slot::I(0)], false)?;
         Ok(ExecResult { return_value: r.as_i32(), output: std::mem::take(&mut self.output) })
     }
 }

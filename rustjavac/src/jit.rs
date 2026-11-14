@@ -44,8 +44,11 @@ impl Jit {
         builder.symbol("vmless_new_object", rt::new_object as *const u8);
         builder.symbol("vmless_new_array", rt::new_array as *const u8);
         builder.symbol("vmless_println_int", rt::println_int as *const u8);
+        builder.symbol("vmless_println_bool", rt::println_bool as *const u8);
         builder.symbol("vmless_println_long", rt::println_long as *const u8);
         builder.symbol("vmless_println_double", rt::println_double as *const u8);
+        builder.symbol("vmless_instanceof", rt::instanceof as *const u8);
+        builder.symbol("vmless_checkcast", rt::checkcast as *const u8);
         builder.symbol("vmless_println_str", rt::println_str as *const u8);
         builder.symbol("vmless_str_const", strtab::str_const as *const u8);
         builder.symbol("vmless_println_obj", strtab::println_str as *const u8);
@@ -110,14 +113,17 @@ impl Jit {
         ctx.func.signature = sig.clone();
         // 声明运行时辅助函数
         let mut sig_new_obj = self.module.make_signature();
-        sig_new_obj.params.push(AbiParam::new(types::I32));
+        sig_new_obj.params.push(AbiParam::new(types::I32)); // 字段个数
+        sig_new_obj.params.push(AbiParam::new(types::I32)); // 类型标签
         sig_new_obj.returns.push(AbiParam::new(types::I64));
         let new_obj_id = self
             .module
             .declare_function("vmless_new_object", Linkage::Import, &sig_new_obj)
             .map_err(|e| JitError(e.to_string()))?;
         let mut sig_new_arr = self.module.make_signature();
-        sig_new_arr.params.push(AbiParam::new(types::I32));
+        sig_new_arr.params.push(AbiParam::new(types::I32)); // 长度
+        sig_new_arr.params.push(AbiParam::new(types::I32)); // 元素字节数
+        sig_new_arr.params.push(AbiParam::new(types::I32)); // 类型标签
         sig_new_arr.returns.push(AbiParam::new(types::I64));
         let new_arr_id = self
             .module
@@ -129,6 +135,25 @@ impl Jit {
         let println_int_id = self
             .module
             .declare_function("vmless_println_int", Linkage::Import, &sig_pi)
+            .map_err(|e| JitError(e.to_string()))?;
+        let println_bool_id = self
+            .module
+            .declare_function("vmless_println_bool", Linkage::Import, &sig_pi)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        let mut sig_io = self.module.make_signature();
+        sig_io.params.push(AbiParam::new(types::I64)); // 对象指针
+        sig_io.params.push(AbiParam::new(types::I32)); // 目标类型标签
+        sig_io.returns.push(AbiParam::new(types::I32));
+        let instanceof_id = self
+            .module
+            .declare_function("vmless_instanceof", Linkage::Import, &sig_io)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_cc = sig_io.clone();
+        sig_cc.returns[0] = AbiParam::new(types::I64);
+        let checkcast_id = self
+            .module
+            .declare_function("vmless_checkcast", Linkage::Import, &sig_cc)
             .map_err(|e| JitError(e.to_string()))?;
 
         let mut sig_pl = self.module.make_signature();
@@ -192,17 +217,13 @@ impl Jit {
         while pc < body.len() {
             let op = body[pc];
             match op {
-                0x99..=0xa4 | 0xa7 => {
+                // 条件跳转 / goto / ifnull / ifnonnull：目标 + 落空地址都是块首
+                0x99..=0xa7 | 0xc6 | 0xc7 => {
                     let off = i16::from_be_bytes([body[pc + 1], body[pc + 2]]) as isize;
                     targets.push((pc as isize + off) as usize);
-                    // 分支之后的指令也是基本块开头（即使当前不可达）
                     targets.push(pc + 3);
                     pc += 3;
                 }
-                0x10 => pc += 2,
-                0x11 | 0x13 | 0x84 | 0xb2 | 0xb4 | 0xb5 | 0xb6 | 0xb7 | 0xb8 | 0xbb => pc += 3,
-                0x12 => pc += 2,
-                0xbc | 0x19 | 0x59 => pc += 2,
                 _ => pc += insn_len(op),
             }
         }
@@ -302,6 +323,7 @@ impl Jit {
             pc += 1;
             match op {
                 0x00 => {}
+                0x01 => stack.push(fb.ins().iconst(types::I64, 0)), // aconst_null
                 0x02 => stack.push(fb.ins().iconst(types::I32, -1)),
                 0x03..=0x08 => stack.push(fb.ins().iconst(types::I32, (op as i64) - 3)),
                 0x10 => {
@@ -411,8 +433,28 @@ impl Jit {
                     cur_start = pc;
                     cur_start = pc;
                 }
-                // 二元比较跳转
-                0x9f..=0xa4 => {
+                // ifnull / ifnonnull：引用是 I64，与 0 比较
+                0xc6 | 0xc7 => {
+                    let off = i16::from_be_bytes([body[pc], body[pc + 1]]) as isize;
+                    pc += 2;
+                    let target = (pc as isize - 3 + off) as usize;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = convert_to(&mut fb, v, types::I64);
+                    let zero = fb.ins().iconst(types::I64, 0);
+                    let cc = if op == 0xc6 { IntCC::Equal } else { IntCC::NotEqual };
+                    let tb = *blocks.get(&target).ok_or_else(|| JitError("缺少目标块".into()))?;
+                    let fall = *blocks.get(&pc).ok_or_else(|| JitError("缺少落空块".into()))?;
+                    let cond = fb.ins().icmp(cc, v, zero);
+                    fb.ins().brif(cond, tb, &[], fall, &[]);
+                    terminated = true;
+                    open.pop();
+                    open.push(fall);
+                    fb.switch_to_block(fall);
+                    terminated = false;
+                    cur_start = pc;
+                }
+                // 二元比较跳转（0xa5/0xa6 是引用比较，引用是 I64）
+                0x9f..=0xa4 | 0xa5 | 0xa6 => {
                     let off = i16::from_be_bytes([body[pc], body[pc + 1]]) as isize;
                     pc += 2;
                     let target = (pc as isize - 3 + off) as usize;
@@ -424,7 +466,24 @@ impl Jit {
                         0xa1 => IntCC::SignedLessThan,
                         0xa2 => IntCC::SignedGreaterThanOrEqual,
                         0xa3 => IntCC::SignedGreaterThan,
-                        _ => IntCC::SignedLessThanOrEqual,
+                        0xa4 => IntCC::SignedLessThanOrEqual,
+                        // if_acmpeq / if_acmpne：按 8 字节比较
+                        _ => {
+                            let a = convert_to(&mut fb, a, types::I64);
+                            let b = convert_to(&mut fb, b, types::I64);
+                            let tb = *blocks.get(&target).ok_or_else(|| JitError("缺少目标块".into()))?;
+                            let fall = *blocks.get(&pc).ok_or_else(|| JitError("缺少落空块".into()))?;
+                            let c = if op == 0xa5 { IntCC::Equal } else { IntCC::NotEqual };
+                            let cond = fb.ins().icmp(c, a, b);
+                            fb.ins().brif(cond, tb, &[], fall, &[]);
+                            terminated = true;
+                            open.pop();
+                            open.push(fall);
+                            fb.switch_to_block(fall);
+                            terminated = false;
+                            cur_start = pc;
+                            continue;
+                        }
                     };
                     let tb = *blocks.get(&target).ok_or_else(|| JitError("缺少目标块".into()))?;
                     let fall = *blocks.get(&pc).ok_or_else(|| JitError("缺少落空块".into()))?;
@@ -452,8 +511,8 @@ impl Jit {
                     terminated = false;
                     cur_start = pc;
                 }
-                // ireturn / lreturn / freturn / dreturn：统一按方法签名声明的返回类型收口
-                0xac | 0xad | 0xae | 0xaf => {
+                // ireturn / lreturn / freturn / dreturn / areturn：统一按方法签名声明的返回类型收口
+                0xac | 0xad | 0xae | 0xaf | 0xb0 => {
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let v = convert_to(&mut fb, v, ret_ty);
                     fb.ins().return_(&[v]);
@@ -758,7 +817,10 @@ impl Jit {
                         let (fid, want) = match desc.as_str() {
                             "(J)V" => (println_long_id, types::I64),
                             "(D)V" | "(F)V" => (println_double_id, types::F64),
-                            "(Ljava/lang/String;)V" => (println_obj_id, types::I64),
+                            "(Z)V" => (println_bool_id, types::I32),
+                            "(Ljava/lang/String;)V" | "(Ljava/lang/Object;)V" => {
+                                (println_obj_id, types::I64)
+                            }
                             _ => (println_int_id, types::I32),
                         };
                         let v = convert_to(&mut fb, v, want);
@@ -795,77 +857,192 @@ impl Jit {
                         }
                     }
                 }
-                // new：分配对象（字段数来自本类）
+                // new：分配对象（8 字节头 + 每字段 8 字节）
                 0xbb => {
-                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
+                    let cls = match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
+                        Some(CpEntry::Class(n)) => {
+                            String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned()
+                        }
+                        other => return Err(JitError(format!("new 的操作数不是类: {other:?}"))),
+                    };
+                    let tag = rt::class_tag(&cls);
                     let nf = fb.ins().iconst(types::I32, field_count as i64);
+                    let tg = fb.ins().iconst(types::I32, tag as i64);
                     let fref = self.module.declare_func_in_func(new_obj_id, fb.func);
-                    let c = fb.ins().call(fref, &[nf]);
+                    let c = fb.ins().call(fref, &[nf, tg]);
                     let p = fb.inst_results(c)[0];
                     stack.push(p);
                 }
-                // getfield（偏移 = 8 + 4*下标）
+                // getfield（偏移 = 8 + 8*下标；类型按字段描述符选）
                 0xb4 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let name = field_ref_of(cf, idx)?.1;
+                    let (_, name, desc) = field_ref_of(cf, idx)?;
                     let f = *fields.get(&name).ok_or_else(|| JitError(format!("未知字段 {name}")))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let v = fb.ins().load(types::I32, MemFlags::new(), p, (8 + 4 * f) as i32);
-                    stack.push(v);
+                    let off = (8 + 8 * f) as i32;
+                    let (ty, want) = field_slot_type(&desc);
+                    let v = fb.ins().load(ty, MemFlags::new(), p, off);
+                    stack.push(convert_to(&mut fb, v, want));
                 }
                 // putfield
                 0xb5 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let name = field_ref_of(cf, idx)?.1;
+                    let (_, name, desc) = field_ref_of(cf, idx)?;
                     let f = *fields.get(&name).ok_or_else(|| JitError(format!("未知字段 {name}")))?;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    fb.ins().store(MemFlags::new(), v, p, (8 + 4 * f) as i32);
+                    let (ty, want) = field_slot_type(&desc);
+                    let v = convert_to(&mut fb, v, want);
+                    let _ = ty;
+                    fb.ins().store(MemFlags::new(), v, p, (8 + 8 * f) as i32);
                 }
-                // newarray
+                // newarray：atype → (元素描述符, 元素字节数)
                 0xbc => {
-                    let _atype = body[pc];
+                    let atype = body[pc];
                     pc += 1;
-                    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let fref = self.module.declare_func_in_func(new_arr_id, fb.func);
-                    let c = fb.ins().call(fref, &[n]);
-                    let p = fb.inst_results(c)[0];
-                    stack.push(p);
+                    let (desc, esize) = match atype {
+                        11 => ("[J", 8),
+                        7 => ("[D", 8),
+                        6 => ("[F", 8),
+                        4 => ("[Z", 4),
+                        5 => ("[C", 4),
+                        8 => ("[B", 4),
+                        9 => ("[S", 4),
+                        _ => ("[I", 4),
+                    };
+                    push_new_array(&mut fb, &mut stack, &mut self.module, new_arr_id, esize, desc)?;
                 }
-                // arraylength
+                // anewarray：操作数是元素类 → 数组描述符 [Lxxx; 或 [[xxx
+                0xbd => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let comp = match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
+                        Some(CpEntry::Class(n)) => {
+                            String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned()
+                        }
+                        other => return Err(JitError(format!("anewarray 的操作数不是类: {other:?}"))),
+                    };
+                    let desc = if comp.starts_with('[') {
+                        format!("[{comp}")
+                    } else {
+                        format!("[L{comp};")
+                    };
+                    push_new_array(&mut fb, &mut stack, &mut self.module, new_arr_id, 8, &desc)?;
+                }
+                // arraylength（长度在偏移 0）
                 0xbe => {
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let v = fb.ins().load(types::I32, MemFlags::new(), p, 0);
                     stack.push(v);
                 }
-                // iaload
-                0x2e => {
+                // iaload / laload / faload / daload / aaload：元素宽度按指令选
+                0x2e | 0x2f | 0x30 | 0x31 | 0x32 => {
+                    let esize: i64 = if matches!(op, 0x2e) { 4 } else { 8 };
+                    let ty = match op {
+                        0x2f => types::I64,
+                        0x30 | 0x31 => types::F64,
+                        0x32 => types::I64,
+                        _ => types::I32,
+                    };
                     let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let off = fb.ins().uextend(types::I64, idx);
-                    let four = fb.ins().iconst(types::I64, 4);
-                    let byte_off = fb.ins().imul(off, four);
-                    let eight = fb.ins().iconst(types::I64, 8);
-                    let addr = fb.ins().iadd(p, byte_off);
-                    let addr = fb.ins().iadd(addr, eight);
-                    let v = fb.ins().load(types::I32, MemFlags::new(), addr, 0);
+                    let addr = elem_addr(&mut fb, p, idx, esize)?;
+                    let v = fb.ins().load(ty, MemFlags::new(), addr, 0);
                     stack.push(v);
                 }
-                // iastore
-                0x4f => {
+                // iastore / lastore / fastore / dastore / aastore
+                0x4f | 0x50 | 0x51 | 0x52 | 0x53 => {
+                    let esize: i64 = if matches!(op, 0x4f) { 4 } else { 8 };
+                    let want = match op {
+                        0x50 => types::I64,
+                        0x51 | 0x52 => types::F64,
+                        0x53 => types::I64,
+                        _ => types::I32,
+                    };
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let off = fb.ins().uextend(types::I64, idx);
-                    let four = fb.ins().iconst(types::I64, 4);
-                    let byte_off = fb.ins().imul(off, four);
-                    let eight = fb.ins().iconst(types::I64, 8);
-                    let addr = fb.ins().iadd(p, byte_off);
-                    let addr = fb.ins().iadd(addr, eight);
+                    let v = convert_to(&mut fb, v, want);
+                    let addr = elem_addr(&mut fb, p, idx, esize)?;
                     fb.ins().store(MemFlags::new(), v, addr, 0);
+                }
+                // instanceof / checkcast：走运行时的类型标签比较
+                0xc1 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let tag = class_const_tag(cf, idx)?;
+                    let obj = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let obj = convert_to(&mut fb, obj, types::I64);
+                    let tg = fb.ins().iconst(types::I32, tag as i64);
+                    let fref = self.module.declare_func_in_func(instanceof_id, fb.func);
+                    let c = fb.ins().call(fref, &[obj, tg]);
+                    stack.push(fb.inst_results(c)[0]);
+                }
+                0xc0 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let tag = class_const_tag(cf, idx)?;
+                    let obj = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let obj = convert_to(&mut fb, obj, types::I64);
+                    let tg = fb.ins().iconst(types::I32, tag as i64);
+                    let fref = self.module.declare_func_in_func(checkcast_id, fb.func);
+                    let c = fb.ins().call(fref, &[obj, tg]);
+                    stack.push(fb.inst_results(c)[0]);
+                }
+                // 移位：int 版本两个操作数都是 I32；long 版本的位数由 I32 扩展成 I64
+                0x78 | 0x7a | 0x7c => {
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = convert_to(&mut fb, b, types::I32);
+                    let a = convert_to(&mut fb, a, types::I32);
+                    let v = match op {
+                        0x78 => fb.ins().ishl(a, b),  // ishl
+                        0x7a => fb.ins().sshr(a, b),  // ishr
+                        _ => fb.ins().ushr(a, b),     // iushr
+                    };
+                    stack.push(v);
+                }
+                0x79 | 0x7b | 0x7d => {
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b32 = convert_to(&mut fb, b, types::I32);
+                    let b = fb.ins().sextend(types::I64, b32);
+                    let a = convert_to(&mut fb, a, types::I64);
+                    let v = match op {
+                        0x79 => fb.ins().ishl(a, b), // lshl
+                        0x7b => fb.ins().sshr(a, b), // lshr
+                        _ => fb.ins().ushr(a, b),    // lushr
+                    };
+                    stack.push(v);
+                }
+                // 位运算
+                0x7e | 0x80 | 0x82 => {
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = convert_to(&mut fb, a, types::I32);
+                    let b = convert_to(&mut fb, b, types::I32);
+                    let v = match op {
+                        0x7e => fb.ins().band(a, b),
+                        0x80 => fb.ins().bor(a, b),
+                        _ => fb.ins().bxor(a, b),
+                    };
+                    stack.push(v);
+                }
+                0x7f | 0x81 | 0x83 => {
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = convert_to(&mut fb, a, types::I64);
+                    let b = convert_to(&mut fb, b, types::I64);
+                    let v = match op {
+                        0x7f => fb.ins().band(a, b),
+                        0x81 => fb.ins().bor(a, b),
+                        _ => fb.ins().bxor(a, b),
+                    };
+                    stack.push(v);
                 }
                 other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
             }
@@ -1049,6 +1226,8 @@ fn ret_type(desc: &str) -> cranelift_codegen::ir::Type {
     match crate::ret_of(desc) {
         Some(b'J') => types::I64,
         Some(b'D') | Some(b'F') => types::F64,
+        // 引用是 8 字节指针，必须按 I64 返回，否则会被截断成 i32
+        Some(b'L') | Some(b'[') => types::I64,
         _ => types::I32,
     }
 }
@@ -1164,6 +1343,11 @@ fn argc_of(desc: &str) -> i32 {
 }
 
 /// JIT 运行时辅助函数（被生成的机器码直接调用）
+///
+/// 堆对象统一布局：**偏移 4 处是 u32 类型标签**，字段/元素从偏移 8 开始。
+/// - 对象：`[0..4] 未用`、`[4..8] class tag`、`[8..] 字段（每字段 8 字节）`
+/// - 数组：`[0..4] 长度`、`[4..8] class tag`、`[8..] 元素（int 4 字节 / long·double·引用 8 字节）`
+/// - 字符串：同数组，`[8..]` 是 UTF-8 字节
 pub mod rt {
     use std::sync::Mutex;
 
@@ -1176,14 +1360,106 @@ pub mod rt {
 
     static STATE: Mutex<Option<State>> = Mutex::new(None);
 
-    /// 分配一个对象：头部 8 字节（class_id + flags），后面 fields 个 4 字节槽
-    pub extern "C" fn new_object(fields: u32) -> *mut u8 {
-        unsafe { alloc_zeroed(8 + fields as usize * 4) }
+    /// 类名 → 类型标签（0 = java/lang/Object，1 = java/lang/String，其余从 2 起）
+    static CLASS_TAGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// 登记/查询一个类的类型标签。编译期调用，把结果当常量嵌进机器码。
+    pub fn class_tag(name: &str) -> u32 {
+        match name {
+            "java/lang/Object" => return 0,
+            "java/lang/String" => return 1,
+            _ => {}
+        }
+        let mut t = CLASS_TAGS.lock().unwrap();
+        if let Some(i) = t.iter().position(|s| s == name) {
+            return i as u32 + 2;
+        }
+        t.push(name.to_string());
+        t.len() as u32 + 1
+    }
+
+    /// 类型标签 → 类名（打印非字符串对象时用）
+    pub fn class_name_of(tag: u32) -> String {
+        match tag {
+            0 => "java.lang.Object".to_string(),
+            1 => "java.lang.String".to_string(),
+            t => {
+                let names = CLASS_TAGS.lock().unwrap();
+                match names.get((t - 2) as usize) {
+                    Some(n) => n.replace('/', "."),
+                    None => format!("<type#{t}>"),
+                }
+            }
+        }
+    }
+
+    fn tag_of(name: &str) -> u32 {    match name {
+            "java/lang/Object" => 0,
+            "java/lang/String" => 1,
+            other => {
+                let mut t = CLASS_TAGS.lock().unwrap();
+                match t.iter().position(|s| s == other) {
+                    Some(i) => i as u32 + 2,
+                    None => {
+                        t.push(other.to_string());
+                        t.len() as u32 + 1
+                    }
+                }
+            }
+        }
+    }
+
+    /// 分配一个对象：头部 8 字节（[4..8] 是类型标签），后面 fields 个 8 字节字段槽
+    pub extern "C" fn new_object(fields: u32, tag: u32) -> *mut u8 {
+        let p = unsafe { alloc_zeroed(8 + fields as usize * 8) };
+        unsafe { std::ptr::write_unaligned(p.add(4) as *mut u32, tag) };
+        p
+    }
+
+    /// 分配一个数组：`[0..4]` 长度，`[4..8]` 类型标签，`[8..]` len 个 elem_size 字节元素
+    pub extern "C" fn new_array(len: u32, elem_size: u32, tag: u32) -> *mut u8 {
+        let p = unsafe { alloc_zeroed(8 + len as usize * elem_size as usize) };
+        unsafe {
+            std::ptr::write_unaligned(p as *mut u32, len);
+            std::ptr::write_unaligned(p.add(4) as *mut u32, tag);
+        }
+        p
+    }
+
+    /// `instanceof`：null 对任何类型都是 false；标签 0（java/lang/Object）对任何非 null 都是 true
+    pub extern "C" fn instanceof(obj: i64, tag: u32) -> i32 {
+        if obj == 0 {
+            return 0;
+        }
+        if tag == 0 {
+            return 1;
+        }
+        let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
+        i32::from(actual == tag)
+    }
+
+    /// `checkcast`：类型不符时按 ClassCastException 退出（JIT 还没有异常机制）
+    pub extern "C" fn checkcast(obj: i64, tag: u32) -> i64 {
+        if obj != 0 && tag != 0 {
+            let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
+            if actual != tag {
+                eprintln!(
+                    "ClassCastException: 类型标签 {actual} 的对象不能转换成标签 {tag}（checkcast 失败）"
+                );
+                std::process::exit(1);
+            }
+        }
+        obj
     }
 
     /// 打印一个 int（对应 System.out.println(int)）
     pub extern "C" fn println_int(v: i32) {
         println!("{v}");
+    }
+
+    /// 打印一个 boolean（对应 System.out.println(boolean)）
+    pub extern "C" fn println_bool(v: i32) {
+        println!("{}", if v != 0 { "true" } else { "false" });
     }
 
     /// 打印一个 long（对应 System.out.println(long)）
@@ -1210,14 +1486,6 @@ pub mod rt {
         println!("{}", String::from_utf8_lossy(s));
     }
 
-    /// 分配一个数组：前 8 字节存长度，之后 len 个 4 字节元素
-    pub extern "C" fn new_array(len: u32) -> *mut u8 {
-        let p = unsafe { alloc_zeroed(8 + len as usize * 4) };
-        // 头 4 字节存长度（arraylength 读这里）
-        unsafe { std::ptr::write_unaligned(p as *mut u32, len) };
-        p
-    }
-
     unsafe fn alloc_zeroed(size: usize) -> *mut u8 {
         let mut g = STATE.lock().unwrap();
         if g.is_none() {
@@ -1232,6 +1500,11 @@ pub mod rt {
         let p = s.base.add(off);
         std::ptr::write_bytes(p, 0, size);
         p
+    }
+
+    /// 让 `strtab` 也能用同一个分配器/标签表
+    pub(super) fn string_tag() -> u32 {
+        tag_of("java/lang/String")
     }
 }
 
@@ -1264,52 +1537,108 @@ fn field_ref_of(cf: &ClassFile, index: u16) -> Result<(String, String, String), 
 pub mod strtab {
     use std::sync::Mutex;
 
-    struct Entry {
-        len: u32,
-        bytes: Box<[u8]>,
-    }
-    // 每个条目前面 4 字节是长度，后面是 UTF-8 字节
+    // 每份缓冲的布局与堆数组一致：`[0..4] 长度`、`[4..8] 类型标签`、`[8..]` UTF-8 字节
     static TABLE: Mutex<Vec<Box<[u8]>>> = Mutex::new(Vec::new());
 
     /// 登记一个字符串，返回序号
     pub fn register(s: &str) -> u32 {
+        let mut buf = Vec::with_capacity(8 + s.len());
+        buf.extend_from_slice(&(s.len() as u32).to_ne_bytes());
+        buf.extend_from_slice(&super::rt::string_tag().to_ne_bytes());
+        buf.extend_from_slice(s.as_bytes());
         let mut t = TABLE.lock().unwrap();
-        t.push(s.as_bytes().to_vec().into_boxed_slice());
+        t.push(buf.into_boxed_slice());
         (t.len() - 1) as u32
     }
 
-    /// 运行时辅助：返回指向「长度 + 内容」缓冲的指针
+    /// 运行时辅助：返回指向「长度 + 标签 + 内容」缓冲的指针（缓冲常驻，指针稳定）
     pub extern "C" fn str_const(idx: u32) -> *const u8 {
         let t = TABLE.lock().unwrap();
         match t.get(idx as usize) {
-            Some(b) => {
-                let _ = Entry { len: b.len() as u32, bytes: Box::new([]) };
-                // 用 Vec 布局：先写长度再写内容
-                let mut buf = Vec::with_capacity(4 + b.len());
-                buf.extend_from_slice(&(b.len() as u32).to_ne_bytes());
-                buf.extend_from_slice(b);
-                let boxed = buf.into_boxed_slice();
-                let p = boxed.as_ptr();
-                std::mem::forget(boxed);
-                p
-            }
+            Some(b) => b.as_ptr(),
             None => std::ptr::null(),
         }
     }
 
-    /// 运行时辅助：打印一个「长度 + 内容」的字符串
+    /// 运行时辅助：打印一个字符串堆里的「长度 + 内容」；
+    /// 不是字符串（标签 ≠ 1）就打类型名，避免把对象字段当成字符串读
     pub extern "C" fn println_str(s: *const u8) {
         if s.is_null() {
-            println!();
+            println!("null"); // Java 打 println((String) null) 也是 "null"
             return;
         }
         unsafe {
             let mut lb = [0u8; 4];
             std::ptr::copy_nonoverlapping(s, lb.as_mut_ptr(), 4);
             let len = u32::from_ne_bytes(lb) as usize;
-            let bytes = std::slice::from_raw_parts(s.add(4), len);
+            let mut tb = [0u8; 4];
+            std::ptr::copy_nonoverlapping(s.add(4), tb.as_mut_ptr(), 4);
+            if u32::from_ne_bytes(tb) != super::rt::string_tag() {
+                println!("{}", super::rt::class_name_of(std::ptr::read_unaligned(s.add(4) as *const u32)));
+                return;
+            }
+            let bytes = std::slice::from_raw_parts(s.add(8), len);
             println!("{}", String::from_utf8_lossy(bytes));
         }
+    }
+}
+
+/// 字段描述符 → (访存用的机器类型, 栈上应保持的类型)
+///
+/// 字段槽统一 8 字节，所以 float 也按 F64 存取（本编译器不产 float 字段）。
+fn field_slot_type(desc: &str) -> (cranelift_codegen::ir::Type, cranelift_codegen::ir::Type) {
+    match desc.as_bytes().first().copied() {
+        Some(b'J') => (types::I64, types::I64),
+        Some(b'D') => (types::F64, types::F64),
+        Some(b'F') => (types::F64, types::F64),
+        Some(b'L') | Some(b'[') => (types::I64, types::I64),
+        _ => (types::I32, types::I32),
+    }
+}
+
+/// 数组元素地址 = 数组指针 + 8 + 下标 * 元素字节数
+fn elem_addr(
+    fb: &mut FunctionBuilder,
+    p: Value,
+    idx: Value,
+    esize: i64,
+) -> Result<Value, JitError> {
+    let idx = convert_to(fb, idx, types::I32);
+    let off = fb.ins().uextend(types::I64, idx);
+    let stride = fb.ins().iconst(types::I64, esize);
+    let byte_off = fb.ins().imul(off, stride);
+    let addr = fb.ins().iadd(p, byte_off);
+    let eight = fb.ins().iconst(types::I64, 8);
+    Ok(fb.ins().iadd(addr, eight))
+}
+
+/// 分配数组：栈顶是长度，按元素字节数与数组描述符的类型标签调运行时
+fn push_new_array(
+    fb: &mut FunctionBuilder,
+    stack: &mut Vec<Value>,
+    module: &mut JITModule,
+    new_arr_id: cranelift_module::FuncId,
+    esize: i64,
+    desc: &str,
+) -> Result<(), JitError> {
+    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+    let n = convert_to(fb, n, types::I32);
+    let es = fb.ins().iconst(types::I32, esize);
+    let tag = fb.ins().iconst(types::I32, rt::class_tag(desc) as i64);
+    let fref = module.declare_func_in_func(new_arr_id, fb.func);
+    let c = fb.ins().call(fref, &[n, es, tag]);
+    stack.push(fb.inst_results(c)[0]);
+    Ok(())
+}
+
+/// 常量池里的 Class 项 → 类型标签
+fn class_const_tag(cf: &ClassFile, index: u16) -> Result<u32, JitError> {
+    match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::Class(n)) => {
+            let name = String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned();
+            Ok(rt::class_tag(&name))
+        }
+        other => Err(JitError(format!("索引 {index} 不是 Class 项: {other:?}"))),
     }
 }
 

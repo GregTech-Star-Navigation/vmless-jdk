@@ -16,6 +16,9 @@ const K_INT: u8 = 0;
 const K_LONG: u8 = 1;
 const K_REF: u8 = 2;
 const K_DOUBLE: u8 = 3;
+/// boolean：JVM 里与 int 同一套 load/store/算术字节码，只有 println 的重载不同
+/// （println(Z) 打 "true"/"false"）
+const K_BOOL: u8 = 4;
 
 fn kind_wide(k: u8) -> bool {
     k == K_LONG || k == K_DOUBLE
@@ -26,8 +29,20 @@ fn kind_of(ty: &Type) -> u8 {
     match ty {
         Type::Prim("long") => K_LONG,
         Type::Prim("double") => K_DOUBLE,
+        Type::Prim("boolean") => K_BOOL,
         Type::Prim(_) => K_INT,
         _ => K_REF,
+    }
+}
+
+/// 按描述符首字符判断种类（字段、方法返回值用）
+fn kind_from_desc(desc: &str) -> u8 {
+    match desc.as_bytes().first().copied() {
+        Some(b'J') => K_LONG,
+        Some(b'D') => K_DOUBLE,
+        Some(b'Z') => K_BOOL,
+        Some(b'L') | Some(b'[') => K_REF,
+        _ => K_INT,
     }
 }
 
@@ -42,14 +57,13 @@ fn promote(a: u8, b: u8) -> u8 {
     }
 }
 
-/// 按描述符的返回值字符判断种类（用于 Call 表达式）
+/// 按描述符的返回值判断种类（用于 Call 表达式）
+///
+/// 必须看**返回类型那一段**（`)` 之后）：直接看描述符最后一个字符会把
+/// `()Ljava/lang/String;` 的 `;` 当成 int。
 fn kind_from_ret(desc: &str) -> u8 {
-    match desc.as_bytes().last().copied() {
-        Some(b'J') => K_LONG,
-        Some(b'D') => K_DOUBLE,
-        Some(b'L') | Some(b'[') => K_REF,
-        _ => K_INT,
-    }
+    let ret = desc.rsplit(')').next().unwrap_or("");
+    kind_from_desc(ret)
 }
 
 #[derive(Debug)]
@@ -242,9 +256,26 @@ impl Emit {
     }
 
     fn bind(&mut self, label: usize) {
+        self.bind_t(label, None);
+    }
+
+    /// 绑定标签，并可选地把脏槽（`SCRATCH_SLOT`）的验证类型单独写进这一帧。
+    ///
+    /// 脏槽必须先写后读，所以「跳到假分支」那一帧里它还是 Top（未赋值），
+    /// 「汇合点」那一帧里才是 Integer —— 全局的 `local_types` 只能有一个值，
+    /// 表达不了这种差别，只能在绑定这一帧时单独覆盖。
+    fn bind_t(&mut self, label: usize, scratch_ty: Option<u16>) {
         let off = self.bytes.len();
         self.labels[label] = Some(off);
-        self.frames.push((off, self.local_types.clone()));
+        let mut snap = self.local_types.clone();
+        if let Some(t) = scratch_ty {
+            let s = SCRATCH_SLOT as usize;
+            if snap.len() <= s {
+                snap.resize(s + 1, u16::MAX);
+            }
+            snap[s] = t;
+        }
+        self.frames.push((off, snap));
     }
 
     fn branch(&mut self, opcode: u8, label: usize) {
@@ -257,6 +288,35 @@ impl Emit {
 
     fn goto(&mut self, label: usize) {
         self.branch(0xA7, label);
+    }
+
+    /// 把栈顶已经算好的比较结果用 `jump_false`（条件为假时跳）收尾成 0/1 压回栈上。
+    ///
+    /// 跳到 l_false 的是「假」分支（写 0），落空的是「真」分支（写 1）；
+    /// 两个分支各自 `iconst` + `istore` 到脏槽，再在 L_end 汇合。
+    ///
+    /// 只在操作数栈为空的位置可用：本项目的 StackMapTable 一律声明「栈为 0」
+    /// （`Emit::stack_map`），所以任何跳转点都不能压着别的值。
+    fn bool_from_branch(&mut self, jump_false: u8) -> Result<(), CompileError> {
+        if self.depth != 0 {
+            return err("比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）");
+        }
+        let s = SCRATCH_SLOT;
+        if self.max_locals < s as u16 + 1 {
+            self.max_locals = s as u16 + 1;
+        }
+        let l_false = self.new_label();
+        let l_end = self.new_label();
+        self.branch(jump_false, l_false);
+        self.const_int(1);
+        let _ = self.istore(s);
+        self.goto(l_end);
+        self.bind_t(l_false, Some(u16::MAX)); // 假分支上脏槽还没存过 → ITEM_Top
+        self.const_int(0);
+        let _ = self.istore(s);
+        self.bind_t(l_end, Some(0)); // 汇合点上两条路径都存过 → ITEM_Integer
+        let _ = self.iload(s);
+        Ok(())
     }
 
     fn resolve(&mut self) -> Result<(), CompileError> {
@@ -350,8 +410,11 @@ impl Emit {
     }
 }
 
-const JAVA_LANG: &[&str] = &[
-    "String", "Object", "System", "Integer", "Long", "Short", "Byte", "Character",
+/// 「比较 → 0/1」用的脏槽：放在局部变量表的最高固定位置。
+/// 用前先用 `set_local_type(.., 0)` 声明成 int，`max_locals` 会跟着抬到 251。
+const SCRATCH_SLOT: u8 = 250;
+
+const JAVA_LANG: &[&str] = &["String", "Object", "System", "Integer", "Long", "Short", "Byte", "Character",
     "Boolean", "Float", "Double", "Number", "Class", "Throwable", "Exception",
     "RuntimeException", "Error", "Math", "StringBuilder", "Iterable", "Comparable",
     "Runnable", "Thread", "Enum", "Record", "Void",
@@ -409,8 +472,12 @@ struct Ctx {
     fields: HashMap<String, usize>,
     /// 字段下标 → 描述符
     field_descs: Vec<String>,
+    /// 字段下标 → 声明类型（选 getfield/putfield 的宽度与 anewarray 的元素类要用）
+    field_tys: Vec<Type>,
     /// 局部变量名 → 类型种类（0=int,1=long,2=ref）
     local_kind: HashMap<String, u8>,
+    /// 局部变量名 → 声明类型（选数组元素宽度、anewarray/checkcast 的元素类要用）
+    local_ty: HashMap<String, Type>,
     /// 当前类名（内部形式 java/lang/X）
     class_name: String,
     is_static: bool,
@@ -424,6 +491,36 @@ impl Ctx {
 
 fn is_println_call(e: &Expr) -> bool {
     matches!(e, Expr::Call { name, .. } if name == "println")
+}
+
+/// println 的引用重载：声明类型确实是 String（或推不出来）才用 println(String)。
+///
+/// 声明成 `Object` 的局部变量，在有栈图的帧里验证器眼里就是 Object，
+/// 这时发 `println(String)` 会直接 VerifyError —— 必须退回 `println(Object)`。
+fn ref_println_desc(e: &Expr, ctx: &Ctx) -> &'static str {
+    match expr_type(e, ctx) {
+        Some(Type::Named { path, .. }) => {
+            let joined = path.join("/");
+            if joined == "String" || joined == "java/lang/String" {
+                "(Ljava/lang/String;)V"
+            } else {
+                "(Ljava/lang/Object;)V"
+            }
+        }
+        // 推不出来（方法调用的返回值等）就按老行为当 String
+        _ => "(Ljava/lang/String;)V",
+    }
+}
+
+/// 这个表达式是不是一次返回 void 的方法调用（语句位置上不能弹返回值）
+fn is_void_call(e: &Expr, ctx: &Ctx) -> bool {
+    let Expr::Call { recv, name, .. } = e else { return false };
+    let desc = if recv.is_some() {
+        ctx.instance_methods.get(name.as_str())
+    } else {
+        ctx.static_methods.get(name.as_str())
+    };
+    matches!(desc, Some(d) if d.ends_with(")V"))
 }
 
 fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
@@ -471,25 +568,51 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             let owner = ctx.class_name.clone();
             let f = cp.field_ref(&owner, name, &desc);
             em.op_u2(0xB4, f); // getfield
+            em.pop(1);
+            em.push(if kind_wide(kind_of(&ctx.field_tys[idx])) { 2 } else { 1 });
             Ok(())
         }
         Expr::ArrayNew { elem, dims } => {
-            if !matches!(elem, Type::Prim("int")) {
-                return err("数组目前只支持 int");
-            }
             if dims.len() != 1 {
                 return err("只支持一维数组");
             }
             compile_expr(&dims[0], em, ctx, cp)?;
-            em.op(0xBC); // newarray
-            em.bytes.push(10); // T_INT
+            // newarray 的操作数是元素类型码，引用元素走 anewarray（操作数是元素类）
+            let atype = match elem {
+                Type::Prim("int") => Some(10u8),    // T_INT
+                Type::Prim("long") => Some(11),     // T_LONG
+                Type::Prim("double") => Some(7),    // T_DOUBLE
+                _ => None,
+            };
+            match atype {
+                Some(a) => {
+                    em.op(0xBC); // newarray
+                    em.bytes.push(a);
+                }
+                None => {
+                    if kind_of(elem) != K_REF {
+                        return err(format!("不支持的数组元素类型: {elem:?}"));
+                    }
+                    let cls = ver_type(cp, elem);
+                    em.op_u2(0xBD, cls); // anewarray
+                }
+            }
+            em.pop(1);
+            em.push(1);
             Ok(())
         }
         Expr::ArrayAccess { array, index } => {
+            let k = elem_kind(array, ctx);
             compile_expr(array, em, ctx, cp)?;
             compile_expr(index, em, ctx, cp)?;
-            em.op(0x2E); // iaload
-            em.pop(1);
+            em.op(match k {
+                K_LONG => 0x2F,   // laload
+                K_DOUBLE => 0x31, // daload
+                K_REF => 0x32,    // aaload
+                _ => 0x2E,        // iaload
+            });
+            em.pop(2);
+            em.push(if kind_wide(k) { 2 } else { 1 });
             Ok(())
         }
         Expr::New { ty, args } => {
@@ -497,11 +620,17 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
                 Type::Named { path, .. } => path.join("/"),
                 _ => return err("只支持创建对象"),
             };
-            let arg_desc: String = args.iter().map(|a| match a {
-                Expr::IntLit(_) | Expr::Ident(_) | Expr::Binary { .. } => "I".to_string(),
-                Expr::StrLit(_) => "Ljava/lang/String;".to_string(),
-                _ => "I".to_string(),
-            }).collect();
+            let arg_desc: String = args
+                .iter()
+                .map(|a| match expr_kind(a, ctx) {
+                    K_LONG => "J".to_string(),
+                    K_DOUBLE => "D".to_string(),
+                    K_REF => expr_type(a, ctx)
+                        .map(|t| descriptor(&t))
+                        .unwrap_or_else(|| "Ljava/lang/String;".to_string()),
+                    _ => "I".to_string(),
+                })
+                .collect();
             let ctor_desc = format!("({arg_desc})V");
             let cls = cp.class(&owner);
             em.op_u2(0xBB, cls); // new
@@ -521,7 +650,36 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             let from = expr_kind(expr, ctx);
             let to = kind_of(ty);
             compile_expr(expr, em, ctx, cp)?;
-            coerce(from, to, em)?;
+            if to == K_REF {
+                // 引用转换不是数值转换：要发 checkcast（失败抛 ClassCastException）
+                if from != K_REF {
+                    return err("只能把引用值转成引用类型");
+                }
+                let cls = ver_type(cp, ty);
+                em.op_u2(0xC0, cls); // checkcast
+            } else {
+                coerce(from, to, em)?;
+            }
+            Ok(())
+        }
+        Expr::InstanceOf { expr, ty, binding } => {
+            if binding.is_some() {
+                return err("暂不支持 instanceof 模式绑定（if (o instanceof T t)）");
+            }
+            compile_expr(expr, em, ctx, cp)?;
+            let cls = ver_type(cp, ty);
+            em.op_u2(0xC1, cls); // instanceof
+            em.pop(1);
+            em.push(1); // 压 0/1
+            Ok(())
+        }
+        Expr::Null => {
+            em.op(0x01); // aconst_null
+            em.push(1);
+            Ok(())
+        }
+        Expr::BoolLit(b) => {
+            em.const_int(if *b { 1 } else { 0 });
             Ok(())
         }
         Expr::FloatLit(s) => {
@@ -581,7 +739,8 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
                         let (desc, width) = match expr_kind(&args[0], ctx) {
                             K_LONG => ("(J)V", 2u16),
                             K_DOUBLE => ("(D)V", 2),
-                            K_REF => ("(Ljava/lang/String;)V", 1),
+                            K_REF => (ref_println_desc(&args[0], ctx), 1),
+                            K_BOOL => ("(Z)V", 1),
                             _ => ("(I)V", 1),
                         };
                         let println = cp.method_ref("java/io/PrintStream", "println", desc);
@@ -644,6 +803,30 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
         Expr::Binary { op, lhs, rhs } => {
             let kl = expr_kind(lhs, ctx);
             let kr = expr_kind(rhs, ctx);
+            // 比较作为**表达式**（`boolean f = a < b;`）：产出 0/1
+            if let Some((jump_false, _)) = compile_cmp_operands(e, em, ctx, cp)? {
+                em.bool_from_branch(jump_false)?;
+                return Ok(());
+            }
+            // 移位：右操作数恒为 int，左操作数决定是 int 还是 long 版本
+            if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
+                let k = if kl == K_LONG { K_LONG } else { K_INT };
+                compile_expr(lhs, em, ctx, cp)?;
+                coerce(kl, k, em)?;
+                compile_expr(rhs, em, ctx, cp)?;
+                coerce(kr, K_INT, em)?;
+                let code = match (op, k) {
+                    (BinOp::Shl, K_LONG) => 0x79u8, // lshl
+                    (BinOp::Shr, K_LONG) => 0x7B,   // lshr
+                    (BinOp::Ushr, K_LONG) => 0x7D,  // lushr
+                    (BinOp::Shl, _) => 0x78,        // ishl
+                    (BinOp::Shr, _) => 0x7A,        // ishr
+                    _ => 0x7C,                      // iushr
+                };
+                em.op(code);
+                em.pop(if kind_wide(k) { 2 } else { 1 });
+                return Ok(());
+            }
             let k = promote(kl, kr);
             compile_expr(lhs, em, ctx, cp)?;
             coerce(kl, k, em)?;
@@ -665,6 +848,12 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
                 (BinOp::Mul, _) => 0x68,
                 (BinOp::Div, _) => 0x6C,
                 (BinOp::Rem, _) => 0x70,
+                (BinOp::BitAnd, K_LONG) => 0x7F, // land
+                (BinOp::BitOr, K_LONG) => 0x81,  // lor
+                (BinOp::BitXor, K_LONG) => 0x83, // lxor
+                (BinOp::BitAnd, _) => 0x7E,      // iand
+                (BinOp::BitOr, _) => 0x80,       // ior
+                (BinOp::BitXor, _) => 0x82,      // ixor
                 (other, _) => return err(format!("暂不支持的二元运算: {other:?}")),
             };
             em.op(code);
@@ -681,8 +870,115 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             }
             Ok(())
         }
+        // ~x：int 走 iconst_m1 + ixor，long 走 ldc2_w -1 + lxor（JVM 没有按位取反指令）
+        Expr::Unary { op: UnOp::BitNot, expr } => {
+            let k = expr_kind(expr, ctx);
+            compile_expr(expr, em, ctx, cp)?;
+            if k == K_LONG {
+                let idx = cp.long(-1);
+                em.op_u2(0x14, idx);
+                em.push(2);
+                em.op(0x83); // lxor
+                em.pop(3);
+            } else {
+                em.op(0x02); // iconst_m1
+                em.push(1);
+                em.op(0x82); // ixor
+                em.pop(2);
+            }
+            Ok(())
+        }
+        // +x：无操作
+        Expr::Unary { op: UnOp::Pos, expr } => compile_expr(expr, em, ctx, cp),
         other => err(format!("暂不支持的表达式: {other:?}")),
     }
+}
+
+/// 编译一个比较表达式（`a < b`、`o == null`、`p != null`），
+/// 返回 `(条件为假时跳的指令, 条件为真时跳的指令)`；操作数已被消费。
+///
+/// 不是比较表达式时返回 `None`（调用方按「求出 0/1 再 ifeq」兜底）。
+fn compile_cmp_operands(
+    e: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<Option<(u8, u8)>, CompileError> {
+    let Expr::Binary { op, lhs, rhs } = e else { return Ok(None) };
+    if !matches!(
+        op,
+        BinOp::Eq | BinOp::Ne | BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge
+    ) {
+        return Ok(None);
+    }
+    let kl = expr_kind(lhs, ctx);
+    let kr = expr_kind(rhs, ctx);
+    // 和 null 比较：ifnull / ifnonnull
+    let l_null = matches!(**lhs, Expr::Null);
+    let r_null = matches!(**rhs, Expr::Null);
+    if l_null || r_null {
+        if !(matches!(op, BinOp::Eq | BinOp::Ne)) {
+            return err("null 只能做 == / != 比较");
+        }
+        let other = if l_null { rhs } else { lhs };
+        compile_expr(other, em, ctx, cp)?;
+        em.pop(1);
+        return Ok(Some(if matches!(op, BinOp::Eq) {
+            (0xC7, 0xC6) // 假 = 非空(ifnonnull)；真 = 空(ifnull)
+        } else {
+            (0xC6, 0xC7)
+        }));
+    }
+    // 引用比较：if_acmpeq / if_acmpne（只有 == / != 有意义）
+    if kl == K_REF || kr == K_REF {
+        if !(matches!(op, BinOp::Eq | BinOp::Ne)) {
+            return err("引用类型只能比较 == / !=");
+        }
+        compile_expr(lhs, em, ctx, cp)?;
+        compile_expr(rhs, em, ctx, cp)?;
+        em.pop(2);
+        return Ok(Some(if matches!(op, BinOp::Eq) {
+            (0xA6, 0xA5) // 假 = if_acmpne；真 = if_acmpeq
+        } else {
+            (0xA5, 0xA6)
+        }));
+    }
+    let k = promote(kl, kr);
+    compile_expr(lhs, em, ctx, cp)?;
+    coerce(kl, k, em)?;
+    compile_expr(rhs, em, ctx, cp)?;
+    coerce(kr, k, em)?;
+    // long/double 要先 lcmp / dcmpl(dcmpg) 压成 int，再用单值比较
+    let widen = match k {
+        K_LONG => Some(0x94u8), // lcmp
+        // NaN 语义：< 和 <= 用 dcmpg，其余用 dcmpl
+        K_DOUBLE => Some(if matches!(op, BinOp::Lt | BinOp::Le) { 0x98 } else { 0x97 }),
+        _ => None,
+    };
+    if let Some(c) = widen {
+        em.op(c);
+        em.pop(3); // 两个宽值 4 槽 → 1 槽 int
+        let ops = match op {
+            BinOp::Lt => (0x9C, 0x9B), // ifge / iflt
+            BinOp::Ge => (0x9B, 0x9C), // iflt / ifge
+            BinOp::Gt => (0x9E, 0x9D), // ifle / ifgt
+            BinOp::Le => (0x9D, 0x9E), // ifgt / ifle
+            BinOp::Eq => (0x9A, 0x99), // ifne / ifeq
+            _ => (0x99, 0x9A),         // ifeq / ifne
+        };
+        em.pop(1);
+        return Ok(Some(ops));
+    }
+    let ops = match op {
+        BinOp::Lt => (0xA2, 0xA1), // if_icmpge / if_icmplt
+        BinOp::Ge => (0xA1, 0xA2), // if_icmplt / if_icmpge
+        BinOp::Gt => (0xA4, 0xA3), // if_icmple / if_icmpgt
+        BinOp::Le => (0xA3, 0xA4), // if_icmpgt / if_icmple
+        BinOp::Eq => (0xA0, 0x9F), // if_icmpne / if_icmpeq
+        _ => (0x9F, 0xA0),         // if_icmpeq / if_icmpne
+    };
+    em.pop(2);
+    Ok(Some(ops))
 }
 
 /// 把 `a < b` 这类条件编成「条件为假时跳到 label」。
@@ -693,54 +989,20 @@ fn compile_cond_false(
     cp: &mut CpBuilder,
     label: usize,
 ) -> Result<(), CompileError> {
-    if let Expr::Binary { op, lhs, rhs } = e {
-        let kl = expr_kind(lhs, ctx);
-        let kr = expr_kind(rhs, ctx);
-        let k = promote(kl, kr);
-        if k == K_REF {
-            return err("暂不支持引用类型的比较");
-        }
-        compile_expr(lhs, em, ctx, cp)?;
-        coerce(kl, k, em)?;
-        compile_expr(rhs, em, ctx, cp)?;
-        coerce(kr, k, em)?;
-        // long/double 要先 lcmp / dcmpl(dcmpg) 压成 int，再用单值比较
-        let widen = match k {
-            K_LONG => Some(0x94u8), // lcmp
-            // NaN 语义：< 和 <= 用 dcmpg，其余用 dcmpl
-            K_DOUBLE => Some(if matches!(op, BinOp::Lt | BinOp::Le) { 0x98 } else { 0x97 }),
-            _ => None,
-        };
-        if let Some(c) = widen {
-            em.op(c);
-            em.pop(3); // 两个宽值 4 槽 → 1 槽 int
-            let code = match op {
-                BinOp::Lt => 0x9C, // ifge
-                BinOp::Ge => 0x9B, // iflt
-                BinOp::Gt => 0x9E, // ifle
-                BinOp::Le => 0x9D, // ifgt
-                BinOp::Eq => 0x9A, // ifne
-                BinOp::Ne => 0x99, // ifeq
-                other => return err(format!("暂不支持的比较: {other:?}")),
-            };
-            em.pop(1);
-            em.branch(code, label);
-            return Ok(());
-        }
-        let code = match op {
-            BinOp::Lt => 0xA2u8, // if_icmpge
-            BinOp::Ge => 0xA1,   // if_icmplt
-            BinOp::Gt => 0xA4,   // if_icmple
-            BinOp::Le => 0xA3,   // if_icmpgt
-            BinOp::Eq => 0xA0,   // if_icmpne
-            BinOp::Ne => 0x9F,   // if_icmpeq
-            other => return err(format!("暂不支持的比较: {other:?}")),
-        };
-        em.pop(2);
-        em.branch(code, label);
+    if let Some((jump_false, _)) = compile_cmp_operands(e, em, ctx, cp)? {
+        em.branch(jump_false, label);
         return Ok(());
     }
-    err("暂不支持的条件表达式")
+    // 兜底：任何产出 0/1 的表达式（instanceof、boolean 局部变量、boolean 方法返回值）
+    // 都编成「求值 → ifeq 跳到 label」。跳转点上操作数栈是空的。
+    let kind = expr_kind(e, ctx);
+    if kind_wide(kind) {
+        return err("条件表达式不能是 long/double");
+    }
+    compile_expr(e, em, ctx, cp)?;
+    em.pop(1);
+    em.branch(0x99, label); // ifeq
+    Ok(())
 }
 
 fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
@@ -787,6 +1049,9 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
         Stmt::Expr(e) if !matches!(e, Expr::Assign { .. }) => {
             let kind = expr_kind(e, ctx);
             compile_expr(e, em, ctx, cp)?;
+            if is_void_call(e, ctx) {
+                return Ok(false); // void 方法调用没有返回值可弹
+            }
             if kind_wide(kind) {
                 em.op(0x58); // pop2
                 em.pop(2);
@@ -798,6 +1063,13 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
         }
         Stmt::LocalVar { ty, name, init } => {
             let slot = ctx.next_slot;
+            if slot >= SCRATCH_SLOT {
+                return err(format!(
+                    "局部变量太多：槽位已用到 {slot}，最高可用 {}（{} 号槽留给比较结果）",
+                    SCRATCH_SLOT - 1,
+                    SCRATCH_SLOT
+                ));
+            }
             let kind = kind_of(ty);
             let wide_local = kind_wide(kind);
             ctx.next_slot += if wide_local { 2 } else { 1 };
@@ -806,6 +1078,13 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             }
             ctx.locals.insert(name.clone(), slot);
             ctx.local_kind.insert(name.clone(), kind);
+            ctx.local_ty.insert(name.clone(), ty.clone());
+            if let Some(e) = init {
+                compile_expr(e, em, ctx, cp)?;
+            }
+            // 槽的验证类型必须在**初始化表达式编译完之后**才登记：
+            // 初始化式里如果带跳转（如 `boolean f = x == null;`），那时候这个槽还没赋值，
+            // 帧里抢先写 ITEM_Integer 会被 HotSpot 判成 VerifyError（top 不可赋给 integer）。
             let vt = ver_type(&mut *cp, ty);
             em.set_local_type(slot as usize, vt);
             if wide_local {
@@ -813,7 +1092,7 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
                 em.set_local_type(slot as usize + 1, u16::MAX);
             }
             if let Some(e) = init {
-                compile_expr(e, em, ctx, cp)?;
+                let _ = e;
                 em.store_slot(slot, kind)?;
             }
             Ok(false)
@@ -823,11 +1102,17 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
                 Expr::ArrayAccess { array, index } => (array.clone(), index.clone()),
                 _ => unreachable!(),
             };
+            let k = elem_kind(&arr, ctx);
             compile_expr(&arr, em, ctx, cp)?;
             compile_expr(&idx, em, ctx, cp)?;
             compile_expr(rhs, em, ctx, cp)?;
-            em.op(0x4F); // iastore
-            em.pop(3);
+            em.op(match k {
+                K_LONG => 0x50,   // lastore
+                K_DOUBLE => 0x52, // dastore
+                K_REF => 0x53,    // aastore
+                _ => 0x4F,        // iastore
+            });
+            em.pop(if kind_wide(k) { 4 } else { 3 });
             Ok(false)
         }
         Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) if matches!(&**lhs, Expr::Field(..)) => {
@@ -845,7 +1130,7 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             let owner = ctx.class_name.clone();
             let f = cp.field_ref(&owner, &fname, &desc);
             em.op_u2(0xB5, f); // putfield
-            em.pop(2);
+            em.pop(if kind_wide(kind_of(&ctx.field_tys[idx])) { 3 } else { 2 });
             Ok(false)
         }
         Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) => {
@@ -1006,6 +1291,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
     // 实例字段：名字 → 下标，以及每个下标的描述符
     let mut field_index: HashMap<String, usize> = HashMap::new();
     let mut field_desc_list: Vec<String> = Vec::new();
+    let mut field_ty_list: Vec<Type> = Vec::new();
     for m in &t.members {
         if let Member::Field(f) = m {
             if f.modifiers.iter().any(|x| x == "static") {
@@ -1013,6 +1299,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             }
             field_index.insert(f.name.clone(), field_desc_list.len());
             field_desc_list.push(descriptor(&f.ty));
+            field_ty_list.push(f.ty.clone());
         }
     }
 
@@ -1086,7 +1373,9 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             instance_methods: inst_methods.clone(),
             fields: field_index.clone(),
             field_descs: field_desc_list.clone(),
+            field_tys: field_ty_list.clone(),
             local_kind: HashMap::new(),
+            local_ty: HashMap::new(),
             class_name: self_name.clone(),
             is_static,
         };
@@ -1105,6 +1394,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             }
             ctx.locals.insert(p.name.clone(), slot);
             ctx.local_kind.insert(p.name.clone(), kind_of(&p.ty));
+            ctx.local_ty.insert(p.name.clone(), p.ty.clone());
             ctx.next_slot += if wide { 2 } else { 1 };
             slot += if wide { 2 } else { 1 };
         }
@@ -1280,6 +1570,10 @@ fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError> {
     if from == to {
         return Ok(());
     }
+    // boolean 与 int 在字节码层面完全相同，不需要任何转换指令
+    if (from == K_BOOL && to == K_INT) || (from == K_INT && to == K_BOOL) {
+        return Ok(());
+    }
     match (from, to) {
         (K_INT, K_LONG) => {
             em.op(0x85); // i2l
@@ -1310,6 +1604,32 @@ fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError> {
     Ok(())
 }
 
+/// 表达式 → 声明类型。能静态推出来的才给（数组元素宽度、anewarray/checkcast 的元素类要用）。
+///
+/// 推不出来返回 `None`：调用方按「int」这一老行为兜底，不要在这里猜。
+fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
+    match e {
+        Expr::Ident(n) => ctx.local_ty.get(n).cloned(),
+        Expr::Field(_, n) => ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).cloned(),
+        Expr::Cast { ty, .. } => Some(ty.clone()),
+        Expr::New { ty, .. } => Some(ty.clone()),
+        Expr::ArrayNew { elem, .. } => Some(Type::Array(Box::new(elem.clone()))),
+        Expr::ArrayAccess { array, .. } => match expr_type(array, ctx)? {
+            Type::Array(inner) => Some(*inner),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 数组表达式的元素种类（决定 iaload/laload/daload/aaload）
+fn elem_kind(array: &Expr, ctx: &Ctx) -> u8 {
+    match expr_type(array, ctx) {
+        Some(Type::Array(inner)) => kind_of(&inner),
+        _ => K_INT,
+    }
+}
+
 /// 表达式 → 类型种类（只用于选字节码，不做严格类型检查）
 fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
     match e {
@@ -1319,8 +1639,13 @@ fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
         Expr::FloatLit(_) => K_DOUBLE,
         Expr::Cast { ty, .. } => kind_of(ty),
         Expr::Ident(n) => ctx.local_kind.get(n).copied().unwrap_or(K_INT),
-        Expr::Binary { lhs, rhs, .. } => promote(expr_kind(lhs, ctx), expr_kind(rhs, ctx)),
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne | BinOp::And
+            | BinOp::Or => K_BOOL,
+            _ => promote(expr_kind(lhs, ctx), expr_kind(rhs, ctx)),
+        },
         Expr::Unary { expr, .. } => expr_kind(expr, ctx),
+        Expr::ArrayAccess { array, .. } => elem_kind(array, ctx),
         Expr::Call { recv, name, .. } => {
             let desc = if recv.is_some() {
                 ctx.instance_methods.get(name.as_str())
@@ -1329,17 +1654,13 @@ fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
             };
             desc.map(|d| kind_from_ret(d)).unwrap_or(K_INT)
         }
-        Expr::StrLit(_) | Expr::This | Expr::New { .. } | Expr::ArrayNew { .. } => K_REF,
+        Expr::StrLit(_) | Expr::This | Expr::New { .. } | Expr::ArrayNew { .. } | Expr::Null => K_REF,
+        Expr::InstanceOf { .. } | Expr::BoolLit(_) => K_BOOL,
         Expr::Field(_, name) => ctx
             .fields
             .get(name)
             .and_then(|i| ctx.field_descs.get(*i))
-            .map(|d| match d.as_bytes().first().copied() {
-                Some(b'J') => K_LONG,
-                Some(b'D') => K_DOUBLE,
-                Some(b'L') | Some(b'[') => K_REF,
-                _ => K_INT,
-            })
+            .map(|d| kind_from_desc(d))
             .unwrap_or(K_INT),
         _ => K_INT,
     }

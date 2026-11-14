@@ -287,3 +287,18 @@
 `cargo test --lib` 29 passed。
 
 **已知边界**：最小次正规数 `4.9E-324` 我们打 `5.0E-324`（Ryū 复刻未做）；long/double 的字段与数组仍为 i32。
+
+## 0.31.0 — 2026-11-15 · 引用数组、类型检查、宽字段与数组、位运算
+
+- **引用**：`aconst_null`、`anewarray`/`aaload`/`aastore`、`if_acmpeq/if_acmpne`、
+  `ifnull/ifnonnull`、`instanceof`、`checkcast`（失败抛 ClassCastException 并退出 1）、引用字段读写
+- **宽类型**：`getfield/putfield` 与数组的 J/D 版本（`laload/lastore/daload/dastore`），
+  JIT 对象字段统一 8 字节、数组元素按指令步长
+- **位运算**：`ishl/ishr/iushr/iand/ior/ixor`（int 与 long）、`~`
+- 修三个真 bug：方法返回引用时 `println` 描述符按**最后一个字符**判类型 → VerifyError；
+  void 调用当语句时多发 `pop`；解释器实例方法 `this` 未偏移导致 long/double 形参错位
+- **验证：26 个样例 java / 解释器 / JIT 三路逐字节一致**（新增 RefArr ObjRef ArrType RefFld
+  RefCmp NullChk WideFld WideArr BitOps PrintObj PrintObj2）；`cargo test --lib` 29 passed
+
+**已知限制**：多维数组（`multianewarray`）未做；异常机制未做（`athrow`/`try/catch`）；
+`println(a == null)` 这类「栈上已有值时的比较」被明确拒绝（本项目栈图恒为空栈）。
