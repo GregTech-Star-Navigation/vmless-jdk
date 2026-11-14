@@ -43,6 +43,8 @@ impl Jit {
         let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
         builder.symbol("vmless_new_object", rt::new_object as *const u8);
         builder.symbol("vmless_new_array", rt::new_array as *const u8);
+        builder.symbol("vmless_println_int", rt::println_int as *const u8);
+        builder.symbol("vmless_println_str", rt::println_str as *const u8);
         let module = JITModule::new(builder);
         Jit { module, compiled: std::collections::HashMap::new() }
     }
@@ -112,6 +114,13 @@ impl Jit {
         let new_arr_id = self
             .module
             .declare_function("vmless_new_array", Linkage::Import, &sig_new_arr)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        let mut sig_pi = self.module.make_signature();
+        sig_pi.params.push(AbiParam::new(types::I32));
+        let println_int_id = self
+            .module
+            .declare_function("vmless_println_int", Linkage::Import, &sig_pi)
             .map_err(|e| JitError(e.to_string()))?;
 
         let mut bctx = FunctionBuilderContext::new();
@@ -492,6 +501,55 @@ impl Jit {
                     let c = fb.ins().call(fref, &[ptr]);
                     let _ = c;
                 }
+                // getstatic：System.out 只当占位
+                0xb2 => {
+                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let z = fb.ins().iconst(types::I64, 0);
+                    stack.push(z);
+                }
+                // invokevirtual：println 走运行时；本类方法走静态分派
+                0xb6 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let (cls, name, desc) = method_ref_of(cf, idx)?;
+                    if name == "println" {
+                        // 栈上顺序是 [接收者, 参数]，先弹参数
+                        let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                        let _recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                        if desc.contains("String") {
+                            // 暂不支持字符串实参
+                            return Err(JitError("JIT 暂不支持 println(String)".into()));
+                        }
+                        let fref = self.module.declare_func_in_func(println_int_id, fb.func);
+                        fb.ins().call(fref, &[v]);
+                    } else {
+                        let _ = cls;
+                        let argc = argc_of(&desc) + 1;
+                        let (fid, ml, _) = self.compile_into(cf, &name, &desc)?;
+                        let mut args = Vec::new();
+                        for _ in 0..argc {
+                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                        }
+                        args.reverse();
+                        let slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            (ml.max(1) * 8) as u32,
+                            3,
+                        ));
+                        for (i, v) in args.iter().enumerate() {
+                            let addr = fb.ins().stack_addr(types::I64, slot, (i * 8) as i32);
+                            fb.ins().store(MemFlags::new(), *v, addr, 0);
+                        }
+                        let ptr = fb.ins().stack_addr(types::I64, slot, 0);
+                        let fref = self.module.declare_func_in_func(fid, fb.func);
+                        let c = fb.ins().call(fref, &[ptr]);
+                        if !desc.ends_with(")V") {
+                            let r = fb.inst_results(c)[0];
+                            stack.push(r);
+                        }
+                    }
+                }
                 // new：分配对象（字段数来自本类）
                 0xbb => {
                     let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
@@ -754,9 +812,23 @@ pub mod rt {
         unsafe { alloc_zeroed(8 + fields as usize * 4) }
     }
 
+    /// 打印一个 int（对应 System.out.println(int)）
+    pub extern "C" fn println_int(v: i32) {
+        println!("{v}");
+    }
+
+    /// 打印一段 UTF-8 文本（指针 + 长度）
+    pub extern "C" fn println_str(ptr: *const u8, len: u32) {
+        let s = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
+        println!("{}", String::from_utf8_lossy(s));
+    }
+
     /// 分配一个数组：前 8 字节存长度，之后 len 个 4 字节元素
     pub extern "C" fn new_array(len: u32) -> *mut u8 {
-        unsafe { alloc_zeroed(8 + len as usize * 4) }
+        let p = unsafe { alloc_zeroed(8 + len as usize * 4) };
+        // 头 4 字节存长度（arraylength 读这里）
+        unsafe { std::ptr::write_unaligned(p as *mut u32, len) };
+        p
     }
 
     unsafe fn alloc_zeroed(size: usize) -> *mut u8 {

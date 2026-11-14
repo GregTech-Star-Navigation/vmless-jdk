@@ -199,3 +199,14 @@
 - 编译器放开局部变量槽上限（>3 用 `iload/istore` 通用形式）
 - 端到端一致：`ObjArr.run(100)` 三个引擎都输出 **29850**（java / rustjava 解释器 / JIT）
 - 同一方法 JIT 调用 1000 次共 0.9 ms
+
+## 0.23.0 — 2026-11-14 · JIT 可以跑完整 main
+
+- JIT 新增：`getstatic`（System.out 占位）、`invokevirtual`（`println(int)` 走运行时辅助；
+  本类方法走静态分派）、`vmless_println_int` 运行时符号
+- 修两个 bug：
+  - `println` 的栈弹出顺序写反（接收者在参数下面，必须先弹参数）
+  - `new_array` 没把长度写进头部 → `arraylength` 恒为 0（`Arr` 输出 0 而不是 20）
+- **四个程序整体 JIT 执行，与官方 java 输出全部一致**：
+  `Arr`→20、`Loop`→10/7、`Perf2`→1283106752、`ObjArr`→29850
+- JIT 编译一个 main 约 1.4 ms，之后执行 0.02 ms
