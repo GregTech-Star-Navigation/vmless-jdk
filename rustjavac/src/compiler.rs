@@ -30,10 +30,12 @@ struct Emit {
     labels: Vec<Option<usize>>,
     /// (操作数位置, 标签 id)，收尾时回填
     patches: Vec<(usize, usize)>,
-    /// 需要 StackMapTable 帧的代码偏移（分支目标）
-    frames: Vec<usize>,
+    /// 需要 StackMapTable 帧的位置及其局部变量快照
+    frames: Vec<(usize, Vec<u16>)>,
     /// 常量池里 "StackMapTable" 的索引
     stack_map_name: u16,
+    /// 每个局部变量槽的验证类型：0 = int，否则是类索引（对象/数组）
+    local_types: Vec<u16>,
 }
 
 impl Emit {
@@ -47,6 +49,7 @@ impl Emit {
             patches: Vec::new(),
             frames: Vec::new(),
             stack_map_name: 0,
+            local_types: vec![u16::MAX; max_locals as usize],
         }
     }
 
@@ -133,10 +136,17 @@ impl Emit {
         self.labels.len() - 1
     }
 
+    fn set_local_type(&mut self, slot: usize, ty: u16) {
+        if slot >= self.local_types.len() {
+            self.local_types.resize(slot + 1, u16::MAX);
+        }
+        self.local_types[slot] = ty;
+    }
+
     fn bind(&mut self, label: usize) {
         let off = self.bytes.len();
         self.labels[label] = Some(off);
-        self.frames.push(off);
+        self.frames.push((off, self.local_types.clone()));
     }
 
     fn branch(&mut self, opcode: u8, label: usize) {
@@ -163,8 +173,8 @@ impl Emit {
             let off = i16::try_from(off).map_err(|_| CompileError { msg: "跳转距离超出 16 位".into() })?;
             self.bytes[pos + 1..pos + 3].copy_from_slice(&off.to_be_bytes());
         }
-        self.frames.sort_unstable();
-        self.frames.dedup();
+        self.frames.sort_unstable_by_key(|(o, _)| *o);
+        self.frames.dedup_by_key(|(o, _)| *o);
         Ok(())
     }
 
@@ -176,7 +186,8 @@ impl Emit {
         let mut info = Vec::new();
         info.extend_from_slice(&(self.frames.len() as u16).to_be_bytes());
         let mut prev: Option<usize> = None;
-        for &off in &self.frames {
+        for (off, snapshot) in &self.frames {
+            let off = *off;
             let delta = match prev {
                 None => off as u16,
                 Some(p) => (off - p - 1) as u16,
@@ -185,8 +196,17 @@ impl Emit {
             info.push(255); // full_frame
             info.extend_from_slice(&delta.to_be_bytes());
             info.extend_from_slice(&self.max_locals.to_be_bytes());
-            for _ in 0..self.max_locals {
-                info.push(1); // ITEM_Integer
+            let locals = &snapshot;
+            for slot in 0..self.max_locals as usize {
+                let t = *locals.get(slot).unwrap_or(&u16::MAX);
+                if t == u16::MAX {
+                    info.push(0); // ITEM_Top（尚未初始化）
+                } else if t == 0 {
+                    info.push(1); // ITEM_Integer
+                } else {
+                    info.push(7); // ITEM_Object
+                    info.extend_from_slice(&t.to_be_bytes());
+                }
             }
             info.extend_from_slice(&0u16.to_be_bytes()); // 空操作数栈
         }
@@ -299,6 +319,11 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             em.push(1);
             Ok(())
         }
+        Expr::Field(recv, name) if name == "length" && !ctx.fields.contains_key(name) => {
+            compile_expr(recv, em, ctx, cp)?;
+            em.op(0xBE); // arraylength
+            Ok(())
+        }
         Expr::Field(recv, name) => {
             compile_expr(recv, em, ctx, cp)?;
             let idx = *ctx
@@ -309,6 +334,25 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             let owner = ctx.class_name.clone();
             let f = cp.field_ref(&owner, name, &desc);
             em.op_u2(0xB4, f); // getfield
+            Ok(())
+        }
+        Expr::ArrayNew { elem, dims } => {
+            if !matches!(elem, Type::Prim("int")) {
+                return err("数组目前只支持 int");
+            }
+            if dims.len() != 1 {
+                return err("只支持一维数组");
+            }
+            compile_expr(&dims[0], em, ctx, cp)?;
+            em.op(0xBC); // newarray
+            em.bytes.push(10); // T_INT
+            Ok(())
+        }
+        Expr::ArrayAccess { array, index } => {
+            compile_expr(array, em, ctx, cp)?;
+            compile_expr(index, em, ctx, cp)?;
+            em.op(0x2E); // iaload
+            em.pop(1);
             Ok(())
         }
         Expr::New { ty, args } => {
@@ -509,10 +553,24 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             ctx.locals.insert(name.clone(), slot);
             let is_ref = !matches!(ty, Type::Prim(_));
             ctx.local_ref.insert(name.clone(), is_ref);
+            let vt = ver_type(&mut *cp, ty);
+            em.set_local_type(slot as usize, vt);
             if let Some(e) = init {
                 compile_expr(e, em, ctx, cp)?;
                 if is_ref { em.astore(slot)?; } else { em.istore(slot)?; }
             }
+            Ok(false)
+        }
+        Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) if matches!(&**lhs, Expr::ArrayAccess { .. }) => {
+            let (arr, idx) = match &**lhs {
+                Expr::ArrayAccess { array, index } => (array.clone(), index.clone()),
+                _ => unreachable!(),
+            };
+            compile_expr(&arr, em, ctx, cp)?;
+            compile_expr(&idx, em, ctx, cp)?;
+            compile_expr(rhs, em, ctx, cp)?;
+            em.op(0x4F); // iastore
+            em.pop(3);
             Ok(false)
         }
         Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) if matches!(&**lhs, Expr::Field(..)) => {
@@ -705,8 +763,14 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             is_static,
         };
         ctx.locals.insert("<this-class>".to_string(), 0);
+        if !is_static {
+            let this_cp = cp.class(&self_name);
+            em.set_local_type(0, this_cp);
+        }
         let mut slot = ctx.next_slot;
         for p in &md.params {
+            let vt = ver_type(&mut cp, &p.ty);
+            em.set_local_type(slot as usize, vt);
             ctx.locals.insert(p.name.clone(), slot);
             if !matches!(p.ty, Type::Prim(_)) {
                 ctx.local_ref.insert(p.name.clone(), true);
@@ -856,5 +920,25 @@ mod tests {
         let cu = parse_compilation_unit(src).expect("parse");
         let out = compile(&cu).expect("compile");
         assert_eq!(out[0].0, "T");
+    }
+}
+
+/// 类型的验证类型编码：int → 0，对象/数组 → 常量池里的类索引
+fn ver_type(cp: &mut CpBuilder, ty: &Type) -> u16 {
+    match ty {
+        Type::Prim(_) => 0,
+        Type::Array(inner) => {
+            let d = descriptor(&Type::Array(inner.clone()));
+            cp.class(&d)
+        }
+        Type::Named { path, .. } => {
+            let joined = if path.len() == 1 && is_java_lang(&path[0]) {
+                format!("java/lang/{}", path[0])
+            } else {
+                path.join("/")
+            };
+            cp.class(&joined)
+        }
+        Type::Var => 0,
     }
 }

@@ -118,3 +118,12 @@
 - 增速：混合尺寸分配 **9.8 ns/对象（101.6 M/s）**；**复用分配 5.9 ns（168.3 M/s）**
 - 全量回收 43.6 ms，**最大单步 0.088 ms**（v1 是 11.2 ms → 127 倍）
 - 启动速度（减去 50 ms 进程创建基线）：`rustjava` **≈2 ms** vs `java` **≈96 ms**
+
+## 0.16.0 — 2026-11-14 · 数组 + 正确的栈图局部变量
+
+- 编译器：`new int[n]` / `a[i]` 读 / `a[i] = v` 写 / `a.length`，字节码为 `newarray`/`iaload`/`iastore`/`arraylength`
+- **StackMapTable 的局部变量类型改为"按帧快照"**：未初始化的槽写 `ITEM_Top`，
+  引用/数组槽写 `ITEM_Object` + 类索引（此前全写 Integer，HotSpot 直接 `VerifyError`）
+- 解释器：数组堆（句柄用负数与对象区分），支持 newarray/iaload/iastore/arraylength
+- `librustjrt`：尺寸类别编码进对象头 `flags` 高位，修正混合尺寸下清扫入错桶的问题
+- 端到端：`Arr.java`（数组写入 + 求和）→ rustjava 与官方 java 都输出 **20**

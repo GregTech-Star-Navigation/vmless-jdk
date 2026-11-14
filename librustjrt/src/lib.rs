@@ -361,6 +361,10 @@ pub struct CompactHeap {
     free: Vec<(usize, Vec<usize>)>,
     /// 新建空闲桶时的预留容量（= 本轮 live 数），避免清扫中扩容尖峰
     free_hint: usize,
+    /// 尺寸类别表：类别号 → 字节数（类别号存进对象头 flags 的高位）
+    size_classes: Vec<usize>,
+    /// 尺寸 → 类别号 的 O(1) 查找表，下标 = size / 4
+    size_class_of: Vec<u32>,
     pub collected: usize,
     metas: Vec<usize>, // 对象偏移 -> meta 下标（简化：同尺寸复用）
 }
@@ -379,6 +383,8 @@ impl CompactHeap {
             live: Vec::new(),
             free: Vec::new(),
             free_hint: 0,
+            size_classes: Vec::new(),
+            size_class_of: Vec::new(),
             collected: 0,
             metas: Vec::new(),
         }
@@ -394,10 +400,24 @@ impl CompactHeap {
             assert!(self.used <= self.cap, "compact heap full");
             off
         };
+        // 找到或登记尺寸类别（O(1)：按 size/4 索引）
+        let slot = size / 4;
+        if slot >= self.size_class_of.len() {
+            self.size_class_of.resize(slot + 8, u32::MAX);
+        }
+        let class_idx = if self.size_class_of[slot] == u32::MAX {
+            let idx = self.size_classes.len() as u32;
+            self.size_classes.push(size);
+            self.size_class_of[slot] = idx;
+            idx
+        } else {
+            self.size_class_of[slot]
+        };
         let p = unsafe { self.base.add(off) } as *mut CompactObject;
         unsafe {
             (*p).class_id = 0;
-            (*p).flags = 0;
+            // 低 1 位是标记位，1..=8 位是尺寸类别号
+            (*p).flags = class_idx << 1;
         }
         // 清零字段槽
         unsafe {
@@ -478,7 +498,9 @@ impl CompactHeap {
                 unsafe { (*p).flags &= !MARK };
                 kept.push(off);
             } else {
-                push_free(&mut self.free, meta.size(), off, self.free_hint);
+                let cls = (unsafe { (*p).flags } >> 1) as usize;
+                let sz = *self.size_classes.get(cls).unwrap_or(&meta.size());
+                push_free(&mut self.free, sz, off, self.free_hint);
                 self.collected += 1;
             }
         }
@@ -586,7 +608,9 @@ impl CompactHeap {
                         self.live[state.write_cursor] = off;
                         state.write_cursor += 1;
                     } else {
-                        push_free(&mut self.free, meta.size(), off, self.free_hint);
+                        let cls = (unsafe { (*p).flags } >> 1) as usize;
+                        let sz = *self.size_classes.get(cls).unwrap_or(&meta.size());
+                        push_free(&mut self.free, sz, off, self.free_hint);
                         self.collected += 1;
                     }
                 }

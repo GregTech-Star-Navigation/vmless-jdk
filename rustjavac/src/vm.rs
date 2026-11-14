@@ -56,6 +56,8 @@ pub struct Vm<'a> {
     field_index: HashMap<String, usize>,
     /// 本类实例字段个数
     field_count: usize,
+    /// 数组堆：每个数组是一组 int；句柄 = -(下标 + 1)
+    arrays: Vec<Vec<i32>>,
 }
 
 impl<'a> Vm<'a> {
@@ -78,7 +80,7 @@ impl<'a> Vm<'a> {
             }
         }
         let n_fields = idx;
-        Vm { class, methods, output: Vec::new(), depth: 0, objects: Vec::new(), field_index, field_count: n_fields }
+        Vm { class, methods, output: Vec::new(), depth: 0, objects: Vec::new(), field_index, field_count: n_fields, arrays: Vec::new() }
     }
 
     fn with_field_count(mut self, n: usize) -> Self {
@@ -300,6 +302,46 @@ impl<'a> Vm<'a> {
                 0x59 => {
                     let v = *frame.stack.last().unwrap_or(&0);
                     frame.push(v);
+                }
+                0xbc => {
+                    // newarray：操作数是元素类型码（10 = int）
+                    let _atype = body[pc];
+                    pc += 1;
+                    let n = frame.pop()?;
+                    if n < 0 {
+                        return err("数组长度为负");
+                    }
+                    self.arrays.push(vec![0; n as usize]);
+                    let handle = -((self.arrays.len() as i32));
+                    frame.push(handle);
+                }
+                // iaload
+                0x2e => {
+                    let idx = frame.pop()?;
+                    let arr = frame.pop()?;
+                    let v = if arr < 0 {
+                        let a = &self.arrays[(-arr - 1) as usize];
+                        *a.get(idx as usize).unwrap_or(&0)
+                    } else { 0 };
+                    frame.push(v);
+                }
+                // iastore
+                0x4f => {
+                    let v = frame.pop()?;
+                    let idx = frame.pop()?;
+                    let arr = frame.pop()?;
+                    if arr < 0 && idx >= 0 {
+                        let a = &mut self.arrays[(-arr - 1) as usize];
+                        if (idx as usize) < a.len() {
+                            a[idx as usize] = v;
+                        }
+                    }
+                }
+                // arraylength
+                0xbe => {
+                    let arr = frame.pop()?;
+                    let n = if arr < 0 { self.arrays[(-arr - 1) as usize].len() as i32 } else { 0 };
+                    frame.push(n);
                 }
                 // new
                 0xbb => {
