@@ -177,6 +177,85 @@ impl ClassFile {
     }
 }
 
+// ------------------------------------------------------- double 的文本形式
+
+/// 方法描述符的返回类型字符（`)` 后面那一个）：`(J)V` → `V`，`()[I` → `[`
+pub fn ret_of(desc: &str) -> Option<u8> {
+    let bytes = desc.as_bytes();
+    let close = bytes.iter().position(|b| *b == b')')?;
+    bytes.get(close + 1).copied()
+}
+
+/// `Double.toString` 的等价实现（解释器与 JIT 的 `println(double)` 共用）。
+///
+/// Java 的规则（JDK 19 起的规范）：
+/// - NaN / Infinity / -Infinity 用这三个字面量；
+/// - 0.0 与 -0.0 保留符号，写成 `0.0` / `-0.0`；
+/// - 十进制数字取「能唯一还原该 double 的最短表示」（Rust 的 `{:e}` 也是同一族
+///   算法，所以直接拿它的有效数字）；
+/// - 值落在 `[1e-3, 1e7)` 用普通写法，且**至少保留一位小数**（`100.0`、`0.001`）；
+/// - 否则用科学计数法 `d.ddd...E<指数>`，尾数同样至少一位小数（`1.0E7`、`4.9E-324`）。
+pub fn java_double_to_string(d: f64) -> String {
+    if d.is_nan() {
+        return "NaN".into();
+    }
+    if d.is_infinite() {
+        return if d > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    if d == 0.0 {
+        return if d.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+    }
+    // 最短往返的科学计数法：Rust 给 `d1.d2..e<exp>`，指数是 10 的幂
+    let sci = format!("{:e}", d.abs());
+    let (mant, exp) = sci.split_once('e').expect("{:e} 应含指数");
+    let exp: i32 = exp.parse().expect("{:e} 的指数应可解析");
+    let digits: Vec<char> = mant.chars().filter(|c| *c != '.').collect();
+
+    let mut out = String::new();
+    if d < 0.0 {
+        out.push('-');
+    }
+    if (-3..7).contains(&exp) {
+        // 普通写法：小数点在 digits 里第 exp+1 位之后
+        let int_len = exp + 1;
+        if int_len > 0 {
+            for i in 0..int_len {
+                out.push(*digits.get(i as usize).unwrap_or(&'0'));
+            }
+        } else {
+            out.push('0');
+        }
+        out.push('.');
+        if int_len < 0 {
+            for _ in 0..-int_len {
+                out.push('0');
+            }
+        }
+        let frac: String = if int_len >= 0 {
+            digits.iter().skip(int_len as usize).collect()
+        } else {
+            digits.iter().collect()
+        };
+        if frac.is_empty() {
+            out.push('0');
+        } else {
+            out.push_str(&frac);
+        }
+    } else {
+        // 科学计数法
+        out.push(digits[0]);
+        out.push('.');
+        if digits.len() > 1 {
+            out.extend(digits.iter().skip(1));
+        } else {
+            out.push('0');
+        }
+        out.push('E');
+        out.push_str(&exp.to_string());
+    }
+    out
+}
+
 // ---------------------------------------------------------------- parse
 
 pub fn parse(buf: &[u8]) -> Result<ClassFile> {
@@ -403,6 +482,44 @@ fn write_attributes(out: &mut Vec<u8>, attrs: &[Attribute]) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 期望值来自 JDK 25 实测（`System.out.println(double)` 的原始输出）
+    #[test]
+    fn double_text_matches_java() {
+        let cases: &[(f64, &str)] = &[
+            (3.5, "3.5"),
+            (5050.0, "5050.0"),
+            (0.1 + 0.2, "0.30000000000000004"),
+            (1.0 / 3.0, "0.3333333333333333"),
+            (2.0, "2.0"),
+            (0.5, "0.5"),
+            (100.0, "100.0"),
+            (1.0, "1.0"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.0e7, "1.0E7"),
+            (9999999.0, "9999999.0"),
+            (1.0e-3, "0.001"),
+            (1.0e-4, "1.0E-4"),
+            (123456789.0, "1.23456789E8"),
+            (1.0e20, "1.0E20"),
+            (1.0e300, "1.0E300"),
+            (f64::MAX, "1.7976931348623157E308"),
+            (1234567.0, "1234567.0"),
+            (-3.5, "-3.5"),
+            (1.0e-7, "1.0E-7"),
+            (6.02e23, "6.02E23"),
+            (2.5e-10, "2.5E-10"),
+            (f64::INFINITY, "Infinity"),
+            (f64::NEG_INFINITY, "-Infinity"),
+            (f64::NAN, "NaN"),
+            (7.0 % 3.0, "1.0"),
+            (-7.0 % 3.0, "-1.0"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(&java_double_to_string(*v), want, "值 {v:?}");
+        }
+    }
 
     fn roundtrip(bytes: &[u8]) -> Vec<u8> {
         let cf = parse(bytes).expect("parse");

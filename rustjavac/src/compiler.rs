@@ -179,7 +179,8 @@ impl Emit {
 
     /// double 的存储（dstore）
     fn dstore(&mut self, slot: u8) -> Result<(), CompileError> {
-        if slot <= 3 { self.op(0x47 + slot); } else { self.op(0x38); self.bytes.push(slot); }
+        // 注意：0x38 是 fstore，dstore 是 0x39
+        if slot <= 3 { self.op(0x47 + slot); } else { self.op(0x39); self.bytes.push(slot); }
         self.pop(2);
         Ok(())
     }
@@ -575,14 +576,17 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
                             return err("println 目前只支持一个参数");
                         }
                         compile_expr(&args[0], em, ctx, cp)?;
-                        let desc = if matches!(&args[0], Expr::StrLit(_)) {
-                            "(Ljava/lang/String;)V"
-                        } else {
-                            "(I)V"
+                        // 按实参类型选重载：int → (I)V，long → (J)V，
+                        // double → (D)V，引用 → (Ljava/lang/String;)V
+                        let (desc, width) = match expr_kind(&args[0], ctx) {
+                            K_LONG => ("(J)V", 2u16),
+                            K_DOUBLE => ("(D)V", 2),
+                            K_REF => ("(Ljava/lang/String;)V", 1),
+                            _ => ("(I)V", 1),
                         };
                         let println = cp.method_ref("java/io/PrintStream", "println", desc);
                         em.op_u2(0xB6, println);
-                        em.pop(2);
+                        em.pop(1 + width); // 接收者 + 实参占的槽数
                         return Ok(());
                     }
                 }
@@ -605,8 +609,9 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             em.op_u2(0xB6, idx); // invokevirtual
             let n = args.len() as u16 + 1;
             em.pop(n);
+            // 返回值占的槽数：long/double 占 2 槽
             if !desc.ends_with(")V") {
-                em.push(1);
+                em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
             }
             Ok(())
         }
@@ -630,10 +635,9 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             em.op_u2(0xB8, idx);
             let argc = args.len() as u16;
             em.pop(argc);
-            if desc.ends_with(")V") {
-                // 无返回值
-            } else {
-                em.push(1);
+            if !desc.ends_with(")V") {
+                // 返回值占的槽数：long/double 占 2 槽
+                em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
             }
             Ok(())
         }

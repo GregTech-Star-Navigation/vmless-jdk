@@ -269,3 +269,21 @@
 另 `cargo test --lib` 27 passed。
 
 **已知缺口**：解释器（`vm.rs`）仍只支持 int —— long/double 会明确报「未实现的字节码 0x14」，不会静默算错。
+
+## 0.30.0 — 2026-11-15 · 解释器支持 long/double，println 重载，JIT 返回精度
+
+- **解释器重写值模型**：栈/局部槽改为 `Slot{I(i32),L(i64),F(f64)}`，long/double 按 JVM 规范占 2 槽；
+  补全 `ldc2_w`、`lconst/dconst`、`lload/dload/lstore/dstore` 全形式、`l*/d*` 算术与 `neg`、
+  `lcmp/dcmpl/dcmpg`、`i2l i2d l2i l2d d2i d2l`、`lreturn/dreturn/areturn`、`pop2/dup2`
+- **println 重载**：按实参类型选 `(I)V/(J)V/(D)V/(Ljava/lang/String;)V`；double 走
+  `java_double_to_string`（Java 版式规则），JIT 侧加 `println_long/println_double`
+- **JIT 返回精度**：函数签名按描述符返回 `I32/I64/F64`，调用点直接上栈（不再「截断→还原」）
+- 顺手修三个真 bug：`dstore` 发成 `fstore`(0x38→0x39)、调用返回 long/double 只 `push(1)` 槽
+  （`max_stack` 少算 → `Operand stack overflow`）、`fcvt_to_sint` 越界插 `ud2`（Java 语义是饱和，
+  改 `fcvt_to_sint_sat`）
+
+**验证：15 个样例 java / 解释器 / JIT 三路一致**
+`Lg Db Point Loop Sw Obj2 ObjArr Arr Demo Perf2 LongEdge Doubles Mix DblCorpus Ret`；
+`cargo test --lib` 29 passed。
+
+**已知边界**：最小次正规数 `4.9E-324` 我们打 `5.0E-324`（Ryū 复刻未做）；long/double 的字段与数组仍为 i32。

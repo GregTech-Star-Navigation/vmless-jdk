@@ -44,6 +44,8 @@ impl Jit {
         builder.symbol("vmless_new_object", rt::new_object as *const u8);
         builder.symbol("vmless_new_array", rt::new_array as *const u8);
         builder.symbol("vmless_println_int", rt::println_int as *const u8);
+        builder.symbol("vmless_println_long", rt::println_long as *const u8);
+        builder.symbol("vmless_println_double", rt::println_double as *const u8);
         builder.symbol("vmless_println_str", rt::println_str as *const u8);
         builder.symbol("vmless_str_const", strtab::str_const as *const u8);
         builder.symbol("vmless_println_obj", strtab::println_str as *const u8);
@@ -86,10 +88,13 @@ impl Jit {
             field_count += 1;
         }
 
-        // 方法签名：(locals_ptr: i64) -> i32
+        // 方法签名：(locals_ptr: i64) -> 返回值
+        // 返回值必须按描述符给出真类型：long → i64、double → f64。
+        // 统一返回 i32 再在调用点还原会把 long/double 截断掉，跨调用就丢精度。
+        let ret_ty = ret_type(desc);
         let mut sig = self.module.make_signature();
         sig.params.push(AbiParam::new(types::I64));
-        sig.returns.push(AbiParam::new(types::I32));
+        sig.returns.push(AbiParam::new(ret_ty));
 
         let func_id = self
             .module
@@ -124,6 +129,20 @@ impl Jit {
         let println_int_id = self
             .module
             .declare_function("vmless_println_int", Linkage::Import, &sig_pi)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        let mut sig_pl = self.module.make_signature();
+        sig_pl.params.push(AbiParam::new(types::I64));
+        let println_long_id = self
+            .module
+            .declare_function("vmless_println_long", Linkage::Import, &sig_pl)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        let mut sig_pd = self.module.make_signature();
+        sig_pd.params.push(AbiParam::new(types::F64));
+        let println_double_id = self
+            .module
+            .declare_function("vmless_println_double", Linkage::Import, &sig_pd)
             .map_err(|e| JitError(e.to_string()))?;
 
         // 登记常量池里的字符串常量（ldc 用）
@@ -352,7 +371,8 @@ impl Jit {
                     let nv = fb.ins().iadd_imm(v, delta);
                     store_local(&mut fb, locals_ptr, slot, nv);
                 }
-                0x57 => {
+                0x57 | 0x58 => {
+                    // pop / pop2：栈上一个条目就是一个 JVM 值，宽值也只占一条
                     stack.pop();
                 }
                 0x60 => bin(&mut fb, &mut stack, |f, a, b| f.ins().iadd(a, b))?,
@@ -432,8 +452,10 @@ impl Jit {
                     terminated = false;
                     cur_start = pc;
                 }
-                0xac => {
+                // ireturn / lreturn / freturn / dreturn：统一按方法签名声明的返回类型收口
+                0xac | 0xad | 0xae | 0xaf => {
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = convert_to(&mut fb, v, ret_ty);
                     fb.ins().return_(&[v]);
                     returns += 1;
                     terminated = true;
@@ -445,7 +467,7 @@ impl Jit {
                     stack.clear();
                 }
                 0xb1 => {
-                    let zero = fb.ins().iconst(types::I32, 0);
+                    let zero = zero_of(&mut fb, ret_ty);
                     fb.ins().return_(&[zero]);
                     returns += 1;
                     terminated = true;
@@ -483,10 +505,10 @@ impl Jit {
                     let ptr = fb.ins().stack_addr(types::I64, slot, 0);
                     let fref = self.module.declare_func_in_func(fid, fb.func);
                     let call = fb.ins().call(fref, &[ptr]);
-                    let res = fb.inst_results(call)[0];
-                    // JIT 签名统一返回 i32，按被调方的真实返回类型还原
-                    let res = widen_ret(&mut fb, res, &callee_desc);
-                    stack.push(res);
+                    // 被调方已按自己的返回类型返回（i64/f64/i32），这里直接上栈
+                    if !callee_desc.ends_with(")V") {
+                        stack.push(fb.inst_results(call)[0]);
+                    }
                 }
                 // 引用类型局部变量（8 字节槽）
                 0x2a..=0x2d => {
@@ -588,8 +610,8 @@ impl Jit {
                     let v = fb.ins().load(types::F64, MemFlags::new(), addr, 0);
                     stack.push(v);
                 }
-                0x38 => {
-                    // dstore
+                0x38 | 0x39 => {
+                    // fstore(0x38) / dstore(0x39)：都只是把栈顶值按值存进 8 字节槽
                     let slot = body[pc] as usize;
                     pc += 1;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
@@ -671,12 +693,12 @@ impl Jit {
                 0x8e => {
                     // d2i
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    stack.push(fb.ins().fcvt_to_sint(types::I32, a));
+                    stack.push(fb.ins().fcvt_to_sint_sat(types::I32, a));
                 }
                 0x8f => {
                     // d2l
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    stack.push(fb.ins().fcvt_to_sint(types::I64, a));
+                    stack.push(fb.ins().fcvt_to_sint_sat(types::I64, a));
                 }
                 // long / double 比较：压出 -1 / 0 / 1
                 0x94 => {
@@ -706,18 +728,6 @@ impl Jit {
                     let d = fb.ins().isub(gt, lt);
                     stack.push(d);
                 }
-                0xaf => {
-                    // dreturn：JIT 签名统一返回 i32，double 截断成 int
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let v32 = fb.ins().fcvt_to_sint(types::I32, v);
-                    fb.ins().return_(&[v32]);
-                    terminated = true;
-                    open.pop();
-                    let dead = fb.create_block();
-                    open.push(dead);
-                    fb.switch_to_block(dead);
-                    stack.clear();
-                }
                 0x88 => {
                     // l2i
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
@@ -727,18 +737,6 @@ impl Jit {
                     // i2l
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     stack.push(fb.ins().sextend(types::I64, a));
-                }
-                0xad => {
-                    // lreturn
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let v32 = fb.ins().ireduce(types::I32, v);
-                    fb.ins().return_(&[v32]);
-                    terminated = true;
-                    open.pop();
-                    let dead = fb.create_block();
-                    open.push(dead);
-                    fb.switch_to_block(dead);
-                    stack.clear();
                 }
                 // getstatic：System.out 只当占位
                 0xb2 => {
@@ -756,12 +754,15 @@ impl Jit {
                         // 栈上顺序是 [接收者, 参数]，先弹参数
                         let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                         let _recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                        if desc.contains("String") {
-                            let fref = self.module.declare_func_in_func(println_obj_id, fb.func);
-                            fb.ins().call(fref, &[v]);
-                            continue;
-                        }
-                        let fref = self.module.declare_func_in_func(println_int_id, fb.func);
+                        // 按重载选运行时函数：(I)V / (J)V / (D)V / (Ljava/lang/String;)V
+                        let (fid, want) = match desc.as_str() {
+                            "(J)V" => (println_long_id, types::I64),
+                            "(D)V" | "(F)V" => (println_double_id, types::F64),
+                            "(Ljava/lang/String;)V" => (println_obj_id, types::I64),
+                            _ => (println_int_id, types::I32),
+                        };
+                        let v = convert_to(&mut fb, v, want);
+                        let fref = self.module.declare_func_in_func(fid, fb.func);
                         fb.ins().call(fref, &[v]);
                     } else {
                         let _ = cls;
@@ -789,9 +790,8 @@ impl Jit {
                         let fref = self.module.declare_func_in_func(fid, fb.func);
                         let c = fb.ins().call(fref, &[ptr]);
                         if !desc.ends_with(")V") {
-                            let r = fb.inst_results(c)[0];
-                            let r = widen_ret(&mut fb, r, &desc);
-                            stack.push(r);
+                            // 被调方已按自己的返回类型返回，直接上栈
+                            stack.push(fb.inst_results(c)[0]);
                         }
                     }
                 }
@@ -870,10 +870,10 @@ impl Jit {
                 other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
             }
         }
-        // 所有还没终结的块统一补 return 0
+        // 所有还没终结的块统一补该返回类型的零值
         for b in open {
             fb.switch_to_block(b);
-            let z = fb.ins().iconst(types::I32, 0);
+            let z = zero_of(&mut fb, ret_ty);
             fb.ins().return_(&[z]);
         }
         let _ = returns;
@@ -921,6 +921,9 @@ impl Jit {
 
 impl CompiledMethod {
     /// 调用：args 依次写入参数字槽，返回值即方法返回值
+    ///
+    /// 对外签名固定成 i32（老调用方都按 int 用），但被调方法可能真的返回
+    /// i64/f64 —— 那种情况下要按它自己的返回类型去调，否则读错寄存器。
     pub fn call(&self, args: &[i64]) -> i32 {
         let slots = param_slots(&self.desc);
         let need = slots.iter().copied().max().map(|m| m + 1).unwrap_or(0);
@@ -931,7 +934,19 @@ impl CompiledMethod {
                 locals[s] = *a;
             }
         }
-        unsafe { (self.code)(locals.as_mut_ptr()) }
+        let p = locals.as_mut_ptr();
+        let ty = ret_type(&self.desc);
+        unsafe {
+            if ty == types::F64 {
+                let f: unsafe extern "C" fn(*mut i64) -> f64 = std::mem::transmute(self.code);
+                f(p) as i32
+            } else if ty == types::I64 {
+                let f: unsafe extern "C" fn(*mut i64) -> i64 = std::mem::transmute(self.code);
+                f(p) as i32
+            } else {
+                (self.code)(p)
+            }
+        }
     }
 }
 
@@ -1029,18 +1044,49 @@ fn insn_len(op: u8) -> usize {
     }
 }
 
-/// JIT 的方法签名统一是 `(i64*) -> i32`，被调方返回 double/long 时
-/// 只能拿到截断后的 i32，调用方按描述符还原成 f64/i64 再继续算。
-fn widen_ret(fb: &mut FunctionBuilder, v: Value, desc: &str) -> Value {
-    match desc.as_bytes().last().copied() {
-        Some(b'D') => fb.ins().fcvt_from_sint(types::F64, v),
-        Some(b'J') => fb.ins().sextend(types::I64, v),
-        _ => v,
+/// 方法返回值的机器类型：long → I64，double → F64，其余（含 void）→ I32
+fn ret_type(desc: &str) -> cranelift_codegen::ir::Type {
+    match crate::ret_of(desc) {
+        Some(b'J') => types::I64,
+        Some(b'D') | Some(b'F') => types::F64,
+        _ => types::I32,
+    }
+}
+
+/// 把栈上的值转成 `ty` 要求的类型（只在确实不同型时才插转换指令）
+fn convert_to(fb: &mut FunctionBuilder, v: Value, ty: cranelift_codegen::ir::Type) -> Value {
+    let from = fb.func.dfg.value_type(v);
+    if from == ty {
+        return v;
+    }
+    if from == types::I32 && ty == types::I64 {
+        fb.ins().sextend(types::I64, v)
+    } else if from == types::I64 && ty == types::I32 {
+        fb.ins().ireduce(types::I32, v)
+    } else if ty == types::F64 {
+        fb.ins().fcvt_from_sint(types::F64, v)
+    } else if from == types::F64 && ty == types::I64 {
+        fb.ins().fcvt_to_sint_sat(types::I64, v)
+    } else if from == types::F64 {
+        fb.ins().fcvt_to_sint_sat(types::I32, v)
+    } else {
+        v
+    }
+}
+
+/// 该类型的零值（补默认返回 / 不可达块收尾用）
+fn zero_of(fb: &mut FunctionBuilder, ty: cranelift_codegen::ir::Type) -> Value {
+    if ty == types::F64 {
+        fb.ins().f64const(0.0)
+    } else if ty == types::I64 {
+        fb.ins().iconst(types::I64, 0)
+    } else {
+        fb.ins().iconst(types::I32, 0)
     }
 }
 
 /// 描述符里每个参数所在的 JVM 槽位（long/double 占两槽；静态方法从 0 起）
-fn param_slots(desc: &str) -> Vec<usize> {
+pub(crate) fn param_slots(desc: &str) -> Vec<usize> {
     let b = desc.as_bytes();
     let mut i = 1usize;
     let mut slot = 0usize;
@@ -1138,6 +1184,16 @@ pub mod rt {
     /// 打印一个 int（对应 System.out.println(int)）
     pub extern "C" fn println_int(v: i32) {
         println!("{v}");
+    }
+
+    /// 打印一个 long（对应 System.out.println(long)）
+    pub extern "C" fn println_long(v: i64) {
+        println!("{v}");
+    }
+
+    /// 打印一个 double（对应 System.out.println(double)，格式与 Java 一致）
+    pub extern "C" fn println_double(v: f64) {
+        println!("{}", crate::java_double_to_string(v));
     }
 
     /// double 取余（drem 没有对应的 cranelift 指令，走 CRT 的 fmod）
