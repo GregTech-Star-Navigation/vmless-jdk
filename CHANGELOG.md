@@ -233,3 +233,11 @@
   `ladd/lsub/lmul/ldiv/lrem/lneg`、`l2i`、`i2l`、`lreturn`
 - **尚未打通**：编译器还不会为 `long` 类型的局部变量分配 2 个槽并产出 `lstore/lload`，
   所以这条路径还没有端到端验证 —— 属于下一步
+
+## 0.27.0 — 2026-11-14 · long 端到端（部分）
+
+- 编译器：long 字面量（`lconst`/`ldc2_w`）、2 槽局部变量（`lstore/lload`）、
+  long 算术（`ladd/lsub/lmul/ldiv/lrem`）、`l2i`/`i2l` 转换、`lreturn`
+- JIT 执行 `Lg.sum(100000)` 得到 **704982704**（= 4999950000 截断为 int，正确）
+- **已知问题**：我们产出的 class 被 HotSpot 拒绝
+  （`ClassFormatError: Arguments can't fit int`），说明 class 文件某处不合规 —— 待查

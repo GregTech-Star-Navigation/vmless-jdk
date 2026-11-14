@@ -115,6 +115,20 @@ impl Emit {
         Ok(())
     }
 
+    /// long 的读取（lload）
+    fn lload(&mut self, slot: u8) -> Result<(), CompileError> {
+        if slot <= 3 { self.op(0x1E + slot); } else { self.op(0x16); self.bytes.push(slot); }
+        self.push(2);
+        Ok(())
+    }
+
+    /// long 的存储（lstore）
+    fn lstore(&mut self, slot: u8) -> Result<(), CompileError> {
+        if slot <= 3 { self.op(0x3F + slot); } else { self.op(0x37); self.bytes.push(slot); }
+        self.pop(2);
+        Ok(())
+    }
+
     /// 引用类型的存储（astore）
     fn astore(&mut self, slot: u8) -> Result<(), CompileError> {
         if slot <= 3 {
@@ -300,8 +314,8 @@ struct Ctx {
     fields: HashMap<String, usize>,
     /// 字段下标 → 描述符
     field_descs: Vec<String>,
-    /// 局部变量名 → 是否引用类型
-    local_ref: HashMap<String, bool>,
+    /// 局部变量名 → 类型种类（0=int,1=long,2=ref）
+    local_kind: HashMap<String, u8>,
     /// 当前类名（内部形式 java/lang/X）
     class_name: String,
     is_static: bool,
@@ -320,6 +334,17 @@ fn is_println_call(e: &Expr) -> bool {
 fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
     match e {
         Expr::IntLit(s) => {
+            if s.ends_with('L') || s.ends_with('l') {
+                let v: i64 = s[..s.len() - 1].parse().map_err(|_| CompileError { msg: format!("long 字面量 `{s}` 解析失败") })?;
+                if v == 0 || v == 1 {
+                    em.op(0x09 + v as u8); // lconst_0/1
+                } else {
+                    let idx = cp.long(v);
+                    em.op_u2(0x14, idx); // ldc2_w
+                }
+                em.push(2);
+                return Ok(());
+            }
             let v: i32 = s.parse().map_err(|_| CompileError { msg: format!("整数字面量 `{s}` 解析失败") })?;
             if (-32768..=32767).contains(&v) {
                 em.const_int(v);
@@ -397,6 +422,15 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             em.pop(n);
             Ok(())
         }
+        Expr::Cast { ty, expr } => {
+            compile_expr(expr, em, ctx, cp)?;
+            match ty {
+                Type::Prim("int") if expr_is_long(expr, ctx) => { em.op(0x88); em.pop(1); } // l2i
+                Type::Prim("long") if !expr_is_long(expr, ctx) => { em.op(0x85); em.push(1); } // i2l
+                _ => {}
+            }
+            Ok(())
+        }
         Expr::StrLit(s) => {
             let idx = cp.string(s);
             em.op_u2(0x13, idx);
@@ -405,10 +439,10 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
         }
         Expr::Ident(name) => {
             if let Some(slot) = ctx.lookup(name) {
-                if *ctx.local_ref.get(name).unwrap_or(&false) {
-                    em.aload(slot)?;
-                } else {
-                    em.iload(slot)?;
+                match *ctx.local_kind.get(name).unwrap_or(&0) {
+                    2 => em.aload(slot)?,
+                    1 => em.lload(slot)?,
+                    _ => em.iload(slot)?,
                 }
                 return Ok(());
             }
@@ -501,13 +535,19 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
         Expr::Binary { op, lhs, rhs } => {
             compile_expr(lhs, em, ctx, cp)?;
             compile_expr(rhs, em, ctx, cp)?;
-            let code = match op {
-                BinOp::Add => 0x60u8,
-                BinOp::Sub => 0x64,
-                BinOp::Mul => 0x68,
-                BinOp::Div => 0x6C,
-                BinOp::Rem => 0x70,
-                other => return err(format!("暂不支持的二元运算: {other:?}")),
+            let is_long = expr_is_long(lhs, ctx) || expr_is_long(rhs, ctx);
+            let code = match (op, is_long) {
+                (BinOp::Add, true) => 0x61u8,
+                (BinOp::Sub, true) => 0x65,
+                (BinOp::Mul, true) => 0x69,
+                (BinOp::Div, true) => 0x6D,
+                (BinOp::Rem, true) => 0x71,
+                (BinOp::Add, false) => 0x60u8,
+                (BinOp::Sub, false) => 0x64,
+                (BinOp::Mul, false) => 0x68,
+                (BinOp::Div, false) => 0x6C,
+                (BinOp::Rem, false) => 0x70,
+                (other, _) => return err(format!("暂不支持的二元运算: {other:?}")),
             };
             em.op(code);
             em.pop(1);
@@ -565,8 +605,13 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
         }
         Stmt::Return(Some(e)) => {
             compile_expr(e, em, ctx, cp)?;
-            em.op(0xAC); // ireturn
-            em.pop(1);
+            if expr_is_long(e, ctx) {
+                em.op(0xAD); // lreturn
+                em.pop(2);
+            } else {
+                em.op(0xAC); // ireturn
+                em.pop(1);
+            }
             Ok(true)
         }
         Stmt::Expr(e) if is_println_call(e) => {
@@ -586,13 +631,17 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
                 em.max_locals = ctx.next_slot as u16;
             }
             ctx.locals.insert(name.clone(), slot);
-            let is_ref = !matches!(ty, Type::Prim(_));
-            ctx.local_ref.insert(name.clone(), is_ref);
+            let kind = if matches!(ty, Type::Prim("long")) { 1u8 } else if matches!(ty, Type::Prim(_)) { 0 } else { 2 };
+            ctx.local_kind.insert(name.clone(), kind);
             let vt = ver_type(&mut *cp, ty);
             em.set_local_type(slot as usize, vt);
             if let Some(e) = init {
                 compile_expr(e, em, ctx, cp)?;
-                if is_ref { em.astore(slot)?; } else { em.istore(slot)?; }
+                match kind {
+                    2 => em.astore(slot)?,
+                    1 => em.lstore(slot)?,
+                    _ => em.istore(slot)?,
+                }
             }
             Ok(false)
         }
@@ -862,7 +911,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             instance_methods: inst_methods.clone(),
             fields: field_index.clone(),
             field_descs: field_desc_list.clone(),
-            local_ref: HashMap::new(),
+            local_kind: HashMap::new(),
             class_name: self_name.clone(),
             is_static,
         };
@@ -877,7 +926,9 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             em.set_local_type(slot as usize, vt);
             ctx.locals.insert(p.name.clone(), slot);
             if !matches!(p.ty, Type::Prim(_)) {
-                ctx.local_ref.insert(p.name.clone(), true);
+                ctx.local_kind.insert(p.name.clone(), 2);
+            } else if matches!(p.ty, Type::Prim("long")) {
+                ctx.local_kind.insert(p.name.clone(), 1);
             }
             ctx.next_slot += 1;
             slot += 1;
@@ -1044,5 +1095,15 @@ fn ver_type(cp: &mut CpBuilder, ty: &Type) -> u16 {
             cp.class(&joined)
         }
         Type::Var => 0,
+    }
+}
+
+/// 粗略判断表达式是不是 long 类型（用于选择 ladd/lsub/... 与 lreturn）
+fn expr_is_long(e: &Expr, ctx: &Ctx) -> bool {
+    match e {
+        Expr::IntLit(s) => s.ends_with('L') || s.ends_with('l'),
+        Expr::Ident(n) => ctx.local_kind.get(n).copied() == Some(1),
+        Expr::Binary { lhs, rhs, .. } => expr_is_long(lhs, ctx) || expr_is_long(rhs, ctx),
+        _ => false,
     }
 }

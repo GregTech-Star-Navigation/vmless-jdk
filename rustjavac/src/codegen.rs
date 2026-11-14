@@ -99,6 +99,11 @@ impl CpBuilder {
         self.push(CpEntry::Integer(v as u32))
     }
 
+    /// long 常量（常量池里占两个槽）
+    pub fn long(&mut self, v: i64) -> u16 {
+        self.push(CpEntry::Long(v as u64))
+    }
+
     pub fn entries(self) -> Vec<Option<CpEntry>> {
         self.entries
     }
