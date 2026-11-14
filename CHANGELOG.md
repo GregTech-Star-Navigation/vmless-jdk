@@ -71,3 +71,9 @@
 - 端到端：`Calc.java`（`static int add(int,int){return a+b;}` + `main` 打印 `add(2,3)`）
   → Rust 编译出 379 字节 `Calc.class` → **官方 JDK 25 执行输出 `5`**
 - `javap -c` 反汇编与 javac 产物同构（`iload_0/iload_1/iadd/ireturn`、`invokestatic Calc.add:(II)I`）
+
+## 0.11.0 — 2026-11-14
+
+- 控制流：`while` / `if`(含 else) / 局部变量声明与赋值，字节码含 **StackMapTable**（full_frame）
+- 跳转偏移按 JVM 规范相对**操作码地址**计算（此前按操作数地址，导致 VerifyError）
+- 端到端：`Loop.java`（`sum(5)` 用 while 累加、`max(7,3)` 用 if）→ Rust 编译 527 字节 → 官方 JDK 输出 `10` `7`

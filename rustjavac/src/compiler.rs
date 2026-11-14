@@ -26,11 +26,28 @@ struct Emit {
     depth: u16,
     max_depth: u16,
     max_locals: u16,
+    /// 标签 id -> 代码偏移
+    labels: Vec<Option<usize>>,
+    /// (操作数位置, 标签 id)，收尾时回填
+    patches: Vec<(usize, usize)>,
+    /// 需要 StackMapTable 帧的代码偏移（分支目标）
+    frames: Vec<usize>,
+    /// 常量池里 "StackMapTable" 的索引
+    stack_map_name: u16,
 }
 
 impl Emit {
     fn new(max_locals: u16) -> Self {
-        Emit { bytes: Vec::new(), depth: 0, max_depth: 0, max_locals }
+        Emit {
+            bytes: Vec::new(),
+            depth: 0,
+            max_depth: 0,
+            max_locals,
+            labels: Vec::new(),
+            patches: Vec::new(),
+            frames: Vec::new(),
+            stack_map_name: 0,
+        }
     }
 
     fn push(&mut self, n: u16) {
@@ -82,14 +99,96 @@ impl Emit {
         self.push(1);
     }
 
+    fn istore(&mut self, slot: u8) -> Result<(), CompileError> {
+        match slot {
+            0..=3 => self.op(0x3B + slot),
+            _ => return err(format!("局部变量槽 {slot} 超出当前支持范围")),
+        }
+        self.pop(1);
+        Ok(())
+    }
+
+    fn new_label(&mut self) -> usize {
+        self.labels.push(None);
+        self.labels.len() - 1
+    }
+
+    fn bind(&mut self, label: usize) {
+        let off = self.bytes.len();
+        self.labels[label] = Some(off);
+        self.frames.push(off);
+    }
+
+    fn branch(&mut self, opcode: u8, label: usize) {
+        // 记录**操作码**位置：JVM 的跳转偏移是相对操作码地址的
+        let pos = self.bytes.len();
+        self.op(opcode);
+        self.bytes.extend_from_slice(&[0, 0]);
+        self.patches.push((pos, label));
+    }
+
+    fn goto(&mut self, label: usize) {
+        self.branch(0xA7, label);
+    }
+
+    fn resolve(&mut self) -> Result<(), CompileError> {
+        let patches = std::mem::take(&mut self.patches);
+        for (pos, label) in patches {
+            let target = self
+                .labels
+                .get(label)
+                .and_then(|o| *o)
+                .ok_or_else(|| CompileError { msg: format!("标签 {label} 未绑定") })?;
+            let off = target as i32 - pos as i32;
+            let off = i16::try_from(off).map_err(|_| CompileError { msg: "跳转距离超出 16 位".into() })?;
+            self.bytes[pos + 1..pos + 3].copy_from_slice(&off.to_be_bytes());
+        }
+        self.frames.sort_unstable();
+        self.frames.dedup();
+        Ok(())
+    }
+
+    /// 生成 StackMapTable（全部用 full_frame，locals 全按 int）
+    fn stack_map(&self) -> Option<Vec<u8>> {
+        if self.frames.is_empty() {
+            return None;
+        }
+        let mut info = Vec::new();
+        info.extend_from_slice(&(self.frames.len() as u16).to_be_bytes());
+        let mut prev: Option<usize> = None;
+        for &off in &self.frames {
+            let delta = match prev {
+                None => off as u16,
+                Some(p) => (off - p - 1) as u16,
+            };
+            prev = Some(off);
+            info.push(255); // full_frame
+            info.extend_from_slice(&delta.to_be_bytes());
+            info.extend_from_slice(&self.max_locals.to_be_bytes());
+            for _ in 0..self.max_locals {
+                info.push(1); // ITEM_Integer
+            }
+            info.extend_from_slice(&0u16.to_be_bytes()); // 空操作数栈
+        }
+        Some(info)
+    }
+
     fn to_attribute(&self, name_index: u16) -> Attribute {
         let mut info = Vec::new();
         info.extend_from_slice(&self.max_depth.to_be_bytes());
         info.extend_from_slice(&self.max_locals.to_be_bytes());
         info.extend_from_slice(&(self.bytes.len() as u32).to_be_bytes());
         info.extend_from_slice(&self.bytes);
-        info.extend_from_slice(&0u16.to_be_bytes());
-        info.extend_from_slice(&0u16.to_be_bytes());
+        info.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        match self.stack_map() {
+            Some(sm) => {
+                info.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
+                info.extend_from_slice(&self.stack_map_name.to_be_bytes());
+                info.extend_from_slice(&(sm.len() as u32).to_be_bytes());
+                info.extend_from_slice(&sm);
+            }
+            None => info.extend_from_slice(&0u16.to_be_bytes()),
+        }
         Attribute { name_index, info }
     }
 }
@@ -142,15 +241,15 @@ fn method_descriptor(params: &[Param], ret: &Option<Type>) -> String {
     s
 }
 
-struct Ctx<'a> {
-    locals: HashMap<&'a str, u8>,
+struct Ctx {
+    locals: HashMap<String, u8>,
     next_slot: u8,
     /// 本类里的静态方法名 → 描述符（用于 invokestatic）
-    static_methods: HashMap<&'a str, String>,
+    static_methods: HashMap<String, String>,
     is_static: bool,
 }
 
-impl<'a> Ctx<'a> {
+impl Ctx {
     fn lookup(&self, name: &str) -> Option<u8> {
         self.locals.get(name).copied()
     }
@@ -160,7 +259,7 @@ fn is_println_call(e: &Expr) -> bool {
     matches!(e, Expr::Call { name, .. } if name == "println")
 }
 
-fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx<'_>, cp: &mut CpBuilder) -> Result<(), CompileError> {
+fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
     match e {
         Expr::IntLit(s) => {
             let v: i32 = s.parse().map_err(|_| CompileError { msg: format!("整数字面量 `{s}` 解析失败") })?;
@@ -246,7 +345,34 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx<'_>, cp: &mut CpBuilder) -> R
     }
 }
 
-fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx<'_>, cp: &mut CpBuilder) -> Result<bool, CompileError> {
+/// 把 `a < b` 这类条件编成「条件为假时跳到 label」。
+fn compile_cond_false(
+    e: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+    label: usize,
+) -> Result<(), CompileError> {
+    if let Expr::Binary { op, lhs, rhs } = e {
+        let code = match op {
+            BinOp::Lt => 0xA2u8, // if_icmpge
+            BinOp::Ge => 0xA1,   // if_icmplt
+            BinOp::Gt => 0xA4,   // if_icmple
+            BinOp::Le => 0xA3,   // if_icmpgt
+            BinOp::Eq => 0xA0,   // if_icmpne
+            BinOp::Ne => 0x9F,   // if_icmpeq
+            other => return err(format!("暂不支持的比较: {other:?}")),
+        };
+        compile_expr(lhs, em, ctx, cp)?;
+        compile_expr(rhs, em, ctx, cp)?;
+        em.pop(2);
+        em.branch(code, label);
+        return Ok(());
+    }
+    err("暂不支持的条件表达式")
+}
+
+fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
     match s {
         Stmt::Block(items) => {
             for it in items {
@@ -270,10 +396,64 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx<'_>, cp: &mut CpBuilder) 
             compile_expr(e, em, ctx, cp)?;
             Ok(false)
         }
-        Stmt::Expr(e) => {
+        Stmt::Expr(e) if !matches!(e, Expr::Assign { .. }) => {
             compile_expr(e, em, ctx, cp)?;
             em.op(0x57); // pop
             em.pop(1);
+            Ok(false)
+        }
+        Stmt::LocalVar { ty: _, name, init } => {
+            let slot = ctx.next_slot;
+            ctx.next_slot += 1;
+            if slot >= 4 {
+                return err("局部变量超过 4 个，暂不支持");
+            }
+            if em.max_locals < ctx.next_slot as u16 {
+                em.max_locals = ctx.next_slot as u16;
+            }
+            ctx.locals.insert(name.clone(), slot);
+            if let Some(e) = init {
+                compile_expr(e, em, ctx, cp)?;
+                em.istore(slot)?;
+            }
+            Ok(false)
+        }
+        Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) => {
+            let name = match &**lhs {
+                Expr::Ident(n) => n.clone(),
+                _ => return err("只支持给局部变量赋值"),
+            };
+            let slot = ctx
+                .lookup(&name)
+                .ok_or_else(|| CompileError { msg: format!("未定义的变量 `{name}`") })?;
+            compile_expr(rhs, em, ctx, cp)?;
+            em.istore(slot)?;
+            Ok(false)
+        }
+        Stmt::While { cond, body } => {
+            let start = em.new_label();
+            let end = em.new_label();
+            em.bind(start);
+            compile_cond_false(cond, em, ctx, cp, end)?;
+            compile_stmt(body, em, ctx, cp)?;
+            em.goto(start);
+            em.bind(end);
+            Ok(false)
+        }
+        Stmt::If { cond, then, els } => {
+            let l_else = em.new_label();
+            let l_end = em.new_label();
+            compile_cond_false(cond, em, ctx, cp, l_else)?;
+            compile_stmt(then, em, ctx, cp)?;
+            match els {
+                Some(e) => {
+                    em.goto(l_end);
+                    em.bind(l_else);
+                    compile_stmt(e, em, ctx, cp)?;
+                    em.bind(l_end);
+                }
+                None => em.bind(l_else),
+            }
             Ok(false)
         }
         other => err(format!("暂不支持的语句: {other:?}")),
@@ -296,11 +476,11 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
     };
 
     // 第一遍：收集静态方法签名（供 invokestatic 使用）
-    let mut static_sigs: HashMap<&str, String> = HashMap::new();
+    let mut static_sigs: HashMap<String, String> = HashMap::new();
     for m in &t.members {
         if let Member::Method(md) = m {
             if md.modifiers.iter().any(|x| x == "static") {
-                static_sigs.insert(md.name.as_str(), method_descriptor(&md.params, &md.ret));
+                static_sigs.insert(md.name.clone(), method_descriptor(&md.params, &md.ret));
             }
         }
     }
@@ -309,6 +489,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
     let this_class = cp.class(&self_name);
     let super_class = cp.class("java/lang/Object");
     let code_name = cp.utf8("Code");
+    let stack_map_name = cp.utf8("StackMapTable");
 
     let mut methods: Vec<CfMember> = Vec::new();
 
@@ -344,10 +525,10 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             static_methods: static_sigs.clone(),
             is_static,
         };
-        ctx.locals.insert("<this-class>", 0);
+        ctx.locals.insert("<this-class>".to_string(), 0);
         let mut slot = ctx.next_slot;
         for p in &md.params {
-            ctx.locals.insert(p.name.as_str(), slot);
+            ctx.locals.insert(p.name.clone(), slot);
             ctx.next_slot += 1;
             slot += 1;
         }
@@ -366,6 +547,8 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             }
         }
 
+        em.stack_map_name = stack_map_name;
+        em.resolve()?;
         let name_index = cp.utf8(&md.name);
         let desc_index = cp.utf8(&desc);
         let flags = if is_static { ACC_PUBLIC | ACC_STATIC } else { ACC_PUBLIC };
