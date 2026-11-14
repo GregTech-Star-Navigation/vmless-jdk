@@ -241,3 +241,10 @@
 - JIT 执行 `Lg.sum(100000)` 得到 **704982704**（= 4999950000 截断为 int，正确）
 - **已知问题**：我们产出的 class 被 HotSpot 拒绝
   （`ClassFormatError: Arguments can't fit int`），说明 class 文件某处不合规 —— 待查
+
+## 0.28.0 — 2026-11-14 · long 槽位与栈图（未收尾）
+
+- 修正 long/double 的**参数与局部变量槽位计数**（各占 2 槽）、`max_locals` 按槽算
+- 栈图里 long 写 `ITEM_Long`，第二个槽写 `ITEM_Top`
+- 现状：`ClassFormatError: StackMapTable format error: bad type array size` 仍未解决
+  （JIT 执行 `Lg` 结果正确 704982704，只是产出的 class 还不能被 HotSpot 接受）

@@ -223,6 +223,8 @@ impl Emit {
                 let t = *locals.get(slot).unwrap_or(&u16::MAX);
                 if t == u16::MAX {
                     info.push(0); // ITEM_Top（尚未初始化）
+                } else if t == 0xFFFE {
+                    info.push(4); // ITEM_Long
                 } else if t == 0 {
                     info.push(1); // ITEM_Integer
                 } else {
@@ -626,7 +628,8 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
         }
         Stmt::LocalVar { ty, name, init } => {
             let slot = ctx.next_slot;
-            ctx.next_slot += 1;
+            let wide_local = matches!(ty, Type::Prim("long") | Type::Prim("double"));
+            ctx.next_slot += if wide_local { 2 } else { 1 };
             if em.max_locals < ctx.next_slot as u16 {
                 em.max_locals = ctx.next_slot as u16;
             }
@@ -895,7 +898,8 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
         let is_static = md.modifiers.iter().any(|x| x == "static");
         let desc = method_descriptor(&md.params, &md.ret);
 
-        let mut em = Emit::new(if is_static { md.params.len() as u16 } else { md.params.len() as u16 + 1 });
+        let param_slots: u16 = md.params.iter().map(|p| if matches!(p.ty, Type::Prim("long") | Type::Prim("double")) { 2 } else { 1 }).sum();
+        let mut em = Emit::new(if is_static { param_slots } else { param_slots + 1 });
         let is_ctor_m = md.ret.is_none() && md.name == t.name;
         if is_ctor_m {
             // 构造器必须先调用父类构造器
@@ -924,14 +928,18 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
         for p in &md.params {
             let vt = ver_type(&mut cp, &p.ty);
             em.set_local_type(slot as usize, vt);
+            let wide = matches!(p.ty, Type::Prim("long") | Type::Prim("double"));
+            if wide {
+                em.set_local_type(slot as usize + 1, u16::MAX);
+            }
             ctx.locals.insert(p.name.clone(), slot);
             if !matches!(p.ty, Type::Prim(_)) {
                 ctx.local_kind.insert(p.name.clone(), 2);
             } else if matches!(p.ty, Type::Prim("long")) {
                 ctx.local_kind.insert(p.name.clone(), 1);
             }
-            ctx.next_slot += 1;
-            slot += 1;
+            ctx.next_slot += if wide { 2 } else { 1 };
+            slot += if wide { 2 } else { 1 };
         }
 
         // 方法体
@@ -1081,6 +1089,7 @@ mod tests {
 /// 类型的验证类型编码：int → 0，对象/数组 → 常量池里的类索引
 fn ver_type(cp: &mut CpBuilder, ty: &Type) -> u16 {
     match ty {
+        Type::Prim("long") => 0xFFFE, // 栈图里要写 ITEM_Long
         Type::Prim(_) => 0,
         Type::Array(inner) => {
             let d = descriptor(&Type::Array(inner.clone()));
