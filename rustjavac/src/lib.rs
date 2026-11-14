@@ -3,6 +3,10 @@
 //! 目标：读入任意 `.class`，原样写回，**逐字节一致**。
 //! 有了它，符号表、代码生成、Rust 运行时（librustjrt）才有共同的数据结构。
 
+pub mod ast;
+pub mod lexer;
+pub mod parser;
+
 use std::fmt;
 
 pub type Result<T> = std::result::Result<T, Error>;
