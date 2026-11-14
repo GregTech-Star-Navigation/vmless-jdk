@@ -127,3 +127,14 @@
 - 解释器：数组堆（句柄用负数与对象区分），支持 newarray/iaload/iastore/arraylength
 - `librustjrt`：尺寸类别编码进对象头 `flags` 高位，修正混合尺寸下清扫入错桶的问题
 - 端到端：`Arr.java`（数组写入 + 求和）→ rustjava 与官方 java 都输出 **20**
+
+## 0.17.0 — 2026-11-14 · 内存层实测口径固定
+
+- 新增 `bench_final`：输出机器可读的 `ALLOC_NS / GC_MS / MAX_STEP_MS / BYTES_PER_OBJ`
+- 与 JVM **交替 8 轮取最小值**（消除负载噪声）：
+  | 指标 | HotSpot G1 | librustjrt | 倍率 |
+  |---|---|---|---|
+  | 分配 | 12.7 ns/对象 | **11.0 ns** | 快 1.15 倍 |
+  | 一次回收 | 42.1 ms | 68.0 ms | 慢 1.6 倍（总 CPU） |
+  | 最大单步停顿 | 23.4 ms | **0.021 ms** | **小 1100 倍** |
+  | 单对象 | 24 B | 12–16 B | 小 1.5–2 倍 |
