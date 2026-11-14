@@ -542,6 +542,79 @@ impl Jit {
                     let c = fb.ins().call(fref, &[ptr]);
                     let _ = c;
                 }
+                // long：常量
+                0x09 | 0x0a => {
+                    stack.push(fb.ins().iconst(types::I64, (op as i64) - 0x09));
+                }
+                0x14 => {
+                    // ldc2_w
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let v = match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
+                        Some(CpEntry::Long(v)) => *v as i64,
+                        _ => 0,
+                    };
+                    stack.push(fb.ins().iconst(types::I64, v));
+                }
+                0x16 => {
+                    // lload
+                    let slot = body[pc] as usize;
+                    pc += 1;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    stack.push(v);
+                }
+                0x1e..=0x21 => {
+                    // lload_0..3
+                    let slot = (op - 0x1e) as usize;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    stack.push(v);
+                }
+                0x37 => {
+                    let slot = body[pc] as usize;
+                    pc += 1;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                }
+                0x3f..=0x42 => {
+                    let slot = (op - 0x3f) as usize;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                }
+                0x61 => lng(&mut fb, &mut stack, |f, a, b| f.ins().iadd(a, b))?,
+                0x65 => lng(&mut fb, &mut stack, |f, a, b| f.ins().isub(a, b))?,
+                0x69 => lng(&mut fb, &mut stack, |f, a, b| f.ins().imul(a, b))?,
+                0x6d => lng(&mut fb, &mut stack, |f, a, b| f.ins().sdiv(a, b))?,
+                0x71 => lng(&mut fb, &mut stack, |f, a, b| f.ins().srem(a, b))?,
+                0x75 => {
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().ineg(a));
+                }
+                0x88 => {
+                    // l2i
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().ireduce(types::I32, a));
+                }
+                0x85 => {
+                    // i2l
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().sextend(types::I64, a));
+                }
+                0xad => {
+                    // lreturn
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v32 = fb.ins().ireduce(types::I32, v);
+                    fb.ins().return_(&[v32]);
+                    terminated = true;
+                    open.pop();
+                    let dead = fb.create_block();
+                    open.push(dead);
+                    fb.switch_to_block(dead);
+                    stack.clear();
+                }
                 // getstatic：System.out 只当占位
                 0xb2 => {
                     let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
@@ -966,4 +1039,17 @@ pub mod strtab {
             println!("{}", String::from_utf8_lossy(bytes));
         }
     }
+}
+
+/// 二元 long 运算
+fn lng(
+    fb: &mut FunctionBuilder,
+    stack: &mut Vec<Value>,
+    f: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
+) -> Result<(), JitError> {
+    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+    let v = f(fb, a, b);
+    stack.push(v);
+    Ok(())
 }

@@ -226,3 +226,10 @@
 - 修三个栈图问题：选择子槽没登记类型、default 跳到空块、**不可达代码也必须有栈图帧**
 - **七个程序三引擎输出全部一致**（java / rustjava 解释器 / JIT）：
   Demo、Point、Loop、Arr、ObjArr、Perf2、Sw、Obj2（`7000`）
+
+## 0.26.0 — 2026-11-14 · JIT 补齐 long 字节码
+
+- JIT 新增：`lconst_0/1`、`ldc2_w`、`lload/lstore`（含 `_0..3`）、
+  `ladd/lsub/lmul/ldiv/lrem/lneg`、`l2i`、`i2l`、`lreturn`
+- **尚未打通**：编译器还不会为 `long` 类型的局部变量分配 2 个槽并产出 `lstore/lload`，
+  所以这条路径还没有端到端验证 —— 属于下一步
