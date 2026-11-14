@@ -2,6 +2,7 @@
 //!
 //! 目标：Java 对象不再由 HotSpot 的 GC 堆管理，而是由 Rust 分配器分配、
 //! 由 Rust 侧的生命周期策略回收。当前版本先把"对象是什么、怎么分配"钉死。
+pub mod gen;
 
 use std::alloc::{alloc, dealloc, Layout};
 use std::sync::atomic::{AtomicUsize, Ordering};
