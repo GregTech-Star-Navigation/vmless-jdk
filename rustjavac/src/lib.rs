@@ -9,6 +9,7 @@ pub mod lower;
 pub mod codegen;
 pub mod compiler;
 pub mod vm;
+pub mod jit;
 pub mod lexer;
 pub mod parser;
 

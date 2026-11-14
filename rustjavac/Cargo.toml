@@ -9,3 +9,18 @@ path = "src/lib.rs"
 
 [dependencies]
 librustjrt = { path = "../librustjrt" }
+
+[dependencies.cranelift-jit]
+version = "0.115"
+
+[dependencies.cranelift-codegen]
+version = "0.115"
+
+[dependencies.cranelift-module]
+version = "0.115"
+
+[dependencies.cranelift-frontend]
+version = "0.115"
+
+[dependencies.cranelift-native]
+version = "0.115"
