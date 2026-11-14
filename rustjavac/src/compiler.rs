@@ -294,6 +294,8 @@ struct Ctx {
     next_slot: u8,
     /// 本类里的静态方法名 → 描述符（用于 invokestatic）
     static_methods: HashMap<String, String>,
+    /// 本类实例方法：名字 → 描述符
+    instance_methods: HashMap<String, String>,
     /// 本类实例字段：名字 → 下标
     fields: HashMap<String, usize>,
     /// 字段下标 → 描述符
@@ -447,6 +449,27 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
                 }
             }
             err(format!("不支持的 println 形态: {name}"))
+        }
+        // 调用对象方法 a.get()
+        Expr::Call { recv: Some(r), name, args, .. } => {
+            let desc = ctx
+                .instance_methods
+                .get(name.as_str())
+                .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`") })?
+                .clone();
+            compile_expr(r, em, ctx, cp)?;
+            for a in args {
+                compile_expr(a, em, ctx, cp)?;
+            }
+            let owner = ctx.class_name.clone();
+            let idx = cp.method_ref(&owner, name, &desc);
+            em.op_u2(0xB6, idx); // invokevirtual
+            let n = args.len() as u16 + 1;
+            em.pop(n);
+            if !desc.ends_with(")V") {
+                em.push(1);
+            }
+            Ok(())
         }
         // 调用本类的静态方法 add(a, b)
         Expr::Call { name, args, .. } => {
@@ -615,6 +638,64 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             em.istore(slot)?;
             Ok(false)
         }
+        Stmt::Switch { selector, cases } => {
+            // 用一个临时槽保存选择子
+            let sel_slot = ctx.next_slot;
+            ctx.next_slot += 1;
+            if em.max_locals < ctx.next_slot as u16 {
+                em.max_locals = ctx.next_slot as u16;
+            }
+            compile_expr(selector, em, ctx, cp)?;
+            em.istore(sel_slot)?;
+            em.set_local_type(sel_slot as usize, 0); // int
+
+            // 为每个 case 建标签；线性比较链 + goto
+            let mut body_labels = Vec::new();
+            for _ in cases {
+                body_labels.push(em.new_label());
+            }
+            let end_label = em.new_label();
+            // default 体在哪里？没有 default 就跳到结尾
+            let default_target = cases
+                .iter()
+                .position(|c| c.labels.iter().any(|l| l.is_none()))
+                .map(|i| body_labels[i])
+                .unwrap_or(end_label);
+
+            for (i, c) in cases.iter().enumerate() {
+                for label in &c.labels {
+                    match label {
+                        Some(v) => {
+                            em.iload(sel_slot)?;
+                            compile_expr(v, em, ctx, cp)?;
+                            let next = em.new_label();
+                            // 不相等就继续比下一个
+                            em.branch(0xa0, next); // if_icmpne
+                            em.pop(2);
+                            em.goto(body_labels[i]);
+                            em.bind(next);
+                        }
+                        None => {
+                            // default 不参与比较链：链条走完自然落到它
+                        }
+                    }
+                }
+            }
+            em.goto(default_target);
+
+            // 依次发射各 case 体（自然贯穿）
+            for (i, c) in cases.iter().enumerate() {
+                em.bind(body_labels[i]);
+                for s in &c.body {
+                    compile_stmt(s, em, ctx, cp)?;
+                }
+            }
+            if default_target == end_label {
+                em.bind(end_label);
+            }
+            // 视为已终结：避免在末尾再补一条不可达的默认 return（HotSpot 要求死代码也有栈图帧）
+            Ok(true)
+        }
         Stmt::For { init, cond, update, body } => {
             for s in init {
                 compile_stmt(s, em, ctx, cp)?;
@@ -685,6 +766,16 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
         if let Member::Method(md) = m {
             if md.modifiers.iter().any(|x| x == "static") {
                 static_sigs.insert(md.name.clone(), method_descriptor(&md.params, &md.ret));
+            }
+        }
+    }
+
+    // 实例方法：名字 → 描述符
+    let mut inst_methods: HashMap<String, String> = HashMap::new();
+    for m in &t.members {
+        if let Member::Method(md) = m {
+            if !md.modifiers.iter().any(|x| x == "static") && !(md.ret.is_none() && md.name == t.name) {
+                inst_methods.insert(md.name.clone(), method_descriptor(&md.params, &md.ret));
             }
         }
     }
@@ -768,6 +859,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             locals: HashMap::new(),
             next_slot: if is_static { 0 } else { 1 },
             static_methods: static_sigs.clone(),
+            instance_methods: inst_methods.clone(),
             fields: field_index.clone(),
             field_descs: field_desc_list.clone(),
             local_ref: HashMap::new(),

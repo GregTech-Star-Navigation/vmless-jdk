@@ -394,6 +394,27 @@ impl<'a> Vm<'a> {
                             arg.to_string()
                         };
                         self.output.push(text);
+                    } else if let Some(target) = self
+                        .methods
+                        .get(&(info.name.clone(), info.desc.clone()))
+                        .copied()
+                    {
+                        // 本类方法的虚调用：接收者当第 0 个参数
+                        let argc = count_args(&info.desc)?;
+                        let mut args = Vec::with_capacity(argc + 1);
+                        for _ in 0..argc {
+                            args.push(frame.pop()?);
+                        }
+                        let recv = frame.pop()?;
+                        args.reverse();
+                        let mut all = vec![recv];
+                        all.extend(args);
+                        self.depth += 1;
+                        let r = self.execute(target, &all)?;
+                        self.depth -= 1;
+                        if !info.desc.ends_with(")V") {
+                            frame.push(r);
+                        }
                     } else {
                         return err(format!("不支持的 invokevirtual: {}.{}", info.class, info.name));
                     }

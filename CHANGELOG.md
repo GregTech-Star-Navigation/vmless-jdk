@@ -218,3 +218,11 @@
 - `ldc`/`ldc_w` 遇到 String 常量走该表；`invokevirtual println(String)` 调 `vmless_println_obj`
 - **五个程序整体 JIT 执行，与官方 java 输出全部一致**：
   `Demo`→`rustjavac + rustjava` / `45`、`Arr`→20、`Loop`→10/7、`Perf2`→1283106752、`ObjArr`→29850
+
+## 0.25.0 — 2026-11-14 · switch 与实例方法调用
+
+- 编译器：`switch`（线性比较链 + 贯穿语义）、实例方法调用 `obj.method()`（`invokevirtual`）
+- 解释器：支持本类方法的 `invokevirtual`（接收者作第 0 个参数）
+- 修三个栈图问题：选择子槽没登记类型、default 跳到空块、**不可达代码也必须有栈图帧**
+- **七个程序三引擎输出全部一致**（java / rustjava 解释器 / JIT）：
+  Demo、Point、Loop、Arr、ObjArr、Perf2、Sw、Obj2（`7000`）
