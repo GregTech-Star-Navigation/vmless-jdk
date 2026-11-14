@@ -101,3 +101,12 @@
   | 分配 | 12.7 ns | 12.6 ns | 15.7 ns | **10.4 ns** |
   | 8M 占用 | 146 MB | 150 MB | 244 MB | **122 MB** |
   | 一次完整回收 | 38.6 ms（累计） | 224.4 ms | 164.2 ms | **86.5 ms** |
+
+## 0.14.0 — 2026-11-14 · 对象与字段
+
+- 编译器：`new` / `dup` / `getfield` / `putfield` / `this` / 构造器（含 `super()` 调用）、
+  引用类型局部变量用 `astore`/`aload`、类文件里真正写出字段表、构造器名统一为 `<init>`
+- 解释器：对象堆、字段读写、`invokespecial <init>` 真正执行构造器
+- 端到端：`Point{int x; Point(int v){this.x=v;} static int twice(Point p){return p.x+p.x;}}`
+  → rustjava 与官方 java 都输出 **42**
+- 测试 27 条全绿（新增 `runs_objects_and_fields`）

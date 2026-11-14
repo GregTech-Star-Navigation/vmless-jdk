@@ -108,6 +108,26 @@ impl Emit {
         Ok(())
     }
 
+    /// 引用类型的存储（astore）
+    fn astore(&mut self, slot: u8) -> Result<(), CompileError> {
+        match slot {
+            0..=3 => self.op(0x4B + slot),
+            _ => return err(format!("局部变量槽 {slot} 超出当前支持范围")),
+        }
+        self.pop(1);
+        Ok(())
+    }
+
+    /// 引用类型的读取（aload）
+    fn aload(&mut self, slot: u8) -> Result<(), CompileError> {
+        match slot {
+            0..=3 => self.op(0x2A + slot),
+            _ => return err(format!("局部变量槽 {slot} 超出当前支持范围")),
+        }
+        self.push(1);
+        Ok(())
+    }
+
     fn new_label(&mut self) -> usize {
         self.labels.push(None);
         self.labels.len() - 1
@@ -246,6 +266,14 @@ struct Ctx {
     next_slot: u8,
     /// 本类里的静态方法名 → 描述符（用于 invokestatic）
     static_methods: HashMap<String, String>,
+    /// 本类实例字段：名字 → 下标
+    fields: HashMap<String, usize>,
+    /// 字段下标 → 描述符
+    field_descs: Vec<String>,
+    /// 局部变量名 → 是否引用类型
+    local_ref: HashMap<String, bool>,
+    /// 当前类名（内部形式 java/lang/X）
+    class_name: String,
     is_static: bool,
 }
 
@@ -266,6 +294,48 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             em.const_int(v);
             Ok(())
         }
+        Expr::This => {
+            em.op(0x2A); // aload_0
+            em.push(1);
+            Ok(())
+        }
+        Expr::Field(recv, name) => {
+            compile_expr(recv, em, ctx, cp)?;
+            let idx = *ctx
+                .fields
+                .get(name)
+                .ok_or_else(|| CompileError { msg: format!("未知字段 `{name}`") })?;
+            let desc = ctx.field_descs[idx].clone();
+            let owner = ctx.class_name.clone();
+            let f = cp.field_ref(&owner, name, &desc);
+            em.op_u2(0xB4, f); // getfield
+            Ok(())
+        }
+        Expr::New { ty, args } => {
+            let owner = match ty {
+                Type::Named { path, .. } => path.join("/"),
+                _ => return err("只支持创建对象"),
+            };
+            let arg_desc: String = args.iter().map(|a| match a {
+                Expr::IntLit(_) | Expr::Ident(_) | Expr::Binary { .. } => "I".to_string(),
+                Expr::StrLit(_) => "Ljava/lang/String;".to_string(),
+                _ => "I".to_string(),
+            }).collect();
+            let ctor_desc = format!("({arg_desc})V");
+            let cls = cp.class(&owner);
+            em.op_u2(0xBB, cls); // new
+            em.push(1);
+            em.op(0x59); // dup
+            em.push(1);
+            for a in args {
+                compile_expr(a, em, ctx, cp)?;
+            }
+            let init = cp.method_ref(&owner, "<init>", &ctor_desc);
+            em.op_u2(0xB7, init); // invokespecial
+            let n = args.len() as u16 + 1;
+            em.pop(n);
+            Ok(())
+        }
         Expr::StrLit(s) => {
             let idx = cp.string(s);
             em.op_u2(0x13, idx);
@@ -273,11 +343,25 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             Ok(())
         }
         Expr::Ident(name) => {
-            let slot = ctx
-                .lookup(name)
-                .ok_or_else(|| CompileError { msg: format!("未定义的变量 `{name}`") })?;
-            em.iload(slot)?;
-            Ok(())
+            if let Some(slot) = ctx.lookup(name) {
+                if *ctx.local_ref.get(name).unwrap_or(&false) {
+                    em.aload(slot)?;
+                } else {
+                    em.iload(slot)?;
+                }
+                return Ok(());
+            }
+            // 隐式 this 字段
+            if let Some(idx) = ctx.fields.get(name).copied() {
+                em.op(0x2A); // aload_0
+                em.push(1);
+                let desc = ctx.field_descs[idx].clone();
+                let owner = ctx.class_name.clone();
+                let f = cp.field_ref(&owner, name, &desc);
+                em.op_u2(0xB4, f);
+                return Ok(());
+            }
+            err(format!("未定义的变量 `{name}`"))
         }
         // System.out.println(x)
         Expr::Call { recv: Some(r), name, args, .. } if name == "println" => {
@@ -413,7 +497,7 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             em.pop(1);
             Ok(false)
         }
-        Stmt::LocalVar { ty: _, name, init } => {
+        Stmt::LocalVar { ty, name, init } => {
             let slot = ctx.next_slot;
             ctx.next_slot += 1;
             if slot >= 4 {
@@ -423,10 +507,30 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
                 em.max_locals = ctx.next_slot as u16;
             }
             ctx.locals.insert(name.clone(), slot);
+            let is_ref = !matches!(ty, Type::Prim(_));
+            ctx.local_ref.insert(name.clone(), is_ref);
             if let Some(e) = init {
                 compile_expr(e, em, ctx, cp)?;
-                em.istore(slot)?;
+                if is_ref { em.astore(slot)?; } else { em.istore(slot)?; }
             }
+            Ok(false)
+        }
+        Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) if matches!(&**lhs, Expr::Field(..)) => {
+            let (recv, fname) = match &**lhs {
+                Expr::Field(r, n) => (r.clone(), n.clone()),
+                _ => unreachable!(),
+            };
+            compile_expr(&recv, em, ctx, cp)?;
+            compile_expr(rhs, em, ctx, cp)?;
+            let idx = *ctx
+                .fields
+                .get(&fname)
+                .ok_or_else(|| CompileError { msg: format!("未知字段 `{fname}`") })?;
+            let desc = ctx.field_descs[idx].clone();
+            let owner = ctx.class_name.clone();
+            let f = cp.field_ref(&owner, &fname, &desc);
+            em.op_u2(0xB5, f); // putfield
+            em.pop(2);
             Ok(false)
         }
         Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) => {
@@ -515,30 +619,63 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
         }
     }
 
+    // 实例字段：名字 → 下标，以及每个下标的描述符
+    let mut field_index: HashMap<String, usize> = HashMap::new();
+    let mut field_desc_list: Vec<String> = Vec::new();
+    for m in &t.members {
+        if let Member::Field(f) = m {
+            if f.modifiers.iter().any(|x| x == "static") {
+                continue;
+            }
+            field_index.insert(f.name.clone(), field_desc_list.len());
+            field_desc_list.push(descriptor(&f.ty));
+        }
+    }
+
     let mut cp = CpBuilder::new();
     let this_class = cp.class(&self_name);
     let super_class = cp.class("java/lang/Object");
     let code_name = cp.utf8("Code");
     let stack_map_name = cp.utf8("StackMapTable");
 
-    let mut methods: Vec<CfMember> = Vec::new();
+    let has_ctor = t.members.iter().any(|m| matches!(m, Member::Method(md) if md.ret.is_none() && md.name == t.name));
 
-    // 默认构造器
+    let mut methods: Vec<CfMember> = Vec::new();
+    let mut fields: Vec<CfMember> = Vec::new();
+    for m in &t.members {
+        if let Member::Field(f) = m {
+            if f.modifiers.iter().any(|x| x == "static") {
+                continue;
+            }
+            let n = cp.utf8(&f.name);
+            let d = cp.utf8(&descriptor(&f.ty));
+            fields.push(CfMember {
+                access_flags: 0x0000,
+                name_index: n,
+                descriptor_index: d,
+                attributes: Vec::new(),
+            });
+        }
+    }
+
     let obj_init = cp.method_ref("java/lang/Object", "<init>", "()V");
-    let mut ctor = Emit::new(1);
-    ctor.op(0x2A); // aload_0
-    ctor.push(1);
-    ctor.op_u2(0xB7, obj_init);
-    ctor.pop(1);
-    ctor.op(0xB1);
-    let ctor_name = cp.utf8("<init>");
-    let ctor_desc = cp.utf8("()V");
-    methods.push(CfMember {
-        access_flags: ACC_PUBLIC,
-        name_index: ctor_name,
-        descriptor_index: ctor_desc,
-        attributes: vec![ctor.to_attribute(code_name)],
-    });
+    if !has_ctor {
+        // 默认构造器
+        let mut ctor = Emit::new(1);
+        ctor.op(0x2A); // aload_0
+        ctor.push(1);
+        ctor.op_u2(0xB7, obj_init);
+        ctor.pop(1);
+        ctor.op(0xB1);
+        let ctor_name = cp.utf8("<init>");
+        let ctor_desc = cp.utf8("()V");
+        methods.push(CfMember {
+            access_flags: ACC_PUBLIC,
+            name_index: ctor_name,
+            descriptor_index: ctor_desc,
+            attributes: vec![ctor.to_attribute(code_name)],
+        });
+    }
 
     for m in &t.members {
         let md = match m {
@@ -549,16 +686,31 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
         let desc = method_descriptor(&md.params, &md.ret);
 
         let mut em = Emit::new(if is_static { md.params.len() as u16 } else { md.params.len() as u16 + 1 });
+        let is_ctor_m = md.ret.is_none() && md.name == t.name;
+        if is_ctor_m {
+            // 构造器必须先调用父类构造器
+            em.op(0x2A);
+            em.push(1);
+            em.op_u2(0xB7, obj_init);
+            em.pop(1);
+        }
         let mut ctx = Ctx {
             locals: HashMap::new(),
             next_slot: if is_static { 0 } else { 1 },
             static_methods: static_sigs.clone(),
+            fields: field_index.clone(),
+            field_descs: field_desc_list.clone(),
+            local_ref: HashMap::new(),
+            class_name: self_name.clone(),
             is_static,
         };
         ctx.locals.insert("<this-class>".to_string(), 0);
         let mut slot = ctx.next_slot;
         for p in &md.params {
             ctx.locals.insert(p.name.clone(), slot);
+            if !matches!(p.ty, Type::Prim(_)) {
+                ctx.local_ref.insert(p.name.clone(), true);
+            }
             ctx.next_slot += 1;
             slot += 1;
         }
@@ -579,7 +731,9 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
 
         em.stack_map_name = stack_map_name;
         em.resolve()?;
-        let name_index = cp.utf8(&md.name);
+        let is_ctor = md.ret.is_none() && md.name == t.name;
+        let method_name = if is_ctor { "<init>" } else { md.name.as_str() };
+        let name_index = cp.utf8(method_name);
         let desc_index = cp.utf8(&desc);
         let flags = if is_static { ACC_PUBLIC | ACC_STATIC } else { ACC_PUBLIC };
         methods.push(CfMember {
@@ -601,7 +755,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
         this_class,
         super_class,
         interfaces: Vec::new(),
-        fields: Vec::new(),
+        fields,
         methods,
         attributes: Vec::new(),
     };

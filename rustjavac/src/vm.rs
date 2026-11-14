@@ -50,6 +50,12 @@ pub struct Vm<'a> {
     methods: HashMap<(String, String), &'a crate::Member>,
     output: Vec<String>,
     depth: usize,
+    /// 对象堆：每个对象就是一组 int 字段；引用 = 下标 + 1（0 表示 null）
+    objects: Vec<Vec<i32>>,
+    /// 实例字段名 → 下标
+    field_index: HashMap<String, usize>,
+    /// 本类实例字段个数
+    field_count: usize,
 }
 
 impl<'a> Vm<'a> {
@@ -61,7 +67,23 @@ impl<'a> Vm<'a> {
                 String::from_utf8_lossy(class.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
             methods.insert((name, desc), m);
         }
-        Vm { class, methods, output: Vec::new(), depth: 0 }
+        let mut field_index = HashMap::new();
+        let mut idx = 0usize;
+        for f in &class.fields {
+            let name = String::from_utf8_lossy(class.utf8(f.name_index).unwrap_or_default()).into_owned();
+            let is_static = f.access_flags & 0x0008 != 0;
+            if !is_static {
+                field_index.insert(name, idx);
+                idx += 1;
+            }
+        }
+        let n_fields = idx;
+        Vm { class, methods, output: Vec::new(), depth: 0, objects: Vec::new(), field_index, field_count: n_fields }
+    }
+
+    fn with_field_count(mut self, n: usize) -> Self {
+        self.field_count = n;
+        self
     }
 
     fn method_ref(&self, index: u16) -> Result<MethodRefInfo, VmError> {
@@ -258,6 +280,57 @@ impl<'a> Vm<'a> {
                     return frame.pop();
                 }
                 0xb1 => return Ok(0),
+                0x19 => {
+                    let slot = body[pc] as usize;
+                    pc += 1;
+                    frame.push(*frame.locals.get(slot).unwrap_or(&0));
+                }
+                0x2a..=0x2d => {
+                    let slot = (op - 0x2a) as usize;
+                    frame.push(*frame.locals.get(slot).unwrap_or(&0));
+                }
+                0x4b..=0x4e => {
+                    let slot = (op - 0x4b) as usize;
+                    let v = frame.pop()?;
+                    if slot >= frame.locals.len() {
+                        frame.locals.resize(slot + 1, 0);
+                    }
+                    frame.locals[slot] = v;
+                }
+                0x59 => {
+                    let v = *frame.stack.last().unwrap_or(&0);
+                    frame.push(v);
+                }
+                // new
+                0xbb => {
+                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    self.objects.push(vec![0; self.field_count.max(1)]);
+                    let handle = self.objects.len() as i32;
+                    frame.push(handle);
+                }
+                // getfield
+                0xb4 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let info = self.method_ref(idx)?;
+                    let obj = frame.pop()?;
+                    let f = *self.field_index.get(&info.name).unwrap_or(&0);
+                    let v = if obj > 0 { self.objects[obj as usize - 1][f] } else { 0 };
+                    frame.push(v);
+                }
+                // putfield
+                0xb5 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let info = self.method_ref(idx)?;
+                    let value = frame.pop()?;
+                    let obj = frame.pop()?;
+                    let f = *self.field_index.get(&info.name).unwrap_or(&0);
+                    if obj > 0 {
+                        self.objects[obj as usize - 1][f] = value;
+                    }
+                }
                 // getstatic：目前只支持 System.out
                 0xb2 => {
                     let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
@@ -282,12 +355,32 @@ impl<'a> Vm<'a> {
                         return err(format!("不支持的 invokevirtual: {}.{}", info.class, info.name));
                     }
                 }
-                // invokespecial：构造器调用，直接当空操作
+                // invokespecial：本类构造器真的执行
                 0xb7 => {
-                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let n = frame.pop()?;
-                    let _ = n;
+                    let info = self.method_ref(idx)?;
+                    if info.name == "<init>" {
+                        let argc = count_args(&info.desc)?;
+                        let mut args = Vec::with_capacity(argc + 1);
+                        for _ in 0..argc {
+                            args.push(frame.pop()?);
+                        }
+                        let obj = frame.pop()?;
+                        args.reverse();
+                        let mut all = vec![obj];
+                        all.extend(args);
+                        if let Some(target) = self.methods.get(&(info.name.clone(), info.desc.clone())).copied() {
+                            self.depth += 1;
+                            let _ = self.execute(target, &all);
+                            self.depth -= 1;
+                        }
+                    } else {
+                        let argc = count_args(&info.desc)? as u16;
+                        for _ in 0..argc + 1 {
+                            frame.pop()?;
+                        }
+                    }
                 }
                 // invokestatic
                 0xb8 => {
@@ -457,6 +550,24 @@ mod tests {
         "#,
         );
         assert_eq!(out, vec!["7", "9"]);
+    }
+
+    #[test]
+    fn runs_objects_and_fields() {
+        let out = compile_and_run(
+            r#"
+            class Point {
+                int x;
+                Point(int v) { this.x = v; }
+                static int twice(Point p) { return p.x + p.x; }
+                public static void main(String[] args) {
+                    Point p = new Point(21);
+                    System.out.println(twice(p));
+                }
+            }
+        "#,
+        );
+        assert_eq!(out, vec!["42"]);
     }
 
     #[test]
