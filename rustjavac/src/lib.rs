@@ -4,6 +4,8 @@
 //! 有了它，符号表、代码生成、Rust 运行时（librustjrt）才有共同的数据结构。
 
 pub mod ast;
+pub mod sema;
+pub mod lower;
 pub mod lexer;
 pub mod parser;
 

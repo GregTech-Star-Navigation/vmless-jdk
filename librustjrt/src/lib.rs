@@ -145,8 +145,8 @@ pub enum FieldKind {
 /// 类元数据：名字、字段布局、对象大小。
 #[derive(Debug)]
 pub struct ClassMeta {
-    pub name: &'static str,
-    pub fields: &'static [FieldKind],
+    pub name: String,
+    pub fields: Vec<FieldKind>,
 }
 
 impl ClassMeta {
@@ -254,6 +254,11 @@ impl Heap {
     pub fn live_count(&self) -> usize {
         self.live.len()
     }
+
+    /// 已向 arena 借出的字节数（用于验证空闲槽复用）
+    pub fn arena_used(&self) -> usize {
+        self.arena.used()
+    }
 }
 
 fn obj_size(o: *mut JavaObject) -> usize {
@@ -264,26 +269,27 @@ fn obj_size(o: *mut JavaObject) -> usize {
 mod gc_tests {
     use super::*;
 
-    static NODE: ClassMeta = ClassMeta { name: "Node", fields: &[FieldKind::Ref, FieldKind::Prim] };
+    fn node_meta() -> ClassMeta { ClassMeta { name: "Node".into(), fields: vec![FieldKind::Ref, FieldKind::Prim] } }
 
     #[test]
     fn mark_sweep_reclaims_unreachable() {
         let mut h = Heap::new(1 << 20);
-        let root = h.alloc(&NODE);
-        let a = h.alloc(&NODE);
-        let b = h.alloc(&NODE);
+        let m = node_meta();
+        let root = h.alloc(&m);
+        let a = h.alloc(&m);
+        let b = h.alloc(&m);
         h.set_ref(root, 0, a);
         h.set_ref(a, 0, b);
         assert_eq!(h.live_count(), 3);
 
         // a -> b 这条链可达，全部保留
-        h.collect(&[root], &[&NODE]);
+        h.collect(&[root], &[&m]);
         assert_eq!(h.collected, 0);
         assert_eq!(h.live_count(), 3);
 
         // 断掉 root->a，a 与 b 都不可达
         h.set_ref(root, 0, std::ptr::null_mut());
-        h.collect(&[root], &[&NODE]);
+        h.collect(&[root], &[&m]);
         assert_eq!(h.collected, 2);
         assert_eq!(h.live_count(), 1);
     }
@@ -291,13 +297,14 @@ mod gc_tests {
     #[test]
     fn freed_slots_are_reused() {
         let mut h = Heap::new(1 << 20);
-        let root = h.alloc(&NODE);
-        let tmp = h.alloc(&NODE);
+        let m = node_meta();
+        let root = h.alloc(&m);
+        let tmp = h.alloc(&m);
         let _ = tmp;
-        h.collect(&[root], &[&NODE]);
+        h.collect(&[root], &[&m]);
         assert_eq!(h.collected, 1);
         let used_before = h.arena.used();
-        let reused = h.alloc(&NODE);
+        let reused = h.alloc(&m);
         assert_eq!(h.arena.used(), used_before, "应当复用空闲槽，不再向 arena 借内存");
         h.set_ref(root, 0, reused);
     }

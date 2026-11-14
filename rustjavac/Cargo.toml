@@ -6,3 +6,6 @@ edition = "2021"
 [lib]
 name = "classfile"
 path = "src/lib.rs"
+
+[dependencies]
+librustjrt = { path = "../librustjrt" }
