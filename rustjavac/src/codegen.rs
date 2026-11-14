@@ -104,6 +104,11 @@ impl CpBuilder {
         self.push(CpEntry::Long(v as u64))
     }
 
+    /// double 常量（常量池里占两个槽，ldc2_w 取用）
+    pub fn double(&mut self, v: f64) -> u16 {
+        self.push(CpEntry::Double(v.to_bits()))
+    }
+
     pub fn entries(self) -> Vec<Option<CpEntry>> {
         self.entries
     }

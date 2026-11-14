@@ -248,3 +248,24 @@
 - 栈图里 long 写 `ITEM_Long`，第二个槽写 `ITEM_Top`
 - 现状：`ClassFormatError: StackMapTable format error: bad type array size` 仍未解决
   （JIT 执行 `Lg` 结果正确 704982704，只是产出的 class 还不能被 HotSpot 接受）
+
+## 0.29.0 — 2026-11-14 · long 与 double 全链路（编译器 + JIT）
+
+**long**
+- 根因修复：HotSpot 的 full_frame 解析器会按 `is_category2()` **自己把 long/double 展开成两槽**，
+  所以栈图里一个 long 只写**一个** `ITEM_Long`（原来写了 [Long,Top,Long,Top…] → 展开后超出 max_locals）
+- 比较改用 `lcmp`/`dcmpl`/`dcmpg` 再单值 `ifXX`（原来对 long 直接发 `if_icmpge`）
+- 参数与局部变量按槽计数、按类型选 `lstore/dstore`（原来 long 也走 `istore`）
+
+**double**
+- 编译器：`ldc2_w`、`dconst_0/1`、`dload/dstore`（通用 + `_0..3`）、
+  `dadd/dsub/dmul/ddiv/drem/dneg`、`i2d/l2d/d2i/d2l`、`dreturn`、栈图 `ITEM_Double`
+- JIT：上述全部 + `drem` 走 CRT `fmod`（`vmless_drem` 符号）
+- 三处配套修正：`param_slots()`（double/long 参数第二槽留位）、`widen_ret()`（跨调用还原 D/J 返回值）、
+  `insn_len()`（合并指令长度表；旧表漏 0x14/0x16/0x37 且把 `dup` 当 2 字节 → 扫描错位）
+
+**验证（java 与 run_jit 逐字节一致，10/10）**
+`Demo`、`Point`、`Loop`、`Arr`、`ObjArr`、`Obj2`、`Perf2`、`Sw`、**`Lg`(long)**、**`Db`(double)**
+另 `cargo test --lib` 27 passed。
+
+**已知缺口**：解释器（`vm.rs`）仍只支持 int —— long/double 会明确报「未实现的字节码 0x14」，不会静默算错。

@@ -11,6 +11,47 @@ use std::collections::HashMap;
 
 pub const ACC_SUPER: u16 = 0x0020;
 
+// 局部变量 / 表达式的类型种类
+const K_INT: u8 = 0;
+const K_LONG: u8 = 1;
+const K_REF: u8 = 2;
+const K_DOUBLE: u8 = 3;
+
+fn kind_wide(k: u8) -> bool {
+    k == K_LONG || k == K_DOUBLE
+}
+
+/// 类型 → 种类
+fn kind_of(ty: &Type) -> u8 {
+    match ty {
+        Type::Prim("long") => K_LONG,
+        Type::Prim("double") => K_DOUBLE,
+        Type::Prim(_) => K_INT,
+        _ => K_REF,
+    }
+}
+
+/// 二元/比较运算的公共类型：double > long > int
+fn promote(a: u8, b: u8) -> u8 {
+    if a == K_DOUBLE || b == K_DOUBLE {
+        K_DOUBLE
+    } else if a == K_LONG || b == K_LONG {
+        K_LONG
+    } else {
+        K_INT
+    }
+}
+
+/// 按描述符的返回值字符判断种类（用于 Call 表达式）
+fn kind_from_ret(desc: &str) -> u8 {
+    match desc.as_bytes().last().copied() {
+        Some(b'J') => K_LONG,
+        Some(b'D') => K_DOUBLE,
+        Some(b'L') | Some(b'[') => K_REF,
+        _ => K_INT,
+    }
+}
+
 #[derive(Debug)]
 pub struct CompileError {
     pub msg: String,
@@ -129,6 +170,40 @@ impl Emit {
         Ok(())
     }
 
+    /// double 的读取（dload）
+    fn dload(&mut self, slot: u8) -> Result<(), CompileError> {
+        if slot <= 3 { self.op(0x26 + slot); } else { self.op(0x18); self.bytes.push(slot); }
+        self.push(2);
+        Ok(())
+    }
+
+    /// double 的存储（dstore）
+    fn dstore(&mut self, slot: u8) -> Result<(), CompileError> {
+        if slot <= 3 { self.op(0x47 + slot); } else { self.op(0x38); self.bytes.push(slot); }
+        self.pop(2);
+        Ok(())
+    }
+
+    /// 按种类发射 load
+    fn load_slot(&mut self, slot: u8, kind: u8) -> Result<(), CompileError> {
+        match kind {
+            K_LONG => self.lload(slot),
+            K_DOUBLE => self.dload(slot),
+            K_REF => self.aload(slot),
+            _ => self.iload(slot),
+        }
+    }
+
+    /// 按种类发射 store
+    fn store_slot(&mut self, slot: u8, kind: u8) -> Result<(), CompileError> {
+        match kind {
+            K_LONG => self.lstore(slot),
+            K_DOUBLE => self.dstore(slot),
+            K_REF => self.astore(slot),
+            _ => self.istore(slot),
+        }
+    }
+
     /// 引用类型的存储（astore）
     fn astore(&mut self, slot: u8) -> Result<(), CompileError> {
         if slot <= 3 {
@@ -200,7 +275,13 @@ impl Emit {
         Ok(())
     }
 
-    /// 生成 StackMapTable（全部用 full_frame，locals 全按 int）
+    /// 生成 StackMapTable（全部用 full_frame）
+    ///
+    /// locals 数组里 **一个变量占一个条目**：long/double 只写一个
+    /// ITEM_Long/ITEM_Double，紧跟的第二个槽由 HotSpot 自己补 Top
+    /// （stackMapTable.cpp 的 full_frame 分支会按 is_category2 自行展开，
+    /// 再多写一个 ITEM_Top 就会让展开后的槽数超出 max_locals，
+    /// 报 ClassFormatError: bad type array size）。
     fn stack_map(&self) -> Option<Vec<u8>> {
         if self.frames.is_empty() {
             return None;
@@ -215,23 +296,34 @@ impl Emit {
                 Some(p) => (off - p - 1) as u16,
             };
             prev = Some(off);
+            let mut entries: Vec<u8> = Vec::new();
+            let mut slot = 0usize;
+            let mut n_entries = 0u16;
+            while slot < self.max_locals as usize {
+                let t = *snapshot.get(slot).unwrap_or(&u16::MAX);
+                if t == 0xFFFE {
+                    entries.push(4); // ITEM_Long，吃掉第 2 槽
+                    slot += 2;
+                } else if t == 0xFFFD {
+                    entries.push(3); // ITEM_Double，吃掉第 2 槽
+                    slot += 2;
+                } else if t == u16::MAX {
+                    entries.push(0); // ITEM_Top（尚未初始化）
+                    slot += 1;
+                } else if t == 0 {
+                    entries.push(1); // ITEM_Integer
+                    slot += 1;
+                } else {
+                    entries.push(7); // ITEM_Object
+                    entries.extend_from_slice(&t.to_be_bytes());
+                    slot += 1;
+                }
+                n_entries += 1;
+            }
             info.push(255); // full_frame
             info.extend_from_slice(&delta.to_be_bytes());
-            info.extend_from_slice(&self.max_locals.to_be_bytes());
-            let locals = &snapshot;
-            for slot in 0..self.max_locals as usize {
-                let t = *locals.get(slot).unwrap_or(&u16::MAX);
-                if t == u16::MAX {
-                    info.push(0); // ITEM_Top（尚未初始化）
-                } else if t == 0xFFFE {
-                    info.push(4); // ITEM_Long
-                } else if t == 0 {
-                    info.push(1); // ITEM_Integer
-                } else {
-                    info.push(7); // ITEM_Object
-                    info.extend_from_slice(&t.to_be_bytes());
-                }
-            }
+            info.extend_from_slice(&n_entries.to_be_bytes());
+            info.extend_from_slice(&entries);
             info.extend_from_slice(&0u16.to_be_bytes()); // 空操作数栈
         }
         Some(info)
@@ -425,12 +517,26 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             Ok(())
         }
         Expr::Cast { ty, expr } => {
+            let from = expr_kind(expr, ctx);
+            let to = kind_of(ty);
             compile_expr(expr, em, ctx, cp)?;
-            match ty {
-                Type::Prim("int") if expr_is_long(expr, ctx) => { em.op(0x88); em.pop(1); } // l2i
-                Type::Prim("long") if !expr_is_long(expr, ctx) => { em.op(0x85); em.push(1); } // i2l
-                _ => {}
+            coerce(from, to, em)?;
+            Ok(())
+        }
+        Expr::FloatLit(s) => {
+            let raw = s.trim_end_matches(['d', 'D', 'f', 'F']);
+            let v: f64 = raw
+                .parse()
+                .map_err(|_| CompileError { msg: format!("浮点字面量 `{s}` 解析失败") })?;
+            if v == 0.0 && !v.is_sign_negative() {
+                em.op(0x0E); // dconst_0
+            } else if v == 1.0 {
+                em.op(0x0F); // dconst_1
+            } else {
+                let idx = cp.double(v);
+                em.op_u2(0x14, idx); // ldc2_w
             }
+            em.push(2);
             Ok(())
         }
         Expr::StrLit(s) => {
@@ -441,11 +547,8 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
         }
         Expr::Ident(name) => {
             if let Some(slot) = ctx.lookup(name) {
-                match *ctx.local_kind.get(name).unwrap_or(&0) {
-                    2 => em.aload(slot)?,
-                    1 => em.lload(slot)?,
-                    _ => em.iload(slot)?,
-                }
+                let kind = *ctx.local_kind.get(name).unwrap_or(&K_INT);
+                em.load_slot(slot, kind)?;
                 return Ok(());
             }
             // 隐式 this 字段
@@ -535,29 +638,43 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
             Ok(())
         }
         Expr::Binary { op, lhs, rhs } => {
+            let kl = expr_kind(lhs, ctx);
+            let kr = expr_kind(rhs, ctx);
+            let k = promote(kl, kr);
             compile_expr(lhs, em, ctx, cp)?;
+            coerce(kl, k, em)?;
             compile_expr(rhs, em, ctx, cp)?;
-            let is_long = expr_is_long(lhs, ctx) || expr_is_long(rhs, ctx);
-            let code = match (op, is_long) {
-                (BinOp::Add, true) => 0x61u8,
-                (BinOp::Sub, true) => 0x65,
-                (BinOp::Mul, true) => 0x69,
-                (BinOp::Div, true) => 0x6D,
-                (BinOp::Rem, true) => 0x71,
-                (BinOp::Add, false) => 0x60u8,
-                (BinOp::Sub, false) => 0x64,
-                (BinOp::Mul, false) => 0x68,
-                (BinOp::Div, false) => 0x6C,
-                (BinOp::Rem, false) => 0x70,
+            coerce(kr, k, em)?;
+            let code = match (op, k) {
+                (BinOp::Add, K_LONG) => 0x61u8,
+                (BinOp::Sub, K_LONG) => 0x65,
+                (BinOp::Mul, K_LONG) => 0x69,
+                (BinOp::Div, K_LONG) => 0x6D,
+                (BinOp::Rem, K_LONG) => 0x71,
+                (BinOp::Add, K_DOUBLE) => 0x63,
+                (BinOp::Sub, K_DOUBLE) => 0x67,
+                (BinOp::Mul, K_DOUBLE) => 0x6B,
+                (BinOp::Div, K_DOUBLE) => 0x6F,
+                (BinOp::Rem, K_DOUBLE) => 0x73,
+                (BinOp::Add, _) => 0x60u8,
+                (BinOp::Sub, _) => 0x64,
+                (BinOp::Mul, _) => 0x68,
+                (BinOp::Div, _) => 0x6C,
+                (BinOp::Rem, _) => 0x70,
                 (other, _) => return err(format!("暂不支持的二元运算: {other:?}")),
             };
             em.op(code);
-            em.pop(1);
+            em.pop(if kind_wide(k) { 2 } else { 1 });
             Ok(())
         }
         Expr::Unary { op: UnOp::Neg, expr } => {
+            let k = expr_kind(expr, ctx);
             compile_expr(expr, em, ctx, cp)?;
-            em.op(0x74); // ineg
+            match k {
+                K_LONG => em.op(0x75),   // lneg
+                K_DOUBLE => em.op(0x77), // dneg
+                _ => em.op(0x74),        // ineg
+            }
             Ok(())
         }
         other => err(format!("暂不支持的表达式: {other:?}")),
@@ -573,6 +690,39 @@ fn compile_cond_false(
     label: usize,
 ) -> Result<(), CompileError> {
     if let Expr::Binary { op, lhs, rhs } = e {
+        let kl = expr_kind(lhs, ctx);
+        let kr = expr_kind(rhs, ctx);
+        let k = promote(kl, kr);
+        if k == K_REF {
+            return err("暂不支持引用类型的比较");
+        }
+        compile_expr(lhs, em, ctx, cp)?;
+        coerce(kl, k, em)?;
+        compile_expr(rhs, em, ctx, cp)?;
+        coerce(kr, k, em)?;
+        // long/double 要先 lcmp / dcmpl(dcmpg) 压成 int，再用单值比较
+        let widen = match k {
+            K_LONG => Some(0x94u8), // lcmp
+            // NaN 语义：< 和 <= 用 dcmpg，其余用 dcmpl
+            K_DOUBLE => Some(if matches!(op, BinOp::Lt | BinOp::Le) { 0x98 } else { 0x97 }),
+            _ => None,
+        };
+        if let Some(c) = widen {
+            em.op(c);
+            em.pop(3); // 两个宽值 4 槽 → 1 槽 int
+            let code = match op {
+                BinOp::Lt => 0x9C, // ifge
+                BinOp::Ge => 0x9B, // iflt
+                BinOp::Gt => 0x9E, // ifle
+                BinOp::Le => 0x9D, // ifgt
+                BinOp::Eq => 0x9A, // ifne
+                BinOp::Ne => 0x99, // ifeq
+                other => return err(format!("暂不支持的比较: {other:?}")),
+            };
+            em.pop(1);
+            em.branch(code, label);
+            return Ok(());
+        }
         let code = match op {
             BinOp::Lt => 0xA2u8, // if_icmpge
             BinOp::Ge => 0xA1,   // if_icmplt
@@ -582,8 +732,6 @@ fn compile_cond_false(
             BinOp::Ne => 0x9F,   // if_icmpeq
             other => return err(format!("暂不支持的比较: {other:?}")),
         };
-        compile_expr(lhs, em, ctx, cp)?;
-        compile_expr(rhs, em, ctx, cp)?;
         em.pop(2);
         em.branch(code, label);
         return Ok(());
@@ -606,13 +754,25 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             Ok(true)
         }
         Stmt::Return(Some(e)) => {
+            let kind = expr_kind(e, ctx);
             compile_expr(e, em, ctx, cp)?;
-            if expr_is_long(e, ctx) {
-                em.op(0xAD); // lreturn
-                em.pop(2);
-            } else {
-                em.op(0xAC); // ireturn
-                em.pop(1);
+            match kind {
+                K_LONG => {
+                    em.op(0xAD); // lreturn
+                    em.pop(2);
+                }
+                K_DOUBLE => {
+                    em.op(0xAF); // dreturn
+                    em.pop(2);
+                }
+                K_REF => {
+                    em.op(0xB0); // areturn
+                    em.pop(1);
+                }
+                _ => {
+                    em.op(0xAC); // ireturn
+                    em.pop(1);
+                }
             }
             Ok(true)
         }
@@ -621,30 +781,36 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             Ok(false)
         }
         Stmt::Expr(e) if !matches!(e, Expr::Assign { .. }) => {
+            let kind = expr_kind(e, ctx);
             compile_expr(e, em, ctx, cp)?;
-            em.op(0x57); // pop
-            em.pop(1);
+            if kind_wide(kind) {
+                em.op(0x58); // pop2
+                em.pop(2);
+            } else {
+                em.op(0x57); // pop
+                em.pop(1);
+            }
             Ok(false)
         }
         Stmt::LocalVar { ty, name, init } => {
             let slot = ctx.next_slot;
-            let wide_local = matches!(ty, Type::Prim("long") | Type::Prim("double"));
+            let kind = kind_of(ty);
+            let wide_local = kind_wide(kind);
             ctx.next_slot += if wide_local { 2 } else { 1 };
             if em.max_locals < ctx.next_slot as u16 {
                 em.max_locals = ctx.next_slot as u16;
             }
             ctx.locals.insert(name.clone(), slot);
-            let kind = if matches!(ty, Type::Prim("long")) { 1u8 } else if matches!(ty, Type::Prim(_)) { 0 } else { 2 };
             ctx.local_kind.insert(name.clone(), kind);
             let vt = ver_type(&mut *cp, ty);
             em.set_local_type(slot as usize, vt);
+            if wide_local {
+                // 第 2 槽没有自己的类型，写「空」占位
+                em.set_local_type(slot as usize + 1, u16::MAX);
+            }
             if let Some(e) = init {
                 compile_expr(e, em, ctx, cp)?;
-                match kind {
-                    2 => em.astore(slot)?,
-                    1 => em.lstore(slot)?,
-                    _ => em.istore(slot)?,
-                }
+                em.store_slot(slot, kind)?;
             }
             Ok(false)
         }
@@ -686,8 +852,9 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             let slot = ctx
                 .lookup(&name)
                 .ok_or_else(|| CompileError { msg: format!("未定义的变量 `{name}`") })?;
+            let kind = *ctx.local_kind.get(&name).unwrap_or(&K_INT);
             compile_expr(rhs, em, ctx, cp)?;
-            em.istore(slot)?;
+            em.store_slot(slot, kind)?;
             Ok(false)
         }
         Stmt::Switch { selector, cases } => {
@@ -933,11 +1100,7 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
                 em.set_local_type(slot as usize + 1, u16::MAX);
             }
             ctx.locals.insert(p.name.clone(), slot);
-            if !matches!(p.ty, Type::Prim(_)) {
-                ctx.local_kind.insert(p.name.clone(), 2);
-            } else if matches!(p.ty, Type::Prim("long")) {
-                ctx.local_kind.insert(p.name.clone(), 1);
-            }
+            ctx.local_kind.insert(p.name.clone(), kind_of(&p.ty));
             ctx.next_slot += if wide { 2 } else { 1 };
             slot += if wide { 2 } else { 1 };
         }
@@ -1090,6 +1253,7 @@ mod tests {
 fn ver_type(cp: &mut CpBuilder, ty: &Type) -> u16 {
     match ty {
         Type::Prim("long") => 0xFFFE, // 栈图里要写 ITEM_Long
+        Type::Prim("double") => 0xFFFD, // 栈图里要写 ITEM_Double
         Type::Prim(_) => 0,
         Type::Array(inner) => {
             let d = descriptor(&Type::Array(inner.clone()));
@@ -1107,12 +1271,77 @@ fn ver_type(cp: &mut CpBuilder, ty: &Type) -> u16 {
     }
 }
 
+/// 把栈顶值从 `from` 种类转换成 `to` 种类（只做数值拓宽/收窄）
+fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError> {
+    if from == to {
+        return Ok(());
+    }
+    match (from, to) {
+        (K_INT, K_LONG) => {
+            em.op(0x85); // i2l
+            em.push(1);
+        }
+        (K_INT, K_DOUBLE) => {
+            em.op(0x87); // i2d
+            em.push(1);
+        }
+        (K_LONG, K_DOUBLE) => {
+            em.op(0x8A); // l2d
+            em.push(0);
+        }
+        (K_LONG, K_INT) => {
+            em.op(0x88); // l2i
+            em.pop(1);
+        }
+        (K_DOUBLE, K_INT) => {
+            em.op(0x8E); // d2i
+            em.pop(1);
+        }
+        (K_DOUBLE, K_LONG) => {
+            em.op(0x8F); // d2l
+            em.push(0);
+        }
+        _ => return err(format!("暂不支持的类型转换（种类 {from} → {to}）")),
+    }
+    Ok(())
+}
+
+/// 表达式 → 类型种类（只用于选字节码，不做严格类型检查）
+fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
+    match e {
+        Expr::IntLit(s) => {
+            if s.ends_with('L') || s.ends_with('l') { K_LONG } else { K_INT }
+        }
+        Expr::FloatLit(_) => K_DOUBLE,
+        Expr::Cast { ty, .. } => kind_of(ty),
+        Expr::Ident(n) => ctx.local_kind.get(n).copied().unwrap_or(K_INT),
+        Expr::Binary { lhs, rhs, .. } => promote(expr_kind(lhs, ctx), expr_kind(rhs, ctx)),
+        Expr::Unary { expr, .. } => expr_kind(expr, ctx),
+        Expr::Call { recv, name, .. } => {
+            let desc = if recv.is_some() {
+                ctx.instance_methods.get(name.as_str())
+            } else {
+                ctx.static_methods.get(name.as_str())
+            };
+            desc.map(|d| kind_from_ret(d)).unwrap_or(K_INT)
+        }
+        Expr::StrLit(_) | Expr::This | Expr::New { .. } | Expr::ArrayNew { .. } => K_REF,
+        Expr::Field(_, name) => ctx
+            .fields
+            .get(name)
+            .and_then(|i| ctx.field_descs.get(*i))
+            .map(|d| match d.as_bytes().first().copied() {
+                Some(b'J') => K_LONG,
+                Some(b'D') => K_DOUBLE,
+                Some(b'L') | Some(b'[') => K_REF,
+                _ => K_INT,
+            })
+            .unwrap_or(K_INT),
+        _ => K_INT,
+    }
+}
+
 /// 粗略判断表达式是不是 long 类型（用于选择 ladd/lsub/... 与 lreturn）
 fn expr_is_long(e: &Expr, ctx: &Ctx) -> bool {
-    match e {
-        Expr::IntLit(s) => s.ends_with('L') || s.ends_with('l'),
-        Expr::Ident(n) => ctx.local_kind.get(n).copied() == Some(1),
-        Expr::Binary { lhs, rhs, .. } => expr_is_long(lhs, ctx) || expr_is_long(rhs, ctx),
-        _ => false,
-    }
+    expr_kind(e, ctx) == K_LONG
 }
