@@ -10,6 +10,7 @@ rm -rf "$OUT" 2>/dev/null; mkdir -p "$OUT"
 
 ALL="InhBasic InhOverride InhChain InhSuperCall InhImplicitSuper InhInstanceof InhWide
 Iface Iface2 CtorThis Multi Multi2 Multi3 Static2
+Cmp1 Cmp2 Cmp3 Enum1 Enum2 Enum3 IfaceDef1 IfaceDef2
 Lg Db Point Loop Sw Obj2 ObjArr Arr Demo Perf2 LongEdge Doubles Mix DblCorpus Ret
 RefArr ObjRef ArrType RefFld RefCmp NullChk WideFld WideArr BitOps PrintObj PrintObj2
 TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2 TryUncaught"
@@ -48,50 +49,43 @@ for c in $ALL; do
     jit =[$(printf '%s' "$to" | head -3 | tr '\n' '/')]"
 done
 
-# ---- 跨编译单元：父类在另一个 .java 里，先编 base 再编子类（同一个输出目录当 classpath）----
-if [ -f "$SRC/InhUnitA.java" ] && [ -f "$SRC/InhUnitB.java" ]; then
-    cu="$OUT/_crossunit"; mkdir -p "$cu"
-    if "$BIN/compile_src.exe" "$SRC/InhUnitA.java" "$cu" >/dev/null 2>&1 \
-       && "$BIN/compile_src.exe" "$SRC/InhUnitB.java" "$cu" >/dev/null 2>&1; then
-        jo=$("$JAVA" -cp "$cu" InhUnitB 2>/dev/null | tr -d '\r'); je=$?
-        io=$("$BIN/rustjava.exe" "$cu/InhUnitB.class" 2>/dev/null | tr -d '\r'); ie=$?
-        to=$("$BIN/run_jit.exe" "$cu/InhUnitB.class" 2>/dev/null | tr -d '\r'); te=$?
-        if same; then ok=$((ok+1)); else
-            bad=$((bad+1)); failed="$failed
-  InhUnit(跨单元)  退出码 java=$je intp=$ie jit=$te
-    java=[$jo]
-    intp=[$io]
-    jit =[$to]"
-        fi
-    else
-        bad=$((bad+1)); failed="$failed
-  InhUnit(跨单元)  编译失败"
-    fi
-fi
-
-# ---- 包名：pkg.PkgA/B/C 同包互引 + 全限定名 + 跨单元继承（必须按依赖顺序编）----
-if [ -f "$SRC/PkgA.java" ] && [ -f "$SRC/PkgB.java" ] && [ -f "$SRC/PkgC.java" ]; then
-    pd="$OUT/_pkg"; mkdir -p "$pd"
-    pkgok=1
-    for c in PkgB PkgC PkgA; do
-        "$BIN/compile_src.exe" "$SRC/$c.java" "$pd" >/dev/null 2>&1 || pkgok=0
+# ---- 包名 + import：按依赖顺序编，同一个输出目录当 classpath ----
+# 每组：先编依赖，再编入口，然后 java <入口类> / rustjava / run_jit 三方比对
+multi_unit() {
+    local label="$1" entry="$2" entryclass="$3"; shift 3
+    local d="$OUT/_mu_$label"; mkdir -p "$d"
+    local i=0
+    for c in "$@"; do
+        i=$((i+1))
+        if [ "$c" = "$entry" ]; then continue; fi
+        "$BIN/compile_src.exe" "$SRC/$c.java" "$d" >/dev/null 2>&1 || { bad=$((bad+1)); failed="$failed
+  $label  依赖 $c 编译失败"; return; }
     done
-    if [ "$pkgok" = 1 ]; then
-        jo=$("$JAVA" -cp "$pd" pkg.PkgA 2>/dev/null | tr -d '\r'); je=$?
-        io=$("$BIN/rustjava.exe" "$pd/pkg/PkgA.class" 2>/dev/null | tr -d '\r'); ie=$?
-        to=$("$BIN/run_jit.exe" "$pd/pkg/PkgA.class" 2>/dev/null | tr -d '\r'); te=$?
-        if same; then ok=$((ok+1)); else
-            bad=$((bad+1)); failed="$failed
-  Pkg(包名)  退出码 java=$je intp=$ie jit=$te
+    if ! "$BIN/compile_src.exe" "$SRC/$entry.java" "$d" >/dev/null 2>&1; then
+        bad=$((bad+1)); failed="$failed
+  $label  入口 $entry 编译失败"; return
+    fi
+    local cls="$d/${entryclass//.//}.class"
+    jo=$("$JAVA" -cp "$d" "$entryclass" 2>/dev/null | tr -d '\r'); je=$?
+    io=$("$BIN/rustjava.exe" "$cls" 2>/dev/null | tr -d '\r'); ie=$?
+    to=$("$BIN/run_jit.exe" "$cls" 2>/dev/null | tr -d '\r'); te=$?
+    if same; then ok=$((ok+1)); else
+        bad=$((bad+1)); failed="$failed
+  $label  退出码 java=$je intp=$ie jit=$te
     java=[$jo]
     intp=[$io]
     jit =[$to]"
-        fi
-    else
-        bad=$((bad+1)); failed="$failed
-  Pkg(包名)  编译失败"
     fi
-fi
+}
+
+# 跨编译单元继承
+multi_unit "跨单元继承" InhUnitB InhUnitB InhUnitA
+# 包名：pkg.PkgA 依赖 PkgB/PkgC
+multi_unit "包名" PkgA pkg.PkgA PkgB PkgC
+# import 单类型（app.Import1 依赖 lib.ImportTool）
+multi_unit "import单类型" Import1 app.Import1 ImportTool
+# import 通配（app2.Import2 依赖 lib.ImportTool + 同包 Import2Helper）
+multi_unit "import通配" Import2 app2.Import2 ImportTool Import2Helper
 
 echo "=========================================="
 echo "三路一致: $ok    失败: $bad    缺样例: $skip"

@@ -49,7 +49,10 @@ pub fn compile_with_path(
     cu: &CompilationUnit,
     classpath: &[std::path::PathBuf],
 ) -> Result<Vec<(String, Vec<u8>)>, CompileError> {
-    // 同包的简单类型名先补成 `p/Name`：后面所有描述符/继承链都按内部名走
+    // 枚举先降级成普通类（静态 final 常量 + 构造器 + values/valueOf/ordinal/name），
+    // 这样 codegen / 解释器 / JIT 都不必认识「枚举」这个概念
+    let cu = &crate::sema::desugar_unit(cu).map_err(|msg| CompileError { msg })?;
+    // 同包的简单类型名先补成 `p/Name`（含 import 指到的）：后面所有描述符/继承链都按内部名走
     let cu = &crate::sema::qualify_unit(cu, classpath);
     let res = crate::sema::Resolver::new(cu, classpath);
     // classpath 上的类先读进来：跨编译单元的字段/方法表要在建 type_fields 之前就绪

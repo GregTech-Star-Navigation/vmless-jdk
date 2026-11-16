@@ -166,6 +166,8 @@ pub(crate) fn compile_type(
         finally_stack: Vec::new(),
         ret_ty: None,
         in_ctor: false,
+        break_labels: Vec::new(),
+        cont_labels: Vec::new(),
     };
 
     for m in &t.members {
@@ -176,10 +178,9 @@ pub(crate) fn compile_type(
         let is_static = md.modifiers.iter().any(|x| x == "static");
         let desc = method_descriptor(&md.params, &md.ret);
 
-        // 抽象方法（含接口里的方法声明）没有 Code 属性 —— 写进去 HotSpot 直接 ClassFormatError
-        let is_abstract_m = is_iface
-            || md.modifiers.iter().any(|x| x == "abstract")
-            || md.body.is_none();
+        // 抽象方法（含接口里**没有方法体**的声明）没有 Code 属性 —— 写进去 HotSpot 直接 ClassFormatError。
+        // 接口里带方法体的是 default 方法（Java 8+），静态接口方法也一样，都要真编出字节码。
+        let is_abstract_m = md.modifiers.iter().any(|x| x == "abstract") || md.body.is_none();
         if is_abstract_m {
             let name_index = cp.utf8(&md.name);
             let desc_index = cp.utf8(&desc);
@@ -249,8 +250,33 @@ pub(crate) fn compile_type(
             Some(body) => {
                 let terminated = compile_stmt(body, &mut em, &mut ctx, &mut cp)?;
                 if !terminated {
-                    // 补默认返回
-                    em.op(if desc.ends_with(")V") { 0xB1 } else { 0x03 });
+                    // 补一条默认返回。方法体里所有路径都 return 过时这里是死代码，
+                    // 但字节码**必须**能通过验证（HotSpot: control flow falls through code end），
+                    // 所以按返回类型给一条合法的「常量 + xreturn」，不能只压个常量。
+                    let ret = desc.rsplit(')').next().unwrap_or("V");
+                    match ret.as_bytes().first().copied() {
+                        Some(b'V') => em.op(0xB1),
+                        Some(b'J') => {
+                            em.op(0x09); // lconst_0
+                            em.push(2);
+                            em.op(0xAD); // lreturn
+                        }
+                        Some(b'D') => {
+                            em.op(0x0E); // dconst_0
+                            em.push(2);
+                            em.op(0xAF); // dreturn
+                        }
+                        Some(b'L') | Some(b'[') => {
+                            em.op(0x01); // aconst_null
+                            em.push(1);
+                            em.op(0xB0); // areturn
+                        }
+                        _ => {
+                            em.op(0x03); // iconst_0
+                            em.push(1);
+                            em.op(0xAC); // ireturn
+                        }
+                    }
                 }
             }
             None => {

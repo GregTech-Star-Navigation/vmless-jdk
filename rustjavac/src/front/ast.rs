@@ -55,6 +55,9 @@ pub enum Member {
     Method(MethodDecl),
     Type(TypeDecl),
     Init { is_static: bool, body: Stmt },
+    /// 枚举常量（`RED` / `GREEN(2)`）。`sema::enums` 会把它降成
+    /// 「静态 final 字段 + 构造调用」，之后的阶段看不到这个变体。
+    EnumConst { name: String, args: Vec<Expr> },
 }
 
 #[derive(Clone, Debug, PartialEq)]

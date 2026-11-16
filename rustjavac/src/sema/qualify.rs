@@ -1,11 +1,17 @@
-//! 包名解析：把 `package p;` 里的**简单类型名**补成 `p/Name`。
+//! 包名解析：把**简单类型名**补成 `pkg/Name` 或 `import` 指到的全名。
 //!
 //! 编译器内部一律用 `p/C` 形式的内部名（描述符 `Lp/C;`、class 文件的 `this_class`、
 //! 继承链查找都是它），所以这一步放在 AST 进 codegen **之前**做一次 ——
 //! 后面所有 `descriptor` / `ver_type` / `internal_name` / 继承链解析都不用再关心包名。
 //!
-//! 判据：`path.len() == 1` 且不是 java.lang 的简写，且（本编译单元里声明了它
-//! 或 classpath 上有 `p/Name.class`）→ 补成 `[p, Name]`。其余原样保留。
+//! 简单名的解析顺序（与 javac 一致，去掉嵌套类型的 `$` 规则）：
+//!
+//! 1. 本编译单元自己声明的类型 → 当前包
+//! 2. `import a.b.C;` 的单类型导入
+//! 3. 当前包下 classpath 上有 `pkg/Name.class`
+//! 4. `import a.b.*;` 的通配导入（`a/b/Name.class` 存在才算命中）
+//!
+//! java.lang 的简写（`String`）不参与这一套，保持原样由 `internal_name` 补全。
 
 use crate::ast::*;
 use crate::codegen::types::is_java_lang;
@@ -16,20 +22,60 @@ struct Qualifier<'a> {
     pkg: String,
     /// 本编译单元声明的类型名（含嵌套类型）
     declared: HashSet<String>,
+    /// 单类型导入：简单名 → 内部名前缀（`a/b`）
+    singles: Vec<(String, String)>,
+    /// 通配导入的包前缀（`a/b`）
+    wildcards: Vec<String>,
     dirs: &'a [PathBuf],
 }
 
 impl Qualifier<'_> {
-    /// 这个简单名是不是同包的类型
-    fn is_same_pkg(&self, name: &str) -> bool {
+    /// 简单名 → 内部名前缀（不含类型名本身）。返回 None 表示按原样保留。
+    fn package_of(&self, name: &str) -> Option<String> {
         if is_java_lang(name) {
-            return false;
+            return None;
         }
-        if self.declared.contains(name) {
-            return true;
+        // 默认包里的类型没有前缀可加
+        let same_pkg = || {
+            let rel = format!("{}/{}.class", self.pkg, name);
+            self.dirs.iter().any(|d| d.join(&rel).is_file())
+        };
+        let hit = if self.declared.contains(name) {
+            Some(self.pkg.clone())
+        } else if let Some((_, pfx)) = self.singles.iter().find(|(s, _)| s == name) {
+            Some(pfx.clone())
+        } else if same_pkg() {
+            Some(self.pkg.clone())
+        } else {
+            self.wildcards
+                .iter()
+                .find(|pfx| {
+                    let rel = format!("{}/{}.class", pfx, name);
+                    self.dirs.iter().any(|d| d.join(&rel).is_file())
+                })
+                .cloned()
+        };
+        hit.filter(|p| !p.is_empty())
+    }
+
+    /// 表达式里的类名引用（`Tool.twice(3)`、`Tool.count`）也要按 import 补全。
+    ///
+    /// 只认**导入**来的名字（单类型 / 通配）：同包的类型名本来就能解析，
+    /// 不去动它以免和同名局部变量/静态字段混淆。
+    fn imported_class(&self, name: &str) -> Option<String> {
+        if is_java_lang(name) {
+            return None;
         }
-        let rel = format!("{}/{}.class", self.pkg.replace('.', "/"), name);
-        self.dirs.iter().any(|d| d.join(&rel).is_file())
+        if let Some((_, pfx)) = self.singles.iter().find(|(s, _)| s == name) {
+            return Some(format!("{pfx}/{name}"));
+        }
+        self.wildcards
+            .iter()
+            .find(|pfx| {
+                let rel = format!("{}/{}.class", pfx, name);
+                self.dirs.iter().any(|d| d.join(&rel).is_file())
+            })
+            .map(|pfx| format!("{pfx}/{name}"))
     }
 
     fn ty(&self, ty: &mut Type) {
@@ -38,8 +84,10 @@ impl Qualifier<'_> {
                 for a in args.iter_mut() {
                     self.ty(a);
                 }
-                if path.len() == 1 && self.is_same_pkg(&path[0]) {
-                    path.insert(0, self.pkg.clone());
+                if path.len() == 1 {
+                    if let Some(pfx) = self.package_of(&path[0]) {
+                        path.insert(0, pfx);
+                    }
                 }
             }
             Type::Array(inner) => self.ty(inner),
@@ -71,6 +119,12 @@ impl Qualifier<'_> {
             }
             Member::Type(t) => self.type_decl(t),
             Member::Init { body, .. } => self.stmt(body),
+            // 枚举常量（降级发生在 qualify 之前；这里兜住嵌套类型里漏下来的）
+            Member::EnumConst { args, .. } => {
+                for a in args.iter_mut() {
+                    self.expr(a);
+                }
+            }
         }
     }
 
@@ -218,6 +272,12 @@ impl Qualifier<'_> {
                 self.expr(els);
             }
             Expr::Lambda { body, .. } => self.expr(body),
+            // 类名当表达式用（静态方法/静态字段的接收者）：按 import 补成内部名
+            Expr::Ident(n) => {
+                if let Some(full) = self.imported_class(n) {
+                    *n = full;
+                }
+            }
             Expr::MethodRef { recv, .. } => self.expr(recv),
             Expr::SwitchExpr(inner) => self.expr(inner),
             _ => {}
@@ -241,12 +301,31 @@ fn collect_names(types: &[TypeDecl], out: &mut HashSet<String>) {
 ///
 /// 没有 `package` 时原样返回（不 clone，走同一条路径）。
 pub fn qualify_unit(cu: &CompilationUnit, dirs: &[PathBuf]) -> CompilationUnit {
-    let Some(pkg) = cu.package.as_deref().filter(|p| !p.is_empty()) else {
-        return cu.clone();
-    };
+    let pkg = cu
+        .package
+        .as_deref()
+        .unwrap_or("")
+        .replace('.', "/");
     let mut declared = HashSet::new();
     collect_names(&cu.types, &mut declared);
-    let q = Qualifier { pkg: pkg.replace('.', "/"), declared, dirs };
+    // 导入表：`import a.b.C;` → ("C", "a/b")，`import a.b.*;` → 通配前缀 "a/b"
+    // （静态导入导的是成员不是类型，这里不参与类型名解析）
+    let mut singles: Vec<(String, String)> = Vec::new();
+    let mut wildcards: Vec<String> = Vec::new();
+    for imp in &cu.imports {
+        if imp.is_static || imp.name.is_empty() {
+            continue;
+        }
+        if imp.wildcard {
+            wildcards.push(imp.name.replace('.', "/"));
+            continue;
+        }
+        let Some((pkg_part, simple)) = imp.name.rsplit_once('.') else {
+            continue;
+        };
+        singles.push((simple.to_string(), pkg_part.replace('.', "/")));
+    }
+    let q = Qualifier { pkg, declared, singles, wildcards, dirs };
     let mut out = cu.clone();
     for t in out.types.iter_mut() {
         q.type_decl(t);

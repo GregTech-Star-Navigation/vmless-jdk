@@ -424,9 +424,9 @@ impl Vm {
                         None => return Err(thrown(h)),
                     }
                 }
-                // iaload / laload / faload / daload / aaload：按指令宽度取元素
+                // iaload / laload / faload / daload / aaload / baload / caload / saload
                 // （元素槽本身带宽度，读出来再按指令语义归一）
-                0x2e | 0x2f | 0x30 | 0x31 | 0x32 => {
+                0x2e | 0x2f | 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 => {
                     let idx = frame.pop_i()?;
                     let arr = frame.pop_i()?;
                     let v = if arr < 0 {
@@ -442,8 +442,8 @@ impl Vm {
                         _ => Slot::I(v.as_i32()),      // iaload / aaload
                     });
                 }
-                // iastore / lastore / fastore / dastore / aastore
-                0x4f | 0x50 | 0x51 | 0x52 | 0x53 => {
+                // iastore / lastore / fastore / dastore / aastore / bastore / castore / sastore
+                0x4f | 0x50 | 0x51 | 0x52 | 0x53 | 0x54 | 0x55 | 0x56 => {
                     let v = frame.pop()?;
                     let idx = frame.pop_i()?;
                     let arr = frame.pop_i()?;
@@ -477,6 +477,10 @@ impl Vm {
                         11 => ("[J", Slot::L(0)),
                         7 => ("[D", Slot::F(0.0)),
                         6 => ("[F", Slot::F(0.0)),
+                        4 => ("[Z", Slot::I(0)),
+                        5 => ("[C", Slot::I(0)),
+                        8 => ("[B", Slot::I(0)),
+                        9 => ("[S", Slot::I(0)),
                         _ => ("[I", Slot::I(0)),
                     };
                     self.arrays.push(vec![zero; n as usize]);
@@ -664,6 +668,22 @@ impl Vm {
                         let _recv = frame.pop()?;
                         let text = self.println_text(&info.desc, arg);
                         self.output.push(text);
+                    } else if info.class == "java/lang/String"
+                        && info.name == "equals"
+                        && info.desc == "(Ljava/lang/Object;)Z"
+                    {
+                        // 内置：按内容比（`String` 没有 .class，走不到 resolve_method）
+                        let arg = frame.pop()?;
+                        let recv = frame.pop()?;
+                        let a = match self.ref_kind(recv.as_i32()) {
+                            RefKind::Str => Some(self.string_text(recv.as_i32())),
+                            _ => None,
+                        };
+                        let b = match self.ref_kind(arg.as_i32()) {
+                            RefKind::Str => Some(self.string_text(arg.as_i32())),
+                            _ => None,
+                        };
+                        frame.push(Slot::I(if a.is_some() && a == b { 1 } else { 0 }));
                     } else {
                         let argc = count_args(&info.desc)?;
                         let mut args = Vec::with_capacity(argc + 1);

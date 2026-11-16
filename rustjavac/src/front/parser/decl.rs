@@ -274,12 +274,23 @@ impl Parser {
             if !matches!(self.cur(), Tok::RBrace | Tok::Semi) {
                 loop {
                     self.skip_annotations()?;
-                    let _cname = self.expect_ident()?;
-                    if matches!(self.cur(), Tok::LParen) {
-                        self.skip_balanced(Tok::LParen, Tok::RParen)?;
+                    let cname = self.expect_ident()?;
+                    let mut cargs = Vec::new();
+                    if self.eat(&Tok::LParen) {
+                        if !matches!(self.cur(), Tok::RParen) {
+                            loop {
+                                cargs.push(self.parse_expr()?);
+                                if self.eat(&Tok::Comma) {
+                                    continue;
+                                }
+                                break;
+                            }
+                        }
+                        self.expect(&Tok::RParen)?;
                     }
+                    members.push(Member::EnumConst { name: cname, args: cargs });
                     if self.eat(&Tok::LBrace) {
-                        // 带体的常量：跳过实现
+                        // 带体的常量（每个常量自己覆写方法）暂不支持：跳过它的实现
                         self.skip_to_matching(Tok::RBrace)?;
                     }
                     if self.eat(&Tok::Comma) {

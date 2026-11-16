@@ -55,6 +55,107 @@ pub(crate) fn is_void_call(e: &Expr, ctx: &Ctx) -> bool {
     matches!(call_desc(recv.as_deref(), name, ctx), Some(d) if d.ends_with(")V"))
 }
 
+/// 这个表达式编成**值**时会不会自己产生跳转（比较、`&&`/`||`、三元）。
+///
+/// 栈图恒声明「操作数栈为空」，所以这种表达式必须从空栈开算。
+/// 调用方若在它前面已经压了东西（`println(…)` 的 PrintStream、`a + (b<c)` 的 a、
+/// 前面几个实参），就得先 `spill` 出去，算完再取回来。
+pub(crate) fn needs_scratch(e: &Expr) -> bool {
+    match e {
+        Expr::Binary { op, lhs, rhs } => {
+            matches!(
+                op,
+                BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne
+                    | BinOp::And | BinOp::Or
+            ) || needs_scratch(lhs)
+                || needs_scratch(rhs)
+        }
+        Expr::Unary { expr, .. } => needs_scratch(expr),
+        Expr::Cast { expr, .. } => needs_scratch(expr),
+        Expr::InstanceOf { expr, .. } => needs_scratch(expr),
+        Expr::ArrayAccess { array, index } => needs_scratch(array) || needs_scratch(index),
+        Expr::ArrayNew { dims, .. } => dims.iter().any(needs_scratch),
+        Expr::ArrayInit(items) => items.iter().any(needs_scratch),
+        Expr::New { args, .. } => args.iter().any(needs_scratch),
+        Expr::Field(r, _) => needs_scratch(r),
+        Expr::Call { recv, args, .. } => {
+            recv.as_deref().map_or(false, needs_scratch) || args.iter().any(needs_scratch)
+        }
+        Expr::Assign { lhs, rhs, .. } => needs_scratch(lhs) || needs_scratch(rhs),
+        Expr::Cond { .. } => true,
+        _ => false,
+    }
+}
+
+/// 一个「先算进脏槽、稍后再取回来」的值
+pub(crate) struct Spilled {
+    slot: u8,
+    kind: u8,
+    /// 借之前该槽的验证类型，还的时候恢复回去
+    saved: u16,
+}
+
+/// 把表达式算进脏槽（要求当前操作数栈为空），返回取回用的句柄
+pub(crate) fn spill(
+    e: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<Spilled, CompileError> {
+    let kind = expr_kind(e, ctx);
+    let slot = em.alloc_scratch()?;
+    let saved = em.local_type_of(slot);
+    compile_expr(e, em, ctx, cp)?;
+    em.store_slot(slot, kind)?;
+    // 槽的验证类型：能推出静态类型就用它，推不出来按种类给最保守的那个
+    // （引用一律声明成 Object，局部变量表里的引用类型不参与 getfield 校验）
+    let vt = match (expr_type(e, ctx), kind) {
+        (Some(t), _) => ver_type(cp, &t),
+        (None, K_LONG) => 0xFFFE,
+        (None, K_DOUBLE) => 0xFFFD,
+        (None, K_REF) => cp.class("java/lang/Object"),
+        (None, _) => 0,
+    };
+    em.set_local_type(slot as usize, vt);
+    Ok(Spilled { slot, kind, saved })
+}
+
+/// 把脏槽里的值取回操作数栈，并归还槽
+pub(crate) fn unspill(sp: &Spilled, em: &mut Emit) -> Result<(), CompileError> {
+    em.load_slot(sp.slot, sp.kind)?;
+    em.set_local_type(sp.slot as usize, sp.saved);
+    em.free_scratch(sp.slot);
+    Ok(())
+}
+
+/// 实参里凡是「会分叉」的先算进脏槽：必须在压接收者/前面的实参**之前**做
+fn hoist_args(
+    args: &[Expr],
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<Vec<Option<Spilled>>, CompileError> {
+    let mut out = Vec::with_capacity(args.len());
+    for a in args {
+        out.push(if needs_scratch(a) { Some(spill(a, em, ctx, cp)?) } else { None });
+    }
+    Ok(out)
+}
+
+/// 按 `hoist_args` 的结果编一个实参（取回脏槽里的值，或当场求值）
+pub(crate) fn emit_val(
+    a: &Expr,
+    sp: &Option<Spilled>,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    match sp {
+        Some(s) => unspill(s, em),
+        None => compile_expr(a, em, ctx, cp),
+    }
+}
+
 pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
     match e {
         Expr::IntLit(s) => {
@@ -143,6 +244,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 Type::Prim("int") => Some(10u8),    // T_INT
                 Type::Prim("long") => Some(11),     // T_LONG
                 Type::Prim("double") => Some(7),    // T_DOUBLE
+                Type::Prim("boolean") => Some(4),   // T_BOOLEAN
+                Type::Prim("char") => Some(5),      // T_CHAR
+                Type::Prim("float") => Some(6),     // T_FLOAT
+                Type::Prim("byte") => Some(8),      // T_BYTE
+                Type::Prim("short") => Some(9),     // T_SHORT
                 _ => None,
             };
             match atype {
@@ -164,14 +270,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         }
         Expr::ArrayAccess { array, index } => {
             let k = elem_kind(array, ctx);
-            compile_expr(array, em, ctx, cp)?;
-            compile_expr(index, em, ctx, cp)?;
-            em.op(match k {
-                K_LONG => 0x2F,   // laload
-                K_DOUBLE => 0x31, // daload
-                K_REF => 0x32,    // aaload
-                _ => 0x2E,        // iaload
-            });
+            let sa = if needs_scratch(array) { Some(spill(array, em, ctx, cp)?) } else { None };
+            let si = if needs_scratch(index) { Some(spill(index, em, ctx, cp)?) } else { None };
+            emit_val(array, &sa, em, ctx, cp)?;
+            emit_val(index, &si, em, ctx, cp)?;
+            em.op(array_ops(array, ctx).0);
             em.pop(2);
             em.push(if kind_wide(k) { 2 } else { 1 });
             Ok(())
@@ -184,12 +287,13 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             };
             let ctor_desc = format!("({})V", args_desc(args, ctx));
             let cls = cp.class(&owner);
+            let sp = hoist_args(args, em, ctx, cp)?;
             em.op_u2(0xBB, cls); // new
             em.push(1);
             em.op(0x59); // dup
             em.push(1);
-            for a in args {
-                compile_expr(a, em, ctx, cp)?;
+            for (a, s) in args.iter().zip(sp.iter()) {
+                emit_val(a, s, em, ctx, cp)?;
             }
             let init = cp.method_ref(&owner, "<init>", &ctor_desc);
             em.op_u2(0xB7, init); // invokespecial
@@ -289,12 +393,15 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 if field == "out" {
                     if let Expr::Ident(_) = &**boxed {
                         let out = cp.field_ref("java/lang/System", "out", "Ljava/io/PrintStream;");
-                        em.op_u2(0xB2, out);
-                        em.push(1);
                         if args.len() != 1 {
                             return err("println 目前只支持一个参数");
                         }
-                        compile_expr(&args[0], em, ctx, cp)?;
+                        // 实参内部有跳转（`println(a == b)`）时先算进脏槽：
+                        // PrintStream 一旦压上栈，比较的跳转点就压着它了
+                        let sp = hoist_args(args, em, ctx, cp)?;
+                        em.op_u2(0xB2, out);
+                        em.push(1);
+                        emit_val(&args[0], &sp[0], em, ctx, cp)?;
                         // 按实参类型选重载：int → (I)V，long → (J)V，
                         // double → (D)V，引用 → (Ljava/lang/String;)V
                         let (desc, width) = match expr_kind(&args[0], ctx) {
@@ -319,10 +426,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 return err("this(...) 只能出现在构造器里");
             }
             let desc = format!("({})V", args_desc(args, ctx));
+            let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
-            for a in args {
-                compile_expr(a, em, ctx, cp)?;
+            for (a, s) in args.iter().zip(sp.iter()) {
+                emit_val(a, s, em, ctx, cp)?;
             }
             let idx = cp.method_ref(&ctx.class_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
@@ -335,10 +443,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 return err("super(...) 只能出现在构造器里");
             }
             let desc = format!("({})V", args_desc(args, ctx));
+            let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
-            for a in args {
-                compile_expr(a, em, ctx, cp)?;
+            for (a, s) in args.iter().zip(sp.iter()) {
+                emit_val(a, s, em, ctx, cp)?;
             }
             let idx = cp.method_ref(&ctx.super_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
@@ -367,10 +476,17 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         Expr::Call { recv: Some(r), name, args, .. } => {
             // 静态方法：`ClassName.m(...)` → invokestatic（owner 就是那个类）
             if let Some((owner, desc)) = static_call(r, name, ctx) {
-                for a in args {
-                    compile_expr(a, em, ctx, cp)?;
+                let sp = hoist_args(args, em, ctx, cp)?;
+                for (a, s) in args.iter().zip(sp.iter()) {
+                    emit_val(a, s, em, ctx, cp)?;
                 }
-                let idx = cp.method_ref(&owner, name, &desc);
+                // 接口的静态方法必须引用 InterfaceMethodref（否则 JVM 报
+                // "must be InterfaceMethodref constant"）
+                let idx = if ctx.iface_types.contains(&owner) {
+                    cp.interface_method_ref(&owner, name, &desc)
+                } else {
+                    cp.method_ref(&owner, name, &desc)
+                };
                 em.op_u2(0xB8, idx); // invokestatic
                 em.pop(args.len() as u16);
                 if !desc.ends_with(")V") {
@@ -380,9 +496,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             let desc = call_desc(Some(r), name, ctx)
                 .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`") })?;
+            let sp = hoist_args(args, em, ctx, cp)?;
             compile_expr(r, em, ctx, cp)?;
-            for a in args {
-                compile_expr(a, em, ctx, cp)?;
+            for (a, s) in args.iter().zip(sp.iter()) {
+                emit_val(a, s, em, ctx, cp)?;
             }
             // 引用类用接收者的**静态类型**：验证器要求接收者可赋给引用类。
             // 分派本身按运行时类走（虚方法覆写），引用类只决定从哪条链开始解析。
@@ -409,8 +526,9 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         // 调用本类（或父类）的方法：静态走 invokestatic，实例走 this 的 invokevirtual
         Expr::Call { name, args, .. } => {
             if let Some(desc) = ctx.static_methods.get(name.as_str()).cloned() {
-                for a in args {
-                    compile_expr(a, em, ctx, cp)?;
+                let sp = hoist_args(args, em, ctx, cp)?;
+                for (a, s) in args.iter().zip(sp.iter()) {
+                    emit_val(a, s, em, ctx, cp)?;
                 }
                 let idx = cp.method_ref("<SELF>", name, &desc);
                 em.op_u2(0xB8, idx);
@@ -428,19 +546,35 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 .get(name.as_str())
                 .ok_or_else(|| CompileError { msg: format!("未找到方法 `{name}`") })?
                 .clone();
+            let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
-            for a in args {
-                compile_expr(a, em, ctx, cp)?;
+            for (a, s) in args.iter().zip(sp.iter()) {
+                emit_val(a, s, em, ctx, cp)?;
             }
-            let idx = cp.method_ref(&ctx.class_name, name, &desc);
-            em.op_u2(0xB6, idx); // invokevirtual
             let n = args.len() as u16 + 1;
+            // 接口里的 default 方法调另一个方法（`area()` = this.area()）：
+            // 自己就是接口时必须是 invokeinterface，否则 JVM 报
+            // "Found interface Shape, but class was expected"
+            if ctx.iface_types.contains(&ctx.class_name) {
+                let idx = cp.interface_method_ref(&ctx.class_name, name, &desc);
+                em.op(0xB9);
+                em.bytes.extend_from_slice(&idx.to_be_bytes());
+                em.bytes.push(n as u8);
+                em.bytes.push(0);
+            } else {
+                let idx = cp.method_ref(&ctx.class_name, name, &desc);
+                em.op_u2(0xB6, idx); // invokevirtual
+            }
             em.pop(n);
             if !desc.ends_with(")V") {
                 em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
             }
             Ok(())
+        }
+        // `&&` / `||` 作为值：短路求值成 0/1
+        Expr::Binary { op: lop @ (BinOp::And | BinOp::Or), lhs, rhs } => {
+            compile_logical(*lop, lhs, rhs, em, ctx, cp)
         }
         Expr::Binary { op, lhs, rhs } => {
             let kl = expr_kind(lhs, ctx);
@@ -453,9 +587,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             // 移位：右操作数恒为 int，左操作数决定是 int 还是 long 版本
             if matches!(op, BinOp::Shl | BinOp::Shr | BinOp::Ushr) {
                 let k = if kl == K_LONG { K_LONG } else { K_INT };
+                let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
                 compile_expr(lhs, em, ctx, cp)?;
                 coerce(kl, k, em)?;
-                compile_expr(rhs, em, ctx, cp)?;
+                emit_val(rhs, &sr, em, ctx, cp)?;
                 coerce(kr, K_INT, em)?;
                 let code = match (op, k) {
                     (BinOp::Shl, K_LONG) => 0x79u8, // lshl
@@ -470,9 +605,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 return Ok(());
             }
             let k = promote(kl, kr);
+            // 右操作数会分叉（`x + (a<b ? …)` 之类）时先把它算进脏槽，别压在左值上面
+            let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
             compile_expr(lhs, em, ctx, cp)?;
             coerce(kl, k, em)?;
-            compile_expr(rhs, em, ctx, cp)?;
+            emit_val(rhs, &sr, em, ctx, cp)?;
             coerce(kr, k, em)?;
             let code = match (op, k) {
                 (BinOp::Add, K_LONG) => 0x61u8,
@@ -532,8 +669,71 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         }
         // +x：无操作
         Expr::Unary { op: UnOp::Pos, expr } => compile_expr(expr, em, ctx, cp),
+        // !x：求 0/1 再翻过来（非零 → 0）
+        Expr::Unary { op: UnOp::Not, expr } => {
+            compile_expr(expr, em, ctx, cp)?;
+            em.pop(1);
+            em.bool_from_branch(0x9A)?; // ifne → 「假」= 原值非零
+            Ok(())
+        }
         other => err(format!("暂不支持的表达式: {other:?}")),
     }
+}
+
+/// `a && b` / `a || b` 编成 0/1 的值：短路求值，两个跳转点都落在空栈上。
+///
+/// 形状（以 `&&` 为例）：
+/// ```text
+///   <left> ; istore s ; iload s ; ifeq L_short   // 左边假 → 直接出 0
+///   <right>; istore s ; iload s ; ifeq L_short
+///   iconst_1 ; istore s ; goto L_end
+/// L_short: iconst_0 ; istore s
+/// L_end  : iload s
+/// ```
+/// 每处跳转指令前面都刚 `iload` 完、`ifeq` 已把它弹掉，所以跳转点上栈是空的。
+fn compile_logical(
+    op: BinOp,
+    lhs: &Expr,
+    rhs: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    if em.depth != 0 {
+        return err("`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）");
+    }
+    let slot = em.alloc_scratch()?;
+    let saved = em.local_type_of(slot);
+    let is_and = op == BinOp::And;
+    // 短路条件：&& 遇假跳出，|| 遇真跳出
+    let jump_short = if is_and { 0x99 } else { 0x9A };
+    let l_short = em.new_label();
+    let l_end = em.new_label();
+
+    for (i, side) in [lhs, rhs].iter().enumerate() {
+        compile_expr(side, em, ctx, cp)?;
+        em.istore(slot)?;
+        // 槽的验证类型必须**第一次存完之后**才登记：左侧表达式内部如果带跳转，
+        // 那些帧里这个槽还没赋值过，抢先声明成 integer 会被判 VerifyError。
+        if i == 0 {
+            em.set_local_type(slot as usize, 0);
+        }
+        em.iload(slot)?;
+        em.branch(jump_short, l_short);
+        em.pop(1); // ifeq/ifne 把刚 load 出来的值弹掉了
+    }
+    // 两侧都没短路：&& → 1，|| → 0
+    em.const_int(if is_and { 1 } else { 0 });
+    let _ = em.istore(slot);
+    em.goto(l_end);
+    em.bind(l_short); // 两条短路路径都在跳之前存过 → 槽里一定是 int
+    em.const_int(if is_and { 0 } else { 1 });
+    let _ = em.istore(slot);
+    em.bind(l_end);
+    let _ = em.iload(slot);
+    em.set_local_type(slot as usize, saved);
+    em.free_scratch(slot);
+    Ok(())
 }
 
 /// 编译一个比较表达式（`a < b`、`o == null`、`p != null`），
@@ -576,8 +776,10 @@ pub(crate) fn compile_cmp_operands(
         if !(matches!(op, BinOp::Eq | BinOp::Ne)) {
             return err("引用类型只能比较 == / !=");
         }
-        compile_expr(lhs, em, ctx, cp)?;
-        compile_expr(rhs, em, ctx, cp)?;
+        let sa = if needs_scratch(lhs) { Some(spill(lhs, em, ctx, cp)?) } else { None };
+        let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
+        emit_val(lhs, &sa, em, ctx, cp)?;
+        emit_val(rhs, &sr, em, ctx, cp)?;
         em.pop(2);
         return Ok(Some(if matches!(op, BinOp::Eq) {
             (0xA6, 0xA5) // 假 = if_acmpne；真 = if_acmpeq
@@ -586,9 +788,12 @@ pub(crate) fn compile_cmp_operands(
         }));
     }
     let k = promote(kl, kr);
-    compile_expr(lhs, em, ctx, cp)?;
+    // 任何一侧自带跳转（`(a<b) == (c<d)`）都要先算进脏槽：否则跳转点上压着另一侧的值
+    let sa = if needs_scratch(lhs) { Some(spill(lhs, em, ctx, cp)?) } else { None };
+    let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
+    emit_val(lhs, &sa, em, ctx, cp)?;
     coerce(kl, k, em)?;
-    compile_expr(rhs, em, ctx, cp)?;
+    emit_val(rhs, &sr, em, ctx, cp)?;
     coerce(kr, k, em)?;
     // long/double 要先 lcmp / dcmpl(dcmpg) 压成 int，再用单值比较
     let widen = match k {

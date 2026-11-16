@@ -141,9 +141,27 @@ pub fn run_class_file(path: &str) -> Result<ExecResult, VmError> {
         .this_class_name()
         .ok_or_else(|| VmError { msg: "class 没有 this_class".into(), exc: None })?;
     let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ".".into());
-    let store = ClassStore::load_dir(&dir, &name)?;
+    let store = ClassStore::load_dir(&package_root(&dir, &name), &name)?;
     let mut vm = Vm::from_store(store);
     vm.run_main()
+}
+
+/// 类文件所在目录 → **包根**：`…/out/app/X.class` 的包根是 `…/out`。
+///
+/// 目录末尾的若干级必须正好等于包的各级名字，否则原样返回（非标准布局时保底）。
+/// 带包名的类分布在包根的子目录里，从包根加载才能同时看到 `lib/` 和 `app/`。
+pub fn package_root(dir: &std::path::Path, class_name: &str) -> std::path::PathBuf {
+    let Some((pkg, _)) = class_name.rsplit_once('/') else {
+        return dir.to_path_buf();
+    };
+    let mut root = dir.to_path_buf();
+    for seg in pkg.split('/').rev() {
+        let matched = root.file_name().and_then(|n| n.to_str()) == Some(seg);
+        if !matched || !root.pop() {
+            return dir.to_path_buf();
+        }
+    }
+    root
 }
 
 #[cfg(test)]

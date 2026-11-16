@@ -442,3 +442,21 @@ ALLOC_NS=188.4  GC_COUNT=6  LIVE_AFTER=4026528  HEAP_MB=3.84
 分配量翻四倍（4M）堆占用**一模一样**（3.84 MB）—— 旧实现按源码推算 16M 次要 245 MB 且只增不减。
 
 `librustjrt` 新增只读访问器 `Heap::base()`。
+
+## 0.40.0 — 2026-11-17 · 比较值化、import、枚举、接口 default/static
+
+- **比较结果当实参**：新增脏槽池（`Emit::alloc_scratch`，位图式不假设 LIFO）+ `needs_scratch`/`spill`，
+  会分叉的子表达式先算进脏槽 → 跳转点永远空栈。`println(a==b)`、`boolean f = x>y`、
+  `a == b && c != d`、`!x`、短路求值成 0/1 全部可用
+- **`import`**：解析顺序「本单元声明 → 单类型导入 → 同包 → 通配导入」；
+  类加载改递归，带包名的主类从包根加载
+- **枚举**：`sema/enums.rs` 把 `enum` 降成普通类（静态 final 常量 + `$name/$ordinal` +
+  `name/ordinal/toString/values/valueOf`）；`switch (enum)` 按 ordinal 比较；支持带字段与实参
+- **接口 default/static 方法**：接口方法带体就编出 Code；default 内部调用发 `invokeinterface`、
+  接口静态方法用 InterfaceMethodref；方法解析在类链找不到时回落接口 default
+- 顺带补：`break`/`continue`、方法末尾按返回类型默认 `xreturn`、
+  `boolean/char/byte/short` 数组的 `ba*/ca*/sa*` 指令
+
+**验证：60 个样例三路一致**（新增 `Cmp1-3 Enum1-3 IfaceDef1-2` + 多单元 `Import1/2`）；`cargo test` 34 passed。
+
+**已知不支持**：嵌套枚举（明确报错）、带标签 break/continue、`?:`、for-each、`import static`。

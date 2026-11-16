@@ -100,14 +100,14 @@ fn effect(
         0x1e..=0x21 => (0, vec![false]),          // lload_0..3
         0x26..=0x29 => (0, vec![false]),          // dload_0..3
         0x2a..=0x2d => (0, vec![true]),           // aload_0..3
-        0x2e | 0x2f | 0x30 | 0x31 => (2, vec![false]), // iaload/laload/faload/daload
+        0x2e | 0x2f | 0x30 | 0x31 | 0x33 | 0x34 | 0x35 => (2, vec![false]), // i/l/f/d/ba/ca/saload
         0x32 => (2, vec![true]),                  // aaload
         0x36 | 0x37 | 0x38 | 0x39 | 0x3a => (1, vec![]), // i/l/f/d/astore
         0x3b..=0x3e => (1, vec![]),               // istore_0..3
         0x3f..=0x42 => (1, vec![]),               // lstore_0..3
         0x47..=0x4a => (1, vec![]),               // dstore_0..3
         0x4b..=0x4e => (1, vec![]),               // astore_0..3
-        0x4f..=0x53 => (3, vec![]),               // i/l/f/d/aastore
+        0x4f..=0x56 => (3, vec![]),               // i/l/f/d/a/ba/ca/sastore
         0x57 | 0x58 => (1, vec![]),               // pop / pop2
         0x59 => (0, vec![stack.last().copied().unwrap_or(false)]), // dup：复制栈顶，不弹出
         0x60 | 0x61 | 0x63 | 0x64 | 0x65 | 0x67 | 0x68 | 0x69 | 0x6b | 0x6c | 0x6d | 0x6f | 0x70

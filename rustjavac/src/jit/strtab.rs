@@ -71,3 +71,36 @@ pub extern "C" fn println_str(s: i64) {
         println!("{}", String::from_utf8_lossy(bytes));
     }
 }
+
+/// 运行时辅助：两个字符串引用按**内容**比较（`String.equals(Object)`）。
+///
+/// 布局与 `println_str` 一致：class_id(4) / flags(4) / 长度(4) / 填充(4) / UTF-8 字节。
+/// 任一侧不是 String（null / 对象 / 数组）→ 0，和 `String.equals` 的语义一致。
+pub extern "C" fn str_equals(a: i64, b: i64) -> i32 {
+    if a == 0 || b == 0 {
+        return 0;
+    }
+    unsafe {
+        let pa = rt::base_ptr().wrapping_add(a as usize);
+        let pb = rt::base_ptr().wrapping_add(b as usize);
+        let sid = rt::string_class_id();
+        if std::ptr::read_unaligned(pa as *const u32) != sid {
+            return 0;
+        }
+        if std::ptr::read_unaligned(pb as *const u32) != sid {
+            return 0;
+        }
+        let la = std::ptr::read_unaligned(pa.add(8) as *const u32) as usize;
+        let lb = std::ptr::read_unaligned(pb.add(8) as *const u32) as usize;
+        if la != lb {
+            return 0;
+        }
+        let ba = std::slice::from_raw_parts(pa.add(16), la);
+        let bb = std::slice::from_raw_parts(pb.add(16), lb);
+        if ba == bb {
+            1
+        } else {
+            0
+        }
+    }
+}

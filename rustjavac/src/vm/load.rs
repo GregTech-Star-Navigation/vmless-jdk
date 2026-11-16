@@ -35,6 +35,22 @@ fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
     Err(VmError { msg: msg.into(), exc: None })
 }
 
+/// 递归收集目录下的 `.class`（包名就是子目录层级）
+fn collect_class_files(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_class_files(&p, depth + 1, out);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("class") {
+            out.push(p);
+        }
+    }
+}
+
 /// 类的直接父类：已加载的类看 `super_class`，其余靠 java.* 写死的表
 fn super_of_of(classes: &[Rc<ClassFile>], by_name: &HashMap<String, usize>, class: &str) -> Option<String> {
     if let Some(&i) = by_name.get(class) {
@@ -51,13 +67,10 @@ impl ClassStore {
     /// 从一个目录里的所有 `.class` 建表；`main` 是入口类名
     pub(super) fn load_dir(dir: &std::path::Path, main_class: &str) -> Result<Self, VmError> {
         let mut files: Vec<ClassFile> = Vec::new();
-        let entries = std::fs::read_dir(dir)
-            .map_err(|e| VmError { msg: format!("读目录 {} 失败: {e}", dir.display()), exc: None })?;
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("class") {
-                continue;
-            }
+        // 递归：带包名的类分布在子目录里（`app/X.class` + `lib/Y.class` 要一起加载）
+        let mut paths = Vec::new();
+        collect_class_files(dir, 0, &mut paths);
+        for p in paths {
             if let Ok(bytes) = std::fs::read(&p) {
                 if let Ok(cf) = crate::parse(&bytes) {
                     files.push(cf);
@@ -181,10 +194,22 @@ impl ClassStore {
         self.metas.get(class)
     }
 
-    /// 从 `from` 开始沿继承链解析方法
+    /// 从 `from` 开始沿继承链解析方法；类链上找不到再找接口的 **default 实现**
     pub(super) fn resolve_method(&self, from: &str, name: &str, desc: &str) -> Option<(usize, usize)> {
+        let key = (name.to_string(), desc.to_string());
         for c in self.chain(from) {
-            if let Some(v) = self.methods.get(&(c, name.to_string(), desc.to_string())) {
+            if let Some(v) = self.methods.get(&(c, key.0.clone(), key.1.clone())) {
+                return Some(*v);
+            }
+        }
+        // 接口里的 default 方法：实现类没覆写时落在这里
+        for i in self.iface_closure(from) {
+            if let Some(v) = self.methods.get(&(i, key.0.clone(), key.1.clone())) {
+                // 抽象声明（没有 Code）不能当实现用
+                let (ci, mi) = *v;
+                if self.classes[ci].methods[mi].attributes.is_empty() {
+                    continue;
+                }
                 return Some(*v);
             }
         }

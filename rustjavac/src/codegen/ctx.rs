@@ -49,6 +49,10 @@ pub(crate) struct Ctx {
     pub(crate) ret_ty: Option<Type>,
     /// 当前方法是不是构造器（`super(...)` 只允许出现在构造器里）
     pub(crate) in_ctor: bool,
+    /// 外层循环/switch 的跳出标签（`break` 跳到最内层的那个）
+    pub(crate) break_labels: Vec<usize>,
+    /// 外层循环的下一轮标签（`continue`；switch 不产生 continue 目标）
+    pub(crate) cont_labels: Vec<usize>,
 }
 
 impl Ctx {

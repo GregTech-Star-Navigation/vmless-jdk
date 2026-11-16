@@ -173,6 +173,15 @@ impl Jit {
             .declare_function("vmless_println_obj", Linkage::Import, &sig_ps)
             .map_err(|e| JitError(e.to_string()))?;
 
+        let mut sig_se = self.module.make_signature();
+        sig_se.params.push(AbiParam::new(types::I64));
+        sig_se.params.push(AbiParam::new(types::I64));
+        sig_se.returns.push(AbiParam::new(types::I32));
+        let str_equals_id = self
+            .module
+            .declare_function("vmless_str_equals", Linkage::Import, &sig_se)
+            .map_err(|e| JitError(e.to_string()))?;
+
         let mut sig_ff = self.module.make_signature();
         sig_ff.params.push(AbiParam::new(types::F64));
         sig_ff.params.push(AbiParam::new(types::F64));
@@ -1077,6 +1086,19 @@ impl Jit {
                         let v = convert_to(&mut fb, v, want);
                         let fref = self.module.declare_func_in_func(fid, fb.func);
                         fb.ins().call(fref, &[v]);
+                    } else if cls == "java/lang/String"
+                        && name == "equals"
+                        && desc == "(Ljava/lang/Object;)Z"
+                    {
+                        // 内置：按内容比（`String` 没有 .class，进不了虚方法表）
+                        let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                        let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                        let a = convert_to(&mut fb, recv, types::I64);
+                        let b = convert_to(&mut fb, v, types::I64);
+                        let fref = self.module.declare_func_in_func(str_equals_id, fb.func);
+                        let call = fb.ins().call(fref, &[a, b]);
+                        let res = fb.inst_results(call)[0];
+                        stack.push(res);
                     } else {
                         // 虚方法：按**运行时类**分派。编译期把所有可能是接收者的类
                         // （静态类型 C 及其子类）的实现都编出来并登记进运行时表，
@@ -1354,9 +1376,10 @@ impl Jit {
                     let v = fb.ins().load(types::I32, MemFlags::new(), addr, 8);
                     stack.push(v);
                 }
-                // iaload / laload / faload / daload / aaload：元素宽度按指令选
-                0x2e | 0x2f | 0x30 | 0x31 | 0x32 => {
-                    let esize: i64 = if matches!(op, 0x2e | 0x32) { 4 } else { 8 };
+                // iaload / laload / faload / daload / aaload / baload / caload / saload
+                // （元素宽度按指令选；boolean/byte/char/short 与 int 一样是 4 字节）
+                0x2e | 0x2f | 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 => {
+                    let esize: i64 = if matches!(op, 0x2f | 0x30 | 0x31) { 8 } else { 4 };
                     let ty = match op {
                         0x2f => types::I64,
                         0x30 | 0x31 => types::F64,
@@ -1376,9 +1399,9 @@ impl Jit {
                     };
                     stack.push(v);
                 }
-                // iastore / lastore / fastore / dastore / aastore
-                0x4f | 0x50 | 0x51 | 0x52 | 0x53 => {
-                    let esize: i64 = if matches!(op, 0x4f | 0x53) { 4 } else { 8 };
+                // iastore / lastore / fastore / dastore / aastore / bastore / castore / sastore
+                0x4f | 0x50 | 0x51 | 0x52 | 0x53 | 0x54 | 0x55 | 0x56 => {
+                    let esize: i64 = if matches!(op, 0x50 | 0x51 | 0x52) { 8 } else { 4 };
                     let want = match op {
                         0x50 => types::I64,
                         0x51 | 0x52 => types::F64,

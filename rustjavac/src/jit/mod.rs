@@ -74,6 +74,7 @@ impl Jit {
         builder.symbol("vmless_checkcast", rt::checkcast as *const u8);
         builder.symbol("vmless_println_str", rt::println_str as *const u8);
         builder.symbol("vmless_str_const", strtab::str_const as *const u8);
+        builder.symbol("vmless_str_equals", strtab::str_equals as *const u8);
         builder.symbol("vmless_println_obj", strtab::println_str as *const u8);
         builder.symbol("vmless_drem", rt::drem as *const u8);
         builder.symbol("vmless_exc_throw", rt::exc_throw as *const u8);
@@ -99,10 +100,12 @@ impl Jit {
         self.classes.load_dir(dir);
     }
 
-    /// 便捷：从主类文件路径加载它和同目录的其它类
+    /// 便捷：从主类文件路径加载它和同包/其它包（同一个包根下）的类
     pub fn load_class_path(&mut self, class_file: &str) {
+        let mut name = String::new();
         if let Ok(bytes) = std::fs::read(class_file) {
             if let Ok(cf) = parse(&bytes) {
+                name = cf.this_class_name().unwrap_or_default();
                 self.classes.insert(cf);
             }
         }
@@ -110,7 +113,8 @@ impl Jit {
             .parent()
             .map(|p| p.to_path_buf())
             .unwrap_or_else(|| ".".into());
-        self.add_class_dir(&dir);
+        // 主类带包名（`app/X.class`）时从包根开始加载，才能看到 `lib/Y.class` 这种邻居包
+        self.add_class_dir(&crate::vm::package_root(&dir, &name));
     }
 
     pub fn compile_static(

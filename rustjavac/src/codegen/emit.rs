@@ -24,6 +24,9 @@ pub(crate) struct Emit {
     pub(crate) stack_map_name: u16,
     /// 每个局部变量槽的验证类型：0 = int，否则是类索引（对象/数组）
     pub(crate) local_types: Vec<u16>,
+    /// 脏槽池（`SCRATCH_POOL_BASE .. +SCRATCH_POOL_LEN`）里哪些正被占用。
+    /// 用位图而不是栈：兄弟表达式（`f(a<b, c<d)`）会同时占着，释放顺序不定。
+    pub(crate) scratch_inuse: [bool; SCRATCH_POOL_LEN as usize],
 }
 
 impl Emit {
@@ -39,7 +42,45 @@ impl Emit {
             exc_table: Vec::new(),
             stack_map_name: 0,
             local_types: vec![u16::MAX; max_locals as usize],
+            scratch_inuse: [false; SCRATCH_POOL_LEN as usize],
         }
+    }
+
+    /// 借一个脏槽（值先算进槽里，再把栈恢复成空）。
+    ///
+    /// 跳转点的栈图恒声明「栈为空」，所以任何会分叉的表达式都必须在空栈上开算；
+    /// 前面已经压了东西（`println(…)` 的 PrintStream、`a + (b<c)` 的 a）时，
+    /// 就先把待消费的东西算进脏槽，等分叉过去再取回来。
+    pub(crate) fn alloc_scratch(&mut self) -> Result<u8, CompileError> {
+        let i = match self.scratch_inuse.iter().position(|u| !*u) {
+            Some(i) => i,
+            None => {
+                return err(format!(
+                    "表达式嵌套过深：脏槽池只有 {SCRATCH_POOL_LEN} 个"
+                ))
+            }
+        };
+        self.scratch_inuse[i] = true;
+        let slot = SCRATCH_POOL_BASE + i as u8;
+        if self.max_locals < slot as u16 + 1 {
+            self.max_locals = slot as u16 + 1;
+        }
+        Ok(slot)
+    }
+
+    pub(crate) fn free_scratch(&mut self, slot: u8) {
+        if slot >= SCRATCH_POOL_BASE {
+            let i = (slot - SCRATCH_POOL_BASE) as usize;
+            if i < self.scratch_inuse.len() {
+                self.scratch_inuse[i] = false;
+            }
+        }
+    }
+
+    /// 取一个槽当前的验证类型（借脏槽前存下来，还的时候恢复 —— 否则后续兄弟分支的
+    /// 合并帧会声明一个「那条路径上根本没赋值」的类型，HotSpot 判 VerifyError）
+    pub(crate) fn local_type_of(&self, slot: u8) -> u16 {
+        self.local_types.get(slot as usize).copied().unwrap_or(u16::MAX)
     }
 
     pub(crate) fn push(&mut self, n: u16) {
@@ -393,3 +434,8 @@ impl Emit {
 /// 「比较 → 0/1」用的脏槽：放在局部变量表的最高固定位置。
 /// 用前先用 `set_local_type(.., 0)` 声明成 int，`max_locals` 会跟着抬到 251。
 pub(crate) const SCRATCH_SLOT: u8 = 250;
+
+/// 临时脏槽池的起点与容量（240..249）：把「会分叉的子表达式」先算进槽里用。
+/// 与 `SCRATCH_SLOT`（比较结果专用）分开，互不踩。
+pub(crate) const SCRATCH_POOL_BASE: u8 = 240;
+pub(crate) const SCRATCH_POOL_LEN: u8 = 10;

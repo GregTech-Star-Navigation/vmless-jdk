@@ -219,6 +219,16 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
             Type::Array(inner) => Some(*inner),
             _ => None,
         },
+        // 方法调用：按返回类型（`Color.values()[i]` 这类链式访问要用它的元素类型）
+        Expr::Call { recv, name, .. } => {
+            let desc = call_desc(recv.as_deref(), name, ctx)?;
+            let ret = desc.rsplit(')').next().unwrap_or("");
+            if ret.is_empty() || ret == "V" {
+                None
+            } else {
+                Some(type_from_desc(ret))
+            }
+        }
         _ => None,
     }
 }
@@ -228,6 +238,27 @@ pub(crate) fn elem_kind(array: &Expr, ctx: &Ctx) -> u8 {
     match expr_type(array, ctx) {
         Some(Type::Array(inner)) => kind_of(&inner),
         _ => K_INT,
+    }
+}
+
+/// 数组元素的 (读取, 写入) 指令。
+///
+/// boolean/byte 必须走 ba*、char 走 ca*、short 走 sa* —— 全用 ia* 会让
+/// HotSpot 在 `boolean[]`/`char[]` 上报 "Bad type on operand stack"。
+pub(crate) fn array_ops(array: &Expr, ctx: &Ctx) -> (u8, u8) {
+    let elem = match expr_type(array, ctx) {
+        Some(Type::Array(inner)) => *inner,
+        _ => return (0x2E, 0x4F), // iaload / iastore
+    };
+    match &elem {
+        Type::Prim("long") => (0x2F, 0x50),
+        Type::Prim("float") => (0x30, 0x51),
+        Type::Prim("double") => (0x31, 0x52),
+        Type::Prim("boolean") | Type::Prim("byte") => (0x33, 0x54),
+        Type::Prim("char") => (0x34, 0x55),
+        Type::Prim("short") => (0x35, 0x56),
+        _ if kind_of(&elem) == K_REF => (0x32, 0x53),
+        _ => (0x2E, 0x4F),
     }
 }
 
@@ -305,6 +336,23 @@ pub(crate) fn type_internal(ty: &Type) -> Option<String> {
     }
 }
 
+/// java.lang.* 里我们**运行时真的实现了**的方法：类名 → (方法名, 描述符)。
+///
+/// 这些类没有 `.class` 在 classpath 上，光靠 `type_methods` 查不到签名；
+/// 但解释器与 JIT 都内置了它们的实现（`String.equals` 用来写枚举的 valueOf）。
+/// 加新方法时三处要一起加：这里、`vm::exec` 的分支、`jit::translate` 的调用点。
+const BUILTIN_METHODS: &[(&str, &str, &str)] = &[
+    ("java/lang/String", "equals", "(Ljava/lang/Object;)Z"),
+];
+
+/// `java.lang.*` 内置方法的描述符
+pub(crate) fn builtin_method_desc(owner: &str, name: &str) -> Option<String> {
+    BUILTIN_METHODS
+        .iter()
+        .find(|(c, n, _)| *c == owner && *n == name)
+        .map(|(_, _, d)| d.to_string())
+}
+
 /// 一次方法调用的描述符。
 ///
 /// 接收者的静态类型能推出来就用它查（`P p = ...; p.get()` 沿 P 的继承链），
@@ -328,6 +376,9 @@ pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, ctx: &Ctx) -> Option<St
     if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
         if let Some(d) = ctx.type_methods.get(&owner).and_then(|m| m.get(name)) {
             return Some(d.clone());
+        }
+        if let Some(d) = builtin_method_desc(&owner, name) {
+            return Some(d);
         }
     }
     ctx.instance_methods.get(name).cloned()

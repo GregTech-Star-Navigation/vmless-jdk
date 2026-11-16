@@ -88,15 +88,13 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 _ => unreachable!(),
             };
             let k = elem_kind(&arr, ctx);
-            compile_expr(&arr, em, ctx, cp)?;
-            compile_expr(&idx, em, ctx, cp)?;
-            compile_expr(rhs, em, ctx, cp)?;
-            em.op(match k {
-                K_LONG => 0x50,   // lastore
-                K_DOUBLE => 0x52, // dastore
-                K_REF => 0x53,    // aastore
-                _ => 0x4F,        // iastore
-            });
+            let sa = if needs_scratch(&arr) { Some(spill(&arr, em, ctx, cp)?) } else { None };
+            let si = if needs_scratch(&idx) { Some(spill(&idx, em, ctx, cp)?) } else { None };
+            let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
+            emit_val(&arr, &sa, em, ctx, cp)?;
+            emit_val(&idx, &si, em, ctx, cp)?;
+            emit_val(rhs, &sr, em, ctx, cp)?;
+            em.op(array_ops(&arr, ctx).1);
             em.pop(if kind_wide(k) { 4 } else { 3 });
             Ok(false)
         }
@@ -118,13 +116,15 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 _ => unreachable!(),
             };
             let is_super = matches!(*recv, Expr::Super);
+            // rhs 会分叉时先算进脏槽：接收者压上栈之后，跳转点就不空了
+            let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
             if is_super {
                 em.op(0x2A); // aload_0
                 em.push(1);
             } else {
                 compile_expr(&recv, em, ctx, cp)?;
             }
-            compile_expr(rhs, em, ctx, cp)?;
+            emit_val(rhs, &sr, em, ctx, cp)?;
             let (mut owner, desc) = field_access(&recv, &fname, ctx);
             if is_super {
                 owner = ctx.super_name.clone();
@@ -167,13 +167,47 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             Ok(false)
         }
         Stmt::Switch { selector, cases } => {
+            // 枚举的选择子是引用：比较前先取 ordinal()（javac 也是这么编的，
+            // switch 的表只认 int）。case 标签同样是枚举常量，两边一起取。
+            let enum_switch = expr_kind(selector, ctx) == K_REF;
+            // `case RED:` 里的 RED 得挂到枚举类上（`Color.RED`），否则按本类的静态字段找。
+            // 标签不做种类推断：RED 是另一个类的静态字段，expr_kind 推不出来。
+            let enum_cls = expr_type(selector, ctx).as_ref().and_then(type_internal);
+            let pin = |e: &Expr, ctx: &Ctx, is_label: bool| -> Expr {
+                if !enum_switch {
+                    return e.clone();
+                }
+                if is_label {
+                    let base = match (e, &enum_cls) {
+                        (Expr::Ident(n), Some(cls)) if ctx.lookup(n).is_none() => {
+                            Expr::Field(Box::new(Expr::Ident(cls.clone())), n.clone())
+                        }
+                        _ => e.clone(),
+                    };
+                    return Expr::Call {
+                        recv: Some(Box::new(base)),
+                        name: "ordinal".into(),
+                        args: Vec::new(),
+                        type_args: Vec::new(),
+                    };
+                }
+                if expr_kind(e, ctx) != K_REF {
+                    return e.clone();
+                }
+                Expr::Call {
+                    recv: Some(Box::new(e.clone())),
+                    name: "ordinal".into(),
+                    args: Vec::new(),
+                    type_args: Vec::new(),
+                }
+            };
             // 用一个临时槽保存选择子
             let sel_slot = ctx.next_slot;
             ctx.next_slot += 1;
             if em.max_locals < ctx.next_slot as u16 {
                 em.max_locals = ctx.next_slot as u16;
             }
-            compile_expr(selector, em, ctx, cp)?;
+            compile_expr(&pin(selector, ctx, false), em, ctx, cp)?;
             em.istore(sel_slot)?;
             em.set_local_type(sel_slot as usize, 0); // int
 
@@ -195,7 +229,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                     match label {
                         Some(v) => {
                             em.iload(sel_slot)?;
-                            compile_expr(v, em, ctx, cp)?;
+                            compile_expr(&pin(v, ctx, true), em, ctx, cp)?;
                             let next = em.new_label();
                             // 不相等就继续比下一个
                             em.branch(0xa0, next); // if_icmpne
@@ -213,6 +247,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
 
             // 依次发射各 case 体（自然贯穿）
             let scope = em.local_types.clone();
+            ctx.break_labels.push(end_label);
             for (i, c) in cases.iter().enumerate() {
                 em.local_types = scope.clone();
                 em.bind(body_labels[i]);
@@ -220,12 +255,29 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                     compile_stmt(s, em, ctx, cp)?;
                 }
             }
-            if default_target == end_label {
-                em.local_types = scope;
-                em.bind(end_label);
-            }
-            // 视为已终结：避免在末尾再补一条不可达的默认 return（HotSpot 要求死代码也有栈图帧）
+            // end_label 是 break 的落点（也可能没有任何 break 跳到它，照样要绑定）
+            em.local_types = scope.clone();
+            em.bind(end_label);
+            ctx.break_labels.pop();
+            // 不声明「已终结」：switch 之后可能还有语句（case 里 break 出来后要接着执行）
+            Ok(false)
+        }
+        Stmt::Break(None) => {
+            let Some(l) = ctx.break_labels.last().copied() else {
+                return err("`break` 不在循环或 switch 里");
+            };
+            em.goto(l);
             Ok(true)
+        }
+        Stmt::Continue(None) => {
+            let Some(l) = ctx.cont_labels.last().copied() else {
+                return err("`continue` 不在循环里");
+            };
+            em.goto(l);
+            Ok(true)
+        }
+        Stmt::Break(Some(l)) | Stmt::Continue(Some(l)) => {
+            err(format!("暂不支持带标签的 `{l}`（break/continue 后跟标签）"))
         }
         Stmt::For { init, cond, update, body } => {
             let scope = em.local_types.clone();
@@ -234,11 +286,18 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             }
             let start = em.new_label();
             let end = em.new_label();
+            // continue 跳到更新表达式之前
+            let cont = em.new_label();
             em.bind(start);
             if let Some(c) = cond {
                 compile_cond_false(c, em, ctx, cp, end)?;
             }
+            ctx.break_labels.push(end);
+            ctx.cont_labels.push(cont);
             compile_stmt(body, em, ctx, cp)?;
+            ctx.break_labels.pop();
+            ctx.cont_labels.pop();
+            em.bind(cont);
             for u in update {
                 // 更新表达式可能是赋值，交给语句编译器处理
                 compile_stmt(&Stmt::Expr(u.clone()), em, ctx, cp)?;
@@ -256,7 +315,11 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             let end = em.new_label();
             em.bind(start);
             compile_cond_false(cond, em, ctx, cp, end)?;
+            ctx.break_labels.push(end);
+            ctx.cont_labels.push(start);
             compile_stmt(body, em, ctx, cp)?;
+            ctx.break_labels.pop();
+            ctx.cont_labels.pop();
             em.local_types = scope;
             em.goto(start);
             em.bind(end);

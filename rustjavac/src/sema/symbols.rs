@@ -117,6 +117,8 @@ impl SymbolTable {
                     }
                 }
                 Member::Type(nested) => Self::collect(st, nested),
+                // 枚举常量在 `sema::enums` 里已经降成静态字段；漏到这里的按无字段处理
+                Member::EnumConst { .. } => {}
                 Member::Init { .. } => {}
             }
         }

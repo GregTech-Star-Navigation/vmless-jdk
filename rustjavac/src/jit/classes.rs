@@ -9,6 +9,22 @@ use std::rc::Rc;
 
 use super::rt;
 
+/// 递归收集目录下的 `.class`（包名就是子目录层级）
+fn collect_class_files(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
+    if depth > 8 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_class_files(&p, depth + 1, out);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("class") {
+            out.push(p);
+        }
+    }
+}
+
 pub(super) struct ClassSet {
     pub(super) classes: HashMap<String, Rc<ClassFile>>,
     /// 类 → (实例字段名 → 下标)
@@ -55,14 +71,11 @@ impl ClassSet {
         self.classes.insert(name, Rc::new(cf));
     }
 
-    /// 把一个目录里的 .class 全部读进来（继承链上的类都在这里）
+    /// 把一个目录下（含子目录，包名就是子目录层级）的 .class 全部读进来
     pub(super) fn load_dir(&mut self, dir: &std::path::Path) {
-        let Ok(entries) = std::fs::read_dir(dir) else { return };
-        for e in entries.flatten() {
-            let p = e.path();
-            if p.extension().and_then(|s| s.to_str()) != Some("class") {
-                continue;
-            }
+        let mut paths = Vec::new();
+        collect_class_files(dir, 0, &mut paths);
+        for p in paths {
             if let Ok(bytes) = std::fs::read(&p) {
                 if let Ok(cf) = crate::parse(&bytes) {
                     self.insert(cf);
@@ -201,6 +214,18 @@ impl ClassSet {
                 let d = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default());
                 if n == name && d == desc {
                     return Some((c, i));
+                }
+            }
+        }
+        // 接口里的 default 方法：实现类没覆写时落在接口上
+        for i in self.iface_closure(from) {
+            let Some(cf) = self.get(&i) else { continue };
+            for (mi, m) in cf.methods.iter().enumerate() {
+                let n = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default());
+                let d = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default());
+                // 抽象声明没有 Code，不能当实现
+                if n == name && d == desc && m.access_flags & 0x0400 == 0 {
+                    return Some((i.clone(), mi));
                 }
             }
         }
