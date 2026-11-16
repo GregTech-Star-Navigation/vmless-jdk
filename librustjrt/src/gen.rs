@@ -9,7 +9,7 @@
 //! 转发指针直接写在年轻对象的头里（class_id 存新偏移，flags 置 FORWARDED），
 //! 不需要为存活对象建哈希表。
 
-use crate::{CompactMeta, CompactObject, COMPACT_HEADER};
+use crate::compat::{CompactMeta, CompactObject, COMPACT_HEADER};
 
 const FORWARDED: u32 = 0x8000_0000;
 
@@ -197,7 +197,7 @@ impl GenerationalHeap {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::FieldKind;
+    use crate::compat::FieldKind;
 
     fn node() -> CompactMeta {
         CompactMeta { name: "Node", fields: vec![FieldKind::Prim, FieldKind::Ref] }

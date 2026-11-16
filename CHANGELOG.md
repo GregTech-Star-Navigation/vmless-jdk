@@ -353,3 +353,33 @@
 - `cargo test` 29 passed；样例 **34/34 三路一致**；vm/jit 警告归零
 
 **遗留警告**：`front/parser/expr.rs` 3 处 `unreachable pattern`（保留待查，可能是真 bug 线索）。
+
+## 0.36.0 — 2026-11-16 · Rust 内存层完整化
+
+**从「最小可用」改成真正完整的内存管理系统。** 原实现有 5 套互不相干的分配器、
+全局只有一个类布局、没有根集管理、**没有写屏障**（`old → young` 的引用会让活对象被误回收，正确性 bug）。
+
+新结构：`object · layout · alloc · heap · young · old · cards · roots · barrier · stats · tests`
+（`compat · gen` 是冻结的旧 API 兼容层，8 个旧 example 仍能编能跑）
+
+| 缺陷 | 修法 |
+|---|---|
+| 全局单类布局 | 对象头存 `class_id`，GC 按**对象自己的类**取引用位图 |
+| 无根集 | `RootScope`（RAII，不借用 Heap）+ `with_roots()` 影子栈 |
+| 无写屏障 | `set_ref` 判「老→年轻」标脏卡；minor 根集 = 显式根 + SATB + 脏卡解析出的对象 |
+| 无大对象空间 | ≥64K 或 ≥eden 的分配直接进老年代独立链表，复制式 GC 不碰 |
+| 无 TLAB | `tlab_alloc(&self, size)` 用 `Cell` 无锁 bump + `refill_tlab()` |
+| 无增长收缩 | 尾部满先真回收再倍增（偏移不变，handle 不失效）；空闲率高则截断 |
+| 无统计 | `Stats`：各代占用、停顿、晋升量、脏卡数、增长/收缩次数 + 环形历史 |
+
+**对象头从 16 字节压到 8 字节**（字段数放 flags 高 16 位），对象 24B→16B，MINOR 从 ~60ms 回到 36ms。
+
+**实测（同机同刻，8M 分配 / 1M 存活）**
+| | 旧实现 | 新实现 |
+|---|---|---|
+| 分配 | 10.8 ns/对象（bump，单类，无屏障） | **10.2 ns/对象**（多类 + 屏障 + TLAB） |
+| 回收 | 标记清扫 89.5 ms | **minor 40.5 ms** |
+| 最大单步 | — | **0.918 ms** |
+
+`cargo test`：28 passed + 1 doc-test（含随机图压力测试，逐对象校验 payload 与引用）；
+rustjavac 重编后样例仍 **34/34 三路一致**。
