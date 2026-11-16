@@ -4,13 +4,15 @@
 //!
 //! ```text
 //! 0        64                                            eden_end        tail_start        cap
-//! ├─保留──┼──────────── eden ────────────┬──semi0──┬──semi1��─┼──── 老年代 + LOS ────┤
+//! ├─保留──┼──────────── eden ────────────┬──semi0──┬──semi1──┼──── 老年代 + LOS ────┤
 //!                                         ↑ 两块 survivor 交替做 from/to
 //! ```
 //!
 //! - 年轻代 = `[young_start, tail_start)`：eden + 两块 survivor 语义空间（复制式回收）。
 //! - 老年代 + LOS 共用尾部 arena，从 `tail_start` 向高地址 bump，靠三条表分开记账。
 //! - 增长 = `realloc` 整块内存：基址变了但偏移不变，所以 handle 不会失效。
+//! - **压缩**会改偏移 → 外部持有的引用必须走 `StableHandle`（句柄表间接层），
+//!   见 [`crate::handles`]。
 
 use std::cell::{Cell, RefCell};
 use std::collections::VecDeque;
@@ -19,11 +21,17 @@ use std::rc::Rc;
 use crate::alloc::{Region, Tlab};
 use crate::barrier::{self, BarrierKind};
 use crate::cards::{CardTable, StartMap};
+use crate::handles::{HandleTable, StableHandle};
+use crate::incremental::{self, GcPhase, Marker, StepReport};
 use crate::layout::{LayoutTable, SlotKind};
-use crate::object::{self, Object, FLAG_ARRAY, FLAG_LOS, FLAG_MARK, HEADER, SLOT_BYTES};
+use crate::object::{
+    self, Object, FLAG_ARRAY, FLAG_FINALIZE, FLAG_FORWARDED, FLAG_LOS, FLAG_MARK, HEADER,
+    SLOT_BYTES,
+};
 use crate::old::{self, MajorReport, OldSpace};
 use crate::roots::{Handle, RootScope};
 use crate::stats::{GcKind, GcRecord, Stats};
+use crate::weak::{FinalizerQueue, WeakRef, WeakTable};
 use crate::young::{self, MinorReport};
 
 /// `[0, RESERVED)` 保留，偏移 0 永远是 null
@@ -53,6 +61,12 @@ pub struct HeapConfig {
     pub major_ratio: f64,
     /// 空闲率超过它就收缩
     pub min_free_ratio: f64,
+    /// 碎片率（`1 - 存活/已提交`）超过它就压缩老年代
+    pub compact_ratio: f64,
+    /// 是否允许自动压缩（关掉之后只能手动 `compact()`）
+    pub auto_compact: bool,
+    /// 增量标记每次 `step()` 的默认预算（对象数）
+    pub incremental_budget: usize,
     pub barrier: BarrierKind,
     /// 保留多少条 GC 历史
     pub history: usize,
@@ -70,6 +84,9 @@ impl Default for HeapConfig {
             tenuring_threshold: 3,
             major_ratio: 0.7,
             min_free_ratio: 0.6,
+            compact_ratio: 0.4,
+            auto_compact: true,
+            incremental_budget: 4096,
             barrier: BarrierKind::IncrementalUpdate,
             history: 64,
         }
@@ -127,6 +144,18 @@ pub(crate) struct GcEnv<'a> {
     pub max_step_ns: u128,
     pub marked: usize,
     pub failures: usize,
+    // 下面三个放在结构体末尾：它们只在 GC 外围用，不碰热循环的字段偏移
+    pub weak: &'a mut WeakTable,
+    /// 本轮进 finalization 队列的偏移（`Heap` 在 env 释放后搬进队列）
+    pub finalize: &'a mut Vec<u32>,
+    /// 堆里出现过带 finalizer 的对象（没有就整段跳过，省 O(live) 的两趟扫）
+    pub finalize_armed: bool,
+    /// 预留槽：`GcEnv` 是每个 GC 入口都在栈上构造的结构，改动它的字节数会让
+    /// 复制热循环的代码生成跟着变。实测（362 次 minor，8M 对象）：同一份逻辑
+    /// 只把这 64 字节去掉，MINOR_MS 从 34.5 漂到 40.6（+18%），MAX_STEP 从
+    /// 0.84 漂到 0.89 —— 纯布局效应，不是算法成本。留一段固定余量给后续字段，
+    /// 免得以后每加一个诊断字段都要重新解释一次「为什么变慢了」。
+    pub _reserved: [u64; 8],
 }
 
 impl<'a> GcEnv<'a> {
@@ -203,6 +232,19 @@ pub struct Heap {
     satb: Vec<u32>,
     tlab: Tlab,
 
+    // 稳定句柄 / 弱引用 / finalization
+    handles: HandleTable,
+    weak: WeakTable,
+    fin: FinalizerQueue,
+    /// 本轮 GC 攒下来的待入队偏移（`GcEnv` 只借到这个 Vec）
+    fin_buf: Vec<u32>,
+    finalize_armed: bool,
+
+    // 增量标记
+    marker: Marker,
+    /// 标记期写屏障着色的新值（增量更新屏障的落点）
+    grey: Vec<u32>,
+
     // 统计
     stats: Stats,
     history: VecDeque<GcRecord>,
@@ -255,6 +297,13 @@ impl Heap {
             roots: Rc::new(RefCell::new(Vec::new())),
             satb: Vec::new(),
             tlab: Tlab::new(),
+            handles: HandleTable::new(),
+            weak: WeakTable::new(),
+            fin: FinalizerQueue::new(),
+            fin_buf: Vec::new(),
+            finalize_armed: false,
+            marker: Marker::new(),
+            grey: Vec::new(),
             stats: Stats::default(),
             history: VecDeque::new(),
             last_survival: 0.0,
@@ -340,6 +389,46 @@ impl Heap {
     #[inline]
     pub fn tlab_size(&self) -> u32 {
         self.tlab.size()
+    }
+
+    // ---- 并发层（`concurrent::SharedHeap`）用的镜像同步口 ----
+
+    /// 当前 eden bump 指针（并发层把它镜像到一个 `AtomicU32`）
+    #[inline]
+    pub fn eden_top_raw(&self) -> u32 {
+        self.eden_top.get()
+    }
+
+    /// 用并发层的原子值覆盖本地的 bump 指针（进锁时对齐一次）
+    #[inline]
+    pub fn sync_eden_top(&mut self, v: u32) {
+        let v = v.clamp(self.eden_start, self.eden_end);
+        if v > self.eden_top.get() {
+            self.eden_top.set(v);
+        }
+        // 线程本地块已经作废（并发层每次都换代际），单线程 TLAB 必须丢掉
+        self.tlab.reset();
+    }
+
+    /// 把并发层记的对象数并进来（`eden_objects` 是 GC 报告的分母）
+    #[inline]
+    pub fn add_eden_objects(&mut self, n: usize) {
+        self.eden_objects.set(self.eden_objects.get() + n);
+    }
+
+    #[inline]
+    pub fn eden_start(&self) -> u32 {
+        self.eden_start
+    }
+
+    #[inline]
+    pub fn eden_end(&self) -> u32 {
+        self.eden_end
+    }
+
+    /// 直接走 LOS 分配（并发层的大对象路径；不走 eden、不上 TLAB）
+    pub fn alloc_los_raw(&mut self, class_id: u32, length: u32, size: u32, flags: u32) -> u32 {
+        self.alloc_los(class_id, length, size, flags | FLAG_LOS).raw()
     }
 
     // ===================== 类布局 =====================
@@ -581,12 +670,17 @@ impl Heap {
     }
 
     /// 写引用槽：过写屏障。老对象存年轻引用会把老对象所在卡标脏。
+    ///
+    /// 增量标记进行中时，**新值**也会被着色进灰队列（增量更新屏障）——
+    /// 这是「A 已扫过、A.f 改成 B」这个漏标漏洞的唯一防线。
     pub fn set_ref(&mut self, obj: Handle, idx: u32, val: Handle) {
         let spaces = self.spaces();
         let kind = self.cfg.barrier;
+        let marking = self.marker.phase().is_marking();
+        let old;
         unsafe {
             let sp = self.slot_ptr(obj.0, idx);
-            let old = *sp;
+            old = *sp;
             *sp = val.0;
             barrier::on_store(
                 kind,
@@ -597,6 +691,15 @@ impl Heap {
                 old,
                 val.0,
             );
+        }
+        if marking {
+            // 删除屏障：标记期被覆盖掉的旧值也是「周期开始时活着的」，
+            // 不记下来就可能提前回收（`barrier::on_store` 只记年轻代的旧值，
+            // 这里补上老年代的目标 —— 增量标记时两者同等重要）。
+            if old != 0 && self.satb.len() < barrier::SATB_LIMIT {
+                self.satb.push(old);
+            }
+            self.grey.push(val.0);
         }
     }
 
@@ -664,10 +767,11 @@ impl Heap {
         self.major_heap()
     }
 
-    /// 全量：minor + major
+    /// 全量：minor + major + 按碎片率决定是否压缩
     pub fn full(&mut self) -> MajorReport {
         self.minor_heap();
         let m = self.major_heap();
+        let m = self.maybe_compact_after(m);
         self.maybe_shrink();
         m
     }
@@ -681,23 +785,267 @@ impl Heap {
         }
     }
 
-    /// 老年代压缩（会移动对象 → 外部 handle 必须从根表重新读）
+    /// 老年代压缩（会移动对象）。
+    ///
+    /// 偏移直用的 `Handle` 在这之后**全部失效** —— 根表里的会被就地改写，
+    /// 但调用方手里攥着的裸 handle 不会。要跨压缩持有引用请用 `StableHandle`
+    /// （[`Heap::handle_new`]），压缩完句柄表已经被重映射过，句柄本身不用动。
     pub fn compact(&mut self) -> MajorReport {
         self.major_heap();
+        self.compact_only()
+    }
+
+    /// 只压缩（假定刚刚已经做过一轮 major，存活标记都在）。
+    fn compact_only(&mut self) -> MajorReport {
+        // 压缩只搬老年代，改写的是「老对象内部的引用槽」。**年轻对象里的引用槽
+        // 不会被改写** —— 一个 eden 里的对象指向老年代对象时，压缩之后它手里
+        // 就是旧地址（而且那块地方可能已经住进别的对象了）。
+        //
+        // 所以压缩前必须把可达的年轻对象全部晋升（`tenuring_threshold = 1`），
+        // 让「所有活对象都在老年代」这个前提成立。这也是真实 JVM 的做法：
+        // full GC / mark-compact 一律晋升全部存活对象。
+        if self.young_used() > 0 {
+            let saved = self.cfg.tenuring_threshold;
+            self.cfg.tenuring_threshold = 1;
+            self.minor_heap();
+            self.cfg.tenuring_threshold = saved;
+        }
+
         let young_objects = self.eden_objects.get() + self.semi_objects;
         let cap = self.region.cap() as u32;
         let roots_cell = self.roots.clone();
         let mut roots = roots_cell.borrow_mut();
-        let rep = {
+        let (rep, map) = {
             let mut env = self.make_env(cap, &mut roots, young_objects, 0);
             old::compact(&mut env)
         };
         drop(roots);
+
+        // 压缩改的是对象偏移 —— 句柄表与弱引用表必须跟着改，否则外面的引用全野
+        if !map.is_empty() {
+            self.handles.retarget(&map);
+            self.weak.retarget(&map);
+        }
+        self.stats.compactions += 1;
+        self.stats.objects_moved += rep.moved as u64;
+        self.stats.last_fragmentation = rep.fragmentation;
         self.record(GcKind::Full, rep.pause_ns, 0, 0, 0, 0, 0);
         rep
     }
 
+    /// 碎片率超过阈值就压缩，否则原样返回上一轮报告
+    fn maybe_compact_after(&mut self, m: MajorReport) -> MajorReport {
+        if self.cfg.auto_compact && self.old.fragmentation() >= self.cfg.compact_ratio {
+            return self.compact_only();
+        }
+        m
+    }
+
+    /// 老年代碎片率：`1 - 存活字节 / 已提交跨度`（0 = 紧实）
+    #[inline]
+    pub fn fragmentation(&self) -> f64 {
+        self.old.fragmentation()
+    }
+
+    /// 老年代已提交的跨度（从 `tail_start` 到 bump 指针）/ 存活字节
+    #[inline]
+    pub fn old_committed(&self) -> u32 {
+        self.old.committed()
+    }
+
+    /// 碎片率超阈值就压一轮（手动版，不受 `auto_compact` 影响）
+    pub fn compact_if_fragmented(&mut self) -> Option<MajorReport> {
+        if self.old.fragmentation() >= self.cfg.compact_ratio {
+            Some(self.compact())
+        } else {
+            None
+        }
+    }
+
+    // ===================== 增量标记 =====================
+
+    /// 当前 GC 阶段（Idle / Marking / Sweeping）
+    #[inline]
+    pub fn phase(&self) -> GcPhase {
+        self.marker.phase()
+    }
+
+    /// 标记器（诊断：还剩多少灰对象、上一轮几步跑完）
+    #[inline]
+    pub fn marker(&self) -> &Marker {
+        &self.marker
+    }
+
+    /// 开始一轮增量标记（幂等：已经在标记中就什么都不做）
+    pub fn begin_incremental(&mut self) {
+        if self.marker.is_active() {
+            return;
+        }
+        self.step(1);
+    }
+
+    /// 推进一小步：最多处理 `budget` 个对象。
+    ///
+    /// 首次调用会顺带开始一轮新回收。返回的阶段告诉调用方下一步该干什么 ——
+    /// `Idle` + `finished` 表示整轮跑完了。
+    pub fn step(&mut self, budget: usize) -> StepReport {
+        let mut marker = std::mem::take(&mut self.marker);
+        let mut grey = std::mem::take(&mut self.grey);
+        let cap = self.region.cap() as u32;
+        let young_objects = self.eden_objects.get() + self.semi_objects;
+        let young_bytes = self.young_used();
+        let roots_cell = self.roots.clone();
+        let mut roots = roots_cell.borrow_mut();
+        let mut rep = {
+            let mut env = self.make_env(cap, &mut roots, young_objects, young_bytes);
+            incremental::step(&mut env, &mut marker, budget, &mut grey)
+        };
+        drop(roots);
+        self.marker = marker;
+        self.grey = grey;
+        self.drain_fin_buf();
+        self.stats.incremental_steps += 1;
+        if let Some(r) = rep.report {
+            self.stats.major_count += 1;
+            self.stats.total_pause_ns += r.pause_ns;
+            self.stats.max_pause_ns = self.stats.max_pause_ns.max(r.pause_ns);
+            self.stats.collected_bytes += r.freed_bytes as u64;
+            self.stats.collected_objects += (r.freed + r.los_freed) as u64;
+            self.stats.last_fragmentation = r.fragmentation;
+            self.record(
+                GcKind::Major,
+                r.pause_ns,
+                (r.freed + r.los_freed) as u64,
+                0,
+                self.young_used(),
+                0,
+                0,
+            );
+            self.prune_handles();
+            // 一轮增量清扫跑完 = 一次 major，碎片率可能已经过阈值
+            if self.cfg.auto_compact && self.old.fragmentation() >= self.cfg.compact_ratio {
+                let c = self.compact_only();
+                rep.report = Some(c);
+            }
+        }
+        rep
+    }
+
+    /// 把当前增量回收推到底，返回完整报告（没有在跑的就返回 `None`）
+    pub fn finish_incremental(&mut self) -> Option<MajorReport> {
+        let mut last = None;
+        let mut guard = 0u64;
+        loop {
+            let budget = self.cfg.incremental_budget.max(1);
+            let r = self.step(budget);
+            guard += 1;
+            if let Some(rep) = r.report {
+                last = Some(rep);
+            }
+            if r.phase == GcPhase::Idle || guard > 1 << 24 {
+                break;
+            }
+        }
+        last
+    }
+
+    /// 增量回收一轮到底（不关心分几步），按默认预算
+    pub fn collect_incremental(&mut self) -> MajorReport {
+        self.finish_incremental().unwrap_or_default()
+    }
+
+    // ===================== 稳定句柄（压缩安全） =====================
+
+    /// 建一个稳定句柄：对象被压缩搬走后它依然能解析到正确位置。
+    pub fn handle_new(&mut self, h: Handle) -> StableHandle {
+        self.handles.alloc(h.0)
+    }
+
+    /// 解析稳定句柄。目标已被回收 → `None`。
+    #[inline]
+    pub fn resolve(&self, s: StableHandle) -> Option<Handle> {
+        self.handles.resolve(s).map(Handle)
+    }
+
+    /// 把稳定句柄重新绑定到另一个对象
+    pub fn handle_set(&mut self, s: StableHandle, h: Handle) -> bool {
+        self.handles.set(s, h.0)
+    }
+
+    pub fn handle_free(&mut self, s: StableHandle) {
+        self.handles.free(s);
+    }
+
+    #[inline]
+    pub fn handles_len(&self) -> usize {
+        self.handles.len()
+    }
+
+    // ===================== 弱引用 / finalization =====================
+
+    /// 建一个弱引用：不阻止 `h` 指向的对象被回收。
+    pub fn weak_new(&mut self, h: Handle) -> WeakRef {
+        let w = self.weak.alloc(h.0);
+        self.stats.weak_refs = self.weak.len();
+        w
+    }
+
+    /// 解析弱引用。目标已死（或已被搬走又死）→ `None`。
+    #[inline]
+    pub fn weak_get(&self, w: WeakRef) -> Option<Handle> {
+        self.weak.get(w).map(Handle)
+    }
+
+    pub fn weak_free(&mut self, w: WeakRef) {
+        self.weak.free(w);
+        self.stats.weak_refs = self.weak.len();
+    }
+
+    #[inline]
+    pub fn weak_len(&self) -> usize {
+        self.weak.len()
+    }
+
+    /// 给对象打上「需要 finalize」。清扫时发现它不可达就先入队、复活一轮。
+    pub fn set_finalizable(&mut self, h: Handle) -> Handle {
+        if !h.is_null() {
+            unsafe {
+                let fl = object::flags_of(self.region.base(), h.0);
+                object::set_flags(self.region.base(), h.0, fl | FLAG_FINALIZE);
+            }
+            self.finalize_armed = true;
+        }
+        h
+    }
+
+    /// 分配 + 立刻标上 finalizer
+    pub fn alloc_finalizable(&mut self, class_id: u32) -> Handle {
+        let h = self.alloc(class_id);
+        self.set_finalizable(h)
+    }
+
+    /// 取一个待 finalize 的对象（**只在本轮与下一轮 GC 之间有效**）
+    pub fn take_finalized(&mut self) -> Option<Handle> {
+        self.fin.take().map(Handle)
+    }
+
+    pub fn drain_finalized(&mut self) -> Vec<Handle> {
+        let mut out = Vec::new();
+        self.fin.drain(&mut out);
+        out.into_iter().map(Handle).collect()
+    }
+
+    #[inline]
+    pub fn finalized_pending(&self) -> usize {
+        self.fin.len()
+    }
+
     fn minor_heap(&mut self) -> MinorReport {
+        // 增量标记会跨拍持有灰队列里的偏移；复制会搬对象 → 先把它推完
+        if self.marker.is_active() {
+            self.finish_incremental();
+        }
+        self.drain_fin_buf();
         self.prepare_minor();
         let young_objects = self.eden_objects.get() + self.semi_objects;
         let young_bytes = self.young_used();
@@ -710,6 +1058,10 @@ impl Heap {
             young::minor(&mut env)
         };
         drop(roots);
+
+        // 弱引用：from-space 还没被覆盖，此时靠转发位判死活最准
+        // （遍历的是弱引用槽位，与年轻代大小无关）
+        self.weak_young_sweep();
 
         // 年轻代复位
         self.eden_top.set(self.eden_start);
@@ -748,6 +1100,10 @@ impl Heap {
     }
 
     fn major_heap(&mut self) -> MajorReport {
+        if self.marker.is_active() {
+            self.finish_incremental();
+        }
+        self.drain_fin_buf();
         let young_objects = self.eden_objects.get() + self.semi_objects;
         let cap = self.region.cap() as u32;
         let old_before = self.old.live_bytes() as u32;
@@ -758,6 +1114,10 @@ impl Heap {
             old::major(&mut env)
         };
         drop(roots);
+        self.drain_fin_buf();
+        // 清扫（不压缩）之后，死在堆里的对象偏移还在句柄表里 —— 清掉，
+        // 否则 `resolve()` 会把一个野偏移当成有效句柄返回。
+        self.prune_handles();
 
         self.stats.major_count += 1;
         self.stats.last_pause_ns = rep.pause_ns;
@@ -765,6 +1125,7 @@ impl Heap {
         self.stats.total_pause_ns += rep.pause_ns;
         self.stats.collected_objects += rep.freed as u64 + rep.los_freed as u64;
         self.stats.collected_bytes += rep.freed_bytes as u64;
+        self.stats.last_fragmentation = rep.fragmentation;
         self.record(
             GcKind::Major,
             rep.pause_ns,
@@ -775,6 +1136,38 @@ impl Heap {
             self.old.live_bytes() as u32,
         );
         rep
+    }
+
+    /// `fin_buf` → `fin`：`GcEnv` 只借到 Vec，队列归 `Heap` 自己
+    fn drain_fin_buf(&mut self) {
+        if self.fin_buf.is_empty() {
+            return;
+        }
+        let mut buf = std::mem::take(&mut self.fin_buf);
+        for off in buf.drain(..) {
+            self.fin.push(off);
+        }
+        self.fin_buf = buf;
+    }
+
+    /// 稳定句柄和弱引用在 minor 之后都要修一遍：活着的跟到新地址，死了的清空。
+    ///
+    /// 判定只看 from-space 里的转发位 —— 这一步必须在 eden 复位**之前**做，
+    /// 之后源对象的内存会被新分配覆盖。
+    fn weak_young_sweep(&mut self) {
+        let base = self.region.base();
+        let young_start = self.young_start;
+        let eden_end = self.eden_end;
+        let semi = self.semi[self.semi_idx as usize];
+        let tail = self.young_end;
+        let fwd = |off: u32| forward_of(base, off, young_start, eden_end, semi, tail);
+        if !self.handles.is_empty() {
+            let n = self.handles.fix_young(fwd);
+            self.stats.handles_pruned += n as u64;
+        }
+        if !self.weak.is_empty() {
+            self.weak.fix_young(fwd);
+        }
     }
 
     fn make_env<'a>(
@@ -811,6 +1204,10 @@ impl Heap {
             max_step_ns: 0,
             marked: 0,
             failures: 0,
+            weak: &mut self.weak,
+            finalize: &mut self.fin_buf,
+            finalize_armed: self.finalize_armed,
+            _reserved: [0; 8],
         }
     }
 
@@ -919,6 +1316,10 @@ impl Heap {
         s.tenuring_threshold = self.cfg.tenuring_threshold;
         s.card_dirty = self.cards.dirty_len();
         s.satb_len = self.satb.len();
+        s.fragmentation = self.old.fragmentation();
+        s.weak_refs = self.weak.len();
+        s.finalize_pending = self.fin.len();
+        s.handles = self.handles.len();
         s
     }
 
@@ -975,6 +1376,34 @@ impl Heap {
             old_before,
             old_after,
         });
+    }
+}
+
+#[inline]
+fn forward_of(
+    base: *mut u8,
+    off: u32,
+    young_start: u32,
+    eden_end: u32,
+    semi: (u32, u32),
+    tail: u32,
+) -> Option<u32> {
+    let (from_lo, from_hi) = semi;
+    let in_from_semi = off >= from_lo && off < from_hi;
+    let in_eden = off >= young_start && off < eden_end;
+    if !in_from_semi && !in_eden {
+        // 老年代 / LOS：这一轮不动它，也判不了它的死活
+        let _ = tail;
+        return Some(off);
+    }
+    unsafe {
+        let fl = object::flags_of(base, off);
+        if fl & FLAG_FORWARDED != 0 {
+            // class_id 槽里存的是转发地址
+            Some(object::class_of(base, off))
+        } else {
+            None // 没被搬 = 死了
+        }
     }
 }
 
@@ -1040,3 +1469,21 @@ pub unsafe extern "C" fn jrt_size_of(heap: *const Heap, obj: u32) -> u32 {
 
 /// 清理编译告警用的常量引用（`FLAG_MARK` 只在 GC 内部用）
 const _: () = assert!(FLAG_MARK == 2);
+
+impl Heap {
+    /// 把句柄表里指向「已经不是对象起点」的槽位清掉。
+    ///
+    /// 判据是对象起点图（`starts`）：清扫时死对象的位已经被清了，
+    /// 所以这里是一次 O(句柄数) 的位查询，与堆大小无关。
+    fn prune_handles(&mut self) {
+        if self.handles.is_empty() {
+            return;
+        }
+        let tail = self.young_end;
+        let starts = &self.starts;
+        let n = self.handles.prune(|off| off < tail || starts.contains(off));
+        if n > 0 {
+            self.stats.handles_pruned += n as u64;
+        }
+    }
+}

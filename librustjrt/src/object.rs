@@ -41,6 +41,10 @@ pub const FLAG_MARK: u32 = 1 << 1;
 pub const FLAG_LOS: u32 = 1 << 2;
 /// 数组标记
 pub const FLAG_ARRAY: u32 = 1 << 3;
+/// 有 finalizer：没标到时先进队列、复活一轮（见 `weak::FinalizerQueue`）
+pub const FLAG_FINALIZE: u32 = 1 << 4;
+/// 已经进过 finalization 队列（保证只入队一次）
+pub const FLAG_FINALIZED: u32 = 1 << 5;
 /// 存活年龄，占 8 位；达阈值即晋升
 pub const AGE_SHIFT: u32 = 8;
 pub const AGE_MASK: u32 = 0xFF << AGE_SHIFT;

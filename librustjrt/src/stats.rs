@@ -43,6 +43,23 @@ pub struct Stats {
     pub tenuring_threshold: u32,
     pub card_dirty: usize,
     pub satb_len: usize,
+    /// 压缩次数
+    pub compactions: u64,
+    /// 压缩搬动过的对象总数
+    pub objects_moved: u64,
+    /// 最近一次压缩后的老年代碎片率
+    pub last_fragmentation: f64,
+    /// 当前老年代碎片率（`stats()` 时刷新）
+    pub fragmentation: f64,
+    /// 增量标记跑过的总步数
+    pub incremental_steps: u64,
+    /// 弱引用数 / finalizer 队列长度
+    pub weak_refs: usize,
+    pub finalize_pending: usize,
+    /// 稳定句柄数
+    pub handles: usize,
+    /// 因目标被回收而清掉的句柄数
+    pub handles_pruned: u64,
 }
 
 impl Stats {

@@ -67,6 +67,47 @@ pub(crate) fn bump_slot(ctx: &mut Ctx, em: &mut Emit, wide: bool) -> Result<u8, 
     Ok(slot)
 }
 
+/// `return e;` 该用哪种 `xreturn`。
+///
+/// 不能只用 `expr_kind(e)`：自动装箱/拆箱之后栈上的种类变了 ——
+/// `int f() { return box; }` 要 `ireturn`（先 intValue），
+/// `Integer f() { return 5; }` 要 `areturn`（先 valueOf）。
+pub(crate) fn ret_kind(x: &Expr, ctx: &Ctx) -> u8 {
+    let rk = ctx.ret_ty.as_ref().map(kind_of);
+    if let Some(k) = rk {
+        if k != K_REF {
+            return k;
+        }
+        // 目标引用、值是基本类型 → 装箱，栈上是引用
+        if matches!(expr_type(x, ctx), Some(t) if kind_of(&t) != K_REF) {
+            return K_REF;
+        }
+    }
+    expr_kind(x, ctx)
+}
+
+/// 编 `return e;`：升宽/checkcast/装箱/拆箱都做完，返回 xreturn 用的种类。
+fn ret_kind_for(
+    x: &Expr,
+    ctx: &mut Ctx,
+    em: &mut Emit,
+    cp: &mut CpBuilder,
+) -> Result<u8, CompileError> {
+    let kind = ret_kind(x, ctx);
+    if kind != K_REF && ctx.ret_ty.as_ref().map(|t| kind_of(t) != K_REF).unwrap_or(false) {
+        // 数值返回：先拆箱（若是包装类）再按目标类型拓宽/收窄
+        let kk = emit_num(x, em, ctx, cp)?;
+        coerce(kk, kind, em)?;
+        return Ok(kind);
+    }
+    compile_expr(x, em, ctx, cp)?;
+    // 泛型擦除后 `return box.get();` 的栈上是 Object，方法签名要 String：补 checkcast
+    if let Some(t) = ctx.ret_ty.clone() {
+        coerce_to(&t, x, ctx, em, cp)?;
+    }
+    Ok(kind)
+}
+
 /// `return e;`
 ///
 /// 有外层 finally 时不能直接把值留在操作数栈上去跑 finally —— 本项目的栈图一律声明
@@ -82,12 +123,7 @@ pub(crate) fn compile_return(
         match e {
             None => em.op(0xB1),
             Some(x) => {
-                let kind = expr_kind(x, ctx);
-                compile_expr(x, em, ctx, cp)?;
-                // 泛型擦除后 `return box.get();` 的栈上是 Object，方法签名要 String：补 checkcast
-                if let Some(t) = ctx.ret_ty.clone() {
-                    coerce_to(&t, x, ctx, em, cp)?;
-                }
+                let kind = ret_kind_for(x, ctx, em, cp)?;
                 emit_xreturn(em, kind);
             }
         }
@@ -95,18 +131,14 @@ pub(crate) fn compile_return(
     }
     let mut tmp: Option<(u8, u8, Vec<u16>)> = None; // (槽, 种类, 该槽原来的验证类型)
     if let Some(x) = e {
-        let kind = expr_kind(x, ctx);
-        let wide = kind_wide(kind);
+        let wide = kind_wide(ret_kind(x, ctx));
         let slot = bump_slot(ctx, em, wide)?;
         // 临时槽只在「这条 return」上存在，用完必须把验证类型退回去：
         // 否则后续帧会声明一个别的路径上根本没初始化过的槽（VerifyError）。
         let prev: Vec<u16> = (0..if wide { 2 } else { 1 })
             .map(|i| *em.local_types.get(slot as usize + i).unwrap_or(&u16::MAX))
             .collect();
-        compile_expr(x, em, ctx, cp)?;
-        if let Some(t) = ctx.ret_ty.clone() {
-            coerce_to(&t, x, ctx, em, cp)?;
-        }
+        let kind = ret_kind_for(x, ctx, em, cp)?;
         let vt = match ctx.ret_ty.clone() {
             Some(t) => ver_type(cp, &t),
             None => 0,

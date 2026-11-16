@@ -7,7 +7,6 @@
 //! 语义要与 javac/JVM 一致：`null` 拼成 `"null"`，`double` 用 Java 的格式化，
 //! `append` 返回 this（编译器在调用点 `pop` 掉它）。
 
-use super::heap::RefKind;
 use super::slot::Slot;
 use super::Vm;
 use super::VmError;
@@ -19,18 +18,11 @@ impl Vm {
             "(J)Ljava/lang/StringBuilder;" => arg.as_i64().to_string(),
             "(D)Ljava/lang/StringBuilder;" => crate::java_double_to_string(arg.as_f64()),
             "(Z)Ljava/lang/StringBuilder;" => (if arg.as_i32() != 0 { "true" } else { "false" }).to_string(),
-            d if d.starts_with("(L") => {
-                let h = arg.as_i32();
-                if h == 0 {
-                    "null".to_string()
-                } else {
-                    match self.ref_kind(h) {
-                        RefKind::Str => self.string_text(h),
-                        RefKind::Obj(_) | RefKind::Arr(_) => self.type_name(h),
-                        RefKind::Null => "null".to_string(),
-                    }
-                }
+            "(C)Ljava/lang/StringBuilder;" => {
+                char::from_u32(arg.as_i32() as u32).unwrap_or(0 as char).to_string()
             }
+            // 引用：null → "null"，String → 内容，包装类 → 值的文本，其余 → `Klass@hash`
+            d if d.starts_with("(L") => self.obj_to_string(arg.as_i32()),
             _ => arg.as_i32().to_string(),
         };
         let buf = self.sb_bufs.entry(handle).or_default();

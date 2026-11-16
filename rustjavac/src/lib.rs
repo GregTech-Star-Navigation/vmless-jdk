@@ -7,6 +7,7 @@
 
 pub mod classfile;
 pub mod front;
+pub mod jdk;
 pub mod sema;
 pub mod lower;
 pub mod codegen;

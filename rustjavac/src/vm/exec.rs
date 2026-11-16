@@ -633,6 +633,9 @@ impl Vm {
                     let info = self.method_ref(&cf, idx)?;
                     if info.class == "java/lang/System" && info.name == "out" {
                         frame.push(Slot::I(0));
+                    } else if let Some(v) = self.builtin_static_field(&info.class, &info.name) {
+                        // 内建常量：`Integer.MAX_VALUE` / `Long.MIN_VALUE`（没有 .class）
+                        frame.push(v);
                     } else {
                         // 首次访问这个类时先跑它的 <clinit>
                         self.ensure_init(&info.class)?;
@@ -668,22 +671,6 @@ impl Vm {
                         let _recv = frame.pop()?;
                         let text = self.println_text(&info.desc, arg);
                         self.output.push(text);
-                    } else if info.class == "java/lang/String"
-                        && info.name == "equals"
-                        && info.desc == "(Ljava/lang/Object;)Z"
-                    {
-                        // 内置：按内容比（`String` 没有 .class，走不到 resolve_method）
-                        let arg = frame.pop()?;
-                        let recv = frame.pop()?;
-                        let a = match self.ref_kind(recv.as_i32()) {
-                            RefKind::Str => Some(self.string_text(recv.as_i32())),
-                            _ => None,
-                        };
-                        let b = match self.ref_kind(arg.as_i32()) {
-                            RefKind::Str => Some(self.string_text(arg.as_i32())),
-                            _ => None,
-                        };
-                        frame.push(Slot::I(if a.is_some() && a == b { 1 } else { 0 }));
                     } else if info.class == "java/lang/StringBuilder" {
                         // 内置：字符串拼接（`StringBuilder` 没有 .class，走不到 resolve_method）
                         if info.name == "append" {
@@ -712,7 +699,7 @@ impl Vm {
                         let mut all = vec![recv];
                         all.extend(args);
                         // 从对象的**实际类**开始解析（这就是覆写的分派点）；
-                        // 拿不到运行时类才退回引用类，再不行才报错。
+                        // 拿不到运行时类才退回引用类，再不行再问内建表。
                         let actual = match self.ref_kind(recv.as_i32()) {
                             RefKind::Obj(c) => Some(c),
                             _ => None,
@@ -720,11 +707,30 @@ impl Vm {
                         let target = actual
                             .as_deref()
                             .and_then(|c| self.store.resolve_method(c, &info.name, &info.desc))
-                            .or_else(|| self.store.resolve_method(&info.class, &info.name, &info.desc))
-                            .ok_or_else(|| VmError {
-                                msg: format!("找不到方法 {}.{}{}", info.class, info.name, info.desc),
-                                exc: None,
-                            })?;
+                            .or_else(|| self.store.resolve_method(&info.class, &info.name, &info.desc));
+                        let target = match target {
+                            Some(t) => t,
+                            None => {
+                                // 内建（String / 包装类 / Object 协议）：没有 .class，查表实现
+                                let builtin = self
+                                    .builtin_virtual(&info.class, &info.name, &info.desc, recv.as_i32(), &all[1..]);
+                                match builtin {
+                                    Some(v) => {
+                                        frame.push(v?);
+                                        continue;
+                                    }
+                                    None => {
+                                        return Err(VmError {
+                                            msg: format!(
+                                                "找不到方法 {}.{}{}",
+                                                info.class, info.name, info.desc
+                                            ),
+                                            exc: None,
+                                        })
+                                    }
+                                }
+                            }
+                        };
                         self.depth += 1;
                         let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &all, true), op_pc);
                         self.depth -= 1;
@@ -796,12 +802,32 @@ impl Vm {
                         args.push(frame.pop()?);
                     }
                     args.reverse();
-                    let target = self
-                        .store
-                        .resolve_method(&info.class, &info.name, &info.desc)
-                        .ok_or_else(|| VmError { msg: format!("找不到方法 {}{}", info.name, info.desc), exc: None })?;
-                    self.depth += 1;
                     let op_pc = pc - 3;
+                    let target = self.store.resolve_method(&info.class, &info.name, &info.desc);
+                    let Some(target) = target else {
+                        // 内建静态方法（`Integer.parseInt` / `System.arraycopy` …）
+                        let Some(v) = self.builtin_static(&info.class, &info.name, &info.desc, &args) else {
+                            return Err(VmError {
+                                msg: format!("找不到方法 {}{}", info.name, info.desc),
+                                exc: None,
+                            });
+                        };
+                        match call_or_handle!(v, op_pc) {
+                            CallOutcome::Value(v) => {
+                                if !info.desc.ends_with(")V") {
+                                    frame.push(v);
+                                }
+                            }
+                            CallOutcome::Handler(t, h) => {
+                                pc = t;
+                                frame.stack.clear();
+                                frame.push(Slot::I(h));
+                                continue;
+                            }
+                        }
+                        continue;
+                    };
+                    self.depth += 1;
                     let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &args, false), op_pc);
                     self.depth -= 1;
                     match r {

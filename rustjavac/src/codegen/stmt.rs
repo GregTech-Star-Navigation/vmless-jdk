@@ -746,7 +746,7 @@ fn compile_for_each(
     }
     // 迭代器协议：`iterator()` 的返回类型从接收者的类元数据里查
     let it_name = format!("$fe{seq}it");
-    let Some(iter_desc) = call_desc(Some(iter), "iterator", ctx) else {
+    let Some(iter_desc) = call_desc(Some(iter), "iterator", &[], ctx) else {
         return err(format!(
             "for-each 的被迭代表达式不是数组，也找不到 `iterator()` 方法（元素类型 `{ty:?}`）"
         ));

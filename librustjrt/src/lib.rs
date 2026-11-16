@@ -3,16 +3,20 @@
 //! # 新架构（`ManagedHeap`）
 //!
 //! ```text
-//! object.rs   对象头（8 字节：class_id + flags，字段数在 flags 高 16 位）+ 4 字节槽
-//! layout.rs   类布局表：class_id → 字段位图 / 大小 / 引用位
-//! alloc.rs    Region（可 realloc 的连续堆）+ TLAB bump + 按大小空闲表
-//! heap.rs     空间划分、分配入口、写屏障接线、增长收缩、策略、extern "C" 入口
-//! young.rs    年轻代复制式回收（eden + survivor → to-space，超龄晋升）
-//! old.rs      老年代标记-清扫 + 可选压缩
-//! cards.rs    卡表 + 对象起点图（脏卡 → 对象）
-//! barrier.rs  写屏障（incremental-update / satb）
-//! roots.rs    RootScope（RAII）+ handle + 影子栈
-//! stats.rs    每次 GC 的耗时 / 回收量 / 晋升量 / 各代占用
+//! object.rs      对象头（8 字节：class_id + flags，字段数在 flags 高 16 位）+ 4 字节槽
+//! layout.rs      类布局表：class_id → 字段位图 / 大小 / 引用位
+//! alloc.rs       Region（可 realloc 的连续堆）+ TLAB bump + 按大小空闲表
+//! heap.rs        空间划分、分配入口、写屏障接线、增长收缩、策略、extern "C" 入口
+//! young.rs       年轻代复制式回收（eden + survivor → to-space，超龄晋升）
+//! old.rs         老年代标记-清扫 + 滑动压缩（返回重映射表）
+//! cards.rs       卡表 + 对象起点图（脏卡 → 对象）
+//! barrier.rs     写屏障（incremental-update / satb）
+//! roots.rs       RootScope（RAII）+ handle + 影子栈
+//! stats.rs       每次 GC 的耗时 / 回收量 / 晋升量 / 各代占用
+//! handles.rs     稳定句柄表：StableHandle → 槽位 → 偏移（压缩安全）
+//! incremental.rs 增量标记状态机 + step(budget)
+//! weak.rs        弱引用表 + finalization 队列
+//! concurrent.rs  SharedHeap：多线程共享堆（每线程 TLAB + 原子取块）
 //! ```
 //!
 //! ```no_run
@@ -39,12 +43,16 @@
 pub mod alloc;
 pub mod barrier;
 pub mod cards;
+pub mod concurrent;
+pub mod handles;
 pub mod heap;
+pub mod incremental;
 pub mod layout;
 pub mod object;
 pub mod old;
 pub mod roots;
 pub mod stats;
+pub mod weak;
 pub mod young;
 
 mod compat;
@@ -52,17 +60,27 @@ pub mod gen;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod tests_prod;
 
 // ---- 新架构 ----
 pub use barrier::BarrierKind;
 pub use cards::{CardTable, StartMap, CARD_BYTES, CARD_SHIFT};
+pub use concurrent::{SharedHeap, ThreadLocalTlab};
+pub use handles::{HandleTable, StableHandle};
 pub use heap::{Heap as ManagedHeap, HeapConfig, Spaces};
 pub use layout::{ClassLayout, LayoutTable, SlotKind};
 pub use object::{Object, HEADER as OBJECT_HEADER, NULL};
 pub use old::{MajorReport, OldSpace};
 pub use roots::{Handle, RootScope};
 pub use stats::{GcKind, GcRecord, Stats};
+pub use weak::{FinalizerQueue, WeakRef, WeakTable};
 pub use young::MinorReport;
+
+// 注意：`GcPhase` 在根上是**兼容层的旧枚举**（`compat::GcPhase`，冻结）。
+// 增量标记的新状态机是 `librustjrt::incremental::GcPhase`，两者语义不同，
+// 所以新枚举只在本模块路径下导出，不抢根上的名字。
+pub use incremental::{GcPhase as MarkPhase, Marker, StepReport};
 
 // ---- 兼容层（旧 API，冻结）----
 pub use compat::{

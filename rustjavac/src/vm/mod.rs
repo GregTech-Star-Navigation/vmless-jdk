@@ -65,6 +65,8 @@ pub struct Vm {
     sb_bufs: std::collections::HashMap<i32, String>,
     /// (类下标, 常量池索引) → 字符串句柄（同一常量必须拿到同一句柄，否则引用相等会错）
     string_handles: HashMap<(usize, u16), i32>,
+    /// 包装类的小整数缓存：`Integer#5` → 对象句柄（Java 的 valueOf 也缓存 -128..127）
+    wrapper_cache: HashMap<String, i32>,
     /// 异常对象句柄 → 构造函数里那个 message 的字符串句柄。
     /// `new RuntimeException("boom")` 的构造器在 java.* 里（我们没有它的字节码），
     /// 所以构造时只把消息记下来，抛出来时再拼。
@@ -93,6 +95,7 @@ impl Vm {
             strings: Vec::new(),
             sb_bufs: HashMap::new(),
             string_handles: HashMap::new(),
+            wrapper_cache: HashMap::new(),
             exc_msgs: HashMap::new(),
             statics: HashMap::new(),
             initialized: std::collections::HashSet::new(),
@@ -269,6 +272,90 @@ mod tests {
         "#,
         );
         assert_eq!(out, vec!["4999950000", "1.9", "1.0E7", "-0.0"]);
+    }
+
+    #[test]
+    fn boxes_and_unboxes_implicitly() {
+        // 自动装箱（`Integer i = 5`）、拆箱（`int n = i`）、以及包装类参与算术
+        let out = compile_and_run(
+            r#"
+            class B1 {
+                static int twice(Integer n) { return n * 2; }
+                public static void main(String[] args) {
+                    Integer i = 5;
+                    int n = i;
+                    System.out.println(n + 1);
+                    System.out.println(i + 3);
+                    System.out.println(twice(21));
+                    Object o = 7;
+                    System.out.println(o);
+                    int back = (Integer) o;
+                    System.out.println(back * 2);
+                }
+            }
+        "#,
+        );
+        assert_eq!(out, vec!["6", "8", "42", "7", "14"]);
+    }
+
+    #[test]
+    fn builtin_string_methods() {
+        let out = compile_and_run(
+            r#"
+            class S1 {
+                public static void main(String[] args) {
+                    String s = "Hello";
+                    System.out.println(s.length());
+                    System.out.println(s.substring(1, 3));
+                    System.out.println(s.toUpperCase());
+                    System.out.println(s.indexOf("l"));
+                    System.out.println("a,b".split(",")[1]);
+                    System.out.println(s.charAt(1));
+                }
+            }
+        "#,
+        );
+        assert_eq!(out, vec!["5", "el", "HELLO", "2", "b", "e"]);
+    }
+
+    #[test]
+    fn object_protocol_defaults() {
+        // 没覆写时：hashCode 按对象标识（同对象稳定、不同对象不同），toString 是 `Klass@hash`
+        let out = compile_and_run(
+            r#"
+            class O1 {
+                int x;
+                O1(int x) { this.x = x; }
+                public static void main(String[] args) {
+                    O1 a = new O1(1);
+                    O1 b = new O1(2);
+                    System.out.println(a.hashCode() == a.hashCode());
+                    System.out.println(a.hashCode() != b.hashCode());
+                    System.out.println(a.equals(a));
+                    System.out.println(a.toString().startsWith("O1@"));
+                }
+            }
+        "#,
+        );
+        assert_eq!(out, vec!["true", "true", "true", "true"]);
+    }
+
+    #[test]
+    fn not_equal_operator_is_not_swallowed() {
+        // `!=` 曾经被词法器当成了 `==`（两个都是一样的输出时才不会被发现）
+        let out = compile_and_run(
+            r#"
+            class N1 {
+                public static void main(String[] args) {
+                    int x = 1;
+                    int y = 2;
+                    System.out.println(x != y);
+                    System.out.println(x == y);
+                }
+            }
+        "#,
+        );
+        assert_eq!(out, vec!["true", "false"]);
     }
 
     #[test]

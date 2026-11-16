@@ -218,7 +218,7 @@ impl Lexer {
             '/' => two!('=', Tok::Slash, Tok::SlashAssign),
             '%' => two!('=', Tok::Percent, Tok::PercentAssign),
             '^' => two!('=', Tok::Caret, Tok::CaretAssign),
-            '!' => two!('=', Tok::Bang, Tok::EqEq),
+            '!' => two!('=', Tok::Bang, Tok::Ne),
             '=' => two!('=', Tok::Assign, Tok::EqEq),
             '&' => {
                 if next == Some('&') {

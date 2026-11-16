@@ -495,3 +495,31 @@ ALLOC_NS=188.4  GC_COUNT=6  LIVE_AFTER=4026528  HEAP_MB=3.84
 
 **已知边界**：装箱/拆箱未做（`int n = box.get()` 会 VerifyError）、`new T[n]` 不支持、
 有界类型参数的类（`Number`）运行时没有内建、多重 catch 变量静态类型统一 `Throwable`。
+
+## 0.43.0 — 2026-11-17 · 装箱拆箱、JDK 内建、内存层生产级化
+
+### 装箱 / 拆箱 + JDK 内建（rustjavac）
+- **新增 `src/jdk.rs`**：String / 5 个包装类 / Object / System / Arrays 的方法与字段表，
+  编译器与两个运行时**共用同一张表**（op 号 = 下标）
+- **自动装箱拆箱**：`coerce_to` 扩成「数值拓宽 + 擦除后 checkcast + 自动装箱/拆箱」，
+  `int n = box.get()`（Object→int）编成 `checkcast Integer` + `intValue`（原来是 `istore` 一个引用 → VerifyError）
+- **String 15 个方法**（length/charAt/substring/indexOf/contains/startsWith/toUpperCase/trim/replace/
+  split/compareTo/isEmpty/concat/hashCode…）、包装类 `valueOf/xxxValue/parseXxx/MAX_VALUE`、
+  `Object` 的 `hashCode/equals/toString`、`Arrays.toString/sort`、`System.arraycopy/currentTimeMillis`
+- Integer 小整数缓存（-128..127）与 Boolean 单例照 Java 语义实现
+
+### 内存层生产级化（librustjrt 0.2.0）
+- **压缩式老年代**：mark-compact 滑动压缩 + 重映射表；新增 `HandleTable`（压缩安全句柄）
+- **增量标记**：`GcPhase` 状态机 + `step(budget)`，SATB + 增量更新双屏障
+- **并发分配**：`SharedHeap` + `ThreadLocalTlab`（CAS 取块，块内纯 bump）
+- **弱引用 / finalization 队列**
+- 压力测试 200 轮随机图（随机增删点/边 + 6 种 GC 轮转），逐对象校验
+- 修两个真 bug：压缩漏改写年轻对象里的老年代引用（悬垂）、不压缩的 major 之后句柄不失效
+
+### 修掉的既有 bug（重要）
+- **`!=` 一直被词法器当成 `==`**（`lexer/mod.rs:221` 发的是 `Tok::EqEq`）。三路跑同一份字节码所以一直"绿"，
+  但语义一直是错的 —— 这条影响所有既有代码
+- `CharLit` 完全不支持；`println(char)` 按 `(I)V` 打码点
+
+**验证**：`rustjavac` 94 个样例三路一致、单测 42；`librustjrt` 单测 51 + doc-test 2。
+**基准**：压缩后碎片率 0.500→0.000、跨度 15.3MB→7.6MB；增量最大单步 **0.683 ms**（全停顿 26.9 ms，≈39×）。

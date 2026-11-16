@@ -121,6 +121,7 @@ pub(crate) fn minor(env: &mut GcEnv) -> MinorReport {
 ///
 /// 三种情况原样返回：老对象、**已经在 to-space 里的对象**（否则会重复复制）、
 /// 已经带转发指针的对象（返回转发地址）。
+#[inline]
 fn fix(env: &mut GcEnv, off: u32) -> u32 {
     if off == 0 {
         return 0;
@@ -193,6 +194,7 @@ fn push_old(env: &mut GcEnv, off: u32) {
 ///
 /// 老对象扫完就地清 MARK，并且**如果它还指向年轻代就把卡标脏** ——
 /// 这代替了「GC 完再全扫一遍幸存老对象」的后处理。
+#[inline]
 fn scan_slots(env: &mut GcEnv, off: u32) {
     let base = env.base;
     let layout = env.layout;

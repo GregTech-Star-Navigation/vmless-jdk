@@ -52,7 +52,7 @@ thread_local! {
 /// 堆基址。生成代码按固定地址读它（`base_addr()` 把地址当立即数嵌进机器码）。
 static BASE: AtomicUsize = AtomicUsize::new(0);
 
-fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
+pub fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
     HEAP.with(|c| {
         let mut g = c.borrow_mut();
         if g.is_none() {
@@ -541,6 +541,10 @@ pub extern "C" fn println_bool(v: i32) {
     println!("{}", if v != 0 { "true" } else { "false" });
 }
 
+/// 打印一个 char（对应 `System.out.println(char)`）：按字符而不是码点
+pub extern "C" fn println_char(v: i32) {
+    println!("{}", char::from_u32(v as u32).unwrap_or('?')); }
+
 /// 打印一个 long（对应 System.out.println(long)）
 pub extern "C" fn println_long(v: i64) {
     println!("{v}");
@@ -959,25 +963,18 @@ pub extern "C" fn sb_append_double(obj: i64, v: f64) {
     sb_push(obj, crate::java_double_to_string(v).as_bytes());
 }
 
-/// 引用实参：null → "null"，String → 内容，其它对象 → 类名
-/// （真正的 Java 会打 `Klass@hash`，我们没有 hashCode，这里给类型名）
+/// `append(char)`：按 UTF-8 字节接上（char 码点不是十进制数字）
+pub extern "C" fn sb_append_char(obj: i64, v: i32) {
+    let mut buf = [0u8; 4];
+    let c = char::from_u32(v as u32).unwrap_or('?');
+    sb_push(obj, c.encode_utf8(&mut buf).as_bytes());
+}
+
+/// 引用实参：null → "null"，String → 内容，包装类 → 值的文本，
+/// 其它对象 → `Klass@hash`（与 `String.valueOf(Object)` 一致）
 pub extern "C" fn sb_append_obj(obj: i64, v: i64) {
-    if v == 0 {
-        sb_push(obj, b"null");
-        return;
-    }
-    let tag = class_tag_at(v);
-    if tag == 1 {
-        // tag 1 = java/lang/String（`class_name_of` 给的是带点的名字，别拿它比）
-        let p = base_ptr().wrapping_add(v as usize);
-        let len = unsafe { std::ptr::read_unaligned(p.add(HEADER) as *const u32) } as usize;
-        let bytes = unsafe { std::slice::from_raw_parts(p.add(ARRAY_HEADER), len) };
-        let owned = bytes.to_vec();
-        sb_push(obj, &owned);
-    } else {
-        let text = class_internal_of(tag);
-        sb_push(obj, text.replace('/', ".").as_bytes());
-    }
+    let text = super::natives::obj_to_string(v);
+    sb_push(obj, text.as_bytes());
 }
 
 /// `toString()`：缓冲 → 堆上的 String 对象（1 字节元素、不追踪引用）

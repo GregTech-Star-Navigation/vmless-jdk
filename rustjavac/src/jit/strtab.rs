@@ -55,21 +55,9 @@ pub extern "C" fn desc_ptr(idx: u32) -> i64 {
 /// 运行时辅助：打印一个字符串引用；
 /// 不是字符串就打类型名，避免把对象的字段当成字符串读
 pub extern "C" fn println_str(s: i64) {
-    if s == 0 {
-        println!("null"); // Java 打 println((String) null) 也是 "null"
-        return;
-    }
-    unsafe {
-        let p = rt::base_ptr().wrapping_add(s as usize);
-        let class_id = std::ptr::read_unaligned(p as *const u32);
-        if class_id != rt::string_class_id() {
-            println!("{}", rt::class_name_of(rt::tag_of_class(class_id)));
-            return;
-        }
-        let len = std::ptr::read_unaligned(p.add(8) as *const u32) as usize;
-        let bytes = std::slice::from_raw_parts(p.add(16), len);
-        println!("{}", String::from_utf8_lossy(bytes));
-    }
+    // 引用 → 文本：null → "null"，String → 内容，包装类 → 值的文本，
+    // 其余 → `Klass@hash`（`println(Object)` 的语义）
+    println!("{}", super::natives::obj_to_string(s));
 }
 
 /// 运行时辅助：两个字符串引用按**内容**比较（`String.equals(Object)`）。

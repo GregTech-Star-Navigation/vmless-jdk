@@ -10,6 +10,10 @@ use super::VmError;
 /// java.* 异常类的继承链（我们没有它们的字节码，这些层级只能写死）
 pub(crate) fn builtin_super(class: &str) -> Option<&'static str> {
     match class {
+        // 包装类：`Integer extends Number`（instanceof Number / Object 要靠它）
+        "java/lang/Integer" | "java/lang/Long" | "java/lang/Double" => Some("java/lang/Number"),
+        "java/lang/Number" => Some("java/lang/Object"),
+        "java/lang/Boolean" | "java/lang/Character" => Some("java/lang/Object"),
         "java/lang/RuntimeException" => Some("java/lang/Exception"),
         "java/lang/Exception" => Some("java/lang/Throwable"),
         "java/lang/Error" => Some("java/lang/Throwable"),

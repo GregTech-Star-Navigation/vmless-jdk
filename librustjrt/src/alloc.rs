@@ -198,6 +198,16 @@ impl FreeList {
         self.buckets.iter().map(|(s, _)| *s)
     }
 
+    /// 能装下的最大空闲块字节数（0 = 一个空洞都没有）
+    pub fn largest(&self) -> u32 {
+        self.buckets
+            .iter()
+            .filter(|(_, v)| !v.is_empty())
+            .map(|(s, _)| *s)
+            .max()
+            .unwrap_or(0)
+    }
+
     pub fn clear(&mut self) {
         self.buckets.clear();
         self.bytes = 0;

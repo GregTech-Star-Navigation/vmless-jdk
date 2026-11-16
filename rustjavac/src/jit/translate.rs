@@ -108,6 +108,12 @@ impl Jit {
             .module
             .declare_function("vmless_println_int", Linkage::Import, &sig_pi)
             .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_pc = self.module.make_signature();
+        sig_pc.params.push(AbiParam::new(types::I32));
+        let println_char_id = self
+            .module
+            .declare_function("vmless_println_char", Linkage::Import, &sig_pc)
+            .map_err(|e| JitError(e.to_string()))?;
         let println_bool_id = self
             .module
             .declare_function("vmless_println_bool", Linkage::Import, &sig_pi)
@@ -215,12 +221,51 @@ impl Jit {
             mk_sb_app("vmless_sb_append_obj", types::I64).map_err(|e| JitError(e.to_string()))?;
         let sb_app_dbl_id =
             mk_sb_app("vmless_sb_append_double", types::F64).map_err(|e| JitError(e.to_string()))?;
+        let sb_app_char_id =
+            mk_sb_app("vmless_sb_append_char", types::I32).map_err(|e| JitError(e.to_string()))?;
         let mut sig_sb_str = self.module.make_signature();
         sig_sb_str.params.push(AbiParam::new(types::I64));
         sig_sb_str.returns.push(AbiParam::new(types::I64));
         let sb_to_str_id = self
             .module
             .declare_function("vmless_sb_to_string", Linkage::Import, &sig_sb_str)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        // 内建 JDK 类：三个通用入口（参数一律 i64，double 由调用点 bitcast）
+        let mut sig_bv = self.module.make_signature();
+        sig_bv.params.push(AbiParam::new(types::I64)); // recv
+        sig_bv.params.push(AbiParam::new(types::I32)); // op
+        sig_bv.params.push(AbiParam::new(types::I64)); // a
+        sig_bv.params.push(AbiParam::new(types::I64)); // b
+        sig_bv.returns.push(AbiParam::new(types::I64));
+        let builtin_vcall_id = self
+            .module
+            .declare_function("vmless_builtin_vcall", Linkage::Import, &sig_bv)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_bs = self.module.make_signature();
+        sig_bs.params.push(AbiParam::new(types::I32)); // op
+        sig_bs.params.push(AbiParam::new(types::I64)); // a
+        sig_bs.params.push(AbiParam::new(types::I64)); // b
+        sig_bs.returns.push(AbiParam::new(types::I64));
+        let builtin_static_id = self
+            .module
+            .declare_function("vmless_builtin_static", Linkage::Import, &sig_bs)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_bsf = self.module.make_signature();
+        sig_bsf.params.push(AbiParam::new(types::I32));
+        sig_bsf.returns.push(AbiParam::new(types::I64));
+        let builtin_sfield_id = self
+            .module
+            .declare_function("vmless_builtin_sfield", Linkage::Import, &sig_bsf)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_ac = self.module.make_signature();
+        for _ in 0..5 {
+            sig_ac.params.push(AbiParam::new(types::I64));
+        }
+        sig_ac.returns.push(AbiParam::new(types::I64));
+        let arraycopy_id = self
+            .module
+            .declare_function("vmless_arraycopy", Linkage::Import, &sig_ac)
             .map_err(|e| JitError(e.to_string()))?;
 
 
@@ -708,6 +753,55 @@ impl Jit {
                 0xb8 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
+                    let (bcls, bname, bdesc) = method_ref_of(&cf, idx)?;
+                    if let Some(op) = crate::jdk::sop(&bcls, &bname, &bdesc) {
+                        // 内建静态方法（`Integer.parseInt` / `System.arraycopy` …）
+                        let params = param_descs(&bdesc);
+                        let mut args = Vec::new();
+                        for _ in 0..params.len() {
+                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                        }
+                        args.reverse();
+                        let op_pc = pc - 3;
+                        let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                        spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                        if has_refs {
+                            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                        }
+                        let raw = if bcls == "java/lang/System" && bname == "arraycopy" {
+                            // 五参数：单独一个入口
+                            let mut vs = Vec::new();
+                            for (i, v) in args.iter().enumerate() {
+                                vs.push(abi_arg(&mut fb, *v, &params[i]));
+                            }
+                            let fref = self.module.declare_func_in_func(arraycopy_id, fb.func);
+                            let c = fb.ins().call(fref, &vs);
+                            fb.inst_results(c)[0]
+                        } else {
+                            let a64 = match args.first() {
+                                Some(v) => abi_arg(&mut fb, *v, &params[0]),
+                                None => fb.ins().iconst(types::I64, 0),
+                            };
+                            let b64 = match args.get(1) {
+                                Some(v) => abi_arg(&mut fb, *v, &params[1]),
+                                None => fb.ins().iconst(types::I64, 0),
+                            };
+                            let oi = fb.ins().iconst(types::I32, op as i64);
+                            let fref =
+                                self.module.declare_func_in_func(builtin_static_id, fb.func);
+                            let c = fb.ins().call(fref, &[oi, a64, b64]);
+                            fb.inst_results(c)[0]
+                        };
+                        if has_refs {
+                            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                        }
+                        reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                        let ret = bdesc.rsplit(')').next().unwrap_or("V").to_string();
+                        if ret != "V" {
+                            let v = abi_result(&mut fb, raw, &ret);
+                            stack.push(v);
+                        }
+                    } else {
                     let (fid, callee_max_locals, argc) = *call_targets
                         .get(&idx)
                         .ok_or_else(|| JitError("调用目标未编译".into()))?;
@@ -784,6 +878,7 @@ impl Jit {
                             root_slots,
                         )?;
                         fb.switch_to_block(cont);
+                    }
                     }
                 }
                 // 引用类型局部变量（8 字节槽）
@@ -1044,6 +1139,17 @@ impl Jit {
                     if owner == "java/lang/System" && fname == "out" {
                         let z = fb.ins().iconst(types::I64, 0);
                         stack.push(z);
+                    } else if let Some(op) = crate::jdk::FIELDS
+                        .iter()
+                        .position(|(c, f, _)| *c == owner && *f == fname)
+                    {
+                        // 内建常量：`Integer.MAX_VALUE` / `Boolean.TRUE`（没有 .class）
+                        let oi = fb.ins().iconst(types::I32, op as i64);
+                        let fref = self.module.declare_func_in_func(builtin_sfield_id, fb.func);
+                        let c = fb.ins().call(fref, &[oi]);
+                        let raw = fb.inst_results(c)[0];
+                        let v = abi_result(&mut fb, raw, &fdesc);
+                        stack.push(v);
                     } else {
                         self.emit_clinit_call(&mut fb, &owner)?;
                         let slot = rt::static_slot(&owner, &fname, is_ref_desc(&fdesc));
@@ -1111,6 +1217,7 @@ impl Jit {
                             "(J)V" => (println_long_id, types::I64),
                             "(D)V" | "(F)V" => (println_double_id, types::F64),
                             "(Z)V" => (println_bool_id, types::I32),
+                            "(C)V" => (println_char_id, types::I32),
                             "(Ljava/lang/String;)V" | "(Ljava/lang/Object;)V" => {
                                 (println_obj_id, types::I64)
                             }
@@ -1150,6 +1257,8 @@ impl Jit {
                             };
                             let fid = if desc.starts_with("(D)") {
                                 sb_app_dbl_id
+                            } else if desc.starts_with("(C)") {
+                                sb_app_char_id
                             } else if desc.starts_with("(J)") {
                                 sb_app_long_id
                             } else if desc.starts_with("(L") {
@@ -1180,6 +1289,43 @@ impl Jit {
                         let call = fb.ins().call(fref, &[a, b]);
                         let res = fb.inst_results(call)[0];
                         stack.push(res);
+                    } else if let Some(op) = self.builtin_vop(&cls, &name, &desc) {
+                        // 内建 JDK 类：统一走 `vmless_builtin_vcall(recv, op, a, b)`
+                        let params = param_descs(&desc);
+                        let mut args = Vec::new();
+                        for _ in 0..params.len() {
+                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                        }
+                        args.reverse();
+                        let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                        let op_pc = pc - if op == 0xb9 { 5 } else { 3 };
+                        let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                        spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                        if has_refs {
+                            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                        }
+                        let recv64 = convert_to(&mut fb, recv, types::I64);
+                        let a64 = match args.first() {
+                            Some(v) => abi_arg(&mut fb, *v, &params[0]),
+                            None => fb.ins().iconst(types::I64, 0),
+                        };
+                        let b64 = match args.get(1) {
+                            Some(v) => abi_arg(&mut fb, *v, &params[1]),
+                            None => fb.ins().iconst(types::I64, 0),
+                        };
+                        let oi = fb.ins().iconst(types::I32, op as i64);
+                        let fref = self.module.declare_func_in_func(builtin_vcall_id, fb.func);
+                        let c = fb.ins().call(fref, &[recv64, oi, a64, b64]);
+                        let raw = fb.inst_results(c)[0];
+                        if has_refs {
+                            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                        }
+                        reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                        let ret = desc.rsplit(')').next().unwrap_or("V").to_string();
+                        if ret != "V" {
+                            let v = abi_result(&mut fb, raw, &ret);
+                            stack.push(v);
+                        }
                     } else {
                         // 虚方法：按**运行时类**分派。编译期把所有可能是接收者的类
                         // （静态类型 C 及其子类）的实现都编出来并登记进运行时表，
@@ -1654,6 +1800,23 @@ impl Jit {
         Ok(true)
     }
 
+    /// 这个调用是不是**内建 JDK 方法**（String / 包装类 / Object 协议）→ op 号。
+    ///
+    /// 只有「类里没有真实现」时才走内建：类自己覆写了 `hashCode` 就必须正常虚分派。
+    fn builtin_vop(&mut self, cls: &str, name: &str, desc: &str) -> Option<u32> {
+        if self.classes.resolve_method(cls, name, desc).is_some() {
+            return None;
+        }
+        if let Some(op) = crate::jdk::vop(cls, name, desc) {
+            return Some(op);
+        }
+        // 没覆写的 `toString`/`hashCode`/`equals`：继承自 Object（我们没有它的 .class）
+        if crate::jdk::object_protocol(name, argc_of(desc) as usize).as_deref() == Some(desc) {
+            return crate::jdk::vop("java/lang/Object", name, desc);
+        }
+        None
+    }
+
     /// 在当前位置插一次 `vmless_clinit(tag)`（只在类真有 `<clinit>` 时）
     fn emit_clinit_call(
         &mut self,
@@ -1714,6 +1877,23 @@ impl Jit {
             }
         }
         Ok(ml_max)
+    }
+}
+
+/// 内建 ABI 的实参：统一转成 i64（double/float 走位模式）
+fn abi_arg(fb: &mut FunctionBuilder, v: Value, desc: &str) -> Value {
+    match desc.as_bytes().first().copied() {
+        Some(b'D') | Some(b'F') => fb.ins().bitcast(types::I64, MemFlags::new(), v),
+        _ => convert_to(fb, v, types::I64),
+    }
+}
+
+/// 内建 ABI 的返回值：i64 → 描述符要求的机器类型（double 走位模式还原）
+fn abi_result(fb: &mut FunctionBuilder, raw: Value, ret: &str) -> Value {
+    match ret.as_bytes().first().copied() {
+        Some(b'D') | Some(b'F') => fb.ins().bitcast(types::F64, MemFlags::new(), raw),
+        Some(b'J') | Some(b'L') | Some(b'[') => raw,
+        _ => convert_to(fb, raw, types::I32),
     }
 }
 

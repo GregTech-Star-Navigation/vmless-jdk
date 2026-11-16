@@ -18,6 +18,7 @@ mod classes;
 mod exc;
 mod insn;
 mod layout;
+mod natives;
 mod refmap;
 pub mod rt;
 pub mod strtab;
@@ -68,6 +69,7 @@ impl Jit {
         builder.symbol("vmless_clinit", rt::clinit as *const u8);
         builder.symbol("vmless_println_int", rt::println_int as *const u8);
         builder.symbol("vmless_println_bool", rt::println_bool as *const u8);
+        builder.symbol("vmless_println_char", rt::println_char as *const u8);
         builder.symbol("vmless_println_long", rt::println_long as *const u8);
         builder.symbol("vmless_println_double", rt::println_double as *const u8);
         builder.symbol("vmless_instanceof", rt::instanceof as *const u8);
@@ -92,6 +94,15 @@ impl Jit {
         builder.symbol("vmless_sb_append_double", rt::sb_append_double as *const u8);
         builder.symbol("vmless_sb_append_obj", rt::sb_append_obj as *const u8);
         builder.symbol("vmless_sb_to_string", rt::sb_to_string as *const u8);
+        builder.symbol("vmless_sb_append_char", rt::sb_append_char as *const u8);
+        // 内建 JDK 类：包装类 / String / Object 协议 / System / Arrays
+        builder.symbol("vmless_builtin_vcall", natives::builtin_vcall as *const u8);
+        builder.symbol("vmless_builtin_static", natives::builtin_static as *const u8);
+        builder.symbol("vmless_builtin_sfield", natives::builtin_sfield as *const u8);
+        builder.symbol("vmless_arraycopy", natives::arraycopy as *const u8);
+        // 包装类的小整数缓存/布尔单例要在这里建好并登记成永久根：
+        // 生成代码每帧都会 push/pop 影子栈，运行期再塞常驻根会截掉帧的根区间
+        natives::init_builtin_roots();
         let module = JITModule::new(builder);
         Jit {
             module,

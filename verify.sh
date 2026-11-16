@@ -2,10 +2,24 @@
 # vmless 三路一致性验收：HotSpot / 解释器 / JIT 输出必须逐字节相等（含退出码）
 # 用法：./verify.sh [bin目录]     默认 /d/vmless/bv6
 set -u
-BIN="${1:-/d/vmless/bv6}"
+BIN="${1:-/d/vmless/bin_l7v}"
 JAVA="C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe"
 SRC="D:/vmless/src"
-OUT="D:/vmless/.verify-out.112723"
+
+# 本机有个带外文件监视器会长期持有「被执行过的 exe」句柄（之后 rm/cp/执行全报
+# "Device or resource busy"）。对策：每轮把三件套复制进带 PID+时间的新目录再跑。
+RUNBIN="/d/vmless/.runbin-$$-$(date +%H%M%S)"
+mkdir -p "$RUNBIN"
+for e in rustjava compile_src run_jit; do
+    cp "$BIN/$e.exe" "$RUNBIN/" 2>/dev/null || cp "$BIN/examples/$e.exe" "$RUNBIN/" 2>/dev/null
+done
+if [ ! -x "$RUNBIN/compile_src.exe" ] || [ ! -x "$RUNBIN/rustjava.exe" ] || [ ! -x "$RUNBIN/run_jit.exe" ]; then
+    echo "三件套不齐：$BIN 下缺 exe（rustjava / compile_src / run_jit）" >&2
+    exit 2
+fi
+BIN="$RUNBIN"
+
+OUT="D:/vmless/.verify-out.$$"
 rm -rf "$OUT" 2>/dev/null; mkdir -p "$OUT"
 
 ALL="InhBasic InhOverride InhChain InhSuperCall InhImplicitSuper InhInstanceof InhWide
@@ -15,7 +29,8 @@ ForEach1 ForEach2 ForEach3 Ternary1 Ternary2 Label1 Label2 Nest1 Nest2 Nest3 Con
 Lg Db Point Loop Sw Obj2 ObjArr Arr Demo Perf2 LongEdge Doubles Mix DblCorpus Ret
 RefArr ObjRef ArrType RefFld RefCmp NullChk WideFld WideArr BitOps PrintObj PrintObj2
 TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2 TryUncaught
-Gen1 Gen2 Gen3 Gen4 Gen5 Vararg1 Vararg2 Vararg3 Vararg4 DoWhile1 SwitchStr1 MultiCatch1 Twr1"
+Gen1 Gen2 Gen3 Gen4 Gen5 Vararg1 Vararg2 Vararg3 Vararg4 DoWhile1 SwitchStr1 MultiCatch1 Twr1
+Box1 Box2 Box3 Str1 Str2 Obj3 Arr2"
 
 # 跑一遍三方，回填全局 jo/io/to/je/ie/te
 run_three() {
