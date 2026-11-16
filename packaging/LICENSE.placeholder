@@ -1,0 +1,10 @@
+许可证尚未指定。
+
+这个文件是打包流程的占位符：分发包里必须有 LICENSE，但本项目还没定许可证。
+
+需要项目所有者决定的事：
+  * rustjavac / librustjrt（本仓库原创的 Rust 代码）用什么许可；
+  * patches/ 下的文件源自 OpenJDK，沿用 GPLv2 + Classpath Exception（见 README 的「许可」一节），
+    这部分不受上面那条影响。
+
+定了之后把文件名改回 LICENSE、删掉这段说明即可；packaging/build.ps1 会优先用仓库根的 LICENSE。

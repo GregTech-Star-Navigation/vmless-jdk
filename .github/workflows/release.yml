@@ -1,0 +1,136 @@
+name: Release
+
+# 触发：推一个 v* 标签（如 v0.42.0），或手动触发并指定版本。
+# 干的事：跑测试与样例验收 → 打三种安装包 → 传成 GitHub Release 的附件。
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      version:
+        description: '版本号（不带 v；留空则用 rustjavac/Cargo.toml 里的）'
+        type: string
+        required: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  release:
+    name: 打安装包并发布
+    runs-on: windows-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: 取出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rustjavac/target
+            librustjrt/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 安装 NSIS
+        run: choco install nsis -y --no-progress
+
+      # 版本口径：标签 v1.2.3 → 1.2.3；手动触发 → 输入值；都没有 → Cargo.toml
+      - name: 确定版本号
+        id: ver
+        shell: pwsh
+        run: |
+          $toml = Get-Content rustjavac/Cargo.toml -Raw
+          $cargo = [regex]::Match($toml, '(?m)^\s*version\s*=\s*"([^"]+)"').Groups[1].Value
+          $ver = ''
+          if ($env:GITHUB_REF_TYPE -eq 'tag' -and $env:GITHUB_REF_NAME) {
+            $ver = $env:GITHUB_REF_NAME -replace '^v', ''
+          } elseif ('${{ inputs.version }}') {
+            $ver = '${{ inputs.version }}' -replace '^v', ''
+          } else {
+            $ver = $cargo
+          }
+          "version=$ver"     >> $env:GITHUB_OUTPUT
+          "cargo=$cargo"     >> $env:GITHUB_OUTPUT
+          Write-Host "打包版本 = $ver（Cargo.toml = $cargo）"
+          if ($ver -ne $cargo) {
+            Write-Host "::warning::标签/输入版本 $ver 与 rustjavac/Cargo.toml 的 $cargo 不一致 —— 发布前请把 Cargo.toml 与 CHANGELOG 对齐"
+          }
+
+      - name: cargo test --release（librustjrt）
+        working-directory: librustjrt
+        run: cargo test --release
+
+      - name: cargo test --release（rustjavac）
+        working-directory: rustjavac
+        run: cargo test --release
+
+      # 发布前的最后一道闸：样例三路一致必须全过，否则不出包
+      - name: 安装 JDK 25（样例三方对照用）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: 样例验收（20 个代表样例）
+        shell: bash
+        run: bash scripts/verify-samples.sh
+
+      - name: 打三种产物
+        shell: pwsh
+        run: ./packaging/build.ps1 -Version '${{ steps.ver.outputs.version }}'
+
+      - name: 核对产物
+        shell: pwsh
+        run: |
+          Set-Location dist
+          Get-ChildItem | Format-Table Name, Length
+          foreach ($line in Get-Content SHA256SUMS) {
+            if (-not $line.Trim()) { continue }
+            $hash, $file = $line -split '\s+', 2
+            $actual = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $hash) { throw "sha256 不匹配: $file" }
+          }
+          foreach ($p in 'SHA256SUMS', 'release-notes.md') {
+            if (-not (Test-Path $p)) { throw "缺 $p" }
+          }
+          if (-not (Get-ChildItem -Filter 'vmless-*-win-x64.zip')) { throw '没生成 zip' }
+          if (-not (Get-ChildItem -Filter 'vmless-*-setup.exe')) { throw '没生成安装包' }
+
+      - name: 上传构建产物（workflow 里可直接下载）
+        uses: actions/upload-artifact@v4
+        with:
+          name: vmless-${{ steps.ver.outputs.version }}-win-x64
+          path: dist/
+          retention-days: 30
+
+      - name: 发布到 GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: vmless ${{ steps.ver.outputs.version }}
+          tag_name: ${{ github.ref_type == 'tag' && github.ref_name || format('v{0}', steps.ver.outputs.version) }}
+          body_path: dist/release-notes.md
+          files: |
+            dist/vmless-${{ steps.ver.outputs.version }}-win-x64.zip
+            dist/vmless-${{ steps.ver.outputs.version }}-setup.exe
+            dist/SHA256SUMS
+            dist/release-notes.md
+          fail_on_unmatched_files: true
+          draft: false
+          prerelease: false

@@ -1,0 +1,149 @@
+name: CI
+
+# 触发：push 到主干、所有 PR、以及手动触发（手动可选跑全量样例）。
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      all_samples:
+        description: '跑样例目录下全部样例（默认只跑 20 个代表样例）'
+        type: boolean
+        default: true
+
+# 同一个分支上连推多次，只留最后一次（前面的自动取消）
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  # cargo 输出别带进度条，日志好看
+  CARGO_INCREMENTAL: '0'
+
+jobs:
+  build-test-verify:
+    name: 构建 · 测试 · 样例验收
+    runs-on: windows-latest
+    timeout-minutes: 40
+
+    steps:
+      - name: 取出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      # 缓存 ~/.cargo 与两个 crate 的 target —— 冷启动约 6 分钟，热缓存 1 分钟以内
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rustjavac/target
+            librustjrt/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: cargo test --release（librustjrt）
+        working-directory: librustjrt
+        run: cargo test --release
+
+      - name: cargo test --release（rustjavac）
+        working-directory: rustjavac
+        run: cargo test --release
+
+      - name: cargo build --release
+        working-directory: rustjavac
+        run: |
+          cargo build --release --bin rustjava
+          cargo build --release --example compile_src --example run_jit
+
+      # 三方对照要 JDK 25：样例是按 25 生成的 class，低版本 JVM 会直接拒绝
+      - name: 安装 JDK 25（样例三方对照用）
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '25'
+
+      - name: 样例验收（20 个代表样例）
+        if: github.event_name != 'workflow_dispatch' || !inputs.all_samples
+        shell: bash
+        run: bash scripts/verify-samples.sh
+
+      - name: 样例验收（--all：样例目录全量）
+        if: github.event_name == 'workflow_dispatch' && inputs.all_samples
+        shell: bash
+        run: bash scripts/verify-samples.sh --all
+
+  # 打包只在 PR 上做一次 --skip-build 的冒烟：确认 packaging 脚本没被改坏
+  # （正式产物由 release.yml 出）。没装 NSIS 时脚本自己会跳过安装包，这里显式装一份。
+  packaging-smoke:
+    name: 打包冒烟（zip + 安装包）
+    runs-on: windows-latest
+    timeout-minutes: 30
+    needs: build-test-verify
+
+    steps:
+      - name: 取出代码
+        uses: actions/checkout@v4
+
+      - name: 安装 Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: 缓存 cargo 与 target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry/index
+            ~/.cargo/registry/cache
+            ~/.cargo/git/db
+            rustjavac/target
+            librustjrt/target
+          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock', '**/Cargo.toml') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-
+
+      - name: 安装 NSIS
+        run: choco install nsis -y --no-progress
+
+      # build.ps1 自己会在 Program Files (x86)\NSIS 下找 makensis，不用传路径
+      # （choco 刚装的目录不在当前进程的 PATH 里，靠 Find 更稳）
+      - name: 打包
+        shell: pwsh
+        run: ./packaging/build.ps1
+
+      - name: 校验产物
+        shell: pwsh
+        run: |
+          Set-Location dist
+          Get-ChildItem | Format-Table Name, Length
+          if (-not (Test-Path SHA256SUMS)) { throw '缺 SHA256SUMS' }
+          if (-not (Test-Path release-notes.md)) { throw '缺 release-notes.md' }
+          foreach ($line in Get-Content SHA256SUMS) {
+            if (-not $line.Trim()) { continue }
+            $hash, $file = $line -split '\s+', 2
+            $actual = (Get-FileHash -Path $file -Algorithm SHA256).Hash.ToLowerInvariant()
+            if ($actual -ne $hash) { throw "sha256 不匹配: $file" }
+          }
+          $zip = Get-ChildItem -Filter 'vmless-*-win-x64.zip' | Select-Object -First 1
+          if (-not $zip) { throw '没生成 zip' }
+          $setup = Get-ChildItem -Filter 'vmless-*-setup.exe' | Select-Object -First 1
+          if (-not $setup) { throw '没生成安装包' }
+          Expand-Archive -Path $zip.FullName -DestinationPath extracted -Force
+          foreach ($f in 'bin/rustjava.exe', 'bin/compile_src.exe', 'bin/run_jit.exe', 'README.txt', 'LICENSE') {
+            if (-not (Test-Path (Join-Path 'extracted' $f))) { throw "zip 里缺 $f" }
+          }
+          Write-Host '打包冒烟通过'
+
+      - name: 保存产物（方便排查失败）
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: packaging-smoke-${{ github.run_id }}
+          path: dist/
+          retention-days: 7

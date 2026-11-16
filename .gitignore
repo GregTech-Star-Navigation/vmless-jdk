@@ -26,3 +26,7 @@ RUST-JAVAC-方案.md
 PLAN.md
 *.png
 *.jpg
+
+# 打包产物与脚本（*.ps1 上面被整体忽略，这里放行 packaging 下的）
+dist/
+!packaging/*.ps1
