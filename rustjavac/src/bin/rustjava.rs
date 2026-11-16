@@ -22,6 +22,11 @@ fn main() {
             for line in &r.output {
                 println!("{line}");
             }
+            // 未捕获的 Java 异常：和 JVM 一样打到 stderr，并以退出码 1 结束
+            if let Some(exc) = &r.exception {
+                eprintln!("{exc}");
+                std::process::exit(1);
+            }
         }
         Err(e) => {
             eprintln!("执行失败: {}", e.msg);

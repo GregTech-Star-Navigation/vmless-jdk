@@ -13,10 +13,18 @@ use std::collections::HashMap;
 #[derive(Debug)]
 pub struct VmError {
     pub msg: String,
+    /// Some(句柄) 表示这是一个**被抛出的 Java 异常对象**（不是 VM 内部错误）:
+    /// 本帧找不到 handler 时向上抛给调用方的 `execute` 继续找。
+    pub exc: Option<i32>,
 }
 
 fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
-    Err(VmError { msg: msg.into() })
+    Err(VmError { msg: msg.into(), exc: None })
+}
+
+/// 抛一个 Java 异常（参数是异常对象的引用句柄）
+fn thrown(h: i32) -> VmError {
+    VmError { msg: format!("未捕获的 Java 异常（句柄 {h}）"), exc: Some(h) }
 }
 
 /// 解释器里的一个值。int/long/double 共用一种表示，用完再按字节码的语义取用。
@@ -58,6 +66,9 @@ impl Slot {
 pub struct ExecResult {
     pub return_value: i32,
     pub output: Vec<String>,
+    /// 未捕获的 Java 异常：已经是定好格式的那一行
+    /// （`Exception in thread "main" java.lang.RuntimeException: boom`）。
+    pub exception: Option<String>,
 }
 
 struct Frame {
@@ -76,7 +87,7 @@ impl Frame {
         self.stack.push(v);
     }
     fn pop(&mut self) -> Result<Slot, VmError> {
-        self.stack.pop().ok_or_else(|| VmError { msg: "操作数栈下溢".into() })
+        self.stack.pop().ok_or_else(|| VmError { msg: "操作数栈下溢".into(), exc: None })
     }
     fn pop_i(&mut self) -> Result<i32, VmError> {
         Ok(self.pop()?.as_i32())
@@ -135,6 +146,37 @@ pub struct Vm<'a> {
     strings: Vec<String>,
     /// 常量池索引 → 字符串句柄（同一常量必须拿到同一句柄，否则引用相等会错）
     string_handles: HashMap<u16, i32>,
+    /// 异常对象句柄 → 构造函数里那个 message 的字符串句柄。
+    /// `new RuntimeException("boom")` 的构造器在 java.* 里（我们没有它的字节码），
+    /// 所以构造时只把消息记下来，抛出来时再拼。
+    exc_msgs: HashMap<i32, i32>,
+}
+
+/// java.* 异常类的继承链（我们只加载一个 class 文件，这些层级只能写死）
+pub(crate) fn builtin_super(class: &str) -> Option<&'static str> {
+    match class {
+        "java/lang/RuntimeException" => Some("java/lang/Exception"),
+        "java/lang/Exception" => Some("java/lang/Throwable"),
+        "java/lang/Error" => Some("java/lang/Throwable"),
+        "java/lang/Throwable" => Some("java/lang/Object"),
+        "java/lang/ArithmeticException"
+        | "java/lang/ArrayStoreException"
+        | "java/lang/ClassCastException"
+        | "java/lang/IllegalArgumentException"
+        | "java/lang/IllegalStateException"
+        | "java/lang/IndexOutOfBoundsException"
+        | "java/lang/NegativeArraySizeException"
+        | "java/lang/NullPointerException"
+        | "java/lang/NumberFormatException"
+        | "java/lang/UnsupportedOperationException"
+        | "java/lang/SecurityException"
+        | "java/lang/ArrayIndexOutOfBoundsException" => Some("java/lang/RuntimeException"),
+        "java/lang/StringIndexOutOfBoundsException" => Some("java/lang/IndexOutOfBoundsException"),
+        "java/lang/StackOverflowError" | "java/lang/OutOfMemoryError" | "java/lang/AssertionError" => {
+            Some("java/lang/Error")
+        }
+        _ => None,
+    }
 }
 
 impl<'a> Vm<'a> {
@@ -170,6 +212,7 @@ impl<'a> Vm<'a> {
             array_class: Vec::new(),
             strings: Vec::new(),
             string_handles: HashMap::new(),
+            exc_msgs: HashMap::new(),
         }
     }
 
@@ -179,7 +222,7 @@ impl<'a> Vm<'a> {
             .constant_pool
             .get(index as usize)
             .and_then(|e| e.as_ref())
-            .ok_or_else(|| VmError { msg: format!("常量池索引 {index} 为空") })?;
+            .ok_or_else(|| VmError { msg: format!("常量池索引 {index} 为空"), exc: None })?;
         let (class_idx, nat_idx) = match e {
             CpEntry::MethodRef(c, n) | CpEntry::InterfaceMethodRef(c, n) => (*c, *n),
             CpEntry::FieldRef(c, n) => (*c, *n),
@@ -254,16 +297,63 @@ impl<'a> Vm<'a> {
         }
     }
 
+    /// 一个类名的直接父类。加载的只有本类，java.* 的层级写死在这张表里 ——
+    /// 没有它 `catch (RuntimeException e)` 接不住 ArithmeticException。
+    fn super_of(&self, class: &str) -> Option<String> {
+        if let Some(s) = builtin_super(class) {
+            return Some(s.to_string());
+        }
+        let this = self.class.this_class_name()?;
+        if class == this {
+            let sup = self.class_name_of(self.class.super_class).ok()?;
+            if sup.is_empty() {
+                return None;
+            }
+            return Some(sup);
+        }
+        None
+    }
+
+    /// actual 是不是 target 或它的子类
+    fn is_subclass(&self, actual: &str, target: &str) -> bool {
+        if actual == target {
+            return true;
+        }
+        let mut cur = actual.to_string();
+        for _ in 0..32 {
+            match self.super_of(&cur) {
+                Some(s) => {
+                    if s == target {
+                        return true;
+                    }
+                    cur = s;
+                }
+                None => return false,
+            }
+        }
+        false
+    }
+
     /// `instanceof` 的判定：null 对任何类型都是 false（含 Object）
     fn is_instance(&self, handle: i32, target: &str) -> bool {
         match self.ref_kind(handle) {
             RefKind::Null => false,
             _ if target == "java/lang/Object" => true,
             RefKind::Str => target == "java/lang/String",
-            RefKind::Obj(c) => c == target,
+            RefKind::Obj(c) => self.is_subclass(&c, target),
             RefKind::Arr(d) => d == target,
         }
     }
+
+    /// 异常对象 → 打印用的 `类名: message`
+    fn exc_text(&self, handle: i32) -> String {
+        let class = self.type_name(handle);
+        match self.exc_msgs.get(&handle) {
+            Some(m) => format!("{class}: {}", self.string_text(*m)),
+            None => class,
+        }
+    }
+
 
     /// 出错信息里用的可读类型名
     fn type_name(&self, handle: i32) -> String {
@@ -317,7 +407,7 @@ impl<'a> Vm<'a> {
             return err("调用深度超限（可能递归过深）");
         }
         let code = self.code_of(m)?;
-        let (max_locals, body) = code;
+        let (max_locals, body, exc_table) = code;
 
         let mut frame = Frame::new(max_locals);
         // 参数按 JVM 槽位落位：this 在 0，long/double 占两槽，后面的参数要跳过一槽
@@ -330,6 +420,28 @@ impl<'a> Vm<'a> {
                 arg_slots.get(i - offset).copied().unwrap_or(i - offset) + offset
             };
             frame.store(slot, *a);
+        }
+
+        // 调用点上的异常：被调方抛出来的 Java 异常不能直接往上冒 ——
+        // 先看本方法的异常表接不接得住（接住就按 handler 入口继续跑）。
+        enum CallOutcome {
+            Value(Slot),
+            /// 交给本方法的 handler：(handler 偏移, 异常对象句柄)
+            Handler(usize, i32),
+        }
+        macro_rules! call_or_handle {
+            ($res:expr, $op_pc:expr) => {{
+                match $res {
+                    Ok(v) => CallOutcome::Value(v),
+                    Err(e) => match e.exc {
+                        Some(h) => match self.find_handler(&exc_table, $op_pc, h)? {
+                            Some(t) => CallOutcome::Handler(t, h),
+                            None => return Err(e),
+                        },
+                        None => return Err(e),
+                    },
+                }
+            }};
         }
 
         let trace = std::env::var_os("VMLESS_TRACE").is_some();
@@ -656,6 +768,20 @@ impl<'a> Vm<'a> {
                 0xaf => return Ok(Slot::F(frame.pop()?.as_f64())),
                 0xb0 => return Ok(Slot::I(frame.pop_i()?)),
                 0xb1 => return Ok(Slot::I(0)),
+                // athrow：沿**本方法**的异常表找 handler；本帧没有就带着异常对象往上抛
+                0xbf => {
+                    let op_pc = pc - 1;
+                    let h = frame.pop_i()?;
+                    match self.find_handler(&exc_table, op_pc, h)? {
+                        Some(target) => {
+                            pc = target;
+                            // handler 入口的约定：操作数栈上就是那个异常对象
+                            frame.stack.clear();
+                            frame.push(Slot::I(h));
+                        }
+                        None => return Err(thrown(h)),
+                    }
+                }
                 // iaload / laload / faload / daload / aaload：按指令宽度取元素
                 // （元素槽本身带宽度，读出来再按指令语义归一）
                 0x2e | 0x2f | 0x30 | 0x31 | 0x32 => {
@@ -881,10 +1007,21 @@ impl<'a> Vm<'a> {
                         let mut all = vec![recv];
                         all.extend(args);
                         self.depth += 1;
-                        let r = self.execute(target, &info.desc, &all, true)?;
+                        let op_pc = pc - 3;
+                        let r = call_or_handle!(self.execute(target, &info.desc, &all, true), op_pc);
                         self.depth -= 1;
-                        if !info.desc.ends_with(")V") {
-                            frame.push(r);
+                        match r {
+                            CallOutcome::Value(v) => {
+                                if !info.desc.ends_with(")V") {
+                                    frame.push(v);
+                                }
+                            }
+                            CallOutcome::Handler(t, h) => {
+                                pc = t;
+                                frame.stack.clear();
+                                frame.push(Slot::I(h));
+                                continue;
+                            }
                         }
                     } else {
                         return err(format!("不支持的 invokevirtual: {}.{}", info.class, info.name));
@@ -909,6 +1046,12 @@ impl<'a> Vm<'a> {
                             self.depth += 1;
                             let _ = self.execute(target, &info.desc, &all, true);
                             self.depth -= 1;
+                        } else if info.desc == "(Ljava/lang/String;)V" {
+                            // java.* 的构造器（`new RuntimeException("boom")`）我们没有字节码：
+                            // 只把消息记在异常对象上，打印未捕获异常时才用得到。
+                            if let Some(msg) = all.get(1) {
+                                self.exc_msgs.insert(all[0].as_i32(), msg.as_i32());
+                            }
                         }
                     } else {
                         let argc = count_args(&info.desc)?;
@@ -932,12 +1075,23 @@ impl<'a> Vm<'a> {
                         .methods
                         .get(&(info.name.clone(), info.desc.clone()))
                         .copied()
-                        .ok_or_else(|| VmError { msg: format!("找不到方法 {}{}", info.name, info.desc) })?;
+                        .ok_or_else(|| VmError { msg: format!("找不到方法 {}{}", info.name, info.desc), exc: None })?;
                     self.depth += 1;
-                    let r = self.execute(target, &info.desc, &args, false)?;
+                    let op_pc = pc - 3;
+                    let r = call_or_handle!(self.execute(target, &info.desc, &args, false), op_pc);
                     self.depth -= 1;
-                    if !info.desc.ends_with(")V") {
-                        frame.push(r);
+                    match r {
+                        CallOutcome::Value(v) => {
+                            if !info.desc.ends_with(")V") {
+                                frame.push(v);
+                            }
+                        }
+                        CallOutcome::Handler(t, h) => {
+                            pc = t;
+                            frame.stack.clear();
+                            frame.push(Slot::I(h));
+                            continue;
+                        }
                     }
                 }
                 other => {
@@ -948,7 +1102,30 @@ impl<'a> Vm<'a> {
         Ok(Slot::I(0))
     }
 
-    fn code_of(&self, m: &'a crate::Member) -> Result<(usize, &'a [u8]), VmError> {
+    /// 按顺序在异常表里找能接住这个异常的 handler（返回 handler 的字节码偏移）
+    fn find_handler(
+        &self,
+        table: &[(u16, u16, u16, u16)],
+        pc: usize,
+        handle: i32,
+    ) -> Result<Option<usize>, VmError> {
+        for &(start, end, handler, catch_type) in table {
+            if (start as usize) <= pc && pc < (end as usize) {
+                if catch_type == 0 {
+                    return Ok(Some(handler as usize)); // catch-all（finally）
+                }
+                let name = self.class_name_of(catch_type)?;
+                if self.is_instance(handle, &name) {
+                    return Ok(Some(handler as usize));
+                }
+            }
+        }
+        Ok(None)
+    }
+
+    /// 返回 (max_locals, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，
+    /// catch_type = 0 表示 catch-all（finally）。
+    fn code_of(&self, m: &'a crate::Member) -> Result<(usize, &'a [u8], Vec<(u16, u16, u16, u16)>), VmError> {
         let code_name = self.class.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
             Some(CpEntry::Utf8(b)) if b == b"Code" => Some(i as u16),
             _ => None,
@@ -963,7 +1140,22 @@ impl<'a> Vm<'a> {
                 let code_len = u32::from_be_bytes([a.info[4], a.info[5], a.info[6], a.info[7]]) as usize;
                 let start = 8;
                 let end = (start + code_len).min(a.info.len());
-                return Ok((max_locals, &a.info[start..end]));
+                // 异常表紧跟在字节码后面：u2 个数 + 每项 4 个 u2
+                let mut table = Vec::new();
+                let mut q = end;
+                if q + 2 <= a.info.len() {
+                    let n = u16::from_be_bytes([a.info[q], a.info[q + 1]]) as usize;
+                    q += 2;
+                    for _ in 0..n {
+                        if q + 8 > a.info.len() {
+                            break;
+                        }
+                        let rd = |i: usize| u16::from_be_bytes([a.info[i], a.info[i + 1]]);
+                        table.push((rd(q), rd(q + 2), rd(q + 4), rd(q + 6)));
+                        q += 8;
+                    }
+                }
+                return Ok((max_locals, &a.info[start..end], table));
             }
         }
         err("方法没有 Code 属性（抽象方法？）")
@@ -974,9 +1166,24 @@ impl<'a> Vm<'a> {
         let m = *self
             .methods
             .get(&("main".to_string(), "([Ljava/lang/String;)V".to_string()))
-            .ok_or_else(|| VmError { msg: "找不到 main([Ljava/lang/String;)V".into() })?;
-        let r = self.execute(m, "([Ljava/lang/String;)V", &[Slot::I(0)], false)?;
-        Ok(ExecResult { return_value: r.as_i32(), output: std::mem::take(&mut self.output) })
+            .ok_or_else(|| VmError { msg: "找不到 main([Ljava/lang/String;)V".into(), exc: None })?;
+        match self.execute(m, "([Ljava/lang/String;)V", &[Slot::I(0)], false) {
+            Ok(r) => Ok(ExecResult {
+                return_value: r.as_i32(),
+                output: std::mem::take(&mut self.output),
+                exception: None,
+            }),
+            // 未捕获的 Java 异常：输出照常给出，另附一行 "Exception in thread ..."
+            Err(e) if e.exc.is_some() => {
+                let text = self.exc_text(e.exc.unwrap());
+                Ok(ExecResult {
+                    return_value: 1,
+                    output: std::mem::take(&mut self.output),
+                    exception: Some(format!("Exception in thread \"main\" {text}")),
+                })
+            }
+            Err(e) => Err(e),
+        }
     }
 }
 
@@ -1022,7 +1229,7 @@ fn count_args(desc: &str) -> Result<usize, VmError> {
 
 /// 从字节加载并执行 main
 pub fn run_class_bytes(bytes: &[u8]) -> Result<ExecResult, VmError> {
-    let cf = parse(bytes).map_err(|e| VmError { msg: format!("class 解析失败: {e}") })?;
+    let cf = parse(bytes).map_err(|e| VmError { msg: format!("class 解析失败: {e}"), exc: None })?;
     let mut vm = Vm::new(&cf);
     vm.run_main()
 }

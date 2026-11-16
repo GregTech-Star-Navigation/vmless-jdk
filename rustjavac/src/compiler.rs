@@ -85,8 +85,12 @@ struct Emit {
     labels: Vec<Option<usize>>,
     /// (操作数位置, 标签 id)，收尾时回填
     patches: Vec<(usize, usize)>,
-    /// 需要 StackMapTable 帧的位置及其局部变量快照
-    frames: Vec<(usize, Vec<u16>)>,
+    /// 需要 StackMapTable 帧的位置、局部变量快照、以及**操作数栈**里那一个引用类型
+    /// （`u16::MAX` = 空栈；否则是常量池 Class 索引 —— 只有异常 handler 入口才会非空）
+    frames: Vec<(usize, Vec<u16>, u16)>,
+    /// 异常表：(start 标签, end 标签, handler 标签, catch_type)
+    /// catch_type = 0 表示「任意」（finally 的 catch-all），否则是常量池 Class 索引
+    exc_table: Vec<(usize, usize, usize, u16)>,
     /// 常量池里 "StackMapTable" 的索引
     stack_map_name: u16,
     /// 每个局部变量槽的验证类型：0 = int，否则是类索引（对象/数组）
@@ -103,6 +107,7 @@ impl Emit {
             labels: Vec::new(),
             patches: Vec::new(),
             frames: Vec::new(),
+            exc_table: Vec::new(),
             stack_map_name: 0,
             local_types: vec![u16::MAX; max_locals as usize],
         }
@@ -275,7 +280,32 @@ impl Emit {
             }
             snap[s] = t;
         }
-        self.frames.push((off, snap));
+        self.frames.push((off, snap, u16::MAX));
+    }
+
+    /// 绑定一个异常 handler 的入口标签。
+    ///
+    /// 与普通标签的唯一区别：这一帧的**操作数栈里有一个异常对象**（JVM 要求）。
+    /// locals 用调用方给的快照（try 入口处的那份）——handler 可能从保护区里任意
+    /// 一条指令跳进来，声明得越少越安全（少声明的槽按 Top 处理，HotSpot 不追究）。
+    fn bind_handler(&mut self, label: usize, locals: Vec<u16>, stack_ty: u16) {
+        let off = self.bytes.len();
+        self.labels[label] = Some(off);
+        self.frames.push((off, locals, stack_ty));
+    }
+
+    /// 登记一条异常表项（标签在 `resolve` 之后再换算成偏移）
+    fn exc(&mut self, start: usize, end: usize, handler: usize, catch_type: u16) {
+        self.exc_table.push((start, end, handler, catch_type));
+    }
+
+    /// 只记下标签的代码偏移，**不**产生栈图帧。
+    ///
+    /// 异常表的「保护区结束」这类边界不是跳转目标，不该有帧：一旦和紧随其后的
+    /// handler 入口落在同一偏移上，`resolve` 的 dedup 会把 handler 那份（栈上带一个
+    /// 异常对象）丢掉，HotSpot 就报 "stack size doesn't match stackmap"。
+    fn place(&mut self, label: usize) {
+        self.labels[label] = Some(self.bytes.len());
     }
 
     fn branch(&mut self, opcode: u8, label: usize) {
@@ -331,8 +361,8 @@ impl Emit {
             let off = i16::try_from(off).map_err(|_| CompileError { msg: "跳转距离超出 16 位".into() })?;
             self.bytes[pos + 1..pos + 3].copy_from_slice(&off.to_be_bytes());
         }
-        self.frames.sort_unstable_by_key(|(o, _)| *o);
-        self.frames.dedup_by_key(|(o, _)| *o);
+        self.frames.sort_unstable_by_key(|(o, _, _)| *o);
+        self.frames.dedup_by_key(|(o, _, _)| *o);
         Ok(())
     }
 
@@ -350,8 +380,9 @@ impl Emit {
         let mut info = Vec::new();
         info.extend_from_slice(&(self.frames.len() as u16).to_be_bytes());
         let mut prev: Option<usize> = None;
-        for (off, snapshot) in &self.frames {
+        for (off, snapshot, stack_ty) in &self.frames {
             let off = *off;
+            let stack_ty = *stack_ty;
             let delta = match prev {
                 None => off as u16,
                 Some(p) => (off - p - 1) as u16,
@@ -385,7 +416,14 @@ impl Emit {
             info.extend_from_slice(&delta.to_be_bytes());
             info.extend_from_slice(&n_entries.to_be_bytes());
             info.extend_from_slice(&entries);
-            info.extend_from_slice(&0u16.to_be_bytes()); // 空操作数栈
+            // 操作数栈：默认空；异常 handler 入口只有一个异常对象
+            if stack_ty == u16::MAX {
+                info.extend_from_slice(&0u16.to_be_bytes());
+            } else {
+                info.extend_from_slice(&1u16.to_be_bytes());
+                info.push(7); // ITEM_Object
+                info.extend_from_slice(&stack_ty.to_be_bytes());
+            }
         }
         Some(info)
     }
@@ -396,7 +434,20 @@ impl Emit {
         info.extend_from_slice(&self.max_locals.to_be_bytes());
         info.extend_from_slice(&(self.bytes.len() as u32).to_be_bytes());
         info.extend_from_slice(&self.bytes);
-        info.extend_from_slice(&0u16.to_be_bytes()); // exception_table_length
+        // 异常表：标签在这里才换算成代码偏移（`resolve` 之前标签是空的）
+        info.extend_from_slice(&(self.exc_table.len() as u16).to_be_bytes());
+        for (start, end, handler, catch_type) in &self.exc_table {
+            for l in [start, end, handler] {
+                let off = self
+                    .labels
+                    .get(*l)
+                    .and_then(|o| *o)
+                    .ok_or_else(|| CompileError { msg: format!("异常表的标签 {l} 未绑定") });
+                // to_attribute 不能返回 Result：标签缺失按 0 写，靠单元测试与 java 校验暴露
+                info.extend_from_slice(&(off.unwrap_or(0) as u16).to_be_bytes());
+            }
+            info.extend_from_slice(&catch_type.to_be_bytes());
+        }
         match self.stack_map() {
             Some(sm) => {
                 info.extend_from_slice(&1u16.to_be_bytes()); // attributes_count
@@ -418,10 +469,26 @@ const JAVA_LANG: &[&str] = &["String", "Object", "System", "Integer", "Long", "S
     "Boolean", "Float", "Double", "Number", "Class", "Throwable", "Exception",
     "RuntimeException", "Error", "Math", "StringBuilder", "Iterable", "Comparable",
     "Runnable", "Thread", "Enum", "Record", "Void",
+    // 异常体系：`catch (ArrayIndexOutOfBoundsException e)` 这类简写也要补成 java/lang/
+    "ArithmeticException", "ArrayIndexOutOfBoundsException", "IndexOutOfBoundsException",
+    "StringIndexOutOfBoundsException", "NullPointerException", "ClassCastException",
+    "NegativeArraySizeException", "IllegalArgumentException", "IllegalStateException",
+    "UnsupportedOperationException", "NumberFormatException", "CloneNotSupportedException",
+    "InterruptedException", "NoSuchElementException", "StackOverflowError",
+    "OutOfMemoryError", "AssertionError",
 ];
 
 fn is_java_lang(name: &str) -> bool {
     JAVA_LANG.contains(&name)
+}
+
+/// 类型路径 → 内部类名（`RuntimeException` 这类 java.lang 简写补全）
+fn internal_name(path: &[String]) -> String {
+    if path.len() == 1 && is_java_lang(&path[0]) {
+        format!("java/lang/{}", path[0])
+    } else {
+        path.join("/")
+    }
 }
 
 /// 类型 → 描述符
@@ -481,6 +548,11 @@ struct Ctx {
     /// 当前类名（内部形式 java/lang/X）
     class_name: String,
     is_static: bool,
+    /// 外层 `try { ... } finally { ... }` 的 finally 体，**外层在前**。
+    /// `return` 要先把这些 finally 各编译一份（javac 的复制策略），再真正返回。
+    finally_stack: Vec<Stmt>,
+    /// 当前方法的声明返回类型（return 的临时槽要按它写验证类型）
+    ret_ty: Option<Type>,
 }
 
 impl Ctx {
@@ -617,7 +689,8 @@ fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Resul
         }
         Expr::New { ty, args } => {
             let owner = match ty {
-                Type::Named { path, .. } => path.join("/"),
+                // java.lang 的类型可以简写：`new RuntimeException("x")` 要补成 java/lang/RuntimeException
+                Type::Named { path, .. } => internal_name(path),
                 _ => return err("只支持创建对象"),
             };
             let arg_desc: String = args
@@ -1005,6 +1078,133 @@ fn compile_cond_false(
     Ok(())
 }
 
+/// 发一条 xreturn（按值的种类）
+fn emit_xreturn(em: &mut Emit, kind: u8) {
+    match kind {
+        K_LONG => {
+            em.op(0xAD); // lreturn
+            em.pop(2);
+        }
+        K_DOUBLE => {
+            em.op(0xAF); // dreturn
+            em.pop(2);
+        }
+        K_REF => {
+            em.op(0xB0); // areturn
+            em.pop(1);
+        }
+        _ => {
+            em.op(0xAC); // ireturn
+            em.pop(1);
+        }
+    }
+}
+
+/// 补一条「不可达」的返回：控制流不允许掉出方法末尾，而不可达块也得有终结指令。
+fn emit_zero_return(em: &mut Emit, ret_ty: Option<Type>) {
+    match ret_ty {
+        None | Some(Type::Prim("void")) => em.op(0xB1),
+        Some(t) => {
+            let kind = kind_of(&t);
+            match kind {
+                K_LONG => em.op(0x09),   // lconst_0
+                K_DOUBLE => em.op(0x0E), // dconst_0
+                K_REF => em.op(0x01),    // aconst_null
+                _ => em.op(0x03),        // iconst_0
+            }
+            emit_xreturn(em, kind);
+        }
+    }
+}
+
+/// 分配一个临时槽（只推进槽位分配，**不**登记验证类型 —— 登记要在初始化表达式编译完之后）。
+fn bump_slot(ctx: &mut Ctx, em: &mut Emit, wide: bool) -> Result<u8, CompileError> {
+    let slot = ctx.next_slot;
+    if slot >= SCRATCH_SLOT {
+        return err(format!(
+            "局部变量太多：槽位已用到 {slot}，最高可用 {}（{} 号槽留给比较结果）",
+            SCRATCH_SLOT - 1,
+            SCRATCH_SLOT
+        ));
+    }
+    ctx.next_slot += if wide { 2 } else { 1 };
+    if em.max_locals < ctx.next_slot as u16 {
+        em.max_locals = ctx.next_slot as u16;
+    }
+    Ok(slot)
+}
+
+/// `return e;`
+///
+/// 有外层 finally 时不能直接把值留在操作数栈上去跑 finally —— 本项目的栈图一律声明
+/// 「栈为 0」，finally 体里只要有一个跳转点就会和「栈上压着值」冲突。所以按 javac 的
+/// 做法：先把值存进临时槽，跑完 finally 副本再取回来返回。
+fn compile_return(
+    e: &Option<Expr>,
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<bool, CompileError> {
+    if ctx.finally_stack.is_empty() {
+        match e {
+            None => em.op(0xB1),
+            Some(x) => {
+                let kind = expr_kind(x, ctx);
+                compile_expr(x, em, ctx, cp)?;
+                emit_xreturn(em, kind);
+            }
+        }
+        return Ok(true);
+    }
+    let mut tmp: Option<(u8, u8, Vec<u16>)> = None; // (槽, 种类, 该槽原来的验证类型)
+    if let Some(x) = e {
+        let kind = expr_kind(x, ctx);
+        let wide = kind_wide(kind);
+        let slot = bump_slot(ctx, em, wide)?;
+        // 临时槽只在「这条 return」上存在，用完必须把验证类型退回去：
+        // 否则后续帧会声明一个别的路径上根本没初始化过的槽（VerifyError）。
+        let prev: Vec<u16> = (0..if wide { 2 } else { 1 })
+            .map(|i| *em.local_types.get(slot as usize + i).unwrap_or(&u16::MAX))
+            .collect();
+        compile_expr(x, em, ctx, cp)?;
+        let vt = match ctx.ret_ty.clone() {
+            Some(t) => ver_type(cp, &t),
+            None => 0,
+        };
+        em.set_local_type(slot as usize, vt);
+        if wide {
+            em.set_local_type(slot as usize + 1, u16::MAX);
+        }
+        em.store_slot(slot, kind)?;
+        tmp = Some((slot, kind, prev));
+    }
+    // 内层 finally 先跑；编译第 i 份时把 pending 换成它外层的那些（否则 return
+    // 会把自己那份 finally 再展开一次，无限递归）。
+    let pending = ctx.finally_stack.clone();
+    for i in (0..pending.len()).rev() {
+        let mut outer: Vec<Stmt> = pending[..i].to_vec();
+        std::mem::swap(&mut ctx.finally_stack, &mut outer);
+        let terminated = compile_stmt(&pending[i], em, ctx, cp)?;
+        std::mem::swap(&mut ctx.finally_stack, &mut outer);
+        if terminated {
+            return Ok(true); // finally 自己就终结了，这个 return 不可达
+        }
+    }
+    match tmp {
+        Some((slot, kind, prev)) => {
+            em.load_slot(slot, kind)?;
+            emit_xreturn(em, kind);
+            // 这条路径到 return 就结束了：临时槽的验证类型退回原样，
+            // 免得后续帧声明一个「别的路径上没初始化」的槽。
+            for (i, v) in prev.iter().enumerate() {
+                em.set_local_type(slot as usize + i, *v);
+            }
+        }
+        None => em.op(0xB1),
+    }
+    Ok(true)
+}
+
 fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
     match s {
         Stmt::Block(items) => {
@@ -1015,33 +1215,8 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             }
             Ok(false)
         }
-        Stmt::Return(None) => {
-            em.op(0xB1);
-            Ok(true)
-        }
-        Stmt::Return(Some(e)) => {
-            let kind = expr_kind(e, ctx);
-            compile_expr(e, em, ctx, cp)?;
-            match kind {
-                K_LONG => {
-                    em.op(0xAD); // lreturn
-                    em.pop(2);
-                }
-                K_DOUBLE => {
-                    em.op(0xAF); // dreturn
-                    em.pop(2);
-                }
-                K_REF => {
-                    em.op(0xB0); // areturn
-                    em.pop(1);
-                }
-                _ => {
-                    em.op(0xAC); // ireturn
-                    em.pop(1);
-                }
-            }
-            Ok(true)
-        }
+        Stmt::Return(None) => compile_return(&None, em, ctx, cp),
+        Stmt::Return(Some(e)) => compile_return(&Some(e.clone()), em, ctx, cp),
         Stmt::Expr(e) if is_println_call(e) => {
             compile_expr(e, em, ctx, cp)?;
             Ok(false)
@@ -1249,6 +1424,131 @@ fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> R
             }
             Ok(false)
         }
+        Stmt::Throw(e) => {
+            compile_expr(e, em, ctx, cp)?;
+            em.op(0xBF); // athrow
+            em.pop(1);
+            Ok(true) // 之后不可达
+        }
+        Stmt::Try { body, catches, finally } => {
+            // try 入口的局部变量快照：handler / 汇合帧只声明到这一层，多出来的槽按
+            // Top 处理 —— 栈图里 Top 接受任何类型，反过来「声明得比实际多」才会 VerifyError。
+            let entry = em.local_types.clone();
+            let start = em.new_label();
+            let body_end = em.new_label();
+            let end = em.new_label();
+            let fin_lbl = em.new_label(); // 正常路径与 catch 路径共用的一份 finally
+            let fin_all = em.new_label(); // catch-all：接住任何异常 → 跑一份 finally → 再抛
+            let fin = finally.as_deref();
+            let normal_target = if fin.is_some() { fin_lbl } else { end };
+
+            if let Some(f) = fin {
+                ctx.finally_stack.push(f.clone());
+            }
+            em.bind(start);
+            let body_terminated = compile_stmt(body, em, ctx, cp)?;
+            // finally 一直挂在 ctx 上，直到**所有 catch 体**也编译完 —— catch 体里的
+            // return 同样要先把 finally 跑一遍。
+            // 保护区的结束位置。这条 goto 已经落在保护区外（goto 本身不会抛）。
+            em.place(body_end);
+            if !body_terminated {
+                em.goto(normal_target);
+            }
+
+            let mut any_catch_falls = false;
+            let mut fin_terminated = true; // 没有 finally 时由下面的分支单独处理
+            for c in catches {
+                let handler = em.new_label();
+                let catch_ty = ver_type(cp, &c.ty); // 常量池 Class 索引
+                em.bind_handler(handler, entry.clone(), catch_ty);
+                em.push(1); // 栈上有一个异常对象（bind_handler 只写栈图，不记账）
+                let slot = bump_slot(ctx, em, false)?;
+                em.set_local_type(slot as usize, catch_ty);
+                em.store_slot(slot, K_REF)?; // astore
+                let saved = (
+                    ctx.locals.insert(c.name.clone(), slot),
+                    ctx.local_kind.insert(c.name.clone(), K_REF),
+                    ctx.local_ty.insert(c.name.clone(), c.ty.clone()),
+                );
+                let catch_terminated = compile_stmt(&c.body, em, ctx, cp)?;
+                any_catch_falls |= !catch_terminated;
+                // 恢复作用域：catch 变量出了 catch 块就不可见
+                match saved.0 {
+                    Some(v) => ctx.locals.insert(c.name.clone(), v),
+                    None => ctx.locals.remove(&c.name),
+                };
+                match saved.1 {
+                    Some(v) => ctx.local_kind.insert(c.name.clone(), v),
+                    None => ctx.local_kind.remove(&c.name),
+                };
+                match saved.2 {
+                    Some(v) => ctx.local_ty.insert(c.name.clone(), v),
+                    None => ctx.local_ty.remove(&c.name),
+                };
+                // catch 体的保护区到此结束（finally 的 catch-all 也要盖住 catch 体）
+                let h_end = em.new_label();
+                em.place(h_end);
+                if !catch_terminated {
+                    em.goto(normal_target);
+                }
+                em.exc(start, body_end, handler, catch_ty);
+                if fin.is_some() {
+                    em.exc(handler, h_end, fin_all, 0);
+                }
+            }
+            // catch-all 必须排在所有具体 catch 之后（异常表按顺序匹配）
+            if fin.is_some() {
+                em.exc(start, body_end, fin_all, 0);
+            }
+
+            if fin.is_some() {
+                ctx.finally_stack.pop(); // finally 自己的副本里不能再展开自己
+            }
+            // 有没有路径能落到 end？try 体和所有 catch 都终结时，这份共用副本
+            // 根本没人跳进来（代码仍在，但只能补一条不可达的返回）。
+            let normal_reaches = !body_terminated || any_catch_falls;
+            if let Some(f) = fin {
+                // finally 里 catch 变量已经出了作用域：把验证类型退回入口快照，
+                // 否则 finally 体内部的帧会声明「某路径上其实没初始化」的槽。
+                em.local_types = entry.clone();
+                em.bind_handler(fin_lbl, entry.clone(), u16::MAX);
+                fin_terminated = compile_stmt(f, em, ctx, cp)?;
+                if !fin_terminated {
+                    if normal_reaches {
+                        em.goto(end);
+                    } else {
+                        // 没人会跳进这份副本：补一条不可达的返回，别让控制流掉出方法末尾
+                        emit_zero_return(em, ctx.ret_ty.clone());
+                    }
+                }
+                // 第二份：异常路径。跑完 finally 再把原异常抛出去。
+                let throwable = cp.class("java/lang/Throwable");
+                em.bind_handler(fin_all, entry.clone(), throwable);
+                em.push(1);
+                let xslot = bump_slot(ctx, em, false)?;
+                em.set_local_type(xslot as usize, throwable);
+                em.store_slot(xslot, K_REF)?; // astore
+                let fin2_terminated = compile_stmt(f, em, ctx, cp)?;
+                if !fin2_terminated {
+                    em.load_slot(xslot, K_REF)?;
+                    em.op(0xBF); // athrow
+                    em.pop(1);
+                }
+            }
+            // 有没有路径能落到 end？全都有终结（return/throw）时这里就没后续代码了：
+            // 不能绑定 end 的帧（偏移会等于 code_length，StackMapTable 报 bad offset），
+            // 也必须报「已终结」，否则外层会补一条不可达的默认返回。
+            let reaches_end = if fin.is_some() { normal_reaches && !fin_terminated } else { normal_reaches };
+            // 汇合点：正常路径、每条 catch 都到这里。
+            // 帧只声明 try 入口那份快照（多出来的槽按 Top：Top 接受任何类型）。
+            if reaches_end {
+                em.bind_handler(end, entry.clone(), u16::MAX);
+            }
+            // catch 变量与 try 体内声明的槽出了语句就不可见：把验证类型退回入口快照，
+            // 否则下一条 try 的 handler 帧会声明一个「实际未初始化」的槽（VerifyError）。
+            em.local_types = entry;
+            Ok(!reaches_end)
+        }
         other => err(format!("暂不支持的语句: {other:?}")),
     }
 }
@@ -1378,6 +1678,8 @@ fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, Compi
             local_ty: HashMap::new(),
             class_name: self_name.clone(),
             is_static,
+            finally_stack: Vec::new(),
+            ret_ty: md.ret.clone(),
         };
         ctx.locals.insert("<this-class>".to_string(), 0);
         if !is_static {

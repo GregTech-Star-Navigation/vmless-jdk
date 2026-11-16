@@ -302,3 +302,21 @@
 
 **已知限制**：多维数组（`multianewarray`）未做；异常机制未做（`athrow`/`try/catch`）；
 `println(a == null)` 这类「栈上已有值时的比较」被明确拒绝（本项目栈图恒为空栈）。
+
+## 0.32.0 — 2026-11-16 · 异常机制（编译器 + 解释器 + JIT）
+
+- **编译器**：`throw` → `athrow`；`try/catch/finally` 生成异常表，catch 入口帧的**栈上带一个异常对象**
+  （本项目其它位置栈恒为空，这是唯一例外）；finally 复制两份（共享 + catch-all），
+  `return` 在 try 内会先跑 finally 副本再返回
+- **解释器**：`athrow`、按异常表匹配（含继承链）、跨方法向上抛、未捕获时
+  `Exception in thread "main" <类>: <msg>` + 退出码 1
+- **JIT**：哨兵路线 —— `exception_pending` 通道，调用点检查 pending 并跳到最近 handler；
+  按类判定是否插检查点（不带异常的类零开销）；未捕获时打印 + exit(1)
+- **关键坑**：异常表的「保护区结束」必须用只记偏移不产帧的 `place()`，
+  否则它和 handler 入口同偏移，`resolve()` 的 dedup 会丢掉 handler 那份（栈上带异常对象）→
+  HotSpot 报 `stack size doesn't match stackmap`
+- 修 bug：`new RuntimeException("x")` 生成类名缺 `java/lang/` 前缀
+
+**验证：7 个异常样例 + 26 个回归样例，HotSpot / 解释器 / JIT 三路逐字节一致**
+（`TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2` + 未捕获退出码 1/1/1）；
+`cargo test --lib` 29 passed。

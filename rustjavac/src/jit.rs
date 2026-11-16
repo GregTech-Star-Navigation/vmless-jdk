@@ -13,6 +13,16 @@ use cranelift_frontend::{FunctionBuilder, FunctionBuilderContext, Variable};
 use cranelift_jit::{JITBuilder, JITModule};
 use cranelift_module::{default_libcall_names, Linkage, Module};
 
+/// 异常相关运行时函数的 FuncId 集合
+struct ExcHelpers {
+    pending: cranelift_module::FuncId,
+    clear: cranelift_module::FuncId,
+    get: cranelift_module::FuncId,
+    throw_: cranelift_module::FuncId,
+    set_msg: cranelift_module::FuncId,
+    catch_match: cranelift_module::FuncId,
+}
+
 pub struct Jit {
     module: JITModule,
     /// (方法名, 描述符) → 已声明/已编译的函数 id
@@ -53,6 +63,12 @@ impl Jit {
         builder.symbol("vmless_str_const", strtab::str_const as *const u8);
         builder.symbol("vmless_println_obj", strtab::println_str as *const u8);
         builder.symbol("vmless_drem", rt::drem as *const u8);
+        builder.symbol("vmless_exc_throw", rt::exc_throw as *const u8);
+        builder.symbol("vmless_exc_pending", rt::exc_pending as *const u8);
+        builder.symbol("vmless_exc_get", rt::exc_get as *const u8);
+        builder.symbol("vmless_exc_clear", rt::exc_clear as *const u8);
+        builder.symbol("vmless_exc_set_msg", rt::exc_set_msg as *const u8);
+        builder.symbol("vmless_catch_match", rt::catch_match as *const u8);
         let module = JITModule::new(builder);
         Jit { module, compiled: std::collections::HashMap::new() }
     }
@@ -76,7 +92,7 @@ impl Jit {
                 n == name && d == desc
             })
             .ok_or_else(|| JitError(format!("找不到方法 {name}{desc}")))?;
-        let (max_locals, body) = code_of(cf, m)?;
+        let (max_locals, body, exc_table) = code_of(cf, m)?;
         let self_class_name = cf.this_class_name().unwrap_or_default();
 
         // 实例字段名 → 下标
@@ -202,8 +218,66 @@ impl Jit {
             .declare_function("vmless_drem", Linkage::Import, &sig_ff)
             .map_err(|e| JitError(e.to_string()))?;
 
+        // 异常机制：pending 标志 / 取异常对象 / 清标志 / catch 类型匹配 / 抛 / 记消息
+        let mut sig_i0 = self.module.make_signature();
+        sig_i0.returns.push(AbiParam::new(types::I32));
+        let exc_pending_id = self
+            .module
+            .declare_function("vmless_exc_pending", Linkage::Import, &sig_i0)
+            .map_err(|e| JitError(e.to_string()))?;
+        let sig_void = self.module.make_signature();
+        let exc_clear_id = self
+            .module
+            .declare_function("vmless_exc_clear", Linkage::Import, &sig_void)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_l0 = self.module.make_signature();
+        sig_l0.returns.push(AbiParam::new(types::I64));
+        let exc_get_id = self
+            .module
+            .declare_function("vmless_exc_get", Linkage::Import, &sig_l0)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_li = self.module.make_signature();
+        sig_li.params.push(AbiParam::new(types::I64));
+        let exc_throw_id = self
+            .module
+            .declare_function("vmless_exc_throw", Linkage::Import, &sig_li)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_ll = self.module.make_signature();
+        sig_ll.params.push(AbiParam::new(types::I64));
+        sig_ll.params.push(AbiParam::new(types::I64));
+        let exc_msg_id = self
+            .module
+            .declare_function("vmless_exc_set_msg", Linkage::Import, &sig_ll)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_li2 = self.module.make_signature();
+        sig_li2.params.push(AbiParam::new(types::I64));
+        sig_li2.params.push(AbiParam::new(types::I32));
+        sig_li2.returns.push(AbiParam::new(types::I32));
+        let catch_match_id = self
+            .module
+            .declare_function("vmless_catch_match", Linkage::Import, &sig_li2)
+            .map_err(|e| JitError(e.to_string()))?;
+        let helpers = ExcHelpers {
+            pending: exc_pending_id,
+            clear: exc_clear_id,
+            get: exc_get_id,
+            throw_: exc_throw_id,
+            set_msg: exc_msg_id,
+            catch_match: catch_match_id,
+        };
+        // 本**类**有没有用到异常：没有就不发任何检查，避免拖慢不带异常的代码。
+        // 注意必须按类判定 —— 只按方法判定的话，`a()` 里不含 try 但被调方抛异常时
+        // 就没有检查点，异常会跑到 main 结束之后才被顶层发现（中间的语句照常执行）。
+        let uses_exc = class_uses_exceptions(cf);
         let mut bctx = FunctionBuilderContext::new();
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut bctx);
+
+        // 异常对象从 dispatch 块传到 handler 块的通道（跨块只能用内存传）
+        let exc_slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            8,
+            3,
+        ));
 
         let entry = fb.create_block();
         fb.append_block_params_for_function_params(entry);
@@ -226,6 +300,12 @@ impl Jit {
                 }
                 _ => pc += insn_len(op),
             }
+        }
+        // handler 入口也是块首（栈上要放一个异常对象）
+        let mut handler_pcs: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        for &(_, _, h, _) in &exc_table {
+            targets.push(h as usize);
+            handler_pcs.insert(h as usize);
         }
         targets.sort_unstable();
         targets.dedup();
@@ -318,6 +398,14 @@ impl Jit {
                 cur_start = pc;
             }
             let _ = cur_block;
+
+            // handler 入口：操作数栈上有一个异常对象（从通道槽里取回来）。
+            // 取不到就说明没人会跳进来，给个 0 占位即可。
+            if handler_pcs.contains(&pc) {
+                let a = fb.ins().stack_addr(types::I64, exc_slot, 0);
+                let v = fb.ins().load(types::I64, MemFlags::new(), a, 0);
+                stack.push(v);
+            }
 
             let op = body[pc];
             pc += 1;
@@ -536,6 +624,21 @@ impl Jit {
                     fb.switch_to_block(dead);
                     stack.clear();
                 }
+                // athrow：把对象交给运行时，然后按本方法的异常表派发
+                0xbf => {
+                    let op_pc = pc - 1;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = convert_to(&mut fb, v, types::I64);
+                    let f = self.module.declare_func_in_func(helpers.throw_, fb.func);
+                    fb.ins().call(f, &[v]);
+                    self.emit_dispatch(&mut fb, cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                    terminated = true;
+                    open.pop();
+                    let dead = fb.create_block();
+                    open.push(dead);
+                    fb.switch_to_block(dead);
+                    stack.clear();
+                }
                 0xb8 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
@@ -567,6 +670,19 @@ impl Jit {
                     // 被调方已按自己的返回类型返回（i64/f64/i32），这里直接上栈
                     if !callee_desc.ends_with(")V") {
                         stack.push(fb.inst_results(call)[0]);
+                    }
+                    if uses_exc {
+                        // 被调方抛了？命中就派发，否则进 cont 块继续
+                        let op_pc = pc - 3;
+                        let cont = fb.create_block();
+                        let disp = fb.create_block();
+                        let pf = self.module.declare_func_in_func(helpers.pending, fb.func);
+                        let pcx = fb.ins().call(pf, &[]);
+                        let flag = fb.inst_results(pcx)[0];
+                        fb.ins().brif(flag, disp, &[], cont, &[]);
+                        fb.switch_to_block(disp);
+                        self.emit_dispatch(&mut fb, cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                        fb.switch_to_block(cont);
                     }
                 }
                 // 引用类型局部变量（8 字节槽）
@@ -604,10 +720,18 @@ impl Jit {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let Some(&(fid, callee_max_locals, argc)) = call_targets.get(&idx) else {
-                        // 外部构造器（如 Object.<init>）：只把接收者和参数丢掉
+                        // 外部构造器（Object.<init> / RuntimeException.<init>）：没有它的
+                        // 字节码，只把 message 记到异常对象上（打印未捕获异常要用）
                         let desc = method_ref_of(cf, idx)?.2;
-                        for _ in 0..(argc_of(&desc) + 1) {
-                            stack.pop();
+                        if desc == "(Ljava/lang/String;)V" && stack.len() >= 2 {
+                            let msg = stack.pop().unwrap();
+                            let obj = stack.pop().unwrap();
+                            let f = self.module.declare_func_in_func(helpers.set_msg, fb.func);
+                            fb.ins().call(f, &[obj, msg]);
+                        } else {
+                            for _ in 0..(argc_of(&desc) + 1) {
+                                stack.pop();
+                            }
                         }
                         continue;
                     };
@@ -855,6 +979,18 @@ impl Jit {
                             // 被调方已按自己的返回类型返回，直接上栈
                             stack.push(fb.inst_results(c)[0]);
                         }
+                        if uses_exc {
+                            let op_pc = pc - 3;
+                            let cont = fb.create_block();
+                            let disp = fb.create_block();
+                            let pf = self.module.declare_func_in_func(helpers.pending, fb.func);
+                            let pcx = fb.ins().call(pf, &[]);
+                            let flag = fb.inst_results(pcx)[0];
+                            fb.ins().brif(flag, disp, &[], cont, &[]);
+                            fb.switch_to_block(disp);
+                            self.emit_dispatch(&mut fb, cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                            fb.switch_to_block(cont);
+                        }
                     }
                 }
                 // new：分配对象（8 字节头 + 每字段 8 字节）
@@ -1074,6 +1210,68 @@ impl Jit {
         Ok((func_id, max_locals, argc))
     }
 
+    /// 生成「异常派发」代码：当前块**一定会被终结**（跳到 handler 或原样返回哨兵）。
+    ///
+    /// 调用前必须已经 `vmless_exc_throw` 过（pending=1），异常对象在运行时的全局里。
+    fn emit_dispatch(
+        &mut self,
+        fb: &mut FunctionBuilder,
+        cf: &ClassFile,
+        exc_table: &[(u16, u16, u16, u16)],
+        blocks: &std::collections::HashMap<usize, cranelift_codegen::ir::Block>,
+        exc_slot: cranelift_codegen::ir::StackSlot,
+        helpers: &ExcHelpers,
+        at: usize,
+        ret_ty: cranelift_codegen::ir::Type,
+    ) -> Result<(), JitError> {
+        let obj = {
+            let f = self.module.declare_func_in_func(helpers.get, fb.func);
+            let c = fb.ins().call(f, &[]);
+            fb.inst_results(c)[0]
+        };
+        // 把异常对象存进通道槽，handler 入口从那里读（跨块只能用内存传）
+        let store_exc = |fb: &mut FunctionBuilder, obj: Value| {
+            let a = fb.ins().stack_addr(types::I64, exc_slot, 0);
+            fb.ins().store(MemFlags::new(), obj, a, 0);
+        };
+        for &(start, end, handler, catch_type) in exc_table {
+            if !((start as usize) <= at && at < (end as usize)) {
+                continue;
+            }
+            let hb = *blocks
+                .get(&(handler as usize))
+                .ok_or_else(|| JitError(format!("handler {handler} 没有对应块")))?;
+            if catch_type == 0 {
+                // catch-all（finally）
+                let f = self.module.declare_func_in_func(helpers.clear, fb.func);
+                fb.ins().call(f, &[]);
+                store_exc(fb, obj);
+                fb.ins().jump(hb, &[]);
+                return Ok(());
+            }
+            let tag = class_const_tag(cf, catch_type)?;
+            let ok = fb.create_block();
+            let next = fb.create_block();
+            let m = {
+                let f = self.module.declare_func_in_func(helpers.catch_match, fb.func);
+                let tg = fb.ins().iconst(types::I32, tag as i64);
+                let c = fb.ins().call(f, &[obj, tg]);
+                fb.inst_results(c)[0]
+            };
+            fb.ins().brif(m, ok, &[], next, &[]);
+            fb.switch_to_block(ok);
+            let f = self.module.declare_func_in_func(helpers.clear, fb.func);
+            fb.ins().call(f, &[]);
+            store_exc(fb, obj);
+            fb.ins().jump(hb, &[]);
+            fb.switch_to_block(next);
+        }
+        // 本方法接不住：把哨兵返回给调用方，pending 保持置位，由它继续找
+        let z = zero_of(fb, ret_ty);
+        fb.ins().return_(&[z]);
+        Ok(())
+    }
+
     /// 编译一个静态方法并拿到可调用的函数指针
     pub fn compile_static(
         &mut self,
@@ -1113,7 +1311,8 @@ impl CompiledMethod {
         }
         let p = locals.as_mut_ptr();
         let ty = ret_type(&self.desc);
-        unsafe {
+        // 顶层：异常没被任何 handler 接住 → 按 JVM 的格式打一行并退出（码 1）
+        let r = unsafe {
             if ty == types::F64 {
                 let f: unsafe extern "C" fn(*mut i64) -> f64 = std::mem::transmute(self.code);
                 f(p) as i32
@@ -1123,7 +1322,11 @@ impl CompiledMethod {
             } else {
                 (self.code)(p)
             }
+        };
+        if rt::exc_pending() != 0 {
+            rt::print_uncaught(rt::exc_get());
         }
+        r
     }
 }
 
@@ -1146,7 +1349,9 @@ fn const_int(cf: &ClassFile, idx: u16) -> i64 {
     }
 }
 
-fn code_of(cf: &ClassFile, m: &Member) -> Result<(usize, Vec<u8>), JitError> {
+/// 返回 (max_locals, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，
+/// catch_type = 0 表示 catch-all（finally）。
+fn code_of(cf: &ClassFile, m: &Member) -> Result<(usize, Vec<u8>, Vec<(u16, u16, u16, u16)>), JitError> {
     let code_name = cf
         .constant_pool
         .iter()
@@ -1161,7 +1366,22 @@ fn code_of(cf: &ClassFile, m: &Member) -> Result<(usize, Vec<u8>), JitError> {
             let max_locals = u16::from_be_bytes([a.info[2], a.info[3]]) as usize;
             let len = u32::from_be_bytes([a.info[4], a.info[5], a.info[6], a.info[7]]) as usize;
             let end = (8 + len).min(a.info.len());
-            return Ok((max_locals, a.info[8..end].to_vec()));
+            // 异常表紧跟在字节码后面：u2 个数 + 每项 4 个 u2
+            let mut table = Vec::new();
+            let mut q = end;
+            if q + 2 <= a.info.len() {
+                let n = u16::from_be_bytes([a.info[q], a.info[q + 1]]) as usize;
+                q += 2;
+                for _ in 0..n {
+                    if q + 8 > a.info.len() {
+                        break;
+                    }
+                    let rd = |i: usize| u16::from_be_bytes([a.info[i], a.info[i + 1]]);
+                    table.push((rd(q), rd(q + 2), rd(q + 4), rd(q + 6)));
+                    q += 8;
+                }
+            }
+            return Ok((max_locals, a.info[8..end].to_vec(), table));
         }
     }
     Err(JitError("方法没有 Code".into()))
@@ -1174,6 +1394,24 @@ pub fn compile_file(path: &str, name: &str, desc: &str) -> Result<(Jit, Compiled
     let mut jit = Jit::new();
     let m = jit.compile_static(&cf, name, desc)?;
     Ok((jit, m))
+}
+
+/// 这个类里有没有任何方法用到异常（异常表非空或出现 athrow）
+fn class_uses_exceptions(cf: &ClassFile) -> bool {
+    for m in &cf.methods {
+        let Ok((_, body, table)) = code_of(cf, m) else { continue };
+        if !table.is_empty() {
+            return true;
+        }
+        let mut q = 0usize;
+        while q < body.len() {
+            if body[q] == 0xbf {
+                return true;
+            }
+            q += insn_len(body[q]);
+        }
+    }
+    false
 }
 
 /// 解析常量池里的方法引用 → (类名, 方法名, 描述符)
@@ -1362,6 +1600,97 @@ pub mod rt {
 
     /// 类名 → 类型标签（0 = java/lang/Object，1 = java/lang/String，其余从 2 起）
     static CLASS_TAGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+
+    /// 正在传播的异常：非 0 表示 pending，值是异常对象指针。
+    /// JIT 出来的代码在每个可能抛异常的调用点后检查它，命中就查本方法的异常表。
+    static EXC_PENDING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
+    static EXC_OBJ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
+    /// 异常对象指针 → message 字符串指针（java.* 的构造器我们没有字节码，只能这样记）
+    static EXC_MSGS: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
+
+    pub extern "C" fn exc_throw(obj: i64) {
+        EXC_OBJ.store(obj, std::sync::atomic::Ordering::Relaxed);
+        EXC_PENDING.store(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub extern "C" fn exc_pending() -> i32 {
+        EXC_PENDING.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub extern "C" fn exc_get() -> i64 {
+        EXC_OBJ.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub extern "C" fn exc_clear() {
+        EXC_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// 记下异常对象的消息（`new RuntimeException("boom")` 那一步）
+    pub extern "C" fn exc_set_msg(obj: i64, msg: i64) {
+        let mut t = EXC_MSGS.lock().unwrap();
+        t.push((obj, msg));
+    }
+
+    fn exc_msg(obj: i64) -> Option<i64> {
+        EXC_MSGS.lock().unwrap().iter().rev().find(|(o, _)| *o == obj).map(|(_, m)| *m)
+    }
+
+    /// 类名的**内部形式**（class_name_of 返回的是带点的那种，继承链比较要用斜杠形式）
+    pub fn class_internal_of(tag: u32) -> String {
+        match tag {
+            0 => "java/lang/Object".to_string(),
+            1 => "java/lang/String".to_string(),
+            t => {
+                let names = CLASS_TAGS.lock().unwrap();
+                match names.get((t - 2) as usize) {
+                    Some(n) => n.clone(),
+                    None => format!("<type#{t}>"),
+                }
+            }
+        }
+    }
+
+    /// catch 子句的类型匹配：同类型或子类（java.* 的继承链写死在 vm 那边，共用一份）
+    pub extern "C" fn catch_match(obj: i64, tag: u32) -> i32 {
+        if obj == 0 {
+            return 0;
+        }
+        let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
+        if actual == tag || tag == 0 {
+            return 1;
+        }
+        let a = class_internal_of(actual);
+        let t = class_internal_of(tag);
+        let mut cur = a;
+        for _ in 0..32 {
+            match crate::vm::builtin_super(&cur) {
+                Some(s) => {
+                    if s == t {
+                        return 1;
+                    }
+                    cur = s.to_string();
+                }
+                None => return 0,
+            }
+        }
+        0
+    }
+
+    /// 未捕获异常：按 JVM 的格式打到 stderr 并结束进程（退出码 1）
+    pub fn print_uncaught(obj: i64) -> ! {
+        let tag = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
+        let class = class_name_of(tag);
+        match exc_msg(obj) {
+            Some(m) if m != 0 => {
+                // message 就是字符串堆里那块的指针：`[0..4] 长度`、`[4..8] 标签`、`[8..]` UTF-8
+                let len = unsafe { std::ptr::read_unaligned(m as *const u32) } as usize;
+                let bytes = unsafe { std::slice::from_raw_parts((m as *const u8).add(8), len) };
+                eprintln!("Exception in thread \"main\" {class}: {}", String::from_utf8_lossy(bytes));
+            }
+            _ => eprintln!("Exception in thread \"main\" {class}"),
+        }
+        std::process::exit(1);
+    }
 
     /// 登记/查询一个类的类型标签。编译期调用，把结果当常量嵌进机器码。
     pub fn class_tag(name: &str) -> u32 {
