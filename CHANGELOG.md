@@ -330,3 +330,15 @@
   逐行多重集合比对，丢失 0 行、新增 0 行逻辑
 - 公开 API 全兼容，`examples/` 零改动；`cargo test` 29 passed；样例 **34/34 三路一致**
 - 新增 `docs/模块结构.md`
+
+## 0.34.0 — 2026-11-16 · 字节码生成器模块化 + 清理死代码
+
+- `compiler.rs`(1974) + `codegen.rs`(373) 合并拆成 `src/codegen/`：
+  `mod · error · emit · constpool · types · ctx · expr · stmt · method · class · simple`（2448 行 / 11 文件）
+- `lib.rs` 用 `pub use crate::codegen as compiler;` 保住旧路径 `classfile::compiler::*`
+- **清理**：删除零调用方的 `expr_is_long`、只写不读的 `Ctx::is_static`、
+  重复的 `ACC_SUPER` 常量、拆分后暴露的 unused import
+- 零逻辑改动（行多重集核对：除删除项与 import 裁剪外每行出现次数完全一致）
+- `cargo test` 29 passed；样例 **34/34 三路一致**；`src/codegen` 零警告
+
+另：仓库根新增 `verify.sh`（34 样例三路比对，带一次重试抗文件监视器干扰）。

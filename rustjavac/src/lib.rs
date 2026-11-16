@@ -10,7 +10,7 @@ pub mod front;
 pub mod sema;
 pub mod lower;
 pub mod codegen;
-pub mod compiler;
+pub use crate::codegen as compiler;
 pub mod vm;
 pub mod jit;
 
