@@ -52,6 +52,9 @@ pub fn compile_with_path(
     // 嵌套类型先拍平成顶层类型（`Outer.Inner` → `Outer$Inner`）：必须在枚举降级之前，
     // 这样嵌套枚举走的是同一条「静态常量 + values/valueOf」的路径
     let cu = &crate::sema::flatten_unit(cu);
+    // 泛型擦除：`Box<T>` 的字段/参数/返回值描述符用上界（默认 Object），
+    // 之后的阶段（符号表、codegen、解释器、JIT）都不必认识类型参数
+    let cu = &crate::sema::erase_unit(cu);
     // 枚举先降级成普通类（静态 final 常量 + 构造器 + values/valueOf/ordinal/name），
     // 这样 codegen / 解释器 / JIT 都不必认识「枚举」这个概念
     let cu = &crate::sema::desugar_unit(cu).map_err(|msg| CompileError { msg })?;

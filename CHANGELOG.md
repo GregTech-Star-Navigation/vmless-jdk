@@ -477,3 +477,21 @@ ALLOC_NS=188.4  GC_COUNT=6  LIVE_AFTER=4026528  HEAP_MB=3.84
 
 **已知不支持**：非 static 内部类（`this$0`）、`do-while`、跨单元的嵌套类型引用、
 拼接非 String 的 Object（JVM 打 `Klass@hash`，我们没有 hashCode）。
+
+## 0.42.0 — 2026-11-17 · 泛型擦除、变参、do-while、switch(String)、多catch、TWR
+
+- **泛型擦除**：新增 `sema/erase.rs`（`type_params` 改成 `TypeParam{name,bound}`，上界进描述符）；
+  调用点按声明取构造器/方法描述符；擦除后**生成桥接方法**（`Holder<String>.value()` 能调到 `String value()`）；
+  `coerce_to` 在源静态类型是 `Object` 时插 `checkcast`
+- **可变参数**：`T...` 的声明类型即 `T[]`；`emit_call_args`/`pack_tail` 在 8 个调用点统一打包；
+  `main(String... args)` 正常当入口
+- **do-while**：continue 落点是条件判断处
+- **switch on String**：`equals` 链（语义同 javac）；顺带修箭头 `case ->` 不贯穿
+- **多重 catch**：`Catch{types: Vec<Type>}`，同一 handler 多条异常表项
+- **try-with-resources**：糖化成 try/finally + 反序 `close()`（原来 `skip_balanced` 直接丢弃资源，静默不 close）
+- 修 If 的 then 分支已终结时仍发 goto 的不可达代码（HotSpot `Expecting a stack map frame`）
+
+**验证：87 个样例三路一致**（新增 `Gen1-5 Vararg1-4 DoWhile1 SwitchStr1 MultiCatch1 Twr1`）；`cargo test` 38 passed。
+
+**已知边界**：装箱/拆箱未做（`int n = box.get()` 会 VerifyError）、`new T[n]` 不支持、
+有界类型参数的类（`Number`）运行时没有内建、多重 catch 变量静态类型统一 `Throwable`。

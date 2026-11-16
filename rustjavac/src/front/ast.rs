@@ -38,12 +38,22 @@ pub enum TypeKind {
     Annotation,
 }
 
+/// 类型参数（`<T>` / `<T extends Number>`）。
+///
+/// 泛型只做**擦除**：`sema::erase` 把引用这个参数的类型全换成它的上界
+/// （没有上界就是 `Object`）。上界要到那时候才有用，所以解析阶段不能只记名字。
+#[derive(Clone, Debug, PartialEq)]
+pub struct TypeParam {
+    pub name: String,
+    pub bound: Option<Type>,
+}
+
 #[derive(Clone, Debug, PartialEq)]
 pub struct TypeDecl {
     pub kind: TypeKind,
     pub name: String,
     pub modifiers: Vec<String>,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<TypeParam>,
     pub extends: Vec<Type>,
     pub implements: Vec<Type>,
     pub members: Vec<Member>,
@@ -71,7 +81,7 @@ pub struct FieldDecl {
 #[derive(Clone, Debug, PartialEq)]
 pub struct MethodDecl {
     pub modifiers: Vec<String>,
-    pub type_params: Vec<String>,
+    pub type_params: Vec<TypeParam>,
     pub ret: Option<Type>,
     pub name: String,
     pub params: Vec<Param>,
@@ -108,8 +118,10 @@ pub struct SwitchCase {
 }
 
 #[derive(Clone, Debug, PartialEq)]
+/// `catch (A | B e)` 的多重捕获：`types` 多个元素时，同一段保护区对每个类型
+/// 各记一条异常表项（catch_type 不同，落到同一段 handler 代码）。
 pub struct Catch {
-    pub ty: Type,
+    pub types: Vec<Type>,
     pub name: String,
     pub body: Stmt,
 }

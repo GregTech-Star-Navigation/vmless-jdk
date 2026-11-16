@@ -14,7 +14,8 @@ Cmp1 Cmp2 Cmp3 Enum1 Enum2 Enum3 IfaceDef1 IfaceDef2
 ForEach1 ForEach2 ForEach3 Ternary1 Ternary2 Label1 Label2 Nest1 Nest2 Nest3 Concat1 Concat2 Concat3 Mix2
 Lg Db Point Loop Sw Obj2 ObjArr Arr Demo Perf2 LongEdge Doubles Mix DblCorpus Ret
 RefArr ObjRef ArrType RefFld RefCmp NullChk WideFld WideArr BitOps PrintObj PrintObj2
-TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2 TryUncaught"
+TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2 TryUncaught
+Gen1 Gen2 Gen3 Gen4 Gen5 Vararg1 Vararg2 Vararg3 Vararg4 DoWhile1 SwitchStr1 MultiCatch1 Twr1"
 
 # 跑一遍三方，回填全局 jo/io/to/je/ie/te
 run_three() {

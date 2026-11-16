@@ -66,6 +66,8 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             ctx.local_ty.insert(name.clone(), ty.clone());
             if let Some(e) = init {
                 compile_expr(e, em, ctx, cp)?;
+                // 泛型擦除后 `String s = box.get();` 的右值是 Object：补 checkcast
+                coerce_to(ty, e, ctx, em, cp)?;
             }
             // 槽的验证类型必须在**初始化表达式编译完之后**才登记：
             // 初始化式里如果带跳转（如 `boolean f = x == null;`），那时候这个槽还没赋值，
@@ -94,6 +96,9 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             emit_val(&arr, &sa, em, ctx, cp)?;
             emit_val(&idx, &si, em, ctx, cp)?;
             emit_val(rhs, &sr, em, ctx, cp)?;
+            if let Some(Type::Array(inner)) = expr_type(&arr, ctx) {
+                coerce_to(&inner, rhs, ctx, em, cp)?;
+            }
             em.op(array_ops(&arr, ctx).1);
             em.pop(if kind_wide(k) { 4 } else { 3 });
             Ok(false)
@@ -106,6 +111,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                     _ => unreachable!(),
                 };
                 compile_expr(rhs, em, ctx, cp)?;
+                coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                 let f = cp.field_ref(&owner, &fname, &desc);
                 em.op_u2(0xB3, f); // putstatic
                 em.pop(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
@@ -129,6 +135,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             if is_super {
                 owner = ctx.super_name.clone();
             }
+            coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
             let f = cp.field_ref(&owner, &fname, &desc);
             em.op_u2(0xB5, f); // putfield
             em.pop(if kind_wide(kind_from_desc(&desc)) { 3 } else { 2 });
@@ -143,6 +150,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 // 本类的静态字段（`count = count + 1;`）
                 if let Some((owner, desc)) = ctx.static_fields.get(&name).cloned() {
                     compile_expr(rhs, em, ctx, cp)?;
+                    coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                     let f = cp.field_ref(&owner, &name, &desc);
                     em.op_u2(0xB3, f); // putstatic
                     em.pop(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
@@ -156,6 +164,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 em.op(0x2A); // aload_0
                 em.push(1);
                 compile_expr(rhs, em, ctx, cp)?;
+                coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                 let f = cp.field_ref(&owner, &name, &desc);
                 em.op_u2(0xB5, f); // putfield
                 em.pop(if kind_wide(kind_from_desc(&desc)) { 3 } else { 2 });
@@ -163,10 +172,20 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             };
             let kind = *ctx.local_kind.get(&name).unwrap_or(&K_INT);
             compile_expr(rhs, em, ctx, cp)?;
+            if let Some(t) = ctx.local_ty.get(&name).cloned() {
+                coerce_to(&t, rhs, ctx, em, cp)?;
+            }
             em.store_slot(slot, kind)?;
             Ok(false)
         }
         Stmt::Switch { selector, cases } => {
+            // `switch` 的选择子是 String：javac 编成 hashCode+equals 两段，
+            // 我们退化成 if-else 链（`String.equals` 已内建），语义相同
+            if is_string_type(&expr_type(selector, ctx).unwrap_or(Type::Prim("int")))
+                || matches!(selector, Expr::StrLit(_) | Expr::TextBlock(_))
+            {
+                return compile_string_switch(selector, cases, em, ctx, cp);
+            }
             // 枚举的选择子是引用：比较前先取 ordinal()（javac 也是这么编的，
             // switch 的表只认 int）。case 标签同样是枚举常量，两边一起取。
             let enum_switch = expr_kind(selector, ctx) == K_REF;
@@ -252,8 +271,16 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             for (i, c) in cases.iter().enumerate() {
                 em.local_types = scope.clone();
                 em.bind(body_labels[i]);
+                let mut term = false;
                 for s in &c.body {
-                    compile_stmt(s, em, ctx, cp)?;
+                    if term {
+                        break; // 终结语句之后的代码不可达，编进去反而打乱栈图
+                    }
+                    term = compile_stmt(s, em, ctx, cp)?;
+                }
+                // 箭头语法（`case "a" -> ...`）**不贯穿**：体末尾自动 break
+                if c.arrow && !term {
+                    em.goto(end_label);
                 }
             }
             // end_label 是 break 的落点（也可能没有任何 break 跳到它，照样要绑定）
@@ -342,6 +369,28 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             em.bind(end);
             Ok(false)
         }
+        // `do { … } while (cond);` —— 先跑一遍体，条件为真再来一轮。
+        // `continue` 跳到**条件判断**处（不是循环头），否则会跳过条件直接重跑。
+        Stmt::DoWhile { body, cond } => {
+            let scope = em.local_types.clone();
+            let start = em.new_label();
+            let cont = em.new_label();
+            let end = em.new_label();
+            em.bind(start);
+            let lbl = ctx.pending_label.take();
+            ctx.break_labels.push(JumpTarget { label: lbl.clone(), target: end });
+            ctx.cont_labels.push(JumpTarget { label: lbl, target: cont });
+            compile_stmt(body, em, ctx, cp)?;
+            ctx.break_labels.pop();
+            ctx.cont_labels.pop();
+            // 循环体里声明的变量出了体就不可见：汇合帧要 chop 掉它们
+            em.local_types = scope;
+            em.bind(cont);
+            compile_cond_false(cond, em, ctx, cp, end)?;
+            em.goto(start);
+            em.bind(end);
+            Ok(false)
+        }
         Stmt::While { cond, body } => {
             let scope = em.local_types.clone();
             let start = em.new_label();
@@ -368,11 +417,16 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             compile_cond_false(cond, em, ctx, cp, l_else)?;
             // 两个分支各自声明的局部变量都不能出现在合并帧里
             let scope = em.local_types.clone();
-            compile_stmt(then, em, ctx, cp)?;
+            let then_term = compile_stmt(then, em, ctx, cp)?;
             match els {
                 Some(e) => {
                     em.local_types = scope.clone();
-                    em.goto(l_end);
+                    // then 分支已经终结（return/throw）时不能再发 goto：那条指令是
+                    // 不可达的，而不可达指令要么有栈图帧、要么只能出现在方法末尾，
+                    // 否则 HotSpot 报 "Expecting a stack map frame at this location"
+                    if !then_term {
+                        em.goto(l_end);
+                    }
                     em.bind(l_else);
                     compile_stmt(e, em, ctx, cp)?;
                     em.local_types = scope;
@@ -420,16 +474,30 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             let mut fin_terminated = true; // 没有 finally 时由下面的分支单独处理
             for c in catches {
                 let handler = em.new_label();
-                let catch_ty = ver_type(cp, &c.ty); // 常量池 Class 索引
-                em.bind_handler(handler, entry.clone(), catch_ty);
+                // 多重捕获（`catch (A | B e)`）：handler 只有一份，异常表里对每个类型
+                // 各记一条（catch_type 不同）。帧里的栈类型必须是公共父类 ——
+                // 声明成 A 而实际抛出 B 会被验证器判 VerifyError。
+                let multi = c.types.len() > 1;
+                let frame_ty = if multi {
+                    cp.class("java/lang/Throwable")
+                } else {
+                    ver_type(cp, &c.types[0])
+                };
+                em.bind_handler(handler, entry.clone(), frame_ty);
                 em.push(1); // 栈上有一个异常对象（bind_handler 只写栈图，不记账）
                 let slot = bump_slot(ctx, em, false)?;
-                em.set_local_type(slot as usize, catch_ty);
+                em.set_local_type(slot as usize, frame_ty);
                 em.store_slot(slot, K_REF)?; // astore
+                // 多重捕获的变量按公共父类算（调用点解析不到具体类的方法，也不会猜错类型）
+                let var_ty = if multi {
+                    Type::Named { path: vec!["Throwable".into()], args: vec![] }
+                } else {
+                    c.types[0].clone()
+                };
                 let saved = (
                     ctx.locals.insert(c.name.clone(), slot),
                     ctx.local_kind.insert(c.name.clone(), K_REF),
-                    ctx.local_ty.insert(c.name.clone(), c.ty.clone()),
+                    ctx.local_ty.insert(c.name.clone(), var_ty),
                 );
                 let catch_terminated = compile_stmt(&c.body, em, ctx, cp)?;
                 any_catch_falls |= !catch_terminated;
@@ -452,7 +520,10 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 if !catch_terminated {
                     em.goto(normal_target);
                 }
-                em.exc(start, body_end, handler, catch_ty);
+                for t in &c.types {
+                    let ct = ver_type(cp, t);
+                    em.exc(start, body_end, handler, ct);
+                }
                 if fin.is_some() {
                     em.exc(handler, h_end, fin_all, 0);
                 }
@@ -515,9 +586,78 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
 }
 
 
+/// `switch (String)`：if-else 链。
+///
+/// 选择子只求值一次（存进引用临时槽），每个 case 标签用 `equals` 逐个比。
+/// `break` 仍然落到 end 标签（和 int switch 同一套 break_labels），
+/// 各 case 体之间**没有**贯穿语义 —— 这也和 javac 的 String switch 一致。
+fn compile_string_switch(
+    selector: &Expr,
+    cases: &[SwitchCase],
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<bool, CompileError> {
+    let sel_slot = ctx.next_slot;
+    ctx.next_slot += 1;
+    if em.max_locals < ctx.next_slot as u16 {
+        em.max_locals = ctx.next_slot as u16;
+    }
+    compile_expr(selector, em, ctx, cp)?;
+    let vt = cp.class("java/lang/String");
+    em.set_local_type(sel_slot as usize, vt);
+    em.astore(sel_slot)?;
+
+    let mut body_labels = Vec::new();
+    for _ in cases {
+        body_labels.push(em.new_label());
+    }
+    let end_label = em.new_label();
+    let default_target = cases
+        .iter()
+        .position(|c| c.labels.iter().any(|l| l.is_none()))
+        .map(|i| body_labels[i])
+        .unwrap_or(end_label);
+    let equals = cp.method_ref("java/lang/String", "equals", "(Ljava/lang/Object;)Z");
+    for (i, c) in cases.iter().enumerate() {
+        for label in &c.labels {
+            let Some(v) = label else { continue };
+            em.aload(sel_slot)?;
+            compile_expr(v, em, ctx, cp)?;
+            em.op_u2(0xB6, equals); // invokevirtual String.equals
+            em.pop(2);
+            em.push(1);
+            em.branch(0x9A, body_labels[i]); // ifne → 命中
+            em.pop(1);
+        }
+    }
+    em.goto(default_target);
+
+    let scope = em.local_types.clone();
+    let lbl = ctx.pending_label.take();
+    ctx.break_labels.push(JumpTarget { label: lbl, target: end_label });
+    for (i, c) in cases.iter().enumerate() {
+        em.local_types = scope.clone();
+        em.bind(body_labels[i]);
+        let mut term = false;
+        for s in &c.body {
+            if term {
+                break;
+            }
+            term = compile_stmt(s, em, ctx, cp)?;
+        }
+        if c.arrow && !term {
+            em.goto(end_label);
+        }
+    }
+    em.local_types = scope.clone();
+    em.bind(end_label);
+    ctx.break_labels.pop();
+    Ok(false)
+}
+
 /// 带标签的跳转：从内向外找第一个同名落点
-fn find_target(stack: &[JumpTarget], name: &str) -> Option<usize> {
-    stack
+fn find_target(stack: &[JumpTarget], name: &str) -> Option<usize> {    stack
         .iter()
         .rev()
         .find(|t| t.label.as_deref() == Some(name))

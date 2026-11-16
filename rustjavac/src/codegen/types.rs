@@ -73,7 +73,7 @@ pub(crate) const JAVA_LANG: &[&str] = &["String", "Object", "System", "Integer",
     "StringIndexOutOfBoundsException", "NullPointerException", "ClassCastException",
     "NegativeArraySizeException", "IllegalArgumentException", "IllegalStateException",
     "UnsupportedOperationException", "NumberFormatException", "CloneNotSupportedException",
-    "InterruptedException", "NoSuchElementException", "StackOverflowError",
+    "InterruptedException", "NoSuchElementException", "StackOverflowError", "AutoCloseable", "Closeable", "Cloneable",
     "OutOfMemoryError", "AssertionError",
 ];
 
@@ -175,6 +175,58 @@ pub(crate) fn desc_slots(desc: &str) -> u16 {
         }
     }
     n
+}
+
+/// 描述符 → 形参描述符列表（`(ILjava/lang/String;)V` → `["I", "Ljava/lang/String;"]`）。
+///
+/// 可变参数打包与实参的隐式 checkcast 都按形参描述符逐位对齐，所以要能把参数段切开。
+pub(crate) fn desc_params(desc: &str) -> Vec<String> {
+    let bytes = desc.as_bytes();
+    let mut i = if bytes.first() == Some(&b'(') { 1 } else { 0 };
+    let mut out = Vec::new();
+    while i < bytes.len() && bytes[i] != b')' {
+        let start = i;
+        while i < bytes.len() && bytes[i] == b'[' {
+            i += 1;
+        }
+        if i < bytes.len() && bytes[i] == b'L' {
+            while i < bytes.len() && bytes[i] != b';' {
+                i += 1;
+            }
+            i += 1;
+        } else {
+            i += 1;
+        }
+        out.push(desc[start..i.min(bytes.len())].to_string());
+    }
+    out
+}
+
+/// 泛型擦除后的隐式收窄：目标槽/形参是具体引用类型，而值的**静态类型**是 `Object`
+/// （泛型方法/泛型类的返回值擦除后就长这样）→ 补一条 `checkcast`。
+///
+/// 不补会 VerifyError（`Object` 不可赋给 `String`）；补了之后 `String s = box.get();`
+/// 与 `take(box.get())` 都能照常使用 —— javac 在泛型位置也是插同样的 checkcast。
+pub(crate) fn coerce_to(
+    target: &Type,
+    e: &Expr,
+    ctx: &Ctx,
+    em: &mut Emit,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    if kind_of(target) != K_REF {
+        return Ok(());
+    }
+    if descriptor(target) == "Ljava/lang/Object;" {
+        return Ok(());
+    }
+    let Some(src) = expr_type(e, ctx) else { return Ok(()) };
+    if descriptor(&src) != "Ljava/lang/Object;" {
+        return Ok(());
+    }
+    let cls = ver_type(cp, target);
+    em.op_u2(0xC0, cls); // checkcast
+    Ok(())
 }
 
 pub(crate) fn method_descriptor(params: &[Param], ret: &Option<Type>) -> String {
@@ -437,7 +489,7 @@ const BUILTIN_METHODS: &[(&str, &str, &str)] = &[
 
 /// 内置的**接口**（没有 .class 在 classpath 上，但调用点该发 invokeinterface）
 pub(crate) fn is_builtin_iface(owner: &str) -> bool {
-    matches!(owner, "java/lang/Iterable" | "java/util/Iterator")
+    matches!(owner, "java/lang/Iterable" | "java/util/Iterator" | "java/lang/AutoCloseable" | "java/io/Closeable")
 }
 
 /// `java.lang.*` 内置方法的描述符

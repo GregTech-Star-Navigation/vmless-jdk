@@ -67,6 +67,10 @@ pub(crate) struct Ctx {
     pub(crate) tmp_seq: u32,
     /// `label: for (...)` 里刚读到、还没交给循环体的标签名
     pub(crate) pending_label: Option<String>,
+    /// 任意类的构造器描述符表：类内部名 → 所有 `<init>` 的描述符。
+    /// `new GenBox<>("x")` 的真实描述符是 `(Ljava/lang/Object;)V`（泛型擦除），
+    /// 不能拿实参类型现拼。
+    pub(crate) type_ctors: HashMap<String, Vec<String>>,
 }
 
 impl Ctx {

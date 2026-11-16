@@ -159,7 +159,7 @@ impl Parser {
         }
     }
 
-    pub(crate) fn parse_type_params(&mut self) -> Result<Vec<String>, ParseError> {
+    pub(crate) fn parse_type_params(&mut self) -> Result<Vec<TypeParam>, ParseError> {
         let mut out = Vec::new();
         if !matches!(self.cur(), Tok::Lt) {
             return Ok(out);
@@ -167,13 +167,16 @@ impl Parser {
         self.expect(&Tok::Lt)?;
         loop {
             self.skip_annotations()?;
-            out.push(self.expect_ident()?);
+            let name = self.expect_ident()?;
+            // 擦除时按第一个上界走（`<T extends A & B>` 只留 A）
+            let mut bound = None;
             if self.eat_kw("extends") {
-                let _ = self.parse_type()?;
+                bound = Some(self.parse_type()?);
                 while self.eat(&Tok::Amp) {
                     let _ = self.parse_type()?;
                 }
             }
+            out.push(TypeParam { name, bound });
             if self.eat(&Tok::Comma) {
                 continue;
             }
@@ -228,6 +231,9 @@ impl Parser {
                     let ty = self.parse_type()?;
                     let pname = self.expect_ident()?;
                     let varargs = self.eat(&Tok::Ellipsis);
+                    // `T...` 的声明类型就是 `T[]`：描述符/字段/局部槽都按数组走，
+                    // 只有调用点需要知道「多余的实参要打包成数组」
+                    let ty = if varargs { Type::Array(Box::new(ty)) } else { ty };
                     record_params.push(Param { ty, name: pname, varargs });
                     if self.eat(&Tok::Comma) {
                         continue;
@@ -497,6 +503,9 @@ impl Parser {
                 self.advance();
                 self.expect(&Tok::RBracket)?;
             }
+            // `String... args` 就是 `String[] args`（javac 也是这么记描述符的）：
+            // 声明侧按数组走，调用侧的打包在 codegen 里按描述符做
+            let ty = if varargs { Type::Array(Box::new(ty)) } else { ty };
             out.push(Param { ty, name, varargs });
             if self.eat(&Tok::Comma) {
                 continue;

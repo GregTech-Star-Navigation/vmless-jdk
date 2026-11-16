@@ -203,7 +203,9 @@ impl Qualifier<'_> {
             Stmt::Try { body, catches, finally } => {
                 self.stmt(body);
                 for c in catches.iter_mut() {
-                    self.ty(&mut c.ty);
+                    for t in c.types.iter_mut() {
+                        self.ty(t);
+                    }
                     self.stmt(&mut c.body);
                 }
                 if let Some(f) = finally {

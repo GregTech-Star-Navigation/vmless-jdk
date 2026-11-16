@@ -230,7 +230,9 @@ impl Flattener {
             Stmt::Try { body, catches, finally } => {
                 self.rewrite_stmt(body, vis);
                 for c in catches.iter_mut() {
-                    self.rewrite_type(&mut c.ty, vis);
+                    for t in c.types.iter_mut() {
+                        self.rewrite_type(t, vis);
+                    }
                     self.rewrite_stmt(&mut c.body, vis);
                 }
                 if let Some(f) = finally {

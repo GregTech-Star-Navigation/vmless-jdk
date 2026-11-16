@@ -156,6 +156,165 @@ pub(crate) fn emit_val(
     }
 }
 
+/// 实参的静态类型看着就是那个数组（`m(new String[]{"a"})` 不该再包一层）
+fn arg_looks_like_array(a: &Expr, param_desc: &str, ctx: &Ctx) -> bool {
+    match expr_type(a, ctx) {
+        Some(t) => {
+            let d = descriptor(&t);
+            d == param_desc || d == "Ljava/lang/Object;"
+        }
+        // 推不出来时按种类判：非引用的值（`sum(1)` 的 1）不可能是数组，必须打包
+        None => expr_kind(a, ctx) == K_REF,
+    }
+}
+
+/// 发一组实参：可变参数的尾部打包成数组 + 泛型擦除后的隐式 checkcast。
+///
+/// 压的槽数**必须**正好等于 `desc_slots(desc)`，调用点的栈深记账（`em.pop`）依赖这一点。
+pub(crate) fn emit_call_args(
+    args: &[Expr],
+    desc: &str,
+    sp: &[Option<Spilled>],
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let params = desc_params(desc);
+    let n = params.len();
+    let argc = args.len();
+    let mut fixed = argc;
+    let mut pack: Option<Type> = None;
+    if n > 0 && params[n - 1].starts_with('[') && argc >= n - 1 {
+        let pdesc = params[n - 1].clone();
+        let many = argc > n;
+        // 实参个数刚好等于形参个数：给的是单元素（`m("a")`）还是整个数组（`m(arr)`）
+        let single = argc == n && !arg_looks_like_array(&args[n - 1], &pdesc, ctx);
+        // 一个实参都没给（`m()`）：形参比实参多一个且最后一个是数组 → 打包成空数组。
+        // 这里不做类型检查，所以 `m(String[] a)` 被写成 `m()` 也会被当成可变参数
+        // （已知的宽松；报错会变成静默容忍，但正常代码不受影响）。
+        let empty = argc + 1 == n;
+        if many || single || empty {
+            fixed = n - 1;
+            pack = Some(type_from_desc(&pdesc[1..]));
+        }
+    }
+    for (i, a) in args.iter().enumerate().take(fixed.min(argc)) {
+        emit_val(a, &sp[i], em, ctx, cp)?;
+        if let Some(pd) = params.get(i) {
+            let target = type_from_desc(pd);
+            coerce_to(&target, a, ctx, em, cp)?;
+        }
+    }
+    if let Some(elem) = pack {
+        pack_tail(&args[fixed.min(argc)..], &sp[fixed.min(argc)..], &elem, em, ctx, cp)?;
+    }
+    Ok(())
+}
+
+/// 把尾部实参装成数组压栈（栈上净增 1 槽）。
+///
+/// 每个元素都从脏槽取（`hoist_args` 已经把会分叉的表达式算好了），
+/// 所以 `aastore` 之前没有跳转点 —— 栈图上「数组还在栈上」这件事是安全的。
+fn pack_tail(
+    tail: &[Expr],
+    sp: &[Option<Spilled>],
+    elem: &Type,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    em.const_int(tail.len() as i32);
+    let store: u8 = match elem {
+        Type::Prim("int") => {
+            em.op(0xBC);
+            em.bytes.push(10); // newarray T_INT
+            0x4F
+        }
+        Type::Prim("long") => {
+            em.op(0xBC);
+            em.bytes.push(11);
+            0x50
+        }
+        Type::Prim("double") => {
+            em.op(0xBC);
+            em.bytes.push(7);
+            0x52
+        }
+        Type::Prim("boolean") => {
+            em.op(0xBC);
+            em.bytes.push(4);
+            0x54
+        }
+        Type::Prim("char") => {
+            em.op(0xBC);
+            em.bytes.push(5);
+            0x55
+        }
+        Type::Prim("byte") => {
+            em.op(0xBC);
+            em.bytes.push(8);
+            0x54
+        }
+        Type::Prim("short") => {
+            em.op(0xBC);
+            em.bytes.push(9);
+            0x56
+        }
+        _ => {
+            let cls = ver_type(cp, elem);
+            em.op_u2(0xBD, cls); // anewarray
+            0x53
+        }
+    };
+    em.pop(1);
+    em.push(1);
+    for (i, a) in tail.iter().enumerate() {
+        em.op(0x59); // dup
+        em.push(1);
+        em.const_int(i as i32);
+        emit_val(a, &sp[i], em, ctx, cp)?;
+        em.op(store);
+        em.pop(3);
+    }
+    Ok(())
+}
+
+/// 按实参挑构造器描述符。
+///
+/// 泛型擦除后 `new GenBox<>("x")` 的构造器是 `(Ljava/lang/Object;)V` ——
+/// 拿实参类型现拼出来的是 `(Ljava/lang/String;)V`，那个方法根本不存在
+/// （HotSpot 的报错是 `NoSuchMethodError: 'void GenBox.<init>(java.lang.String)'`）。
+/// 所以先按「精确匹配」试，再退回「形参个数相同里最贴的那个」。
+fn pick_ctor(owner: &str, args: &[Expr], ctx: &Ctx) -> Option<String> {
+    let list = ctx.type_ctors.get(owner)?;
+    let exact = format!("({})V", args_desc(args, ctx));
+    if list.iter().any(|d| d == &exact) {
+        return Some(exact);
+    }
+    let arg_descs: Vec<String> = args
+        .iter()
+        .map(|a| expr_type(a, ctx).map(|t| descriptor(&t)).unwrap_or_default())
+        .collect();
+    let mut best: Option<(i32, String)> = None;
+    for d in list {
+        let ps = desc_params(d);
+        let n = ps.len();
+        let mut score = -1i32;
+        if n == args.len() {
+            score = ps.iter().enumerate().filter(|(i, p)| arg_descs.get(*i) == Some(*p)).count() as i32;
+        } else if n > 0 && ps[n - 1].starts_with('[') && args.len() + 1 >= n {
+            score = 0; // 可变参数构造器
+        }
+        if score < 0 {
+            continue;
+        }
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, d.clone()));
+        }
+    }
+    best.map(|(_, d)| d)
+}
+
 pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
     match e {
         Expr::IntLit(s) => {
@@ -285,16 +444,14 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 Type::Named { path, .. } => internal_name(path),
                 _ => return err("只支持创建对象"),
             };
-            let ctor_desc = format!("({})V", args_desc(args, ctx));
+            let ctor_desc = pick_ctor(&owner, args, ctx).unwrap_or_else(|| format!("({})V", args_desc(args, ctx)));
             let cls = cp.class(&owner);
             let sp = hoist_args(args, em, ctx, cp)?;
             em.op_u2(0xBB, cls); // new
             em.push(1);
             em.op(0x59); // dup
             em.push(1);
-            for (a, s) in args.iter().zip(sp.iter()) {
-                emit_val(a, s, em, ctx, cp)?;
-            }
+            emit_call_args(args, &ctor_desc, &sp, em, ctx, cp)?;
             let init = cp.method_ref(&owner, "<init>", &ctor_desc);
             em.op_u2(0xB7, init); // invokespecial
             em.pop(desc_slots(&ctor_desc) + 1);
@@ -424,13 +581,12 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             if !ctx.in_ctor {
                 return err("this(...) 只能出现在构造器里");
             }
-            let desc = format!("({})V", args_desc(args, ctx));
+            let desc = pick_ctor(&ctx.class_name, args, ctx)
+                .unwrap_or_else(|| format!("({})V", args_desc(args, ctx)));
             let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
-            for (a, s) in args.iter().zip(sp.iter()) {
-                emit_val(a, s, em, ctx, cp)?;
-            }
+            emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let idx = cp.method_ref(&ctx.class_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
             em.pop(desc_slots(&desc) + 1);
@@ -441,13 +597,12 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             if !ctx.in_ctor {
                 return err("super(...) 只能出现在构造器里");
             }
-            let desc = format!("({})V", args_desc(args, ctx));
+            let desc = pick_ctor(&ctx.super_name, args, ctx)
+                .unwrap_or_else(|| format!("({})V", args_desc(args, ctx)));
             let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
-            for (a, s) in args.iter().zip(sp.iter()) {
-                emit_val(a, s, em, ctx, cp)?;
-            }
+            emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let idx = cp.method_ref(&ctx.super_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
             em.pop(desc_slots(&desc) + 1);
@@ -457,11 +612,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         Expr::Call { recv: Some(r), name, args, .. } if matches!(**r, Expr::Super) => {
             let desc = call_desc(Some(r), name, ctx)
                 .ok_or_else(|| CompileError { msg: format!("父类里未找到方法 `{name}`") })?;
+            let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
-            for a in args {
-                compile_expr(a, em, ctx, cp)?;
-            }
+            emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let idx = cp.method_ref(&ctx.super_name, name, &desc);
             em.op_u2(0xB7, idx); // invokespecial
             em.pop(desc_slots(&desc) + 1);
@@ -475,9 +629,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             // 静态方法：`ClassName.m(...)` → invokestatic（owner 就是那个类）
             if let Some((owner, desc)) = static_call(r, name, ctx) {
                 let sp = hoist_args(args, em, ctx, cp)?;
-                for (a, s) in args.iter().zip(sp.iter()) {
-                    emit_val(a, s, em, ctx, cp)?;
-                }
+                emit_call_args(args, &desc, &sp, em, ctx, cp)?;
                 // 接口的静态方法必须引用 InterfaceMethodref（否则 JVM 报
                 // "must be InterfaceMethodref constant"）
                 let idx = if ctx.iface_types.contains(&owner) {
@@ -496,9 +648,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`") })?;
             let sp = hoist_args(args, em, ctx, cp)?;
             compile_expr(r, em, ctx, cp)?;
-            for (a, s) in args.iter().zip(sp.iter()) {
-                emit_val(a, s, em, ctx, cp)?;
-            }
+            emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             // 引用类用接收者的**静态类型**：验证器要求接收者可赋给引用类。
             // 分派本身按运行时类走（虚方法覆写），引用类只决定从哪条链开始解析。
             let owner = expr_type(r, ctx).as_ref().and_then(type_internal).unwrap_or_else(|| ctx.class_name.clone());
@@ -525,9 +675,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         Expr::Call { name, args, .. } => {
             if let Some(desc) = ctx.static_methods.get(name.as_str()).cloned() {
                 let sp = hoist_args(args, em, ctx, cp)?;
-                for (a, s) in args.iter().zip(sp.iter()) {
-                    emit_val(a, s, em, ctx, cp)?;
-                }
+                emit_call_args(args, &desc, &sp, em, ctx, cp)?;
                 let idx = cp.method_ref("<SELF>", name, &desc);
                 em.op_u2(0xB8, idx);
                 em.pop(desc_slots(&desc));
@@ -546,9 +694,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
-            for (a, s) in args.iter().zip(sp.iter()) {
-                emit_val(a, s, em, ctx, cp)?;
-            }
+            emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let n = args.len() as u16 + 1;
             // 接口里的 default 方法调另一个方法（`area()` = this.area()）：
             // 自己就是接口时必须是 invokeinterface，否则 JVM 报

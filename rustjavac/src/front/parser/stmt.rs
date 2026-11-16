@@ -292,9 +292,26 @@ impl Parser {
 
     pub(crate) fn parse_try(&mut self) -> Result<Stmt, ParseError> {
         self.expect_kw("try")?;
+        let mut resources: Vec<Stmt> = Vec::new();
         if matches!(self.cur(), Tok::LParen) {
-            // try-with-resources
-            self.skip_balanced(Tok::LParen, Tok::RParen)?;
+            // try-with-resources：`try (R r = e; S s = f) { ... }`
+            self.advance();
+            if !matches!(self.cur(), Tok::RParen) {
+                loop {
+                    self.skip_annotations()?;
+                    let _ = self.eat_kw("final");
+                    let ty = self.parse_type()?;
+                    let name = self.expect_ident()?;
+                    self.expect(&Tok::Assign)?;
+                    // 资源初始化式里可能有 `,`（`new X(a, b)`）—— parse_expr 会自己吃干净
+                    let init = self.parse_expr()?;
+                    resources.push(Stmt::LocalVar { ty, name, init: Some(init) });
+                    if !self.eat(&Tok::Semi) {
+                        break;
+                    }
+                }
+            }
+            self.expect(&Tok::RParen)?;
         }
         let body = Box::new(self.parse_block()?);
         let mut catches = Vec::new();
@@ -302,14 +319,53 @@ impl Parser {
             self.advance();
             self.expect(&Tok::LParen)?;
             let _ = self.eat_kw("final");
-            let ty = self.parse_type()?;
-            while self.eat(&Tok::Bar) { let _ = self.parse_type()?; }
+            // 多重捕获：`catch (A | B e)`
+            let mut types = vec![self.parse_type()?];
+            while self.eat(&Tok::Bar) {
+                types.push(self.parse_type()?);
+            }
             let name = self.expect_ident()?;
             self.expect(&Tok::RParen)?;
             let cbody = self.parse_block()?;
-            catches.push(Catch { ty, name, body: cbody });
+            catches.push(Catch { types, name, body: cbody });
         }
         let finally = if self.eat_kw("finally") { Some(Box::new(self.parse_block()?)) } else { None };
-        Ok(Stmt::Try { body, catches, finally })
+        if resources.is_empty() {
+            return Ok(Stmt::Try { body, catches, finally });
+        }
+        // 糖化：`try (R r = e) { B } finally { F }`
+        //   → `{ R r = e; try { B } finally { if (r != null) r.close(); F } }`
+        // 多个资源按声明顺序，关闭按**反序**（java 的规则）；关闭放在用户 finally 之前。
+        let mut fin_stmts: Vec<Stmt> = Vec::new();
+        for r in resources.iter().rev() {
+            let name = match r {
+                Stmt::LocalVar { name, .. } => name.clone(),
+                _ => unreachable!(),
+            };
+            fin_stmts.push(Stmt::If {
+                cond: Expr::Binary {
+                    op: BinOp::Ne,
+                    lhs: Box::new(Expr::Ident(name.clone())),
+                    rhs: Box::new(Expr::Null),
+                },
+                then: Box::new(Stmt::Block(vec![Stmt::Expr(Expr::Call {
+                    recv: Some(Box::new(Expr::Ident(name))),
+                    name: "close".into(),
+                    args: Vec::new(),
+                    type_args: Vec::new(),
+                })])),
+                els: None,
+            });
+        }
+        if let Some(f) = finally {
+            fin_stmts.push(*f);
+        }
+        let mut block = resources;
+        block.push(Stmt::Try {
+            body,
+            catches,
+            finally: Some(Box::new(Stmt::Block(fin_stmts))),
+        });
+        Ok(Stmt::Block(block))
     }
 }

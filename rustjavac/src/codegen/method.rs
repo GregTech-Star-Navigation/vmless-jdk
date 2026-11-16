@@ -84,6 +84,10 @@ pub(crate) fn compile_return(
             Some(x) => {
                 let kind = expr_kind(x, ctx);
                 compile_expr(x, em, ctx, cp)?;
+                // 泛型擦除后 `return box.get();` 的栈上是 Object，方法签名要 String：补 checkcast
+                if let Some(t) = ctx.ret_ty.clone() {
+                    coerce_to(&t, x, ctx, em, cp)?;
+                }
                 emit_xreturn(em, kind);
             }
         }
@@ -100,6 +104,9 @@ pub(crate) fn compile_return(
             .map(|i| *em.local_types.get(slot as usize + i).unwrap_or(&u16::MAX))
             .collect();
         compile_expr(x, em, ctx, cp)?;
+        if let Some(t) = ctx.ret_ty.clone() {
+            coerce_to(&t, x, ctx, em, cp)?;
+        }
         let vt = match ctx.ret_ty.clone() {
             Some(t) => ver_type(cp, &t),
             None => 0,

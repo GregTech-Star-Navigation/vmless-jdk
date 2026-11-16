@@ -68,6 +68,12 @@ pub(crate) fn compile_type(
     let mut type_static_methods: HashMap<String, HashMap<String, String>> = HashMap::new();
     // 接口类型名集合：调用点据此选 invokeinterface（0xB9）而不是 invokevirtual
     let mut iface_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+    let mut type_ctors: HashMap<String, Vec<String>> = HashMap::new();
+    for c in res.all_classes() {
+        if let Ok(cs) = res.ctor_descs(&c) {
+            type_ctors.insert(c.clone(), cs);
+        }
+    }
     for c in res.all_classes() {
         if let Ok(f) = res.field_types(&c) {
             type_fields.insert(c.clone(), f);
@@ -170,6 +176,7 @@ pub(crate) fn compile_type(
         cont_labels: Vec::new(),
         tmp_seq: 0,
         pending_label: None,
+        type_ctors: type_ctors.clone(),
     };
 
     for m in &t.members {
@@ -299,6 +306,77 @@ pub(crate) fn compile_type(
             descriptor_index: desc_index,
             attributes: vec![em.to_attribute(code_name)],
         });
+    }
+
+    // ---- 桥接方法 ----
+    //
+    // 泛型擦除后父类型上的方法描述符是**上界**（`interface Holder<T> { T value(); }`
+    // 擦成 `()Ljava/lang/Object;`），实现类写的是具体类型 `()Ljava/lang/String;`。
+    // 没有桥，`Holder<String> h = ...; h.value()`（调用点按擦除后的描述符发
+    // invokeinterface）在运行时就找不到方法。
+    //
+    // 桥只做一次转发：`aload_0; <各形参>; invokevirtual 具体实现; xreturn`。
+    // 判据：同名、形参描述符逐个相同、返回描述符不同 —— 这正是协变返回/泛型实现的样子。
+    {
+        let mut parents: Vec<String> = vec![super_name.clone()];
+        for i in t.implements.iter() {
+            if let Some(n) = type_internal(i) {
+                if !parents.contains(&n) {
+                    parents.push(n);
+                }
+            }
+        }
+        let mut bridges: Vec<(String, String, String)> = Vec::new(); // (名字, 桥描述符, 目标描述符)
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        for m in &t.members {
+            let Member::Method(md) = m else { continue };
+            if md.ret.is_none() || md.name == t.name || md.body.is_none() {
+                continue;
+            }
+            if md.modifiers.iter().any(|x| x == "static") {
+                continue;
+            }
+            let ours = method_descriptor(&md.params, &md.ret);
+            let our_params = desc_params(&ours);
+            for p in &parents {
+                let Some(map) = type_methods.get(p) else { continue };
+                let Some(pdesc) = map.get(&md.name) else { continue };
+                if *pdesc == ours || desc_params(pdesc) != our_params {
+                    continue;
+                }
+                if !seen.insert(format!("{}{}", md.name, pdesc)) {
+                    continue;
+                }
+                bridges.push((md.name.clone(), pdesc.clone(), ours.clone()));
+            }
+        }
+        for (bname, bdesc, tdesc) in bridges {
+            let pdescs = desc_params(&bdesc);
+            let mut slots: u16 = 1; // 0 是 this
+            let mut em = Emit::new(1 + pdescs.iter().map(|p| if p.starts_with('J') || p.starts_with('D') { 2 } else { 1 }).sum::<u16>());
+            em.op(0x2A); // aload_0
+            em.push(1);
+            for p in &pdescs {
+                let k = kind_from_desc(p);
+                em.load_slot(slots as u8, k)?;
+                slots += if kind_wide(k) { 2 } else { 1 };
+            }
+            let idx = cp.method_ref(&self_name, &bname, &tdesc);
+            em.op_u2(0xB6, idx); // invokevirtual 具体实现
+            em.pop(desc_slots(&tdesc) + 1);
+            let rk = kind_from_ret(&bdesc);
+            em.push(if kind_wide(rk) { 2 } else { 1 });
+            super::method::emit_xreturn(&mut em, rk);
+            let n = cp.utf8(&bname);
+            let d = cp.utf8(&bdesc);
+            methods.push(CfMember {
+                // ACC_PUBLIC | ACC_BRIDGE | ACC_SYNTHETIC
+                access_flags: ACC_PUBLIC | 0x0040 | 0x1000,
+                name_index: n,
+                descriptor_index: d,
+                attributes: vec![em.to_attribute(code_name)],
+            });
+        }
     }
 
     // 静态初始化 `<clinit>`：静态字段的初始化式与 `static { }` 块按**源码顺序**执行
