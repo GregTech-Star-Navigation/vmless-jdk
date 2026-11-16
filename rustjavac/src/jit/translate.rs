@@ -7,10 +7,16 @@ use cranelift_module::{Linkage, Module};
 
 use crate::{ClassFile, CpEntry};
 
-use super::call::{argc_of, code_of, convert_to, method_ref_of, param_slots, ret_type, zero_of};
+use super::call::{
+    argc_of, code_of, convert_to, method_ref_of, param_descs, param_slots, ret_type, zero_of,
+};
 use super::exc::{class_uses_exceptions, ExcHelpers};
 use super::insn::insn_len;
-use super::layout::{class_const_tag, elem_addr, field_ref_of, field_slot_type, push_new_array};
+use super::layout::{
+    class_const_tag, elem_addr, emit_ref_addr, field_off, field_ref_of, field_slot_idx,
+    field_slot_type, is_ref_desc, push_new_array,
+};
+use super::refmap;
 use super::rt;
 use super::strtab;
 use super::{Jit, JitError};
@@ -32,7 +38,7 @@ impl Jit {
             .classes
             .get(class)
             .ok_or_else(|| JitError(format!("类 {class} 没有加载")))?;
-        let (max_locals, body, exc_table) = {
+        let (max_locals, max_stack, body, exc_table, is_static) = {
             let m = cf
                 .methods
                 .iter()
@@ -42,7 +48,9 @@ impl Jit {
                     n == name && d == desc
                 })
                 .ok_or_else(|| JitError(format!("{class} 里找不到方法 {name}{desc}")))?;
-            code_of(&cf, m)?
+            let is_static = m.access_flags & 0x0008 != 0;
+            let (ml, ms, body, table) = code_of(&cf, m)?;
+            (ml, ms, body, table, is_static)
         };
 
         // 方法签名：(locals_ptr: i64) -> 返回值
@@ -69,17 +77,15 @@ impl Jit {
         ctx.func.signature = sig.clone();
         // 声明运行时辅助函数
         let mut sig_new_obj = self.module.make_signature();
-        sig_new_obj.params.push(AbiParam::new(types::I32)); // 字段个数
-        sig_new_obj.params.push(AbiParam::new(types::I32)); // 类型标签
-        sig_new_obj.returns.push(AbiParam::new(types::I64));
+        sig_new_obj.params.push(AbiParam::new(types::I32)); // class_id（字段布局在 LayoutTable 里）
+        sig_new_obj.returns.push(AbiParam::new(types::I64)); // 对象引用（堆内偏移）
         let new_obj_id = self
             .module
             .declare_function("vmless_new_object", Linkage::Import, &sig_new_obj)
             .map_err(|e| JitError(e.to_string()))?;
         let mut sig_new_arr = self.module.make_signature();
+        sig_new_arr.params.push(AbiParam::new(types::I32)); // class_id（元素宽度在布局表里）
         sig_new_arr.params.push(AbiParam::new(types::I32)); // 长度
-        sig_new_arr.params.push(AbiParam::new(types::I32)); // 元素字节数
-        sig_new_arr.params.push(AbiParam::new(types::I32)); // 类型标签
         sig_new_arr.returns.push(AbiParam::new(types::I64));
         let new_arr_id = self
             .module
@@ -152,6 +158,14 @@ impl Jit {
             .module
             .declare_function("vmless_str_const", Linkage::Import, &sig_sc)
             .map_err(|e| JitError(e.to_string()))?;
+        let mut sig_dp = self.module.make_signature();
+        sig_dp.params.push(AbiParam::new(types::I32));
+        sig_dp.returns.push(AbiParam::new(types::I64));
+        let desc_ptr_id = self
+            .module
+            .declare_function("vmless_desc_ptr", Linkage::Import, &sig_dp)
+            .map_err(|e| JitError(e.to_string()))?;
+
         let mut sig_ps = self.module.make_signature();
         sig_ps.params.push(AbiParam::new(types::I64));
         let println_obj_id = self
@@ -216,6 +230,16 @@ impl Jit {
             .module
             .declare_function("vmless_vcall", Linkage::Import, &sig_vc)
             .map_err(|e| JitError(e.to_string()))?;
+        // 引用写屏障：老对象存年轻引用必须把卡标脏，否则 minor 会把活对象回收掉
+        let mut sig_sr = self.module.make_signature();
+        sig_sr.params.push(AbiParam::new(types::I64));
+        sig_sr.params.push(AbiParam::new(types::I32));
+        sig_sr.params.push(AbiParam::new(types::I64));
+        let set_ref_id = self
+            .module
+            .declare_function("vmless_set_ref", Linkage::Import, &sig_sr)
+            .map_err(|e| JitError(e.to_string()))?;
+
         let helpers = ExcHelpers {
             pending: exc_pending_id,
             clear: exc_clear_id,
@@ -274,6 +298,57 @@ impl Jit {
         for t in &targets {
             let b = fb.create_block();
             blocks.insert(*t, b);
+        }
+
+        // 每个 pc 上「操作数栈哪一位是引用」：GC 点同步影子栈、GC 后读回新偏移都靠它
+        let refs = refmap::analyze(&cf, &body, &blocks, &handler_pcs)?;
+        // 整个方法都不碰引用（纯数值代码）就不必维护影子栈：省掉每次调用/分配的
+        // 根区登记与读写
+        let has_refs =
+            refs.uses_ref || !is_static || param_descs(desc).iter().any(|d| is_ref_desc(d));
+
+        // ---- 影子栈（根区）----
+        // 每帧在自己的栈帧里留 max_locals + max_stack 个 u32：**引用型局部变量只住这里**，
+        // 操作数栈上的引用在 GC 点前也写进来。整块登记进 Heap 的根表，GC 搬完对象就地
+        // 改写它，本帧再从根区把新偏移读回去。
+        let root_slots = if has_refs { (max_locals + max_stack).max(1) as i32 } else { 0 };
+        let root_area = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
+            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+            (root_slots * 4) as u32,
+            2,
+        ));
+        let root_ptr = fb.ins().stack_addr(types::I64, root_area, 0);
+        {
+            // 栈槽不保证是 0：先清零，别让垃圾值被当成偏移
+            let zero = fb.ins().iconst(types::I32, 0);
+            for i in 0..root_slots {
+                let addr = fb.ins().iadd_imm(root_ptr, (i * 4) as i64);
+                fb.ins().store(MemFlags::new(), zero, addr, 0);
+            }
+            // 引用型参数从 locals 搬进根区（局部变量区只留基本类型）
+            let mut slots = param_slots(desc);
+            let mut kinds: Vec<bool> = Vec::new();
+            if !is_static {
+                // 实例方法：this 在槽 0，参数从槽 1 起（与调用点写参的布局一致）
+                for s in slots.iter_mut() {
+                    *s += 1;
+                }
+                slots.insert(0, 0);
+                kinds.push(true);
+            }
+            for d in param_descs(desc) {
+                kinds.push(is_ref_desc(&d));
+            }
+            for (k, slot) in slots.iter().enumerate() {
+                if kinds.get(k).copied().unwrap_or(false) && *slot < max_locals {
+                    let addr = fb.ins().iadd_imm(locals_ptr, (*slot * 8) as i64);
+                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    store_root(&mut fb, root_ptr, *slot, v);
+                }
+            }
+        }
+        if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
         }
 
         // 局部变量在内存里：locals_ptr + i*4
@@ -535,6 +610,9 @@ impl Jit {
                 0xac | 0xad | 0xae | 0xaf | 0xb0 => {
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let v = convert_to(&mut fb, v, ret_ty);
+                    if has_refs {
+                        self.emit_frame_exit(&mut fb, root_ptr, root_slots)?;
+                    }
                     fb.ins().return_(&[v]);
                     returns += 1;
                     terminated = true;
@@ -547,6 +625,9 @@ impl Jit {
                 }
                 0xb1 => {
                     let zero = zero_of(&mut fb, ret_ty);
+                    if has_refs {
+                        self.emit_frame_exit(&mut fb, root_ptr, root_slots)?;
+                    }
                     fb.ins().return_(&[zero]);
                     returns += 1;
                     terminated = true;
@@ -563,7 +644,18 @@ impl Jit {
                     let v = convert_to(&mut fb, v, types::I64);
                     let f = self.module.declare_func_in_func(helpers.throw_, fb.func);
                     fb.ins().call(f, &[v]);
-                    self.emit_dispatch(&mut fb, &cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                    self.emit_dispatch(
+                            &mut fb,
+                            &cf,
+                            &exc_table,
+                            &blocks,
+                            exc_slot,
+                            &helpers,
+                            op_pc,
+                            ret_ty,
+                            root_ptr,
+                            root_slots,
+                        )?;
                     terminated = true;
                     open.pop();
                     let dead = fb.create_block();
@@ -577,9 +669,22 @@ impl Jit {
                     let (fid, callee_max_locals, argc) = *call_targets
                         .get(&idx)
                         .ok_or_else(|| JitError("调用目标未编译".into()))?;
+                    // <clinit> 与调用本身都可能分配对象：先把操作数栈上的引用写进根区并登记
+                    let op_pc = pc - 3;
+                    let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
                     // 首次调用这个类的静态方法时先跑它的 <clinit>
                     let callee_owner = method_ref_of(&cf, idx)?.0;
                     self.emit_clinit_call(&mut fb, &callee_owner)?;
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
                     // 参数出栈（逆序），写进为被调方法准备的栈槽
                     let mut args = Vec::new();
                     for _ in 0..argc {
@@ -602,9 +707,17 @@ impl Jit {
                     let ptr = fb.ins().stack_addr(types::I64, slot, 0);
                     let fref = self.module.declare_func_in_func(fid, fb.func);
                     let call = fb.ins().call(fref, &[ptr]);
-                    // 被调方已按自己的返回类型返回（i64/f64/i32），这里直接上栈
-                    if !callee_desc.ends_with(")V") {
-                        stack.push(fb.inst_results(call)[0]);
+                    // 被调方已按自己的返回类型返回（i64/f64/i32）
+                    let rv = if callee_desc.ends_with(")V") {
+                        None
+                    } else {
+                        Some(fb.inst_results(call)[0])
+                    };
+                    // 被调方可能分配过对象：撤根区，把（可能被搬过的）新偏移读回操作数栈
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                    if let Some(v) = rv {
+                        stack.push(v);
                     }
                     if uses_exc {
                         // 被调方抛了？命中就派发，否则进 cont 块继续
@@ -616,36 +729,44 @@ impl Jit {
                         let flag = fb.inst_results(pcx)[0];
                         fb.ins().brif(flag, disp, &[], cont, &[]);
                         fb.switch_to_block(disp);
-                        self.emit_dispatch(&mut fb, &cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                        self.emit_dispatch(
+                            &mut fb,
+                            &cf,
+                            &exc_table,
+                            &blocks,
+                            exc_slot,
+                            &helpers,
+                            op_pc,
+                            ret_ty,
+                            root_ptr,
+                            root_slots,
+                        )?;
                         fb.switch_to_block(cont);
                     }
                 }
                 // 引用类型局部变量（8 字节槽）
                 0x2a..=0x2d => {
                     let slot = (op - 0x2a) as usize;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    // 引用型局部变量只住影子栈（根区）：GC 搬过对象后那里是最新偏移
+                    let v = load_root(&mut fb, root_ptr, slot);
                     stack.push(v);
                 }
                 0x19 => {
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    let v = load_root(&mut fb, root_ptr, slot);
                     stack.push(v);
                 }
                 0x4b..=0x4e => {
                     let slot = (op - 0x4b) as usize;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    store_root(&mut fb, root_ptr, slot, v);
                 }
                 0x3a => {
                     let slot = body[pc] as usize;
                     pc += 1;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    store_root(&mut fb, root_ptr, slot, v);
                 }
                 0x59 => {
                     let v = *stack.last().ok_or_else(|| JitError("栈下溢".into()))?;
@@ -670,6 +791,12 @@ impl Jit {
                         }
                         continue;
                     };
+                    let op_pc = pc - 3;
+                    let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
                     let mut args = Vec::new();
                     for _ in 0..argc {
                         args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
@@ -692,8 +819,15 @@ impl Jit {
                     let c = fb.ins().call(fref, &[ptr]);
                     // super.m() 有返回值：直接调用，被调方返回的就是真类型
                     let callee_desc = method_ref_of(&cf, idx)?.2;
-                    if !callee_desc.ends_with(")V") {
-                        stack.push(fb.inst_results(c)[0]);
+                    let rv = if callee_desc.ends_with(")V") {
+                        None
+                    } else {
+                        Some(fb.inst_results(c)[0])
+                    };
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                    if let Some(v) = rv {
+                        stack.push(v);
                     }
                 }
                 // long：常量
@@ -870,7 +1004,7 @@ impl Jit {
                         stack.push(z);
                     } else {
                         self.emit_clinit_call(&mut fb, &owner)?;
-                        let slot = rt::static_slot(&owner, &fname);
+                        let slot = rt::static_slot(&owner, &fname, is_ref_desc(&fdesc));
                         let (_, want) = field_slot_type(&fdesc);
                         let mut sig = self.module.make_signature();
                         sig.params.push(AbiParam::new(types::I32));
@@ -897,7 +1031,7 @@ impl Jit {
                     pc += 2;
                     let (owner, fname, fdesc) = field_ref_of(&cf, idx)?;
                     self.emit_clinit_call(&mut fb, &owner)?;
-                    let slot = rt::static_slot(&owner, &fname);
+                    let slot = rt::static_slot(&owner, &fname, is_ref_desc(&fdesc));
                     let (ty, _) = field_slot_type(&fdesc);
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     // 统一按 i64 位模式存
@@ -969,13 +1103,25 @@ impl Jit {
                             let addr = fb.ins().stack_addr(types::I64, slot, off);
                             fb.ins().store(MemFlags::new(), *v, addr, 0);
                         }
+                        let op_pc = pc - if op == 0xb9 { 5 } else { 3 };
+                        let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                        spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                        if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
                         let ptr = fb.ins().stack_addr(types::I64, slot, 0);
                         let key = fb.ins().iconst(types::I32, sig as i64);
                         let fref = self.module.declare_func_in_func(vcall_id, fb.func);
                         let c = fb.ins().call(fref, &[ptr, key]);
-                        if !desc.ends_with(")V") {
+                        let rv = if desc.ends_with(")V") {
+                            None
+                        } else {
+                            Some(fb.inst_results(c)[0])
+                        };
+                        self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                        reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                        if let Some(raw) = rv {
                             // vcall 统一按 i64 回来，按真实返回类型转一次
-                            let raw = fb.inst_results(c)[0];
                             let want = ret_type(&desc);
                             let v = if want == types::F64 {
                                 fb.ins().bitcast(types::F64, MemFlags::new(), raw)
@@ -993,7 +1139,18 @@ impl Jit {
                             let flag = fb.inst_results(pcx)[0];
                             fb.ins().brif(flag, disp, &[], cont, &[]);
                             fb.switch_to_block(disp);
-                            self.emit_dispatch(&mut fb, &cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                            self.emit_dispatch(
+                            &mut fb,
+                            &cf,
+                            &exc_table,
+                            &blocks,
+                            exc_slot,
+                            &helpers,
+                            op_pc,
+                            ret_ty,
+                            root_ptr,
+                            root_slots,
+                        )?;
                             fb.switch_to_block(cont);
                         }
                     }
@@ -1009,13 +1166,28 @@ impl Jit {
                         other => return Err(JitError(format!("new 的操作数不是类: {other:?}"))),
                     };
                     let tag = rt::class_tag(&cls);
-                    // 首次 new 这个类时先跑它的 <clinit>
+                    // 类布局进 LayoutTable：GC 靠它知道哪些字段是引用（每字段两槽）
+                    let descs = self.classes.field_descs(&cls);
+                    let class_id = rt::register_class(tag, &cls, &descs);
+                    let refs_pc = refs.at.get(&(pc - 3)).cloned().unwrap_or_default();
+                    // <clinit> 里也可能分配对象 → 先登记根区再调
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
                     self.emit_clinit_call(&mut fb, &cls)?;
-                    // 字段个数按**被创建的那个类**的布局（含父类字段）算，不是本类的
-                    let nf = fb.ins().iconst(types::I32, self.classes.field_count(&cls) as i64);
-                    let tg = fb.ins().iconst(types::I32, tag as i64);
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                    // 分配本身也是 GC 点
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
+                    let cid = fb.ins().iconst(types::I32, class_id as i64);
                     let fref = self.module.declare_func_in_func(new_obj_id, fb.func);
-                    let c = fb.ins().call(fref, &[nf, tg]);
+                    let c = fb.ins().call(fref, &[cid]);
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     let p = fb.inst_results(c)[0];
                     stack.push(p);
                 }
@@ -1030,10 +1202,18 @@ impl Jit {
                         .field_offset(&owner, &name)
                         .ok_or_else(|| JitError(format!("未知字段 {owner}.{name}")))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let off = (8 + 8 * f) as i32;
-                    let (ty, want) = field_slot_type(&desc);
-                    let v = fb.ins().load(ty, MemFlags::new(), p, off);
-                    stack.push(convert_to(&mut fb, v, want));
+                    let addr = emit_ref_addr(&mut fb, p);
+                    let off = field_off(f);
+                    let v = if is_ref_desc(&desc) {
+                        // 引用槽只占低 4 字节，读出来是堆内偏移
+                        let v32 = fb.ins().load(types::I32, MemFlags::new(), addr, off);
+                        fb.ins().uextend(types::I64, v32)
+                    } else {
+                        let (ty, want) = field_slot_type(&desc);
+                        let v = fb.ins().load(ty, MemFlags::new(), addr, off);
+                        convert_to(&mut fb, v, want)
+                    };
+                    stack.push(v);
                 }
                 // putfield
                 0xb5 => {
@@ -1046,10 +1226,20 @@ impl Jit {
                         .ok_or_else(|| JitError(format!("未知字段 {owner}.{name}")))?;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let (ty, want) = field_slot_type(&desc);
-                    let v = convert_to(&mut fb, v, want);
-                    let _ = ty;
-                    fb.ins().store(MemFlags::new(), v, p, (8 + 8 * f) as i32);
+                    if is_ref_desc(&desc) {
+                        // 引用字段走写屏障：老对象存年轻引用必须把卡标脏
+                        let idx = fb.ins().iconst(types::I32, field_slot_idx(f) as i64);
+                        let p64 = convert_to(&mut fb, p, types::I64);
+                        let v64 = convert_to(&mut fb, v, types::I64);
+                        let fref = self.module.declare_func_in_func(set_ref_id, fb.func);
+                        fb.ins().call(fref, &[p64, idx, v64]);
+                    } else {
+                        let (ty, want) = field_slot_type(&desc);
+                        let v = convert_to(&mut fb, v, want);
+                        let _ = ty;
+                        let addr = emit_ref_addr(&mut fb, p);
+                        fb.ins().store(MemFlags::new(), v, addr, field_off(f));
+                    }
                 }
                 // newarray：atype → (元素描述符, 元素字节数)
                 0xbc => {
@@ -1065,7 +1255,18 @@ impl Jit {
                         9 => ("[S", 4),
                         _ => ("[I", 4),
                     };
-                    push_new_array(&mut fb, &mut stack, &mut self.module, new_arr_id, esize, desc)?;
+                    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let n = convert_to(&mut fb, n, types::I32);
+                    let refs_pc = refs.at.get(&(pc - 2)).cloned().unwrap_or_default();
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
+                    let v = push_new_array(&mut self.module, &mut fb, new_arr_id, desc, n);
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                    stack.push(v);
+                    let _ = esize;
                 }
                 // multianewarray：长度先落到一个栈槽里，再交给运行时递归建
                 0xc5 => {
@@ -1101,13 +1302,21 @@ impl Jit {
                     let ptr = fb.ins().stack_addr(types::I64, slot, 0);
                     let nd = fb.ins().iconst(types::I32, ndims as i64);
                     // 描述符串：编译期登记，运行时取稳定指针
-                    let sidx = strtab::register(&desc);
-                    let sref = self.module.declare_func_in_func(str_const_id, fb.func);
+                    // 描述符串只给 Rust 侧读，走独立表（不是 Java 对象）
+                    let sidx = strtab::register_desc(&desc);
+                    let sref = self.module.declare_func_in_func(desc_ptr_id, fb.func);
                     let si = fb.ins().iconst(types::I32, sidx as i64);
                     let sc = fb.ins().call(sref, &[si]);
                     let sp = fb.inst_results(sc)[0];
+                    let refs_pc = refs.at.get(&(pc - 4)).cloned().unwrap_or_default();
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
                     let fref = self.module.declare_func_in_func(new_multi_id, fb.func);
                     let c = fb.ins().call(fref, &[ptr, nd, sp]);
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     stack.push(fb.inst_results(c)[0]);
                 }
                 // anewarray：操作数是元素类 → 数组描述符 [Lxxx; 或 [[xxx
@@ -1125,17 +1334,29 @@ impl Jit {
                     } else {
                         format!("[L{comp};")
                     };
-                    push_new_array(&mut fb, &mut stack, &mut self.module, new_arr_id, 8, &desc)?;
+                    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let n = convert_to(&mut fb, n, types::I32);
+                    let refs_pc = refs.at.get(&(pc - 3)).cloned().unwrap_or_default();
+                    spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                    if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
+                    let v = push_new_array(&mut self.module, &mut fb, new_arr_id, &desc, n);
+                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                    stack.push(v);
                 }
                 // arraylength（长度在偏移 0）
                 0xbe => {
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let v = fb.ins().load(types::I32, MemFlags::new(), p, 0);
+                    let addr = emit_ref_addr(&mut fb, p);
+                    // librustjrt 的数组头 16 字节：class_id / flags / 长度 / 填充
+                    let v = fb.ins().load(types::I32, MemFlags::new(), addr, 8);
                     stack.push(v);
                 }
                 // iaload / laload / faload / daload / aaload：元素宽度按指令选
                 0x2e | 0x2f | 0x30 | 0x31 | 0x32 => {
-                    let esize: i64 = if matches!(op, 0x2e) { 4 } else { 8 };
+                    let esize: i64 = if matches!(op, 0x2e | 0x32) { 4 } else { 8 };
                     let ty = match op {
                         0x2f => types::I64,
                         0x30 | 0x31 => types::F64,
@@ -1144,13 +1365,20 @@ impl Jit {
                     };
                     let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = elem_addr(&mut fb, p, idx, esize)?;
-                    let v = fb.ins().load(ty, MemFlags::new(), addr, 0);
+                    let paddr = emit_ref_addr(&mut fb, p);
+                    let addr = elem_addr(&mut fb, paddr, idx, esize)?;
+                    let v = if op == 0x32 {
+                        // 引用元素是 4 字节偏移
+                        let v32 = fb.ins().load(types::I32, MemFlags::new(), addr, 0);
+                        fb.ins().uextend(types::I64, v32)
+                    } else {
+                        fb.ins().load(ty, MemFlags::new(), addr, 0)
+                    };
                     stack.push(v);
                 }
                 // iastore / lastore / fastore / dastore / aastore
                 0x4f | 0x50 | 0x51 | 0x52 | 0x53 => {
-                    let esize: i64 = if matches!(op, 0x4f) { 4 } else { 8 };
+                    let esize: i64 = if matches!(op, 0x4f | 0x53) { 4 } else { 8 };
                     let want = match op {
                         0x50 => types::I64,
                         0x51 | 0x52 => types::F64,
@@ -1160,9 +1388,19 @@ impl Jit {
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let v = convert_to(&mut fb, v, want);
-                    let addr = elem_addr(&mut fb, p, idx, esize)?;
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    if op == 0x53 {
+                        // 引用元素走写屏障（老数组存年轻引用）
+                        let p64 = convert_to(&mut fb, p, types::I64);
+                        let i32v = convert_to(&mut fb, idx, types::I32);
+                        let v64 = convert_to(&mut fb, v, types::I64);
+                        let fref = self.module.declare_func_in_func(set_ref_id, fb.func);
+                        fb.ins().call(fref, &[p64, i32v, v64]);
+                    } else {
+                        let v = convert_to(&mut fb, v, want);
+                        let paddr = emit_ref_addr(&mut fb, p);
+                        let addr = elem_addr(&mut fb, paddr, idx, esize)?;
+                        fb.ins().store(MemFlags::new(), v, addr, 0);
+                    }
                 }
                 // instanceof / checkcast：走运行时的类型标签比较
                 0xc1 => {
@@ -1245,6 +1483,9 @@ impl Jit {
         for b in open {
             fb.switch_to_block(b);
             let z = zero_of(&mut fb, ret_ty);
+            if has_refs {
+                self.emit_frame_exit(&mut fb, root_ptr, root_slots)?;
+            }
             fb.ins().return_(&[z]);
         }
         let _ = returns;
@@ -1386,4 +1627,83 @@ fn lng(
     let v = f(fb, a, b);
     stack.push(v);
     Ok(())
+}
+
+// ---------- 影子栈（根区）辅助 ----------
+
+/// 把引用型局部变量写进根区（局部变量区只放基本类型，引用只住根区）
+fn store_root(fb: &mut FunctionBuilder, root_ptr: Value, slot: usize, v: Value) {
+    let v = convert_to(fb, v, types::I64);
+    let v32 = fb.ins().ireduce(types::I32, v);
+    let addr = fb.ins().iadd_imm(root_ptr, (slot * 4) as i64);
+    fb.ins().store(MemFlags::new(), v32, addr, 0);
+}
+
+/// 从根区读一个引用（GC 之后这里是最新偏移）
+fn load_root(fb: &mut FunctionBuilder, root_ptr: Value, slot: usize) -> Value {
+    let addr = fb.ins().iadd_imm(root_ptr, (slot * 4) as i64);
+    let v32 = fb.ins().load(types::I32, MemFlags::new(), addr, 0);
+    fb.ins().uextend(types::I64, v32)
+}
+
+/// GC 点前：把操作数栈上的引用写进根区（局部变量早就在里面了）
+fn spill_refs(fb: &mut FunctionBuilder, stack: &[Value], refs: &[bool], root_ptr: Value, base: usize) {
+    for (j, v) in stack.iter().enumerate() {
+        if refs.get(j).copied().unwrap_or(false) {
+            store_root(fb, root_ptr, base + j, *v);
+        }
+    }
+}
+
+/// GC 点后：把根区里（可能被 GC 改写过的）新偏移读回操作数栈
+fn reload_refs(
+    fb: &mut FunctionBuilder,
+    stack: &mut [Value],
+    refs: &[bool],
+    root_ptr: Value,
+    base: usize,
+) {
+    for (j, v) in stack.iter_mut().enumerate() {
+        if refs.get(j).copied().unwrap_or(false) {
+            *v = load_root(fb, root_ptr, base + j);
+        }
+    }
+}
+
+impl Jit {
+    /// 把本帧根区登记进 / 撤出堆的根表
+    pub(super) fn emit_roots(
+        &mut self,
+        fb: &mut FunctionBuilder,
+        root: Value,
+        n: i32,
+        push: bool,
+    ) -> Result<(), JitError> {
+        // 方法里没有任何引用（root_slots == 0）：整块影子栈都不需要，连调用都不发
+        if n == 0 {
+            return Ok(());
+        }
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I64));
+        sig.params.push(AbiParam::new(types::I32));
+        let name = if push { "vmless_roots_push" } else { "vmless_roots_pop" };
+        let id = self
+            .module
+            .declare_function(name, Linkage::Import, &sig)
+            .map_err(|e| JitError(e.to_string()))?;
+        let fref = self.module.declare_func_in_func(id, fb.func);
+        let nn = fb.ins().iconst(types::I32, n as i64);
+        fb.ins().call(fref, &[root, nn]);
+        Ok(())
+    }
+
+    /// 离开本帧：撤掉根区（异常传播的 return 路径也必须走到这里）
+    pub(super) fn emit_frame_exit(
+        &mut self,
+        fb: &mut FunctionBuilder,
+        root: Value,
+        n: i32,
+    ) -> Result<(), JitError> {
+        self.emit_roots(fb, root, n, false)
+    }
 }

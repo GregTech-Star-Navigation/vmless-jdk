@@ -18,6 +18,7 @@ mod classes;
 mod exc;
 mod insn;
 mod layout;
+mod refmap;
 pub mod rt;
 pub mod strtab;
 mod translate;
@@ -58,6 +59,10 @@ impl Jit {
         builder.symbol("vmless_new_object", rt::new_object as *const u8);
         builder.symbol("vmless_new_array", rt::new_array as *const u8);
         builder.symbol("vmless_new_multi_array", rt::new_multi_array as *const u8);
+        builder.symbol("vmless_set_ref", rt::set_ref as *const u8);
+        builder.symbol("vmless_roots_push", rt::roots_push as *const u8);
+        builder.symbol("vmless_roots_pop", rt::roots_pop as *const u8);
+        builder.symbol("vmless_desc_ptr", strtab::desc_ptr as *const u8);
         builder.symbol("vmless_get_static", rt::get_static as *const u8);
         builder.symbol("vmless_put_static", rt::put_static as *const u8);
         builder.symbol("vmless_clinit", rt::clinit as *const u8);

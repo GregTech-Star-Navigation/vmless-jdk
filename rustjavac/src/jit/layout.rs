@@ -1,6 +1,6 @@
 //! 类标签、字段偏移与数组元素步长。
 
-use cranelift_codegen::ir::{types, InstBuilder, Value};
+use cranelift_codegen::ir::{types, InstBuilder, MemFlags, Value};
 use cranelift_frontend::FunctionBuilder;
 use cranelift_jit::JITModule;
 use cranelift_module::Module;
@@ -12,7 +12,7 @@ use super::rt;
 use super::JitError;
 
 /// 解析常量池里的**字段**引用 → (类名, 字段名, 描述符)
-    pub(super) fn field_ref_of(cf: &ClassFile, index: u16) -> Result<(String, String, String), JitError> {
+pub(super) fn field_ref_of(cf: &ClassFile, index: u16) -> Result<(String, String, String), JitError> {
     let e = cf
         .constant_pool
         .get(index as usize)
@@ -39,7 +39,7 @@ use super::JitError;
 /// 字段描述符 → (访存用的机器类型, 栈上应保持的类型)
 ///
 /// 字段槽统一 8 字节，所以 float 也按 F64 存取（本编译器不产 float 字段）。
-    pub(super) fn field_slot_type(desc: &str) -> (cranelift_codegen::ir::Type, cranelift_codegen::ir::Type) {
+pub(super) fn field_slot_type(desc: &str) -> (cranelift_codegen::ir::Type, cranelift_codegen::ir::Type) {
     match desc.as_bytes().first().copied() {
         Some(b'J') => (types::I64, types::I64),
         Some(b'D') => (types::F64, types::F64),
@@ -49,8 +49,44 @@ use super::JitError;
     }
 }
 
-/// 数组元素地址 = 数组指针 + 8 + 下标 * 元素字节数
-    pub(super) fn elem_addr(
+/// 引用字段 / 引用元素
+pub(super) fn is_ref_desc(desc: &str) -> bool {
+    matches!(desc.as_bytes().first().copied(), Some(b'L') | Some(b'['))
+}
+
+/// 字段 `i` 在对象里的字节偏移。
+///
+/// 每个 Java 字段占 8 字节（两个 librustjrt 槽：值 + 填充），所以偏移与旧布局一致；
+/// 但引用只写低 4 字节 —— 那正好是 GC 位图里的那个槽。
+#[inline]
+pub(super) fn field_off(i: usize) -> i32 {
+    (8 + 8 * i) as i32
+}
+
+/// 字段 `i` 在 librustjrt 布局表里的槽下标（引用写屏障用）
+#[inline]
+pub(super) fn field_slot_idx(i: usize) -> u32 {
+    (2 * i) as u32
+}
+
+/// 生成「读一次堆基址」的代码。
+///
+/// 偏移是相对堆基址的，而堆扩容会 `realloc` 搬整块 —— 基址必须每次现读，不能缓存。
+pub(super) fn emit_base(fb: &mut FunctionBuilder) -> Value {
+    let addr = fb.ins().iconst(types::I64, rt::base_addr());
+    fb.ins().load(types::I64, MemFlags::new(), addr, 0)
+}
+
+/// 对象引用（偏移）→ 可访存的地址（基址 + 偏移）
+pub(super) fn emit_ref_addr(fb: &mut FunctionBuilder, h: Value) -> Value {
+    let base = emit_base(fb);
+    let h = convert_to(fb, h, types::I64);
+    fb.ins().iadd(base, h)
+}
+
+/// 数组元素地址 = 数组地址 + 16 + 下标 * 元素字节数
+/// （librustjrt 的数组头 16 字节：class_id / flags / 长度 / 填充）
+pub(super) fn elem_addr(
     fb: &mut FunctionBuilder,
     p: Value,
     idx: Value,
@@ -61,31 +97,27 @@ use super::JitError;
     let stride = fb.ins().iconst(types::I64, esize);
     let byte_off = fb.ins().imul(off, stride);
     let addr = fb.ins().iadd(p, byte_off);
-    let eight = fb.ins().iconst(types::I64, 8);
-    Ok(fb.ins().iadd(addr, eight))
+    let hdr = fb.ins().iconst(types::I64, 16);
+    Ok(fb.ins().iadd(addr, hdr))
 }
 
-/// 分配数组：栈顶是长度，按元素字节数与数组描述符的类型标签调运行时
-    pub(super) fn push_new_array(
-    fb: &mut FunctionBuilder,
-    stack: &mut Vec<Value>,
+/// 分配数组：按数组描述符的 class_id 调运行时（元素宽度在布局表里）
+pub(super) fn push_new_array(
     module: &mut JITModule,
+    fb: &mut FunctionBuilder,
     new_arr_id: cranelift_module::FuncId,
-    esize: i64,
     desc: &str,
-) -> Result<(), JitError> {
-    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-    let n = convert_to(fb, n, types::I32);
-    let es = fb.ins().iconst(types::I32, esize);
-    let tag = fb.ins().iconst(types::I32, rt::class_tag(desc) as i64);
+    len: Value,
+) -> Value {
+    let class_id = rt::array_class_of(desc);
+    let cid = fb.ins().iconst(types::I32, class_id as i64);
     let fref = module.declare_func_in_func(new_arr_id, fb.func);
-    let c = fb.ins().call(fref, &[n, es, tag]);
-    stack.push(fb.inst_results(c)[0]);
-    Ok(())
+    let c = fb.ins().call(fref, &[cid, len]);
+    fb.inst_results(c)[0]
 }
 
 /// 常量池里的 Class 项 → 类型标签
-    pub(super) fn class_const_tag(cf: &ClassFile, index: u16) -> Result<u32, JitError> {
+pub(super) fn class_const_tag(cf: &ClassFile, index: u16) -> Result<u32, JitError> {
     match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
         Some(CpEntry::Class(n)) => {
             let name = String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned();

@@ -16,9 +16,12 @@ pub struct CompiledMethod {
     pub max_locals: usize,
 }
 
-/// 返回 (max_locals, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，
+/// 返回 (max_locals, max_stack, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，
 /// catch_type = 0 表示 catch-all（finally）。
-    pub(super) fn code_of(cf: &ClassFile, m: &Member) -> Result<(usize, Vec<u8>, Vec<(u16, u16, u16, u16)>), JitError> {
+    pub(super) fn code_of(
+        cf: &ClassFile,
+        m: &Member,
+    ) -> Result<(usize, usize, Vec<u8>, Vec<(u16, u16, u16, u16)>), JitError> {
     let code_name = cf
         .constant_pool
         .iter()
@@ -31,6 +34,7 @@ pub struct CompiledMethod {
     for a in &m.attributes {
         if a.name_index == code_name && a.info.len() >= 8 {
             let max_locals = u16::from_be_bytes([a.info[2], a.info[3]]) as usize;
+            let max_stack = u16::from_be_bytes([a.info[0], a.info[1]]) as usize;
             let len = u32::from_be_bytes([a.info[4], a.info[5], a.info[6], a.info[7]]) as usize;
             let end = (8 + len).min(a.info.len());
             // 异常表紧跟在字节码后面：u2 个数 + 每项 4 个 u2
@@ -48,7 +52,7 @@ pub struct CompiledMethod {
                     q += 8;
                 }
             }
-            return Ok((max_locals, a.info[8..end].to_vec(), table));
+            return Ok((max_locals, max_stack, a.info[8..end].to_vec(), table));
         }
     }
     Err(JitError("方法没有 Code".into()))
@@ -124,6 +128,40 @@ pub struct CompiledMethod {
 }
 
 /// 描述符里每个参数所在的 JVM 槽位（long/double 占两槽；静态方法从 0 起）
+/// 方法描述符里的参数描述符（按顺序，不含 this）
+pub(super) fn param_descs(desc: &str) -> Vec<String> {
+    let b = desc.as_bytes();
+    let mut i = 1usize;
+    let mut out = Vec::new();
+    while i < b.len() && b[i] != b')' {
+        let start = i;
+        match b[i] {
+            b'J' | b'D' | b'F' | b'I' | b'B' | b'C' | b'S' | b'Z' => i += 1,
+            b'L' => {
+                while i < b.len() && b[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+            }
+            b'[' => {
+                i += 1;
+                while i < b.len() && b[i] == b'[' {
+                    i += 1;
+                }
+                if i < b.len() && b[i] == b'L' {
+                    while i < b.len() && b[i] != b';' {
+                        i += 1;
+                    }
+                }
+                i += 1;
+            }
+            _ => i += 1,
+        }
+        out.push(String::from_utf8_lossy(&b[start..i.min(b.len())]).into_owned());
+    }
+    out
+}
+
 pub(crate) fn param_slots(desc: &str) -> Vec<usize> {
     let b = desc.as_bytes();
     let mut i = 1usize;

@@ -35,6 +35,8 @@ impl Jit {
         helpers: &ExcHelpers,
         at: usize,
         ret_ty: cranelift_codegen::ir::Type,
+        root_ptr: Value,
+        root_slots: i32,
     ) -> Result<(), JitError> {
         let obj = {
             let f = self.module.declare_func_in_func(helpers.get, fb.func);
@@ -80,6 +82,7 @@ impl Jit {
         }
         // 本方法接不住：把哨兵返回给调用方，pending 保持置位，由它继续找
         let z = zero_of(fb, ret_ty);
+        self.emit_frame_exit(fb, root_ptr, root_slots)?;
         fb.ins().return_(&[z]);
         Ok(())
     }
@@ -88,7 +91,7 @@ impl Jit {
 /// 这个类里有没有任何方法用到异常（异常表非空或出现 athrow）
     pub(super) fn class_uses_exceptions(cf: &ClassFile) -> bool {
     for m in &cf.methods {
-        let Ok((_, body, table)) = code_of(cf, m) else { continue };
+        let Ok((_, _, body, table)) = code_of(cf, m) else { continue };
         if !table.is_empty() {
             return true;
         }

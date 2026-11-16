@@ -1,57 +1,363 @@
 //! JIT 运行时辅助函数（被生成的机器码直接调用）
 //!
-//! 堆对象统一布局：**偏移 4 处是 u32 类型标签**，字段/元素从偏移 8 开始。
-//! - 对象：`[0..4] 未用`、`[4..8] class tag`、`[8..] 字段（每字段 8 字节）`
-//! - 数组：`[0..4] 长度`、`[4..8] class tag`、`[8..] 元素（int 4 字节 / long·double·引用 8 字节）`
-//! - 字符串：同数组，`[8..]` 是 UTF-8 字节
+//! # 对象布局（librustjrt 的分代堆）
+//!
+//! ```text
+//! 对象: [0..4] class_id [4..8] flags [8..] 字段（每 Java 字段占 8 字节 = 两个 4 字节槽）
+//! 数组: [0..4] class_id [4..8] flags [8..12] 长度 [12..16] 填充 [16..] 元素
+//! ```
+//!
+//! **引用是堆内 4 字节偏移**（`0` = null），不是裸指针：GC 搬对象时会把根区和
+//! 引用槽里的偏移**就地改写**，所以生成代码一律「基址 + 偏移」现算。基址存在
+//! `BASE` 里，堆扩容（realloc 搬块）后由运行时更新，生成代码按固定地址每次重读。
+//!
+//! 一个 Java 字段占 8 字节（两个 4 字节槽：值 + 填充）是刻意保留的旧布局：
+//! 字段偏移 `8 + 8*i` 不变，long/double 天然 8 字节对齐，而引用只占低 4 字节，
+//! 正好是 librustjrt 的槽语义（GC 按 `class_id` 的位图找到这些槽）。
 
+use std::cell::RefCell;
+use std::sync::atomic::{AtomicI32, AtomicUsize, Ordering};
 use std::sync::Mutex;
 
-const CAP: usize = 256 << 20;
-struct State {
-    base: *mut u8,
-    used: usize,
-}
-unsafe impl Send for State {}
+use librustjrt::object::{ARRAY_HEADER, FLAG_ARRAY, HEADER};
+// 注意：`librustjrt::Heap` 是 0.1 兼容层，新架构的堆叫 `ManagedHeap`
+use librustjrt::{Handle, HeapConfig, ManagedHeap as Heap, SlotKind};
 
-static STATE: Mutex<Option<State>> = Mutex::new(None);
+// ---------- 堆 ----------
+
+const HEAP_INITIAL: usize = 64 << 20;
+const HEAP_MAX: usize = 1 << 30;
+
+/// 初始堆大小（MB）：`VMLESS_HEAP_MB` 可覆盖 —— 基准里用一个小堆，
+/// 几次分配就能把 eden 填满，GC 才跑得起来。
+fn heap_initial() -> usize {
+    std::env::var("VMLESS_HEAP_MB")
+        .ok()
+        .and_then(|v| v.parse::<usize>().ok())
+        .filter(|mb| *mb > 0)
+        .map(|mb| mb << 20)
+        .unwrap_or(HEAP_INITIAL)
+}
+
+/// 两个常驻根槽（下标固定，永不出栈）：0 = 待抛异常对象，1 = 异常消息
+const ROOT_EXC: usize = 0;
+const ROOT_MSG: usize = 1;
+const RESERVED_ROOTS: usize = 2;
+
+thread_local! {
+    /// 单线程 JIT：一个线程一个堆（`Heap` 不是 `Sync`，`RefCell` 就够）
+    static HEAP: RefCell<Option<Heap>> = RefCell::new(None);
+}
+
+/// 堆基址。生成代码按固定地址读它（`base_addr()` 把地址当立即数嵌进机器码）。
+static BASE: AtomicUsize = AtomicUsize::new(0);
+
+fn with_heap<R>(f: impl FnOnce(&mut Heap) -> R) -> R {
+    HEAP.with(|c| {
+        let mut g = c.borrow_mut();
+        if g.is_none() {
+            let mut cfg = HeapConfig::default();
+            cfg.initial = heap_initial();
+            cfg.max = HEAP_MAX;
+            let h = Heap::new(cfg);
+            for _ in 0..RESERVED_ROOTS {
+                h.push_root(Handle::NULL);
+            }
+            BASE.store(h.base() as usize, Ordering::Relaxed);
+            *g = Some(h);
+        }
+        let h = g.as_mut().expect("JIT 堆未初始化");
+        let r = f(h);
+        // 扩容会 realloc 搬块：每次交互后都把基址刷新一遍
+        BASE.store(h.base() as usize, Ordering::Relaxed);
+        r
+    })
+}
+
+/// 堆基址变量的地址（编译期嵌进机器码，生成代码用 `load.i64` 读当前基址）
+pub fn base_addr() -> i64 {
+    &BASE as *const AtomicUsize as i64
+}
+
+/// 当前基址（Rust 侧用）
+pub fn base_ptr() -> *mut u8 {
+    BASE.load(Ordering::Relaxed) as *mut u8
+}
+
+// ---------- 类型标签 ↔ class_id ----------
+//
+// 生成代码里凡是「读对象头拿类型」的地方都必须走 `tag_of_class`：对象头里存的是
+// `class_id`（librustjrt 分配），而 instanceof/checkcast/vcall 的立即数是 tag。
+
+/// class_id → tag（下标是 class_id；注册过才有值）
+static TAG_OF_CLASS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// tag → class_id（`u32::MAX` = 还没注册）
+static CLASS_OF_TAG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+const NO_CLASS: u32 = u32::MAX;
+
+#[inline]
+pub fn tag_of_class(class_id: u32) -> u32 {
+    let g = TAG_OF_CLASS.lock().unwrap();
+    match g.get(class_id as usize) {
+        Some(&t) => t,
+        None => 0, // 未注册（<opaque>）：按 Object 处理，不炸
+    }
+}
+
+/// tag → class_id；没注册过就 panic（编译期就该注册好，运行期拿到 NO_CLASS 是 bug）
+pub fn class_id_of(tag: u32) -> u32 {
+    let g = CLASS_OF_TAG.lock().unwrap();
+    match g.get(tag as usize).copied() {
+        Some(id) if id != NO_CLASS => id,
+        _ => panic!("类 tag {tag} 没有注册进 LayoutTable（JIT 编译期漏了 register_class）"),
+    }
+}
+
+fn record_mapping(tag: u32, class_id: u32) {
+    let mut tm = TAG_OF_CLASS.lock().unwrap();
+    if tm.len() <= class_id as usize {
+        tm.resize(class_id as usize + 1, 0);
+    }
+    tm[class_id as usize] = tag;
+    drop(tm);
+    let mut cm = CLASS_OF_TAG.lock().unwrap();
+    if cm.len() <= tag as usize {
+        cm.resize(tag as usize + 1, NO_CLASS);
+    }
+    cm[tag as usize] = class_id;
+}
+
+fn is_ref_desc(d: &str) -> bool {
+    matches!(d.as_bytes().first().copied(), Some(b'L') | Some(b'['))
+}
+
+/// 注册一个对象类（幂等）。`descs` 是实例字段描述符，顺序与 JIT 的字段下标一致。
+///
+/// 每个 Java 字段注册成**两个** librustjrt 槽：`[值/引用][填充]`。这样字段偏移
+/// 仍是 `8 + 8*i`，而 GC 只追踪每个字段的第一个槽。
+pub fn register_class(tag: u32, name: &str, descs: &[String]) -> u32 {
+    {
+        let g = CLASS_OF_TAG.lock().unwrap();
+        if let Some(&id) = g.get(tag as usize) {
+            if id != NO_CLASS {
+                return id;
+            }
+        }
+    }
+    let mut slots: Vec<SlotKind> = Vec::with_capacity(descs.len() * 2);
+    for d in descs {
+        slots.push(if is_ref_desc(d) { SlotKind::Ref } else { SlotKind::Prim });
+        slots.push(SlotKind::Prim);
+    }
+    let id = with_heap(|h| h.register_object(name, &slots));
+    record_mapping(tag, id);
+    id
+}
+
+/// 注册一个数组类（幂等）：元素宽度 / 是否引用都进布局表，GC 按它追元素
+pub fn register_array_class(tag: u32, name: &str, elem_size: u32, ref_elem: bool) -> u32 {
+    {
+        let g = CLASS_OF_TAG.lock().unwrap();
+        if let Some(&id) = g.get(tag as usize) {
+            if id != NO_CLASS {
+                return id;
+            }
+        }
+    }
+    let id = with_heap(|h| h.register_array(name, elem_size, ref_elem));
+    record_mapping(tag, id);
+    id
+}
+
+/// 数组描述符（`[I` / `[[Ljava/lang/String;`）→ (元素字节数, 元素是不是引用)
+pub fn array_desc_shape(elem_desc: &str) -> (u32, bool) {
+    match elem_desc.as_bytes().first().copied() {
+        Some(b'J') | Some(b'D') => (8, false),
+        Some(b'L') | Some(b'[') => (4, true),
+        _ => (4, false),
+    }
+}
+
+/// 数组描述符 → class_id（编译期/运行期都可调，幂等）
+pub fn array_class_of(desc: &str) -> u32 {
+    let tag = tag_of(desc);
+    let (esize, is_ref) = array_desc_shape(&desc[1..]);
+    register_array_class(tag, desc, esize, is_ref)
+}
+
+// ---------- 分配 ----------
+
+fn init_array_header(h: &Heap, hd: Handle, class_id: u32, len: u32) {
+    unsafe {
+        let base = h.base();
+        let p = base.add(hd.0 as usize) as *mut librustjrt::object::Object;
+        (*p).class_id = class_id;
+        (*p).flags = FLAG_ARRAY;
+        *(base.add(hd.0 as usize + HEADER) as *mut u32) = len;
+    }
+}
+
+/// 分配一个对象：TLAB bump + 写头；TLAB 用完就先回收再切一块
+pub extern "C" fn new_object(class_id: u32) -> i64 {
+    with_heap(|h| {
+        let size = h.layout().class(class_id).total_size(0);
+        if size >= h.cfg().los_threshold {
+            return h.alloc(class_id).raw() as i64;
+        }
+        if let Some(hd) = h.tlab_alloc_object(class_id) {
+            return hd.raw() as i64;
+        }
+        // 这块 TLAB 用完了：先切一块新的（不回收）
+        if h.refill_tlab() {
+            if let Some(hd) = h.tlab_alloc_object(class_id) {
+                return hd.raw() as i64;
+            }
+        }
+        // eden 也满了：回收一轮（根集 = 影子栈），再切新 TLAB
+        h.collect();
+        h.refill_tlab();
+        if let Some(hd) = h.tlab_alloc_object(class_id) {
+            return hd.raw() as i64;
+        }
+        // 实在装不下（对象比 eden 还大）：走 LOS / 扩容慢路径
+        h.alloc(class_id).raw() as i64
+    })
+}
+
+/// 分配一个数组：元素宽度取自数组类布局
+pub extern "C" fn new_array(class_id: u32, len: u32) -> i64 {
+    with_heap(|h| {
+        let size = h.layout().class(class_id).total_size(len);
+        if size >= h.cfg().los_threshold {
+            return h.alloc_array(class_id, len).raw() as i64;
+        }
+        if let Some(hd) = h.tlab_alloc(size) {
+            init_array_header(h, hd, class_id, len);
+            return hd.raw() as i64;
+        }
+        if h.refill_tlab() {
+            if let Some(hd) = h.tlab_alloc(size) {
+                init_array_header(h, hd, class_id, len);
+                return hd.raw() as i64;
+            }
+        }
+        h.collect();
+        h.refill_tlab();
+        if let Some(hd) = h.tlab_alloc(size) {
+            init_array_header(h, hd, class_id, len);
+            return hd.raw() as i64;
+        }
+        h.alloc_array(class_id, len).raw() as i64
+    })
+}
+
+/// `multianewarray`：`counts` 是 ndims 个 i32（从最外层开始），`desc` 指向
+/// 「长度 + 内容」缓冲（描述符串由 strtab 常驻）。
+pub extern "C" fn new_multi_array(counts: *const i32, ndims: u32, desc: *const u8) -> i64 {
+    let len = unsafe { std::ptr::read_unaligned(desc as *const u32) } as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(desc.add(8), len) };
+    let d = String::from_utf8_lossy(bytes).into_owned();
+    let mut dims = Vec::with_capacity(ndims as usize);
+    for i in 0..ndims as usize {
+        dims.push(unsafe { std::ptr::read_unaligned(counts.add(i)) });
+    }
+    build_multi(&d, &dims)
+}
+
+fn build_multi(desc: &str, counts: &[i32]) -> i64 {
+    let n = counts.first().copied().unwrap_or(0).max(0) as u32;
+    let class_id = array_class_of(desc);
+    let hd = new_array(class_id, n);
+    if counts.len() > 1 {
+        let elem_desc = &desc[1..];
+        let (esize, _) = array_desc_shape(elem_desc);
+        // 外层数组要先登记成根：内层的分配可能触发 GC，把还没填完的外层搬走
+        let slot = with_heap(|h| {
+            h.push_root(Handle(hd as u32));
+            h.roots_len() - 1
+        });
+        for i in 0..n {
+            let sub = build_multi(elem_desc, &counts[1..]);
+            // 每轮都从根槽重读：GC 可能已经把外层搬到新位置
+            let outer = with_heap(|h| {
+                let r = h.roots_handle();
+                let b = r.borrow();
+                b[slot]
+            });
+            // 内层数组的引用：元素是引用，必须过写屏障
+            store_elem_ref(outer, i, sub as u32, esize);
+        }
+        with_heap(|h| {
+            h.pop_root();
+        });
+    }
+    hd
+}
+
+fn store_elem_ref(arr: u32, idx: u32, val: u32, _esize: u32) {
+    with_heap(|h| h.set_ref(Handle(arr), idx, Handle(val)));
+}
+
+/// 写引用槽 / 引用元素：过卡表写屏障（老对象存年轻引用必须把卡标脏）
+pub extern "C" fn set_ref(obj: i64, idx: u32, val: i64) {
+    with_heap(|h| h.set_ref(Handle(obj as u32), idx, Handle(val as u32)));
+}
+
+// ---------- 影子栈（根区）----------
+//
+// JIT 每帧在**自己的栈帧**里留一块 `max_locals + max_stack` 个 u32 的根区：
+// 引用型局部变量只住在这里，操作数栈上的引用在 GC 点前也写进来。帧进入时整块
+// 登记进 `Heap` 的根表（拷贝），退出时收回并**把 GC 改写过的新偏移拷回根区**。
+
+/// 把根区登记进堆的根表（帧入口 / 每次 GC 点）
+pub extern "C" fn roots_push(p: *mut u32, n: u32) {
+    with_heap(|h| {
+        let r = h.roots_handle();
+        let mut b = r.borrow_mut();
+        for i in 0..n as usize {
+            b.push(unsafe { *p.add(i) });
+        }
+    })
+}
+
+/// 收回根表并把（可能被 GC 搬过的）偏移写回根区
+pub extern "C" fn roots_pop(p: *mut u32, n: u32) {
+    with_heap(|h| {
+        let r = h.roots_handle();
+        let mut b = r.borrow_mut();
+        let n = n as usize;
+        // 弹得比登记的多 = 生成的代码里 push/pop 不平衡：宁可直接报错，
+        // 也不能悄悄把常驻根（异常 / 字符串常量 / 静态引用字段）一起截掉
+        assert!(
+            b.len() >= n,
+            "roots_pop: 根表里只有 {} 项，却要弹出 {n} 项（影子栈 push/pop 不平衡）",
+            b.len()
+        );
+        let start = b.len() - n;
+        for i in 0..n {
+            let v = b[start + i];
+            unsafe { *p.add(i) = v };
+        }
+        b.truncate(start);
+    })
+}
+
+// ---------- 类型判断 ----------
+
+/// 对象头里的 class_id → tag
+#[inline]
+fn class_tag_at(obj: i64) -> u32 {
+    if obj == 0 {
+        return 0;
+    }
+    let p = base_ptr().wrapping_add(obj as usize);
+    let id = unsafe { std::ptr::read_unaligned(p as *const u32) };
+    tag_of_class(id)
+}
 
 /// 类名 → 类型标签（0 = java/lang/Object，1 = java/lang/String，其余从 2 起）
 static CLASS_TAGS: Mutex<Vec<String>> = Mutex::new(Vec::new());
-
-/// 正在传播的异常：非 0 表示 pending，值是异常对象指针。
-/// JIT 出来的代码在每个可能抛异常的调用点后检查它，命中就查本方法的异常表。
-static EXC_PENDING: std::sync::atomic::AtomicI32 = std::sync::atomic::AtomicI32::new(0);
-static EXC_OBJ: std::sync::atomic::AtomicI64 = std::sync::atomic::AtomicI64::new(0);
-/// 异常对象指针 → message 字符串指针（java.* 的构造器我们没有字节码，只能这样记）
-static EXC_MSGS: Mutex<Vec<(i64, i64)>> = Mutex::new(Vec::new());
-
-pub extern "C" fn exc_throw(obj: i64) {
-    EXC_OBJ.store(obj, std::sync::atomic::Ordering::Relaxed);
-    EXC_PENDING.store(1, std::sync::atomic::Ordering::Relaxed);
-}
-
-pub extern "C" fn exc_pending() -> i32 {
-    EXC_PENDING.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub extern "C" fn exc_get() -> i64 {
-    EXC_OBJ.load(std::sync::atomic::Ordering::Relaxed)
-}
-
-pub extern "C" fn exc_clear() {
-    EXC_PENDING.store(0, std::sync::atomic::Ordering::Relaxed);
-}
-
-/// 记下异常对象的消息（`new RuntimeException("boom")` 那一步）
-pub extern "C" fn exc_set_msg(obj: i64, msg: i64) {
-    let mut t = EXC_MSGS.lock().unwrap();
-    t.push((obj, msg));
-}
-
-fn exc_msg(obj: i64) -> Option<i64> {
-    EXC_MSGS.lock().unwrap().iter().rev().find(|(o, _)| *o == obj).map(|(_, m)| *m)
-}
 
 /// 类名的**内部形式**（class_name_of 返回的是带点的那种，继承链比较要用斜杠形式）
 pub fn class_internal_of(tag: u32) -> String {
@@ -76,24 +382,7 @@ pub extern "C" fn catch_match(obj: i64, tag: u32) -> i32 {
     if tag == 0 {
         return 1; // catch-all（finally）
     }
-    let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
-    i32::from(is_subclass_tag(actual, tag))
-}
-
-/// 未捕获异常：按 JVM 的格式打到 stderr 并结束进程（退出码 1）
-pub fn print_uncaught(obj: i64) -> ! {
-    let tag = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
-    let class = class_name_of(tag);
-    match exc_msg(obj) {
-        Some(m) if m != 0 => {
-            // message 就是字符串堆里那块的指针：`[0..4] 长度`、`[4..8] 标签`、`[8..]` UTF-8
-            let len = unsafe { std::ptr::read_unaligned(m as *const u32) } as usize;
-            let bytes = unsafe { std::slice::from_raw_parts((m as *const u8).add(8), len) };
-            eprintln!("Exception in thread \"main\" {class}: {}", String::from_utf8_lossy(bytes));
-        }
-        _ => eprintln!("Exception in thread \"main\" {class}"),
-    }
-    std::process::exit(1);
+    i32::from(is_subclass_tag(class_tag_at(obj), tag))
 }
 
 /// 登记/查询一个类的类型标签。编译期调用，把结果当常量嵌进机器码。
@@ -126,7 +415,8 @@ pub fn class_name_of(tag: u32) -> String {
     }
 }
 
-fn tag_of(name: &str) -> u32 {    match name {
+fn tag_of(name: &str) -> u32 {
+    match name {
         "java/lang/Object" => 0,
         "java/lang/String" => 1,
         other => {
@@ -142,85 +432,104 @@ fn tag_of(name: &str) -> u32 {    match name {
     }
 }
 
-/// 分配一个对象：头部 8 字节（[4..8] 是类型标签），后面 fields 个 8 字节字段槽
-pub extern "C" fn new_object(fields: u32, tag: u32) -> *mut u8 {
-    let p = unsafe { alloc_zeroed(8 + fields as usize * 8) };
-    unsafe { std::ptr::write_unaligned(p.add(4) as *mut u32, tag) };
-    p
+/// String 类的 class_id（数组形态：元素 1 字节，不追踪引用）
+pub fn string_class_id() -> u32 {
+    register_array_class(1, "java/lang/String", 1, false)
 }
 
-/// 分配一个数组：`[0..4]` 长度，`[4..8]` 类型标签，`[8..]` len 个 elem_size 字节元素
-pub extern "C" fn new_array(len: u32, elem_size: u32, tag: u32) -> *mut u8 {
-    let p = unsafe { alloc_zeroed(8 + len as usize * elem_size as usize) };
+/// 把一段 UTF-8 分配成堆上的 String 对象，并登记成**永久根**（常量活到进程结束）。
+/// 返回根槽下标 —— 常量表存的是它，取的时候现读（GC 搬过之后那里是新偏移）。
+pub fn alloc_string_const(bytes: &[u8]) -> usize {
+    let cid = string_class_id();
+    let hd = new_array(cid, bytes.len() as u32);
     unsafe {
-        std::ptr::write_unaligned(p as *mut u32, len);
-        std::ptr::write_unaligned(p.add(4) as *mut u32, tag);
+        // 元素区从 ARRAY_HEADER(16) 开始：头 8 + 长度槽 4 + 填充 4
+        let p = base_ptr().add(hd as u32 as usize + ARRAY_HEADER);
+        std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len());
     }
-    p
+    with_heap(|h| {
+        let r = h.roots_handle();
+        let mut b = r.borrow_mut();
+        b.push(hd as u32);
+        b.len() - 1
+    })
 }
 
-/// `multianewarray`：一次建出多维数组。
-///
-/// `counts` 是 ndims 个 i32（从最外层开始），`s` 指向「长度 + 标签 + 描述符字节」
-/// 缓冲（strtab 那种布局），描述符形如 `[[I` / `[[Ljava/lang/String;`。
-pub extern "C" fn new_multi_array(counts: *const i32, ndims: u32, s: *const u8) -> *mut u8 {
-    let len = unsafe { std::ptr::read_unaligned(s as *const u32) } as usize;
-    let bytes = unsafe { std::slice::from_raw_parts(s.add(8), len) };
-    let desc = String::from_utf8_lossy(bytes).into_owned();
-    let mut dims = Vec::with_capacity(ndims as usize);
-    for i in 0..ndims as usize {
-        dims.push(unsafe { std::ptr::read_unaligned(counts.add(i)) });
-    }
-    build_multi(&desc, &dims)
+/// 读一个永久根槽的当前值（GC 可能已经把它改写成新偏移）
+pub fn root_value(idx: usize) -> u32 {
+    with_heap(|h| {
+        let r = h.roots_handle();
+        let b = r.borrow();
+        b.get(idx).copied().unwrap_or(0)
+    })
 }
 
-/// 递归建多维数组：先建外层，再把内层数组填进元素槽
-fn build_multi(desc: &str, counts: &[i32]) -> *mut u8 {
-    let n = counts.first().copied().unwrap_or(0).max(0) as u32;
-    let elem_desc = &desc[1..];
-    // 元素字节数：引用（含下一维数组）8，其余 4（与 translate 的 newarray/anewarray 一致）
-    let esize: u32 = match elem_desc.as_bytes().first().copied() {
-        Some(b'J') | Some(b'D') | Some(b'F') | Some(b'L') | Some(b'[') => 8,
-        _ => 4,
-    };
-    let tag = tag_of(desc);
-    let p = new_array(n, esize, tag);
-    if counts.len() > 1 {
-        for i in 0..n as usize {
-            let sub = build_multi(elem_desc, &counts[1..]);
-            unsafe {
-                std::ptr::write_unaligned((p.add(8 + i * esize as usize)) as *mut i64, sub as i64);
-            }
+// ---------- 异常 ----------
+
+/// 正在传播的异常：非 0 表示 pending
+static EXC_PENDING: AtomicI32 = AtomicI32::new(0);
+
+/// 抛异常：对象存进常驻根槽（GC 搬了也会就地改写），再置 pending
+pub extern "C" fn exc_throw(obj: i64) {
+    set_reserved_root(ROOT_EXC, obj as u32);
+    EXC_PENDING.store(1, Ordering::Relaxed);
+}
+
+pub extern "C" fn exc_pending() -> i32 {
+    EXC_PENDING.load(Ordering::Relaxed)
+}
+
+/// 取当前待抛的异常对象（偏移从常驻根槽读，永远是 GC 后的新位置）
+pub extern "C" fn exc_get() -> i64 {
+    reserved_root(ROOT_EXC) as i64
+}
+
+pub extern "C" fn exc_clear() {
+    EXC_PENDING.store(0, Ordering::Relaxed);
+}
+
+/// 记下异常对象的消息（`new RuntimeException("boom")` 那一步）。
+/// 消息也进常驻根槽：GC 搬过之后 print_uncaught 还能读对。
+pub extern "C" fn exc_set_msg(_obj: i64, msg: i64) {
+    set_reserved_root(ROOT_MSG, msg as u32);
+}
+
+fn set_reserved_root(idx: usize, val: u32) {
+    with_heap(|h| {
+        let r = h.roots_handle();
+        let mut b = r.borrow_mut();
+        if b.len() <= idx {
+            b.resize(idx + 1, 0);
         }
-    }
-    p
+        b[idx] = val;
+    });
 }
 
-/// `instanceof`：null 对任何类型都是 false；标签 0（java/lang/Object）对任何非 null 都是 true
-pub extern "C" fn instanceof(obj: i64, tag: u32) -> i32 {
-    if obj == 0 {
-        return 0;
-    }
-    if tag == 0 {
-        return 1;
-    }
-    let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
-    i32::from(is_subclass_tag(actual, tag))
+fn reserved_root(idx: usize) -> u32 {
+    with_heap(|h| {
+        let r = h.roots_handle();
+        let b = r.borrow();
+        b.get(idx).copied().unwrap_or(0)
+    })
 }
 
-/// `checkcast`：类型不符时按 ClassCastException 退出（JIT 还没有异常机制）
-pub extern "C" fn checkcast(obj: i64, tag: u32) -> i64 {
-    if obj != 0 && tag != 0 {
-        let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
-        if !is_subclass_tag(actual, tag) {
-            eprintln!(
-                "ClassCastException: 类型标签 {actual} 的对象不能转换成标签 {tag}（checkcast 失败）"
-            );
-            std::process::exit(1);
-        }
+/// 未捕获异常：按 JVM 的格式打到 stderr 并结束进程（退出码 1）
+pub fn print_uncaught(obj: i64) -> ! {
+    let tag = class_tag_at(obj);
+    let class = class_name_of(tag);
+    let msg = reserved_root(ROOT_MSG);
+    if msg != 0 {
+        let p = base_ptr().wrapping_add(msg as usize);
+        let len = unsafe { std::ptr::read_unaligned(p.add(HEADER) as *const u32) } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(p.add(ARRAY_HEADER), len) };
+        eprintln!("Exception in thread \"main\" {class}: {}", String::from_utf8_lossy(bytes));
+    } else {
+        eprintln!("Exception in thread \"main\" {class}");
     }
-    obj
+    std::process::exit(1);
 }
+
+// ---------- 打印 ----------
 
 /// 打印一个 int（对应 System.out.println(int)）
 pub extern "C" fn println_int(v: i32) {
@@ -250,36 +559,26 @@ pub extern "C" fn drem(a: f64, b: f64) -> f64 {
     unsafe { fmod(a, b) }
 }
 
-/// 打印一段 UTF-8 文本（指针 + 长度）
+/// 打印一段 UTF-8 文本（指针 + 长度，缓冲常驻、不归 GC 管）
 pub extern "C" fn println_str(ptr: *const u8, len: u32) {
     let s = unsafe { std::slice::from_raw_parts(ptr, len as usize) };
     println!("{}", String::from_utf8_lossy(s));
 }
 
-unsafe fn alloc_zeroed(size: usize) -> *mut u8 {
-    let mut g = STATE.lock().unwrap();
-    if g.is_none() {
-        let layout = std::alloc::Layout::from_size_align(CAP, 8).unwrap();
-        let p = std::alloc::alloc_zeroed(layout);
-        *g = Some(State { base: p, used: 0 });
-    }
-    let s = g.as_mut().unwrap();
-    let off = s.used;
-    s.used += (size + 7) & !7;
-    assert!(s.used <= CAP, "JIT heap full");
-    let p = s.base.add(off);
-    std::ptr::write_bytes(p, 0, size);
-    p
-}
-
 // ---------- 静态字段与静态初始化 ----------
+//
+// 引用型静态字段是**永久根**：它的存储就是堆根表里的一个槽，GC 会就地改写。
+// 否则 GC 搬走对象之后静态字段里留的就是个野偏移。
 
 /// (类, 字段) → 静态槽下标（编译期登记，运行期按下标读写）
 static STATIC_SLOTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 static STATIC_VALS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+/// 静态槽 → 堆根表下标（只对引用型字段有值）
+static STATIC_ROOTS: Mutex<Vec<usize>> = Mutex::new(Vec::new());
 
-/// 登记一个静态字段，返回它的槽下标（同一个字段永远同号）
-pub fn static_slot(class: &str, name: &str) -> u32 {
+/// 登记一个静态字段，返回它的槽下标（同一个字段永远同号）。
+/// `is_ref` 的字段会额外占一个永久根槽。
+pub fn static_slot(class: &str, name: &str, is_ref: bool) -> u32 {
     let mut g = STATIC_SLOTS.lock().unwrap();
     if let Some(i) = g.iter().position(|(c, n)| c == class && n == name) {
         return i as u32;
@@ -291,15 +590,57 @@ pub fn static_slot(class: &str, name: &str) -> u32 {
     while v.len() <= i {
         v.push(0);
     }
+    drop(v);
+    let root_idx = if is_ref {
+        with_heap(|h| {
+            let r = h.roots_handle();
+            let mut b = r.borrow_mut();
+            b.push(0);
+            b.len() - 1
+        })
+    } else {
+        usize::MAX
+    };
+    let mut sr = STATIC_ROOTS.lock().unwrap();
+    while sr.len() <= i {
+        sr.push(usize::MAX);
+    }
+    sr[i] = root_idx;
     i as u32
+}
+
+fn static_root_of(idx: u32) -> Option<usize> {
+    let sr = STATIC_ROOTS.lock().unwrap();
+    match sr.get(idx as usize).copied() {
+        Some(r) if r != usize::MAX => Some(r),
+        _ => None,
+    }
 }
 
 /// 读静态字段（值统一按 i64 位模式存，调用点再按字段类型还原）
 pub extern "C" fn get_static(idx: u32) -> i64 {
+    if let Some(r) = static_root_of(idx) {
+        return with_heap(|h| {
+            let roots = h.roots_handle();
+            let b = roots.borrow();
+            b.get(r).copied().unwrap_or(0) as i64
+        });
+    }
     STATIC_VALS.lock().unwrap().get(idx as usize).copied().unwrap_or(0)
 }
 
 pub extern "C" fn put_static(idx: u32, v: i64) {
+    if let Some(r) = static_root_of(idx) {
+        with_heap(|h| {
+            let roots = h.roots_handle();
+            let mut b = roots.borrow_mut();
+            if b.len() <= r {
+                b.resize(r + 1, 0);
+            }
+            b[r] = v as u32;
+        });
+        return;
+    }
     let mut g = STATIC_VALS.lock().unwrap();
     let i = idx as usize;
     if g.len() <= i {
@@ -337,11 +678,6 @@ pub extern "C" fn clinit(tag: u32) {
             f(std::ptr::null_mut());
         }
     }
-}
-
-/// 让 `strtab` 也能用同一个分配器/标签表
-pub(super) fn string_tag() -> u32 {
-    tag_of("java/lang/String")
 }
 
 // ---------- 继承：父类表、虚方法表、虚分派 ----------
@@ -441,6 +777,31 @@ fn is_subclass_tag(actual: u32, target: u32) -> bool {
     implements_iface(&class_internal_of(actual), &t)
 }
 
+/// `instanceof`：null 对任何类型都是 false；标签 0（java/lang/Object）对任何非 null 都是 true
+pub extern "C" fn instanceof(obj: i64, tag: u32) -> i32 {
+    if obj == 0 {
+        return 0;
+    }
+    if tag == 0 {
+        return 1;
+    }
+    i32::from(is_subclass_tag(class_tag_at(obj), tag))
+}
+
+/// `checkcast`：类型不符时按 ClassCastException 退出（JIT 还没有异常机制）
+pub extern "C" fn checkcast(obj: i64, tag: u32) -> i64 {
+    if obj != 0 && tag != 0 {
+        let actual = class_tag_at(obj);
+        if !is_subclass_tag(actual, tag) {
+            eprintln!(
+                "ClassCastException: 类型标签 {actual} 的对象不能转换成标签 {tag}（checkcast 失败）"
+            );
+            std::process::exit(1);
+        }
+    }
+    obj
+}
+
 /// (方法名, 描述符) → 签名号（同一个签名永远同号）
 pub fn intern_sig(name: &str, desc: &str) -> u32 {
     let key = format!("{name}{desc}");
@@ -462,7 +823,7 @@ pub fn register_vmethod(class_tag: u32, sig: u32, ptr: usize, ret: u8) {
     }
 }
 
-/// 虚方法分派：`locals[0]` 是接收者，按它的**运行时类型标签**查表再间接调用。
+/// 虚方法分派：`locals[0]` 是接收者，按它的**运行时类型**查表再间接调用。
 ///
 /// 返回值统一按 i64 传回（f64 走位模式、i32 零扩展），调用点再转成真类型。
 pub extern "C" fn vcall(locals: *mut i64, sig: u32) -> i64 {
@@ -475,7 +836,7 @@ pub extern "C" fn vcall(locals: *mut i64, sig: u32) -> i64 {
         eprintln!("NullPointerException: 在 null 上调用虚方法（sig {sig}）");
         std::process::exit(1);
     }
-    let tag = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
+    let tag = class_tag_at(obj);
     let entry = VMETHODS.lock().unwrap().iter().find(|(k, _)| *k == (tag, sig)).map(|(_, v)| *v);
     let Some((ptr, ret)) = entry else {
         eprintln!(
@@ -500,4 +861,38 @@ pub extern "C" fn vcall(locals: *mut i64, sig: u32) -> i64 {
             }
         }
     }
+}
+
+// ---------- 统计（VMLESS_GC_STATS=1）----------
+
+/// 打印一轮 GC 统计到 stderr（GC 真的在回收的可见证据）
+pub fn print_gc_stats(tag: &str) {
+    with_heap(|h| {
+        let s = h.stats();
+        let st = h.spaces();
+        eprintln!(
+            "[gc] {tag}: minor={} major={} 暂停={:.2}ms 最大={:.2}ms 回收对象={} 晋升={} 老年代活={}B 容量={}B",
+            s.minor_count,
+            s.major_count,
+            s.total_pause_ns as f64 / 1e6,
+            s.max_pause_ns as f64 / 1e6,
+            s.collected_objects,
+            s.promoted_objects,
+            h.old_live_bytes(),
+            st.cap
+        );
+    });
+}
+
+/// 堆当前占用的字节数（年轻代 + 老年代活对象 + LOS），基准用
+pub fn heap_live_bytes() -> usize {
+    with_heap(|h| h.young_used() as usize + h.old_live_bytes())
+}
+
+/// 已发生的 GC 次数
+pub fn gc_count() -> u64 {
+    with_heap(|h| {
+        let s = h.stats();
+        s.minor_count + s.major_count
+    })
 }

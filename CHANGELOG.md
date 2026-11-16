@@ -419,3 +419,26 @@ InhInstanceof InhWide` + 跨单元 `InhUnit`）；`cargo test` 29 passed。
 
 **已知不支持**：接口 default/static 方法、`import`（跨包需写全限定名）、
 `println(a == b)` 这类「比较结果当实参」（改动前就存在，栈图限制）。
+
+## 0.39.0 — 2026-11-17 · JIT 分配接进分代 GC（影子栈 + 根集 + 写屏障）
+
+JIT 原来分配走裸 bump 区，对象**永不回收**；现在全部走 `librustjrt` 的分代堆。
+
+- **分配**：`new_object`/`new_array`/`new_multi_array` → `tlab_alloc_object`；
+  TLAB 满先 refill、eden 满才 collect、超大走 LOS
+- **布局注册**：每个 Java 类懒注册进 `LayoutTable`（每字段占值+填充两槽，引用字段进 GC 位图），
+  `class_id` 与 JIT tag 双向映射，对象头存 `class_id`
+- **写屏障**：`putfield`/`aastore` 存引用走卡表；引用型静态字段是永久根
+- **影子栈**：新增 `jit/refmap.rs`（每个 pc 的「操作数栈哪一位是引用」）；
+  每帧根区住引用型局部变量，GC 点（new/newarray/invoke*/`<clinit>`）push/pop 根；
+  `roots_pop` 带平衡断言，不平衡直接报错而不是悄悄截断根
+- **零回归**：`verify.sh` **50/50 三路一致**（`VMLESS_HEAP_MB=8` 强制回收再跑一遍同样 50/0）；
+  `cargo test` 31 passed
+
+**实测（`bench_jit_gc`，50 万次短命对象分配）**
+```
+ALLOC_NS=188.4  GC_COUNT=6  LIVE_AFTER=4026528  HEAP_MB=3.84
+```
+分配量翻四倍（4M）堆占用**一模一样**（3.84 MB）—— 旧实现按源码推算 16M 次要 245 MB 且只增不减。
+
+`librustjrt` 新增只读访问器 `Heap::base()`。

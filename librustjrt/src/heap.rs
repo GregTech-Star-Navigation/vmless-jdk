@@ -275,6 +275,13 @@ impl Heap {
         &self.layout
     }
 
+    /// 堆内存基址。偏移是相对它的，`grow_capacity`（realloc）之后会变 ——
+    /// 编译代码每次访存前都得重新读一次，不能缓存。
+    #[inline]
+    pub fn base(&self) -> *mut u8 {
+        self.region.base()
+    }
+
     pub fn spaces(&self) -> Spaces {
         Spaces {
             young_start: self.young_start,

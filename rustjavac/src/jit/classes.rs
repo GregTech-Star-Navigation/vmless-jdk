@@ -15,11 +15,18 @@ pub(super) struct ClassSet {
     fields: HashMap<String, HashMap<String, usize>>,
     /// 类 → 实例字段总数（含继承）
     counts: HashMap<String, usize>,
+    /// 类 → 实例字段描述符（下标即字段槽下标，含继承；被遮蔽的槽占位但不被访问）
+    descs: HashMap<String, Vec<String>>,
 }
 
 impl ClassSet {
     pub(super) fn new() -> Self {
-        ClassSet { classes: HashMap::new(), fields: HashMap::new(), counts: HashMap::new() }
+        ClassSet {
+            classes: HashMap::new(),
+            fields: HashMap::new(),
+            counts: HashMap::new(),
+            descs: HashMap::new(),
+        }
     }
 
     /// 登记一个类（重复登记直接忽略），并刷新它的布局
@@ -150,22 +157,17 @@ impl ClassSet {
         None
     }
 
-    pub(super) fn field_count(&self, class: &str) -> usize {
-        self.counts.get(class).copied().unwrap_or_else(|| self.own_field_count(class))
-    }
-
-    fn own_field_count(&self, class: &str) -> usize {
-        self.classes
-            .get(class)
-            .map(|cf| cf.fields.iter().filter(|f| f.access_flags & 0x0008 == 0).count())
-            .unwrap_or(0)
+    /// 实例字段描述符（下标 = 字段槽下标）。JIT 用它把布局注册进 librustjrt：
+    /// 引用字段必须进 GC 的位图，否则 GC 追不到它指向的对象。
+    pub(super) fn field_descs(&self, class: &str) -> Vec<String> {
+        self.descs.get(class).cloned().unwrap_or_default()
     }
 
     /// 重建 `class` 的字段布局（父类在前）
     pub(super) fn build_layout(&mut self, class: &str) {
         let chain = self.chain(class);
         let mut map = HashMap::new();
-        let mut count = 0usize;
+        let mut descs: Vec<String> = Vec::new();
         for c in chain.iter().rev() {
             let Some(cf) = self.get(c) else { continue };
             for f in &cf.fields {
@@ -173,12 +175,21 @@ impl ClassSet {
                     continue;
                 }
                 let n = String::from_utf8_lossy(cf.utf8(f.name_index).unwrap_or_default()).into_owned();
-                map.entry(n).or_insert(count);
-                count += 1;
+                let d =
+                    String::from_utf8_lossy(cf.utf8(f.descriptor_index).unwrap_or_default()).into_owned();
+                if map.contains_key(&n) {
+                    // 被遮蔽的父类字段：占一个槽，但 `field_offset` 永远指不到它
+                    descs.push("I".to_string());
+                } else {
+                    map.insert(n, descs.len());
+                    descs.push(d);
+                }
             }
         }
+        let count = descs.len();
         self.fields.insert(class.to_string(), map);
         self.counts.insert(class.to_string(), count);
+        self.descs.insert(class.to_string(), descs);
     }
 
     /// 沿继承链找方法，返回 (声明类, 方法下标)
