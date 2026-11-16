@@ -342,3 +342,14 @@
 - `cargo test` 29 passed；样例 **34/34 三路一致**；`src/codegen` 零警告
 
 另：仓库根新增 `verify.sh`（34 样例三路比对，带一次重试抗文件监视器干扰）。
+
+## 0.35.0 — 2026-11-16 · 解释器与 JIT 模块化 + 清理死代码
+
+- `vm.rs`(1346) → `src/vm/`：`mod · slot · frame · heap · class · exec · call · exception · natives`
+- `jit.rs`(1985) → `src/jit/`：`mod · insn · rt · strtab · layout · translate · call · exc`
+- **清理**：删 `unused import Signature/Variable`、从未展开的 `flush_to` 宏、
+  7 处死赋值（5× `terminated = true` + 2× 重复 `cur_start = pc`）
+- 零逻辑改动（新文件按原文件行号原样抽取，函数体一字未改；符号名单比对一致）
+- `cargo test` 29 passed；样例 **34/34 三路一致**；vm/jit 警告归零
+
+**遗留警告**：`front/parser/expr.rs` 3 处 `unreachable pattern`（保留待查，可能是真 bug 线索）。
