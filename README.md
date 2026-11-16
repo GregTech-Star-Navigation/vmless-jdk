@@ -79,22 +79,40 @@ bash scripts/verify-samples.sh --all    # samples/ 下全部样例
 | `float` 算术 | ❌（相关指令一条没实现）|
 | 包名 + `import` 跨编译单元 | ❌（当前提交上解析有 bug，见支持矩阵）|
 
-## 和真 JVM 差在哪
+## 现在的边界与路线
 
-**没有**的东西，不打算有：
+下面这五项是「**现在还没有，但为了跑真实 Java 程序必须补**」的，不是不打算有：
 
-- **没有 JNI**，`System.loadLibrary` 之类不存在
-- **没有线程**：`java.lang.Thread` 跑不了，`synchronized` 语法接受但**不加锁**（不生成 `monitorenter`）
-- **没有反射**：`Class.forName`、注解运行时读取都没有
-- **没有类加载器**：类路径就是「入口 `.class` 所在目录树」，运行期不能决定加载什么
-- **不支持 jar / 模块系统**：只吃 `.class` 文件
+| 缺口 | 现状 | 为什么必须补 |
+|---|---|---|
+| **jar / 模块** | 只吃 `.class` 文件 | 任何真实程序（含 Minecraft）都是 jar 形态 |
+| **类加载器** | 类路径 = 入口 `.class` 所在目录树 | ModLauncher / FML 靠自定义 ClassLoader 做字节码转换 |
+| **反射 + 注解** | 无 | FML、Jackson、Spring 这一层全靠它 |
+| **线程 + `synchronized`** | 语法接受但**不加锁**（不生成 `monitorenter`） | 游戏是渲染线程 + 逻辑线程 + 工作池 |
+| **JNI** | 无 | LWJGL 的 GLFW/OpenGL 绑定就是 JNI；没有它开不出窗口 |
 
-**不一样**的地方：
+### 跑 Minecraft 意味着什么（不粉饰）
 
-- `switch` 不生成 `tableswitch`/`lookupswitch`，降级成比较链 —— 分支多时比 HotSpot 慢
+`java.base` 有 **7350 个类**。自己写这套库是不可能的；
+**可行的路线是让我们的 VM 去执行 OpenJDK 自己的 class 文件** —— 那是 HotSpot 的活，不是重写 JDK 库的活。
+
+所以目标从那句「Rust 写的 javac + JVM」升级成：**一个能跑真 `java.base` 的 JVM**。七步，每步都能独立验收：
+
+1. **jimage/jar 读取** —— 从真 JDK 的 `lib/modules` 或任意 jar 里按名字取类
+2. **类加载器** —— `ClassLoader.defineClass` + 双亲委派 + 多 jar classpath
+3. **native 方法层** —— `java.base` 自己声明的 native（`System.arraycopy`、`Object.hashCode`、`FileInputStream`…），核心约 200 个
+4. **invokedynamic + MethodHandles** —— lambda 与字符串拼接的字节码形态，现代 Java 代码到处都是
+5. **线程 + monitor** —— `Thread` 映射到 OS 线程，`monitorenter/exit` 真加锁
+6. **反射 + 注解**
+7. **JNI** —— 实现 JNI 函数表里 LWJGL 用到的那部分，才能初始化 GLFW 开窗口
+
+前 3 步做完，「跑一个真 jar」就通了；4–6 做完，框架类代码能跑；第 7 步才轮到 Minecraft。
+
+### 和 HotSpot 仍有的差距
+
+- `switch` 分支数小时降级成比较链 —— 分支多时比 HotSpot 慢
 - 方法调用没有内联、没有去虚拟化；JIT 是「方法级一次编译」，不是分层热点编译
-- GC 是**分代但非并发**的：最大单步停顿很小（见下），但不追求吞吐峰值
-
+- GC 是**分代但非并发**的：最大单步停顿很小，但不追求吞吐峰值
 ## 基准（历史实测，出处逐条标）
 
 > 下列数字来自 `CHANGELOG.md` 里记录的实测，**本轮没有重测**；每次记录的机器状态与日期不同，比较的是同一次记录里的两个数。
