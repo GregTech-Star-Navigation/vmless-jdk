@@ -31,6 +31,20 @@ impl ClassSet {
         if let Some(sup) = super_of(&cf) {
             rt::register_super(&name, &sup);
         }
+        // 接口登记进运行时的「实现」表：instanceof / checkcast / catch 都按它判
+        let ifaces: Vec<String> = cf
+            .interfaces
+            .iter()
+            .filter_map(|ix| match cf.constant_pool.get(*ix as usize).and_then(|e| e.as_ref()) {
+                Some(crate::CpEntry::Class(n)) => {
+                    cf.utf8(*n).map(|b| String::from_utf8_lossy(b).into_owned())
+                }
+                _ => None,
+            })
+            .collect();
+        for i in &ifaces {
+            rt::register_iface(&name, i);
+        }
         self.classes.insert(name, Rc::new(cf));
     }
 
@@ -78,7 +92,50 @@ impl ClassSet {
     }
 
     pub(super) fn is_subclass(&self, actual: &str, target: &str) -> bool {
-        actual == target || self.chain(actual).iter().any(|c| c == target)
+        if actual == target || self.chain(actual).iter().any(|c| c == target) {
+            return true;
+        }
+        // 接口：链上任何一个类（或接口）实现了它都算
+        self.iface_closure(actual).iter().any(|c| c == target)
+    }
+
+    /// 一个类**直接**实现的接口名
+    pub(super) fn interfaces_of(&self, class: &str) -> Vec<String> {
+        let Some(cf) = self.classes.get(class) else { return Vec::new() };
+        cf.interfaces
+            .iter()
+            .filter_map(|ix| match cf.constant_pool.get(*ix as usize).and_then(|e| e.as_ref()) {
+                Some(crate::CpEntry::Class(n)) => {
+                    cf.utf8(*n).map(|b| String::from_utf8_lossy(b).into_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 类（含继承链）实现的所有接口，传递闭包
+    pub(super) fn iface_closure(&self, class: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: Vec<String> = self.chain(class);
+        while let Some(c) = queue.pop() {
+            for i in self.interfaces_of(&c) {
+                if seen.insert(i.clone()) {
+                    out.push(i.clone());
+                    queue.push(i);
+                }
+            }
+        }
+        out
+    }
+
+    /// 这个方法是不是抽象的（接口里的方法声明没有 Code，不能编译成机器码）
+    pub(super) fn is_abstract_method(&self, owner: &str, idx: usize) -> bool {
+        self.classes
+            .get(owner)
+            .and_then(|cf| cf.methods.get(idx))
+            .map(|m| m.access_flags & 0x0400 != 0)
+            .unwrap_or(false)
     }
 
     /// 实例字段名 → 下标（沿继承链找声明它的那一层）

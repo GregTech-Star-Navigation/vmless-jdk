@@ -401,3 +401,21 @@ rustjavac 重编后样例仍 **34/34 三路一致**。
 InhInstanceof InhWide` + 跨单元 `InhUnit`）；`cargo test` 29 passed。
 
 **已知不支持**：接口（`implements` 仍忽略）、`this(...)` 委托、带包名的继承（现已明确报错）。
+
+## 0.38.0 — 2026-11-17 · 接口、包名、this(...) 委托、多维数组、静态字段
+
+- **接口**：`implements`/接口继承写进 class 文件、`invokeinterface`(0xB9) 用 InterfaceMethodref、
+  抽象方法无 Code、`instanceof` 接口按实现闭包判定、接口常量
+- **包名**：新增 `sema/qualify.rs`，进 codegen 前把同包简单名补成 `p/Name`；
+  `compile_src` 按内部名建目录写盘（`out/pkg/C.class`）；`preload()` 预读 classpath
+- **`this(...)`**：本类构造器委托 → `invokespecial` 到另一个 `<init>`
+- **多维数组**：`multianewarray`(0xC5)、`new int[3][]` 锯齿、二维/三维读写、JIT 侧 `new_multi_array`
+- **静态字段 + `<clinit>`**：`getstatic/putstatic`（含继承）、静态初始化块按源码顺序、
+  首次使用触发且只执行一次（先父类）；JIT 侧懒初始化
+- 修作用域 bug：循环内声明变量未 chop → `top is not assignable to integer`（javac 同样 chop）
+
+**验证：50 个样例三路一致**（新增 `Iface Iface2 CtorThis Multi Multi2 Multi3 Static2` + 包名 `Pkg`）；
+`cargo test` 31 passed。
+
+**已知不支持**：接口 default/static 方法、`import`（跨包需写全限定名）、
+`println(a == b)` 这类「比较结果当实参」（改动前就存在，栈图限制）。

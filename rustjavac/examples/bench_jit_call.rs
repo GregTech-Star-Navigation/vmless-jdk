@@ -3,12 +3,12 @@ fn main() {
     let path = "D:/vmless/genc/CallTest.class";
     let (_, m) = classfile::jit::compile_file(path, "work", "(I)I").expect("JIT work");
     let t = std::time::Instant::now();
-    let r = m.call(&[50_000_000]);
+    let r = m.call(&[50_000_000i64]);
     println!("JIT work(50M) = {r}  {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
 
     let (_, f) = classfile::jit::compile_file(path, "fib", "(I)I").expect("JIT fib");
     let t = std::time::Instant::now();
-    let fr = f.call(&[30]);
+    let fr = f.call(&[30i64]);
     println!("JIT fib(30) = {fr}  {:.1} ms", t.elapsed().as_secs_f64() * 1e3);
 
     // 解释器对照

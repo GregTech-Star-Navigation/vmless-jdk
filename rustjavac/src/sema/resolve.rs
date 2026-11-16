@@ -36,8 +36,14 @@ pub struct MethodMeta {
 #[derive(Clone, Debug, Default)]
 struct Own {
     super_name: Option<String>,
+    /// 直接实现的接口（`implements A, B` / 接口的 `extends A, B`）
+    ifaces: Vec<String>,
+    /// 是不是接口（决定 class 文件的访问标志与 invokeinterface）
+    is_iface: bool,
     /// 只含实例字段，按声明顺序
     fields: Vec<FieldMeta>,
+    /// 只含静态字段（`<clinit>` 初始化与 getstatic 用）
+    static_fields: Vec<FieldMeta>,
     methods: Vec<MethodMeta>,
 }
 
@@ -54,7 +60,10 @@ pub struct Resolver {
 fn object_meta() -> Own {
     Own {
         super_name: None,
+        ifaces: Vec::new(),
+        is_iface: false,
         fields: Vec::new(),
+        static_fields: Vec::new(),
         methods: vec![MethodMeta { name: "<init>".into(), desc: "()V".into(), is_static: false }],
     }
 }
@@ -66,13 +75,34 @@ impl Resolver {
         own.insert("java/lang/Object".to_string(), object_meta());
         for t in flat_types(&cu.types) {
             let name = internal_type_name(cu.package.as_deref(), &t.name);
-            let super_name = t.extends.first().map(|ty| qualify(cu.package.as_deref(), ty));
+            // 接口的 `extends A, B` 是**父接口**（不是父类）：两处合并进 ifaces
+            let (super_name, ifaces) = if t.kind == TypeKind::Interface {
+                (
+                    None,
+                    t.extends
+                        .iter()
+                        .chain(t.implements.iter())
+                        .map(|ty| qualify(cu.package.as_deref(), ty))
+                        .collect::<Vec<String>>(),
+                )
+            } else {
+                (
+                    t.extends.first().map(|ty| qualify(cu.package.as_deref(), ty)),
+                    t.implements.iter().map(|ty| qualify(cu.package.as_deref(), ty)).collect(),
+                )
+            };
             let mut fields = Vec::new();
+            let mut static_fields = Vec::new();
             let mut methods = Vec::new();
             for m in &t.members {
                 match m {
                     Member::Field(f) => {
-                        if !f.modifiers.iter().any(|x| x == "static") {
+                        // 接口里的字段一律是 public static final（Java 语言规范，可不写 static）
+                        let is_static_f = f.modifiers.iter().any(|x| x == "static")
+                            || t.kind == TypeKind::Interface;
+                        if is_static_f {
+                            static_fields.push(FieldMeta { name: f.name.clone(), desc: descriptor(&f.ty) });
+                        } else {
                             fields.push(FieldMeta { name: f.name.clone(), desc: descriptor(&f.ty) });
                         }
                     }
@@ -87,7 +117,17 @@ impl Resolver {
                     _ => {}
                 }
             }
-            own.insert(name.clone(), Own { super_name, fields, methods });
+            own.insert(
+                name.clone(),
+                Own {
+                    super_name,
+                    ifaces,
+                    is_iface: t.kind == TypeKind::Interface,
+                    fields,
+                    static_fields,
+                    methods,
+                },
+            );
         }
         Resolver { own: RefCell::new(own), dirs: dirs.to_vec(), missing: RefCell::new(HashSet::new()) }
     }
@@ -162,9 +202,12 @@ impl Resolver {
     }
 
     /// 实例方法：名字 → 描述符（本类优先，然后沿继承链；不含静态方法与 `<init>`）
+    ///
+    /// 接口方法也算：`Shape x; x.area()` 要从接口上取到 `()I` 这个描述符
+    /// （`implements` 进来的接口在链上，接口自己的 `extends` 也要跟进去）。
     pub fn instance_methods(&self, class: &str) -> Result<HashMap<String, String>, String> {
         let mut out = HashMap::new();
-        for c in self.chain(class)? {
+        for c in self.chain_with_ifaces(class)? {
             let own = self.load(&c)?;
             for m in &own.methods {
                 if m.is_static || m.name == "<init>" {
@@ -172,6 +215,56 @@ impl Resolver {
                 }
                 out.entry(m.name.clone()).or_insert_with(|| m.desc.clone());
             }
+        }
+        Ok(out)
+    }
+
+    /// 静态字段：名字 → (声明类, 描述符)，含继承
+    pub fn static_fields(&self, class: &str) -> Result<HashMap<String, (String, String)>, String> {
+        let mut out = HashMap::new();
+        for c in self.chain_with_ifaces(class)? {
+            let own = self.load(&c)?;
+            for f in &own.static_fields {
+                out.entry(f.name.clone()).or_insert_with(|| (c.clone(), f.desc.clone()));
+            }
+        }
+        Ok(out)
+    }
+
+    /// 这个类型是不是接口
+    pub fn is_interface(&self, class: &str) -> bool {
+        self.load(class).map(|o| o.is_iface).unwrap_or(false)
+    }
+
+    /// 直接实现的接口
+    pub fn interfaces_of(&self, class: &str) -> Vec<String> {
+        self.load(class).map(|o| o.ifaces).unwrap_or_default()
+    }
+
+    /// 继承链 + 链上每个类/接口实现（含继承）的接口，去重
+    fn chain_with_ifaces(&self, class: &str) -> Result<Vec<String>, String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: HashSet<String> = HashSet::new();
+        let mut queue: Vec<String> = vec![class.to_string()];
+        while let Some(c) = queue.pop() {
+            if !seen.insert(c.clone()) {
+                continue;
+            }
+            out.push(c.clone());
+            let own = match self.load(&c) {
+                Ok(o) => o,
+                // 接口没跟到（java.* 的接口我们没有 .class）就跳过，别让整条链失败
+                Err(e) => {
+                    if c == class {
+                        return Err(e);
+                    }
+                    continue;
+                }
+            };
+            if let Some(s) = own.super_name.clone() {
+                queue.push(s);
+            }
+            queue.extend(own.ifaces.iter().cloned());
         }
         Ok(out)
     }
@@ -233,22 +326,59 @@ impl Resolver {
     fn load_from_disk(&self, class: &str) -> Option<Own> {
         let path = self.find_class_file(class)?;
         let bytes = std::fs::read(&path).ok()?;
-        let cf = crate::parse(&bytes).ok()?;
-        // 文件名不一定等于类名：以 class 文件里的 this_class 为准
+        self.own_from_bytes(&bytes)
+    }
+
+    /// 把 classpath 目录里的 `.class` 全部预加载进符号表。
+    ///
+    /// 跨编译单元引用（`PkgB b = new PkgB(...)`）需要知道对方的字段/方法表，
+    /// 而 codegen 的 `type_fields` / `type_methods` 是**一次性**建好的 —— 所以先把
+    /// classpath 上的类都读进来，后面查表就不会缺项。
+    pub fn preload(&self) {
+        let mut files: Vec<PathBuf> = Vec::new();
+        for d in &self.dirs {
+            collect_class_files(d, 0, &mut files);
+        }
+        for p in files {
+            let Ok(bytes) = std::fs::read(&p) else { continue };
+            let Some(o) = self.own_from_bytes(&bytes) else { continue };
+            let Some(name) = class_name_of_bytes(&bytes) else { continue };
+            if self.own.borrow().contains_key(&name) {
+                continue;
+            }
+            self.own.borrow_mut().insert(name, o);
+        }
+    }
+
+    /// 所有已知的类名：本编译单元的 + classpath 预加载进来的
+    pub fn all_classes(&self) -> Vec<String> {
+        self.own
+            .borrow()
+            .keys()
+            .filter(|k| *k != "java/lang/Object")
+            .cloned()
+            .collect()
+    }
+
+    fn own_from_bytes(&self, bytes: &[u8]) -> Option<Own> {
+        let cf = crate::parse(bytes).ok()?;
         let _ = cf.this_class_name()?;
         let super_name = match cf.constant_pool.get(cf.super_class as usize).and_then(|e| e.as_ref()) {
             Some(crate::CpEntry::Class(n)) => cf.utf8(*n).map(|b| String::from_utf8_lossy(b).into_owned()),
             _ => None,
         };
         let mut fields = Vec::new();
+        let mut static_fields = Vec::new();
         for f in &cf.fields {
-            if f.access_flags & 0x0008 != 0 {
-                continue;
-            }
-            fields.push(FieldMeta {
+            let meta = FieldMeta {
                 name: String::from_utf8_lossy(cf.utf8(f.name_index).unwrap_or_default()).into_owned(),
                 desc: String::from_utf8_lossy(cf.utf8(f.descriptor_index).unwrap_or_default()).into_owned(),
-            });
+            };
+            if f.access_flags & 0x0008 != 0 {
+                static_fields.push(meta);
+            } else {
+                fields.push(meta);
+            }
         }
         let mut methods = Vec::new();
         for m in &cf.methods {
@@ -258,7 +388,22 @@ impl Resolver {
                 is_static: m.access_flags & 0x0008 != 0,
             });
         }
-        Some(Own { super_name, fields, methods })
+        let ifaces = cf
+            .interfaces
+            .iter()
+            .filter_map(|i| match cf.constant_pool.get(*i as usize).and_then(|e| e.as_ref()) {
+                Some(crate::CpEntry::Class(n)) => cf.utf8(*n).map(|b| String::from_utf8_lossy(b).into_owned()),
+                _ => None,
+            })
+            .collect();
+        Some(Own {
+            super_name,
+            ifaces,
+            is_iface: cf.access_flags & 0x0200 != 0,
+            fields,
+            static_fields,
+            methods,
+        })
     }
 
     fn find_class_file(&self, class: &str) -> Option<PathBuf> {
@@ -278,6 +423,28 @@ impl Resolver {
         self.missing.borrow_mut().insert(class.to_string());
         None
     }
+}
+
+/// 递归收集目录里的 `.class`（包目录最多四层，够用且不会扫进奇怪的东西）
+fn collect_class_files(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
+    if depth > 4 {
+        return;
+    }
+    let Ok(entries) = std::fs::read_dir(dir) else { return };
+    for e in entries.flatten() {
+        let p = e.path();
+        if p.is_dir() {
+            collect_class_files(&p, depth + 1, out);
+        } else if p.extension().and_then(|s| s.to_str()) == Some("class") {
+            out.push(p);
+        }
+    }
+}
+
+/// class 文件里的内部类名
+fn class_name_of_bytes(bytes: &[u8]) -> Option<String> {
+    let cf = crate::parse(bytes).ok()?;
+    cf.this_class_name()
 }
 
 /// 类型声明名（带包前缀）

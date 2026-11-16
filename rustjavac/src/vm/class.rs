@@ -45,12 +45,32 @@ pub(super) fn class_name_of(cf: &ClassFile, index: u16) -> Result<String, VmErro
 }
 
 impl Vm {
-    /// actual 是不是 target 或它的子类（沿继承链，接口暂不支持）
+    /// 静态初始化：先父类、再自己，只跑一次（JVM 的 `<clinit>` 语义）
+    pub(super) fn ensure_init(&mut self, class: &str) -> Result<(), VmError> {
+        if self.initialized.contains(class) {
+            return Ok(());
+        }
+        // 先标记：`<clinit>` 里引用自己的静态字段时不能无限递归
+        self.initialized.insert(class.to_string());
+        if let Some(s) = self.store.super_of(class) {
+            self.ensure_init(&s)?;
+        }
+        if let Some((ci, mi)) = self.store.method_in_class(class, "<clinit>", "()V") {
+            self.depth += 1;
+            let r = self.execute(ci, mi, "()V", &[], false);
+            self.depth -= 1;
+            r?;
+        }
+        Ok(())
+    }
+
+    /// actual 是不是 target 或它的子类（**接口也算**：实际类 implements 它即成立）
     pub(super) fn is_subclass(&self, actual: &str, target: &str) -> bool {
         if actual == target {
             return true;
         }
         self.store.chain(actual).iter().any(|c| c == target)
+            || self.store.iface_closure(actual).iter().any(|c| c == target)
             || {
                 // 链上没加载的 java.* 祖先再按内置表走一遍
                 let mut cur = actual.to_string();

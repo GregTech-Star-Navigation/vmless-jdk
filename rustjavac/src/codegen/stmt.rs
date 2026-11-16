@@ -14,11 +14,15 @@ use super::types::*;
 pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
     match s {
         Stmt::Block(items) => {
+            // 块内声明的局部变量出了块就不可见：验证类型要退回入口快照，
+            // 否则后续合并帧会声明一个「别处是 top」的槽（VerifyError）
+            let scope = em.local_types.clone();
             for it in items {
                 if compile_stmt(it, em, ctx, cp)? {
                     return Ok(true);
                 }
             }
+            em.local_types = scope;
             Ok(false)
         }
         Stmt::Return(None) => compile_return(&None, em, ctx, cp),
@@ -97,6 +101,18 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             Ok(false)
         }
         Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) if matches!(&**lhs, Expr::Field(..)) => {
+            // 静态字段：`StaticCounter.count = ...`
+            if let Some((owner, desc)) = static_field_access(lhs, ctx) {
+                let fname = match &**lhs {
+                    Expr::Field(_, n) => n.clone(),
+                    _ => unreachable!(),
+                };
+                compile_expr(rhs, em, ctx, cp)?;
+                let f = cp.field_ref(&owner, &fname, &desc);
+                em.op_u2(0xB3, f); // putstatic
+                em.pop(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
+                return Ok(false);
+            }
             let (recv, fname) = match &**lhs {
                 Expr::Field(r, n) => (r.clone(), n.clone()),
                 _ => unreachable!(),
@@ -124,6 +140,14 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 _ => return err("只支持给局部变量赋值"),
             };
             let Some(slot) = ctx.lookup(&name) else {
+                // 本类的静态字段（`count = count + 1;`）
+                if let Some((owner, desc)) = ctx.static_fields.get(&name).cloned() {
+                    compile_expr(rhs, em, ctx, cp)?;
+                    let f = cp.field_ref(&owner, &name, &desc);
+                    em.op_u2(0xB3, f); // putstatic
+                    em.pop(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
+                    return Ok(false);
+                }
                 // 不是局部变量 → 隐式 this 字段（`x = v;` 这种写法）
                 let (owner, desc) = field_access(&Expr::This, &name, ctx);
                 let Some(_) = ctx.fields.get(&name) else {
@@ -188,19 +212,23 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             em.goto(default_target);
 
             // 依次发射各 case 体（自然贯穿）
+            let scope = em.local_types.clone();
             for (i, c) in cases.iter().enumerate() {
+                em.local_types = scope.clone();
                 em.bind(body_labels[i]);
                 for s in &c.body {
                     compile_stmt(s, em, ctx, cp)?;
                 }
             }
             if default_target == end_label {
+                em.local_types = scope;
                 em.bind(end_label);
             }
             // 视为已终结：避免在末尾再补一条不可达的默认 return（HotSpot 要求死代码也有栈图帧）
             Ok(true)
         }
         Stmt::For { init, cond, update, body } => {
+            let scope = em.local_types.clone();
             for s in init {
                 compile_stmt(s, em, ctx, cp)?;
             }
@@ -215,16 +243,21 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 // 更新表达式可能是赋值，交给语句编译器处理
                 compile_stmt(&Stmt::Expr(u.clone()), em, ctx, cp)?;
             }
+            // 循环里声明的变量出了循环就不可见：汇合帧必须 chop 掉它们，
+            // 否则从循环外跳进来的路径会判 "top is not assignable to integer"
+            em.local_types = scope;
             em.goto(start);
             em.bind(end);
             Ok(false)
         }
         Stmt::While { cond, body } => {
+            let scope = em.local_types.clone();
             let start = em.new_label();
             let end = em.new_label();
             em.bind(start);
             compile_cond_false(cond, em, ctx, cp, end)?;
             compile_stmt(body, em, ctx, cp)?;
+            em.local_types = scope;
             em.goto(start);
             em.bind(end);
             Ok(false)
@@ -233,15 +266,22 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             let l_else = em.new_label();
             let l_end = em.new_label();
             compile_cond_false(cond, em, ctx, cp, l_else)?;
+            // 两个分支各自声明的局部变量都不能出现在合并帧里
+            let scope = em.local_types.clone();
             compile_stmt(then, em, ctx, cp)?;
             match els {
                 Some(e) => {
+                    em.local_types = scope.clone();
                     em.goto(l_end);
                     em.bind(l_else);
                     compile_stmt(e, em, ctx, cp)?;
+                    em.local_types = scope;
                     em.bind(l_end);
                 }
-                None => em.bind(l_else),
+                None => {
+                    em.local_types = scope;
+                    em.bind(l_else);
+                }
             }
             Ok(false)
         }

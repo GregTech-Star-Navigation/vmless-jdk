@@ -49,10 +49,19 @@ pub fn compile_with_path(
     cu: &CompilationUnit,
     classpath: &[std::path::PathBuf],
 ) -> Result<Vec<(String, Vec<u8>)>, CompileError> {
+    // 同包的简单类型名先补成 `p/Name`：后面所有描述符/继承链都按内部名走
+    let cu = &crate::sema::qualify_unit(cu, classpath);
     let res = crate::sema::Resolver::new(cu, classpath);
+    // classpath 上的类先读进来：跨编译单元的字段/方法表要在建 type_fields 之前就绪
+    res.preload();
     let mut out = Vec::new();
     for t in &cu.types {
-        out.push((t.name.clone(), compile_type(&cu.package, t, &res)?));
+        // 返回的类名是**内部名**（带包前缀），写盘时按它建目录
+        let name = match &cu.package {
+            Some(p) if !p.is_empty() => format!("{}/{}", p.replace('.', "/"), t.name),
+            _ => t.name.clone(),
+        };
+        out.push((name, compile_type(&cu.package, t, &res)?));
     }
     Ok(out)
 }

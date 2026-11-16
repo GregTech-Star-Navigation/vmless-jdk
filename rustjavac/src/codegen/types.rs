@@ -194,8 +194,16 @@ pub(crate) fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError
 /// 推不出来返回 `None`：调用方按「int」这一老行为兜底，不要在这里猜。
 pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
     match e {
-        Expr::Ident(n) => ctx.local_ty.get(n).cloned(),
+        Expr::Ident(n) => ctx
+            .local_ty
+            .get(n)
+            .cloned()
+            .or_else(|| ctx.static_fields.get(n).map(|(_, d)| type_from_desc(d))),
         Expr::Field(r, n) => {
+            // 静态字段：`ClassName.f`
+            if let Some((_, d)) = static_field_access(e, ctx) {
+                return Some(type_from_desc(&d));
+            }
             // 接收者静态类型已知就按它的字段表查（含继承）
             if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
                 if let Some(d) = ctx.type_fields.get(&owner).and_then(|f| f.get(n)) {
@@ -238,6 +246,7 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
                 .get(n)
                 .and_then(|i| ctx.field_descs.get(*i))
                 .map(|d| kind_from_desc(d))
+                .or_else(|| ctx.static_fields.get(n).map(|(_, d)| kind_from_desc(d)))
                 .unwrap_or(K_INT)
         }),
         Expr::Binary { op, lhs, rhs } => match op {
@@ -253,6 +262,10 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
         Expr::StrLit(_) | Expr::This | Expr::Super | Expr::New { .. } | Expr::ArrayNew { .. } | Expr::Null => K_REF,
         Expr::InstanceOf { .. } | Expr::BoolLit(_) => K_BOOL,
         Expr::Field(r, name) => {
+            // 静态字段按它的描述符定种类（否则 long/double/String 会被当成 int）
+            if let Some((_, desc)) = static_field_access(e, ctx) {
+                return kind_from_desc(&desc);
+            }
             let (_, desc) = field_access(r, name, ctx);
             kind_from_desc(&desc)
         }
@@ -308,12 +321,53 @@ pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, ctx: &Ctx) -> Option<St
     if matches!(r, Expr::Super) {
         return ctx.type_methods.get(&ctx.super_name).and_then(|m| m.get(name)).cloned();
     }
+    // ClassName.staticMethod(...)
+    if let Some((_, d)) = static_call(r, name, ctx) {
+        return Some(d);
+    }
     if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
         if let Some(d) = ctx.type_methods.get(&owner).and_then(|m| m.get(name)) {
             return Some(d.clone());
         }
     }
     ctx.instance_methods.get(name).cloned()
+}
+
+/// 静态字段访问：`ClassName.f`，或者本类的静态字段名 `count`。
+///
+/// 返回 (声明类, 描述符)。`ClassName` 只有在不是局部变量名时才当类名。
+pub(crate) fn static_field_access(e: &Expr, ctx: &Ctx) -> Option<(String, String)> {
+    match e {
+        Expr::Ident(n) => ctx.static_fields.get(n).cloned(),
+        Expr::Field(recv, f) => {
+            if let Expr::Ident(cls) = &**recv {
+                if ctx.lookup(cls).is_none() {
+                    let owner = internal_name(std::slice::from_ref(cls));
+                    // 值里带**声明类**：继承来的静态字段要用父类的名字（getstatic 的 owner）
+                    if let Some(v) = ctx.type_static_fields.get(&owner).and_then(|m| m.get(f)) {
+                        return Some(v.clone());
+                    }
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// 静态方法调用 `ClassName.m(...)`：返回 (声明类, 描述符)。
+///
+/// `ClassName` 只有在不是局部变量名时才当类名。
+pub(crate) fn static_call(recv: &Expr, name: &str, ctx: &Ctx) -> Option<(String, String)> {
+    if let Expr::Ident(cls) = recv {
+        if ctx.lookup(cls).is_none() {
+            let owner = internal_name(std::slice::from_ref(cls));
+            if let Some(d) = ctx.type_static_methods.get(&owner).and_then(|m| m.get(name)) {
+                return Some((owner, d.clone()));
+            }
+        }
+    }
+    None
 }
 
 /// 一次字段访问的 (引用类, 描述符)。

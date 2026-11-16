@@ -65,6 +65,10 @@ pub struct Vm {
     /// `new RuntimeException("boom")` 的构造器在 java.* 里（我们没有它的字节码），
     /// 所以构造时只把消息记下来，抛出来时再拼。
     exc_msgs: HashMap<i32, i32>,
+    /// 静态字段：(声明类, 字段名) → 值（没有条目就是默认值 0/null）
+    statics: HashMap<(String, String), Slot>,
+    /// 已经跑过 `<clinit>` 的类（静态初始化只跑一次，且先跑父类）
+    initialized: std::collections::HashSet<String>,
 }
 
 impl Vm {
@@ -85,6 +89,8 @@ impl Vm {
             strings: Vec::new(),
             string_handles: HashMap::new(),
             exc_msgs: HashMap::new(),
+            statics: HashMap::new(),
+            initialized: std::collections::HashSet::new(),
         }
     }
 
@@ -95,6 +101,9 @@ impl Vm {
             .main_method()
             .ok_or_else(|| VmError { msg: "找不到 main([Ljava/lang/String;)V".into(), exc: None })?;
         let main_class = self.store.main;
+        // JVM 在调 main 之前会先初始化入口类
+        let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
+        self.ensure_init(&main_name)?;
         match self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false) {
             Ok(r) => Ok(ExecResult {
                 return_value: r.as_i32(),

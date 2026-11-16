@@ -124,6 +124,37 @@ impl ClassStore {
         out
     }
 
+    /// 一个类**直接**实现的接口（class 文件的 `interfaces` 表）
+    pub(super) fn interfaces_of(&self, class: &str) -> Vec<String> {
+        let Some(&i) = self.by_name.get(class) else { return Vec::new() };
+        let cf = &self.classes[i];
+        cf.interfaces
+            .iter()
+            .filter_map(|ix| match cf.constant_pool.get(*ix as usize).and_then(|e| e.as_ref()) {
+                Some(crate::CpEntry::Class(n)) => {
+                    cf.utf8(*n).map(|b| String::from_utf8_lossy(b).into_owned())
+                }
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// 类（含继承链上每个类）实现的全部接口，传递闭包（接口 extends 接口也算）
+    pub(super) fn iface_closure(&self, class: &str) -> Vec<String> {
+        let mut out: Vec<String> = Vec::new();
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: Vec<String> = self.chain(class);
+        while let Some(c) = queue.pop() {
+            for i in self.interfaces_of(&c) {
+                if seen.insert(i.clone()) {
+                    out.push(i.clone());
+                    queue.push(i);
+                }
+            }
+        }
+        out
+    }
+
     fn build_metas(&mut self) {
         let names: Vec<String> = self.by_name.keys().cloned().collect();
         for name in names {
@@ -158,6 +189,16 @@ impl ClassStore {
             }
         }
         None
+    }
+
+    /// 只在这个类**自己**里找方法（`<clinit>` 不继承，不能用 resolve_method）
+    pub(super) fn method_in_class(&self, class: &str, name: &str, desc: &str) -> Option<(usize, usize)> {
+        self.methods.get(&(class.to_string(), name.to_string(), desc.to_string())).copied()
+    }
+
+    /// 直接父类名（已加载的类看 super_class，java.* 靠内置表）
+    pub(super) fn super_of(&self, class: &str) -> Option<String> {
+        super_of_of(&self.classes, &self.by_name, class)
     }
 
     /// 从 `from` 开始的继承链上，字段名 → 下标

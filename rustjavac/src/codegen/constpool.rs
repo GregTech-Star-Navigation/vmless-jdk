@@ -12,6 +12,7 @@ pub struct CpBuilder {
     nat_cache: HashMap<(u16, u16), u16>,
     field_cache: HashMap<(u16, u16), u16>,
     method_cache: HashMap<(u16, u16), u16>,
+    iface_method_cache: HashMap<(u16, u16), u16>,
     string_cache: HashMap<u16, u16>,
 }
 
@@ -79,6 +80,20 @@ impl CpBuilder {
         }
         let i = self.push(CpEntry::MethodRef(c, nt));
         self.method_cache.insert((c, nt), i);
+        i
+    }
+
+    /// 接口方法引用：invokeinterface 的操作数**必须**是 InterfaceMethodref 项，
+    /// 用 MethodRef 会被 HotSpot 判成 `Illegal type at constant pool entry`
+    pub fn interface_method_ref(&mut self, owner: &str, name: &str, desc: &str) -> u16 {
+        let c = self.class(owner);
+        let nt = self.name_and_type(name, desc);
+        let key = (c, nt);
+        if let Some(i) = self.iface_method_cache.get(&key) {
+            return *i;
+        }
+        let i = self.push(CpEntry::InterfaceMethodRef(c, nt));
+        self.iface_method_cache.insert(key, i);
         i
     }
 

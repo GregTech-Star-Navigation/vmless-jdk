@@ -440,11 +440,16 @@ impl Parser {
                 // 数组创建
                 if matches!(self.cur(), Tok::LBracket) {
                     let mut dims = Vec::new();
+                    let mut extra = 0usize; // 后面那些没给长度的 `[]`
                     while matches!(self.cur(), Tok::LBracket) {
                         self.advance();
                         if matches!(self.cur(), Tok::RBracket) {
                             self.advance();
-                            break;
+                            extra += 1;
+                            continue;
+                        }
+                        if extra > 0 {
+                            return Err(self.err("数组维度的长度必须写在前面（`new int[3][]`）".into()));
                         }
                         dims.push(self.parse_expr()?);
                         self.expect(&Tok::RBracket)?;
@@ -453,10 +458,13 @@ impl Parser {
                         let init = self.parse_array_or_expr()?;
                         return Ok(init);
                     }
-                    if let Type::Array(inner) = &ty {
-                        return Ok(Expr::ArrayNew { elem: (**inner).clone(), dims });
+                    // `new int[3][]` 的元素类型是 `int[]`：把没给长度的维度包进 elem，
+                    // 这样 `dims.len()` 就是 multianewarray 的维数，elem 是最后一维的元素
+                    let mut elem = ty;
+                    for _ in 0..extra {
+                        elem = Type::Array(Box::new(elem));
                     }
-                    return Ok(Expr::ArrayNew { elem: ty, dims });
+                    return Ok(Expr::ArrayNew { elem, dims });
                 }
                 let args = if matches!(self.cur(), Tok::LParen) { self.parse_args()? } else { vec![] };
                 // 匿名类体

@@ -8,6 +8,7 @@
 use crate::ast::*;
 use std::collections::HashMap;
 
+#[derive(Clone)]
 pub(crate) struct Ctx {
     pub(crate) locals: HashMap<String, u8>,
     pub(crate) next_slot: u8,
@@ -33,6 +34,14 @@ pub(crate) struct Ctx {
     pub(crate) type_fields: HashMap<String, HashMap<String, String>>,
     /// 任意类的实例方法表：类内部名 → (方法名 → 描述符)，含继承
     pub(crate) type_methods: HashMap<String, HashMap<String, String>>,
+    /// 接口类型（内部名）集合：调用点据此发 invokeinterface
+    pub(crate) iface_types: std::collections::HashSet<String>,
+    /// 本类（含继承）静态字段：名字 → (声明类, 描述符)
+    pub(crate) static_fields: HashMap<String, (String, String)>,
+    /// 任意类的静态字段表：类内部名 → (字段名 → (声明类, 描述符))
+    pub(crate) type_static_fields: HashMap<String, HashMap<String, (String, String)>>,
+    /// 任意类的静态方法表：类内部名 → (方法名 → 描述符)
+    pub(crate) type_static_methods: HashMap<String, HashMap<String, String>>,
     /// 外层 `try { ... } finally { ... }` 的 finally 体，**外层在前**。
     /// `return` 要先把这些 finally 各编译一份（javac 的复制策略），再真正返回。
     pub(crate) finally_stack: Vec<Stmt>,

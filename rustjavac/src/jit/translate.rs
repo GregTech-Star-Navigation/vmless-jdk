@@ -85,6 +85,16 @@ impl Jit {
             .module
             .declare_function("vmless_new_array", Linkage::Import, &sig_new_arr)
             .map_err(|e| JitError(e.to_string()))?;
+        // multianewarray：counts 指针 + 维数 + 描述符串指针
+        let mut sig_new_multi = self.module.make_signature();
+        sig_new_multi.params.push(AbiParam::new(types::I64));
+        sig_new_multi.params.push(AbiParam::new(types::I32));
+        sig_new_multi.params.push(AbiParam::new(types::I64));
+        sig_new_multi.returns.push(AbiParam::new(types::I64));
+        let new_multi_id = self
+            .module
+            .declare_function("vmless_new_multi_array", Linkage::Import, &sig_new_multi)
+            .map_err(|e| JitError(e.to_string()))?;
 
         let mut sig_pi = self.module.make_signature();
         sig_pi.params.push(AbiParam::new(types::I32));
@@ -567,6 +577,9 @@ impl Jit {
                     let (fid, callee_max_locals, argc) = *call_targets
                         .get(&idx)
                         .ok_or_else(|| JitError("调用目标未编译".into()))?;
+                    // 首次调用这个类的静态方法时先跑它的 <clinit>
+                    let callee_owner = method_ref_of(&cf, idx)?.0;
+                    self.emit_clinit_call(&mut fb, &callee_owner)?;
                     // 参数出栈（逆序），写进为被调方法准备的栈槽
                     let mut args = Vec::new();
                     for _ in 0..argc {
@@ -847,17 +860,71 @@ impl Jit {
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     stack.push(fb.ins().sextend(types::I64, a));
                 }
-                // getstatic：System.out 只当占位
+                // getstatic：静态字段（System.out 仍是 PrintStream 占位）
                 0xb2 => {
-                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
-                    pc += 2;
-                    let z = fb.ins().iconst(types::I64, 0);
-                    stack.push(z);
-                }
-                // invokevirtual：println 走运行时；本类方法走静态分派
-                0xb6 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
+                    let (owner, fname, fdesc) = field_ref_of(&cf, idx)?;
+                    if owner == "java/lang/System" && fname == "out" {
+                        let z = fb.ins().iconst(types::I64, 0);
+                        stack.push(z);
+                    } else {
+                        self.emit_clinit_call(&mut fb, &owner)?;
+                        let slot = rt::static_slot(&owner, &fname);
+                        let (_, want) = field_slot_type(&fdesc);
+                        let mut sig = self.module.make_signature();
+                        sig.params.push(AbiParam::new(types::I32));
+                        sig.returns.push(AbiParam::new(types::I64));
+                        let fid = self
+                            .module
+                            .declare_function("vmless_get_static", Linkage::Import, &sig)
+                            .map_err(|e| JitError(e.to_string()))?;
+                        let fref = self.module.declare_func_in_func(fid, fb.func);
+                        let si = fb.ins().iconst(types::I32, slot as i64);
+                        let c = fb.ins().call(fref, &[si]);
+                        let raw = fb.inst_results(c)[0];
+                        let v = if want == types::F64 {
+                            fb.ins().bitcast(types::F64, MemFlags::new(), raw)
+                        } else {
+                            convert_to(&mut fb, raw, want)
+                        };
+                        stack.push(v);
+                    }
+                }
+                // putstatic
+                0xb3 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let (owner, fname, fdesc) = field_ref_of(&cf, idx)?;
+                    self.emit_clinit_call(&mut fb, &owner)?;
+                    let slot = rt::static_slot(&owner, &fname);
+                    let (ty, _) = field_slot_type(&fdesc);
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    // 统一按 i64 位模式存
+                    let v = if ty == types::F64 {
+                        let b = fb.ins().bitcast(types::I64, MemFlags::new(), v);
+                        b
+                    } else {
+                        convert_to(&mut fb, v, types::I64)
+                    };
+                    let mut sig = self.module.make_signature();
+                    sig.params.push(AbiParam::new(types::I32));
+                    sig.params.push(AbiParam::new(types::I64));
+                    let fid = self
+                        .module
+                        .declare_function("vmless_put_static", Linkage::Import, &sig)
+                        .map_err(|e| JitError(e.to_string()))?;
+                    let fref = self.module.declare_func_in_func(fid, fb.func);
+                    let si = fb.ins().iconst(types::I32, slot as i64);
+                    fb.ins().call(fref, &[si, v]);
+                }
+                // invokevirtual：println 走运行时；本类方法走静态分派
+                0xb6 | 0xb9 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    if op == 0xb9 {
+                        pc += 2; // count + 保留字节（invokeinterface 比 invokevirtual 多两字节）
+                    }
                     let (cls, name, desc) = method_ref_of(&cf, idx)?;
                     if name == "println" {
                         // 栈上顺序是 [接收者, 参数]，先弹参数
@@ -918,7 +985,7 @@ impl Jit {
                             stack.push(v);
                         }
                         if uses_exc {
-                            let op_pc = pc - 3;
+                            let op_pc = pc - if op == 0xb9 { 5 } else { 3 };
                             let cont = fb.create_block();
                             let disp = fb.create_block();
                             let pf = self.module.declare_func_in_func(helpers.pending, fb.func);
@@ -942,6 +1009,8 @@ impl Jit {
                         other => return Err(JitError(format!("new 的操作数不是类: {other:?}"))),
                     };
                     let tag = rt::class_tag(&cls);
+                    // 首次 new 这个类时先跑它的 <clinit>
+                    self.emit_clinit_call(&mut fb, &cls)?;
                     // 字段个数按**被创建的那个类**的布局（含父类字段）算，不是本类的
                     let nf = fb.ins().iconst(types::I32, self.classes.field_count(&cls) as i64);
                     let tg = fb.ins().iconst(types::I32, tag as i64);
@@ -997,6 +1066,49 @@ impl Jit {
                         _ => ("[I", 4),
                     };
                     push_new_array(&mut fb, &mut stack, &mut self.module, new_arr_id, esize, desc)?;
+                }
+                // multianewarray：长度先落到一个栈槽里，再交给运行时递归建
+                0xc5 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let ndims = body[pc] as usize;
+                    pc += 1;
+                    let desc = match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
+                        Some(CpEntry::Class(n)) => {
+                            String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned()
+                        }
+                        other => {
+                            return Err(JitError(format!("multianewarray 的操作数不是类: {other:?}")))
+                        }
+                    };
+                    let mut counts = Vec::with_capacity(ndims);
+                    for _ in 0..ndims {
+                        counts.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                    }
+                    counts.reverse();
+                    let slot = fb.create_sized_stack_slot(
+                        cranelift_codegen::ir::StackSlotData::new(
+                            cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                            (ndims.max(1) * 4) as u32,
+                            2,
+                        ),
+                    );
+                    for (i, v) in counts.iter().enumerate() {
+                        let v = convert_to(&mut fb, *v, types::I32);
+                        let addr = fb.ins().stack_addr(types::I64, slot, (i * 4) as i32);
+                        fb.ins().store(MemFlags::new(), v, addr, 0);
+                    }
+                    let ptr = fb.ins().stack_addr(types::I64, slot, 0);
+                    let nd = fb.ins().iconst(types::I32, ndims as i64);
+                    // 描述符串：编译期登记，运行时取稳定指针
+                    let sidx = strtab::register(&desc);
+                    let sref = self.module.declare_func_in_func(str_const_id, fb.func);
+                    let si = fb.ins().iconst(types::I32, sidx as i64);
+                    let sc = fb.ins().call(sref, &[si]);
+                    let sp = fb.inst_results(sc)[0];
+                    let fref = self.module.declare_func_in_func(new_multi_id, fb.func);
+                    let c = fb.ins().call(fref, &[ptr, nd, sp]);
+                    stack.push(fb.inst_results(c)[0]);
                 }
                 // anewarray：操作数是元素类 → 数组描述符 [Lxxx; 或 [[xxx
                 0xbd => {
@@ -1158,6 +1270,51 @@ impl Jit {
         Ok((func_id, max_locals, argc))
     }
 
+    /// 这个类自己有没有 `<clinit>`
+    fn has_clinit(&self, class: &str) -> bool {
+        let Some(cf) = self.classes.get(class) else { return false };
+        cf.methods.iter().any(|m| {
+            String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()) == "<clinit>"
+                && String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()) == "()V"
+        })
+    }
+
+    /// 确保 `class` 的 `<clinit>` 已经编成机器码并登记（返回是否真的有）
+    pub(super) fn ensure_clinit(&mut self, class: &str) -> Result<bool, JitError> {
+        if !self.has_clinit(class) {
+            return Ok(false);
+        }
+        let tag = rt::class_tag(class);
+        if !self.clinit_started.insert(tag) {
+            return Ok(true); // 已经在编（或编过）
+        }
+        let (fid, _, _) = self.compile_into(class, "<clinit>", "()V")?;
+        self.pending_clinit.push((tag, fid));
+        Ok(true)
+    }
+
+    /// 在当前位置插一次 `vmless_clinit(tag)`（只在类真有 `<clinit>` 时）
+    fn emit_clinit_call(
+        &mut self,
+        fb: &mut FunctionBuilder,
+        class: &str,
+    ) -> Result<(), JitError> {
+        if !self.ensure_clinit(class)? {
+            return Ok(());
+        }
+        let tag = rt::class_tag(class);
+        let mut sig = self.module.make_signature();
+        sig.params.push(AbiParam::new(types::I32));
+        let fid = self
+            .module
+            .declare_function("vmless_clinit", Linkage::Import, &sig)
+            .map_err(|e| JitError(e.to_string()))?;
+        let fref = self.module.declare_func_in_func(fid, fb.func);
+        let t = fb.ins().iconst(types::I32, tag as i64);
+        fb.ins().call(fref, &[t]);
+        Ok(())
+    }
+
     /// 准备一个虚调用点：
     ///
     /// 1. 把「静态类型 `static_class` 及其所有子类」对该方法的实现都编译出来
@@ -1183,7 +1340,11 @@ impl Jit {
             if !self.classes.is_subclass(&k, static_class) {
                 continue;
             }
-            let Some((owner, _)) = self.classes.resolve_method(&k, name, desc) else { continue };
+            let Some((owner, mi)) = self.classes.resolve_method(&k, name, desc) else { continue };
+            // 接口里的抽象方法声明没有 Code：跳过（实现类的那份会被编到）
+            if self.classes.is_abstract_method(&owner, mi) {
+                continue;
+            }
             let (fid, ml, _) = self.compile_into(&owner, name, desc)?;
             ml_max = ml_max.max(ml);
             let tag = rt::class_tag(&k);

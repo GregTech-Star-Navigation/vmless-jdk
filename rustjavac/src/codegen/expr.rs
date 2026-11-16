@@ -48,8 +48,8 @@ pub(crate) fn ref_println_desc(e: &Expr, ctx: &Ctx) -> &'static str {
 /// 这个表达式是不是一次返回 void 的方法调用（语句位置上不能弹返回值）
 pub(crate) fn is_void_call(e: &Expr, ctx: &Ctx) -> bool {
     let Expr::Call { recv, name, .. } = e else { return false };
-    // super(...) / super.m() 都是 invokespecial，没有返回值可弹
-    if name == "super" {
+    // super(...) / this(...) / super.m() 都是 invokespecial，没有返回值可弹
+    if name == "super" || name == "this" {
         return true;
     }
     matches!(call_desc(recv.as_deref(), name, ctx), Some(d) if d.ends_with(")V"))
@@ -92,6 +92,13 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             Ok(())
         }
         Expr::Field(recv, name) => {
+            // 静态字段：`StaticCounter.count`（接收者是类名，不是对象）
+            if let Some((owner, desc)) = static_field_access(e, ctx) {
+                let f = cp.field_ref(&owner, name, &desc);
+                em.op_u2(0xB2, f); // getstatic
+                em.push(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
+                return Ok(());
+            }
             // super.x → 读父类字段，接收者还是 this
             let is_super = matches!(**recv, Expr::Super);
             if is_super {
@@ -111,10 +118,26 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             Ok(())
         }
         Expr::ArrayNew { elem, dims } => {
-            if dims.len() != 1 {
-                return err("只支持一维数组");
+            if dims.is_empty() {
+                return err("数组创建至少要给一维长度");
             }
-            compile_expr(&dims[0], em, ctx, cp)?;
+            for d in dims {
+                compile_expr(d, em, ctx, cp)?;
+            }
+            // 多维：multianewarray，操作数是**整个数组**的描述符与维数
+            if dims.len() > 1 {
+                let mut ty = Type::Array(Box::new(elem.clone()));
+                for _ in 1..dims.len() {
+                    ty = Type::Array(Box::new(ty));
+                }
+                let cls = ver_type(cp, &ty);
+                em.op(0xC5); // multianewarray
+                em.bytes.extend_from_slice(&cls.to_be_bytes());
+                em.bytes.push(dims.len() as u8);
+                em.pop(dims.len() as u16);
+                em.push(1);
+                return Ok(());
+            }
             // newarray 的操作数是元素类型码，引用元素走 anewarray（操作数是元素类）
             let atype = match elem {
                 Type::Prim("int") => Some(10u8),    // T_INT
@@ -251,6 +274,13 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 em.push(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
                 return Ok(());
             }
+            // 静态字段（本类或继承来的）
+            if let Some((owner, desc)) = ctx.static_fields.get(name).cloned() {
+                let f = cp.field_ref(&owner, name, &desc);
+                em.op_u2(0xB2, f); // getstatic
+                em.push(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
+                return Ok(());
+            }
             err(format!("未定义的变量 `{name}`"))
         }
         // System.out.println(x)
@@ -282,6 +312,22 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 }
             }
             err(format!("不支持的 println 形态: {name}"))
+        }
+        // this(...) → invokespecial 本类另一个 <init>（构造器委托）
+        Expr::Call { recv: None, name, args, .. } if name == "this" => {
+            if !ctx.in_ctor {
+                return err("this(...) 只能出现在构造器里");
+            }
+            let desc = format!("({})V", args_desc(args, ctx));
+            em.op(0x2A); // aload_0
+            em.push(1);
+            for a in args {
+                compile_expr(a, em, ctx, cp)?;
+            }
+            let idx = cp.method_ref(&ctx.class_name, "<init>", &desc);
+            em.op_u2(0xB7, idx); // invokespecial
+            em.pop(args.len() as u16 + 1);
+            Ok(())
         }
         // super(...) → invokespecial 父类 <init>（父类构造器）
         Expr::Call { recv: Some(r), name, args, .. } if name == "super" && matches!(**r, Expr::Super) => {
@@ -319,6 +365,19 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         }
         // 调用对象方法 a.get()
         Expr::Call { recv: Some(r), name, args, .. } => {
+            // 静态方法：`ClassName.m(...)` → invokestatic（owner 就是那个类）
+            if let Some((owner, desc)) = static_call(r, name, ctx) {
+                for a in args {
+                    compile_expr(a, em, ctx, cp)?;
+                }
+                let idx = cp.method_ref(&owner, name, &desc);
+                em.op_u2(0xB8, idx); // invokestatic
+                em.pop(args.len() as u16);
+                if !desc.ends_with(")V") {
+                    em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
+                }
+                return Ok(());
+            }
             let desc = call_desc(Some(r), name, ctx)
                 .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`") })?;
             compile_expr(r, em, ctx, cp)?;
@@ -328,9 +387,18 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             // 引用类用接收者的**静态类型**：验证器要求接收者可赋给引用类。
             // 分派本身按运行时类走（虚方法覆写），引用类只决定从哪条链开始解析。
             let owner = expr_type(r, ctx).as_ref().and_then(type_internal).unwrap_or_else(|| ctx.class_name.clone());
-            let idx = cp.method_ref(&owner, name, &desc);
-            em.op_u2(0xB6, idx); // invokevirtual
             let n = args.len() as u16 + 1;
+            if ctx.iface_types.contains(&owner) {
+                // 接口方法调用必须是 invokeinterface：index, count(含 this), 0
+                let idx = cp.interface_method_ref(&owner, name, &desc);
+                em.op(0xB9);
+                em.bytes.extend_from_slice(&idx.to_be_bytes());
+                em.bytes.push(n as u8);
+                em.bytes.push(0);
+            } else {
+                let idx = cp.method_ref(&owner, name, &desc);
+                em.op_u2(0xB6, idx); // invokevirtual
+            }
             em.pop(n);
             // 返回值占的槽数：long/double 占 2 槽
             if !desc.ends_with(")V") {

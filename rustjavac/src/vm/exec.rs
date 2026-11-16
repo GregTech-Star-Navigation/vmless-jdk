@@ -508,6 +508,8 @@ impl Vm {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let cls = class_name_of(&cf, idx)?;
+                    // 首次 new 这个类时先跑它的 <clinit>
+                    self.ensure_init(&cls)?;
                     let n = self.store.field_count(&cls);
                     self.objects.push(vec![Slot::I(0); n.max(1)]);
                     self.object_class.push(cls);
@@ -620,16 +622,42 @@ impl Vm {
                     };
                     frame.push(Slot::L(r));
                 }
-                // getstatic：目前只支持 System.out
+                // getstatic：静态字段（System.out 仍是 PrintStream 占位，println 走内建）
                 0xb2 => {
-                    let _idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
-                    pc += 2;
-                    frame.push(Slot::I(0));
-                }
-                // invokevirtual：println 走内建；其余按**接收者的运行时类**虚分派
-                0xb6 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
+                    let info = self.method_ref(&cf, idx)?;
+                    if info.class == "java/lang/System" && info.name == "out" {
+                        frame.push(Slot::I(0));
+                    } else {
+                        // 首次访问这个类时先跑它的 <clinit>
+                        self.ensure_init(&info.class)?;
+                        let v = self
+                            .statics
+                            .get(&(info.class.clone(), info.name.clone()))
+                            .copied()
+                            .unwrap_or(Slot::I(0));
+                        frame.push(v);
+                    }
+                }
+                // putstatic
+                0xb3 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let info = self.method_ref(&cf, idx)?;
+                    let value = frame.pop()?;
+                    self.ensure_init(&info.class)?;
+                    self.statics.insert((info.class, info.name), value);
+                }
+                // invokevirtual / invokeinterface：println 走内建；
+                // 其余按**接收者的运行时类**虚分派（接口与类走同一条路，只是指令编码多两字节）
+                0xb6 | 0xb9 => {
+                    let op_pc = pc - 1;
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    if op == 0xb9 {
+                        pc += 2; // count + 保留字节
+                    }
                     let info = self.method_ref(&cf, idx)?;
                     if info.name == "println" {
                         let arg = frame.pop()?;
@@ -661,7 +689,6 @@ impl Vm {
                                 exc: None,
                             })?;
                         self.depth += 1;
-                        let op_pc = pc - 3;
                         let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &all, true), op_pc);
                         self.depth -= 1;
                         match r {
@@ -724,6 +751,8 @@ impl Vm {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let info = self.method_ref(&cf, idx)?;
+                    // 首次调用这个类的静态方法时先跑它的 <clinit>
+                    self.ensure_init(&info.class)?;
                     let argc = count_args(&info.desc)?;
                     let mut args = Vec::with_capacity(argc);
                     for _ in 0..argc {
@@ -752,12 +781,47 @@ impl Vm {
                         }
                     }
                 }
+                // multianewarray：一次建出多维数组（内层数组递归建）
+                0xc5 => {
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 2;
+                    let ndims = body[pc] as usize;
+                    pc += 1;
+                    let desc = class_name_of(&cf, idx)?;
+                    let mut counts = Vec::with_capacity(ndims);
+                    for _ in 0..ndims {
+                        counts.push(frame.pop_i()?);
+                    }
+                    counts.reverse();
+                    let h = self.new_multi(&desc, &counts)?;
+                    frame.push(Slot::I(h));
+                }
                 other => {
                     return err(format!("未实现的字节码 0x{other:02x} @pc={}", pc - 1));
                 }
             }
         }
         Ok(Slot::I(0))
+    }
+
+    /// 多维数组：`desc` 是完整描述符（`[[I`），`counts` 每维一个长度。
+    /// 内层数组先建，再塞进外层（和 JVM 的 multianewarray 语义一致）。
+    fn new_multi(&mut self, desc: &str, counts: &[i32]) -> Result<i32, VmError> {
+        let n = counts.first().copied().unwrap_or(0);
+        if n < 0 {
+            return err("数组长度为负");
+        }
+        self.arrays.push(vec![Slot::I(0); n as usize]);
+        self.array_class.push(desc.to_string());
+        let handle = -(self.arrays.len() as i32);
+        if counts.len() > 1 {
+            let elem_desc = &desc[1..];
+            for i in 0..n as usize {
+                let sub = self.new_multi(elem_desc, &counts[1..])?;
+                self.arrays[(handle.abs() - 1) as usize][i] = Slot::I(sub);
+            }
+        }
+        Ok(handle)
     }
 
     /// 字段偏移：先按引用类的继承链找，找不到再按对象的**运行时类**找

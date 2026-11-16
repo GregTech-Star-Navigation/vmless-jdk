@@ -10,7 +10,7 @@ fn main() {
 
     // 2) 跑 JIT 版本
     let t = std::time::Instant::now();
-    let r1 = m.call(&[n]);
+    let r1 = m.call(&[n as i64]);
     let jit_ms = t.elapsed().as_secs_f64() * 1e3;
     println!("JIT      : 结果={r1}  {:.1} ms", jit_ms);
 

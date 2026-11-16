@@ -159,6 +159,43 @@ pub extern "C" fn new_array(len: u32, elem_size: u32, tag: u32) -> *mut u8 {
     p
 }
 
+/// `multianewarray`：一次建出多维数组。
+///
+/// `counts` 是 ndims 个 i32（从最外层开始），`s` 指向「长度 + 标签 + 描述符字节」
+/// 缓冲（strtab 那种布局），描述符形如 `[[I` / `[[Ljava/lang/String;`。
+pub extern "C" fn new_multi_array(counts: *const i32, ndims: u32, s: *const u8) -> *mut u8 {
+    let len = unsafe { std::ptr::read_unaligned(s as *const u32) } as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(s.add(8), len) };
+    let desc = String::from_utf8_lossy(bytes).into_owned();
+    let mut dims = Vec::with_capacity(ndims as usize);
+    for i in 0..ndims as usize {
+        dims.push(unsafe { std::ptr::read_unaligned(counts.add(i)) });
+    }
+    build_multi(&desc, &dims)
+}
+
+/// 递归建多维数组：先建外层，再把内层数组填进元素槽
+fn build_multi(desc: &str, counts: &[i32]) -> *mut u8 {
+    let n = counts.first().copied().unwrap_or(0).max(0) as u32;
+    let elem_desc = &desc[1..];
+    // 元素字节数：引用（含下一维数组）8，其余 4（与 translate 的 newarray/anewarray 一致）
+    let esize: u32 = match elem_desc.as_bytes().first().copied() {
+        Some(b'J') | Some(b'D') | Some(b'F') | Some(b'L') | Some(b'[') => 8,
+        _ => 4,
+    };
+    let tag = tag_of(desc);
+    let p = new_array(n, esize, tag);
+    if counts.len() > 1 {
+        for i in 0..n as usize {
+            let sub = build_multi(elem_desc, &counts[1..]);
+            unsafe {
+                std::ptr::write_unaligned((p.add(8 + i * esize as usize)) as *mut i64, sub as i64);
+            }
+        }
+    }
+    p
+}
+
 /// `instanceof`：null 对任何类型都是 false；标签 0（java/lang/Object）对任何非 null 都是 true
 pub extern "C" fn instanceof(obj: i64, tag: u32) -> i32 {
     if obj == 0 {
@@ -235,6 +272,73 @@ unsafe fn alloc_zeroed(size: usize) -> *mut u8 {
     p
 }
 
+// ---------- 静态字段与静态初始化 ----------
+
+/// (类, 字段) → 静态槽下标（编译期登记，运行期按下标读写）
+static STATIC_SLOTS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+static STATIC_VALS: Mutex<Vec<i64>> = Mutex::new(Vec::new());
+
+/// 登记一个静态字段，返回它的槽下标（同一个字段永远同号）
+pub fn static_slot(class: &str, name: &str) -> u32 {
+    let mut g = STATIC_SLOTS.lock().unwrap();
+    if let Some(i) = g.iter().position(|(c, n)| c == class && n == name) {
+        return i as u32;
+    }
+    g.push((class.to_string(), name.to_string()));
+    let i = g.len() - 1;
+    drop(g);
+    let mut v = STATIC_VALS.lock().unwrap();
+    while v.len() <= i {
+        v.push(0);
+    }
+    i as u32
+}
+
+/// 读静态字段（值统一按 i64 位模式存，调用点再按字段类型还原）
+pub extern "C" fn get_static(idx: u32) -> i64 {
+    STATIC_VALS.lock().unwrap().get(idx as usize).copied().unwrap_or(0)
+}
+
+pub extern "C" fn put_static(idx: u32, v: i64) {
+    let mut g = STATIC_VALS.lock().unwrap();
+    let i = idx as usize;
+    if g.len() <= i {
+        g.resize(i + 1, 0);
+    }
+    g[i] = v;
+}
+
+/// 类标签 → `<clinit>` 的函数指针（finalize 之后才登记得进来）
+static CLINITS: Mutex<Vec<(u32, usize)>> = Mutex::new(Vec::new());
+static CLINIT_DONE: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+
+pub fn register_clinit(tag: u32, ptr: usize) {
+    let mut g = CLINITS.lock().unwrap();
+    if let Some(e) = g.iter_mut().find(|(t, _)| *t == tag) {
+        e.1 = ptr;
+    } else {
+        g.push((tag, ptr));
+    }
+}
+
+/// 静态初始化：第一次访问这个类时跑一次（先标记再调用，自引用不会无限递归）
+pub extern "C" fn clinit(tag: u32) {
+    {
+        let mut done = CLINIT_DONE.lock().unwrap();
+        if done.contains(&tag) {
+            return;
+        }
+        done.push(tag);
+    }
+    let ptr = CLINITS.lock().unwrap().iter().find(|(t, _)| *t == tag).map(|(_, p)| *p);
+    if let Some(p) = ptr {
+        let f: unsafe extern "C" fn(*mut i64) -> i32 = unsafe { std::mem::transmute(p) };
+        unsafe {
+            f(std::ptr::null_mut());
+        }
+    }
+}
+
 /// 让 `strtab` 也能用同一个分配器/标签表
 pub(super) fn string_tag() -> u32 {
     tag_of("java/lang/String")
@@ -244,6 +348,8 @@ pub(super) fn string_tag() -> u32 {
 
 /// 我们自己 JIT 出来的类的父类（instanceof / checkcast / 虚分派都要沿链走）
 static SUPERS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// 类 → 它**直接**实现的接口（一个类可以有多个，所以是表不是映射）
+static IFACES: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
 /// (方法名, 描述符) → 签名号（调用点只传一个 u32）
 static SIG_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// (类型标签, 签名号) → (函数指针, 返回种类)
@@ -272,7 +378,46 @@ fn super_of_name(class: &str) -> Option<String> {
     crate::vm::builtin_super(class).map(|s| s.to_string())
 }
 
-/// actual 是不是 target 本身或它的子类
+/// 登记「class 实现了 iface」
+pub fn register_iface(class: &str, iface: &str) {
+    let mut g = IFACES.lock().unwrap();
+    if !g.iter().any(|(c, i)| c == class && i == iface) {
+        g.push((class.to_string(), iface.to_string()));
+    }
+}
+
+fn ifaces_of(class: &str) -> Vec<String> {
+    IFACES.lock().unwrap().iter().filter(|(c, _)| c == class).map(|(_, i)| i.clone()).collect()
+}
+
+/// `actual`（含继承链上每一层）有没有实现 `target`（接口 extends 接口也算）
+fn implements_iface(actual: &str, target: &str) -> bool {
+    let mut queue: Vec<String> = vec![actual.to_string()];
+    let mut cur = actual.to_string();
+    for _ in 0..64 {
+        match super_of_name(&cur) {
+            Some(s) if s != cur => {
+                queue.push(s.clone());
+                cur = s;
+            }
+            _ => break,
+        }
+    }
+    let mut seen = std::collections::HashSet::new();
+    while let Some(c) = queue.pop() {
+        for i in ifaces_of(&c) {
+            if i == target {
+                return true;
+            }
+            if seen.insert(i.clone()) {
+                queue.push(i);
+            }
+        }
+    }
+    false
+}
+
+/// actual 是不是 target 本身、它的子类，或它实现的接口
 fn is_subclass_tag(actual: u32, target: u32) -> bool {
     if actual == target {
         return true;
@@ -290,10 +435,10 @@ fn is_subclass_tag(actual: u32, target: u32) -> bool {
                 }
                 cur = s;
             }
-            None => return false,
+            None => return implements_iface(&class_internal_of(actual), &t),
         }
     }
-    false
+    implements_iface(&class_internal_of(actual), &t)
 }
 
 /// (方法名, 描述符) → 签名号（同一个签名永远同号）

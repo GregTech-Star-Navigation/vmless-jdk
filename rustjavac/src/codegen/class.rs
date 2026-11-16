@@ -9,6 +9,7 @@ use super::constpool::CpBuilder;
 use super::ctx::Ctx;
 use super::emit::Emit;
 use super::error::*;
+use super::expr::compile_expr;
 use super::stmt::*;
 use super::types::*;
 
@@ -16,6 +17,9 @@ use super::types::*;
 pub const ACC_PUBLIC: u16 = 0x0001;
 pub const ACC_STATIC: u16 = 0x0008;
 pub const ACC_SUPER: u16 = 0x0020;
+/// 接口的访问标志：public interface abstract（接口**不能**带 ACC_SUPER）
+pub const ACC_INTERFACE: u16 = 0x0200;
+pub const ACC_ABSTRACT: u16 = 0x0400;
 
 
 pub(crate) fn compile_type(
@@ -27,7 +31,8 @@ pub(crate) fn compile_type(
         Some(p) => format!("{}/{}", p.replace('.', "/"), t.name),
         None => t.name.clone(),
     };
-    // 父类：AST 里写了 extends 就用它，否则就是 Object
+    let is_iface = t.kind == TypeKind::Interface;
+    // 父类：AST 里写了 extends 就用它，否则就是 Object（接口的 extends 是父接口，见 interfaces）
     let super_name = match res.super_of(&self_name)? {
         Some(s) => s,
         None => "java/lang/Object".to_string(),
@@ -59,14 +64,29 @@ pub(crate) fn compile_type(
     // 任意一个类的字段/方法表：接收者静态类型可能不是本类（`P p = ...; p.get()`）
     let mut type_fields: HashMap<String, HashMap<String, String>> = HashMap::new();
     let mut type_methods: HashMap<String, HashMap<String, String>> = HashMap::new();
-    for c in res.unit_classes() {
+    let mut type_static_fields: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
+    let mut type_static_methods: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // 接口类型名集合：调用点据此选 invokeinterface（0xB9）而不是 invokevirtual
+    let mut iface_types: std::collections::HashSet<String> = std::collections::HashSet::new();
+    for c in res.all_classes() {
         if let Ok(f) = res.field_types(&c) {
             type_fields.insert(c.clone(), f);
         }
         if let Ok(m) = res.instance_methods(&c) {
-            type_methods.insert(c, m);
+            type_methods.insert(c.clone(), m);
+        }
+        if let Ok(sf) = res.static_fields(&c) {
+            type_static_fields.insert(c.clone(), sf);
+        }
+        if let Ok(sm) = res.static_methods(&c) {
+            type_static_methods.insert(c.clone(), sm.into_iter().map(|(k, (d, _))| (k, d)).collect());
+        }
+        if res.is_interface(&c) {
+            iface_types.insert(c.clone());
         }
     }
+    // 本类（含继承）的静态字段：名字 → (声明类, 描述符)
+    let static_fields_map = res.static_fields(&self_name)?;
 
     let mut cp = CpBuilder::new();
     let this_class = cp.class(&self_name);
@@ -80,13 +100,17 @@ pub(crate) fn compile_type(
     let mut fields: Vec<CfMember> = Vec::new();
     for m in &t.members {
         if let Member::Field(f) = m {
-            if f.modifiers.iter().any(|x| x == "static") {
-                continue;
-            }
+            // 接口里的字段一律是 public static final
+            let is_static_f = f.modifiers.iter().any(|x| x == "static") || is_iface;
             let n = cp.utf8(&f.name);
             let d = cp.utf8(&descriptor(&f.ty));
+            // 静态字段也要写进字段表：getstatic/putstatic 靠它解析（值本身在 <clinit> 里初始化）
+            let mut flags = if is_static_f { ACC_PUBLIC | ACC_STATIC } else { 0x0000 };
+            if f.modifiers.iter().any(|x| x == "final") || is_iface {
+                flags |= 0x0010; // ACC_FINAL
+            }
             fields.push(CfMember {
-                access_flags: 0x0000,
+                access_flags: flags,
                 name_index: n,
                 descriptor_index: d,
                 attributes: Vec::new(),
@@ -95,7 +119,7 @@ pub(crate) fn compile_type(
     }
 
     let super_init = cp.method_ref(&super_name, "<init>", "()V");
-    if !has_ctor {
+    if !has_ctor && !is_iface {
         // 默认构造器：隐式调用父类无参构造器（父类没有就报错，和 javac 一致）
         if !res.has_default_ctor(&super_name)? {
             return err(format!(
@@ -120,6 +144,30 @@ pub(crate) fn compile_type(
         });
     }
 
+    // 方法/静态初始化块共用的上下文底板（每个方法 clone 一份再按需改）
+    let base_ctx = Ctx {
+        locals: HashMap::new(),
+        next_slot: 0,
+        static_methods: static_sigs.clone(),
+        instance_methods: inst_methods.clone(),
+        fields: field_index.clone(),
+        field_descs: field_desc_list.clone(),
+        field_tys: field_ty_list.clone(),
+        local_kind: HashMap::new(),
+        local_ty: HashMap::new(),
+        class_name: self_name.clone(),
+        super_name: super_name.clone(),
+        type_fields: type_fields.clone(),
+        type_methods: type_methods.clone(),
+        iface_types: iface_types.clone(),
+        static_fields: static_fields_map.clone(),
+        type_static_fields: type_static_fields.clone(),
+        type_static_methods: type_static_methods.clone(),
+        finally_stack: Vec::new(),
+        ret_ty: None,
+        in_ctor: false,
+    };
+
     for m in &t.members {
         let md = match m {
             Member::Method(md) => md,
@@ -127,6 +175,22 @@ pub(crate) fn compile_type(
         };
         let is_static = md.modifiers.iter().any(|x| x == "static");
         let desc = method_descriptor(&md.params, &md.ret);
+
+        // 抽象方法（含接口里的方法声明）没有 Code 属性 —— 写进去 HotSpot 直接 ClassFormatError
+        let is_abstract_m = is_iface
+            || md.modifiers.iter().any(|x| x == "abstract")
+            || md.body.is_none();
+        if is_abstract_m {
+            let name_index = cp.utf8(&md.name);
+            let desc_index = cp.utf8(&desc);
+            methods.push(CfMember {
+                access_flags: ACC_PUBLIC | ACC_ABSTRACT,
+                name_index,
+                descriptor_index: desc_index,
+                attributes: Vec::new(),
+            });
+            continue;
+        }
 
         let param_slots: u16 = md.params.iter().map(|p| if matches!(p.ty, Type::Prim("long") | Type::Prim("double")) { 2 } else { 1 }).sum();
         let mut em = Emit::new(if is_static { param_slots } else { param_slots + 1 });
@@ -142,7 +206,7 @@ pub(crate) fn compile_type(
                     t.name
                 ));
             }
-            if !ctor_call.first_is_super {
+            if !ctor_call.first_is_ctor_call {
                 if !res.has_default_ctor(&super_name)? {
                     return err(format!(
                         "类 `{}` 的构造器隐式调用了 super()，但父类 `{}` 没有无参构造器",
@@ -156,24 +220,10 @@ pub(crate) fn compile_type(
                 em.pop(1);
             }
         }
-        let mut ctx = Ctx {
-            locals: HashMap::new(),
-            next_slot: if is_static { 0 } else { 1 },
-            static_methods: static_sigs.clone(),
-            instance_methods: inst_methods.clone(),
-            fields: field_index.clone(),
-            field_descs: field_desc_list.clone(),
-            field_tys: field_ty_list.clone(),
-            local_kind: HashMap::new(),
-            local_ty: HashMap::new(),
-            class_name: self_name.clone(),
-            super_name: super_name.clone(),
-            type_fields: type_fields.clone(),
-            type_methods: type_methods.clone(),
-            finally_stack: Vec::new(),
-            ret_ty: md.ret.clone(),
-            in_ctor: is_ctor_m,
-        };
+        let mut ctx = base_ctx.clone();
+        ctx.next_slot = if is_static { 0 } else { 1 };
+        ctx.ret_ty = md.ret.clone();
+        ctx.in_ctor = is_ctor_m;
         ctx.locals.insert("<this-class>".to_string(), 0);
         if !is_static {
             let this_cp = cp.class(&self_name);
@@ -223,6 +273,55 @@ pub(crate) fn compile_type(
         });
     }
 
+    // 静态初始化 `<clinit>`：静态字段的初始化式与 `static { }` 块按**源码顺序**执行
+    // （javac 的行为，字段与块交替出现时也是这个顺序）。
+    let has_clinit = t.members.iter().any(|m| match m {
+        Member::Init { is_static, .. } => *is_static,
+        Member::Field(f) => {
+            f.init.is_some() && (f.modifiers.iter().any(|x| x == "static") || is_iface)
+        }
+        _ => false,
+    });
+    if has_clinit {
+        let mut em = Emit::new(0);
+        let mut ctx = base_ctx.clone();
+        let mut terminated = false;
+        for m in &t.members {
+            match m {
+                Member::Field(f)
+                    if f.init.is_some()
+                        && (f.modifiers.iter().any(|x| x == "static") || is_iface) =>
+                {
+                    let desc = descriptor(&f.ty);
+                    compile_expr(f.init.as_ref().unwrap(), &mut em, &ctx, &mut cp)?;
+                    let idx = cp.field_ref(&self_name, &f.name, &desc);
+                    em.op_u2(0xB3, idx); // putstatic
+                    em.pop(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
+                }
+                Member::Init { is_static: true, body } => {
+                    terminated = compile_stmt(body, &mut em, &mut ctx, &mut cp)?;
+                }
+                _ => {}
+            }
+        }
+        if !terminated {
+            em.op(0xB1); // return
+        }
+        em.stack_map_name = stack_map_name;
+        em.resolve()?;
+        let n = cp.utf8("<clinit>");
+        let d = cp.utf8("()V");
+        methods.push(CfMember {
+            access_flags: ACC_STATIC,
+            name_index: n,
+            descriptor_index: d,
+            attributes: vec![em.to_attribute(code_name)],
+        });
+    }
+
+    // 接口表：`implements A, B`（接口自己的 `extends A, B` 也算父接口）
+    let iface_idxs: Vec<u16> = res.interfaces_of(&self_name).iter().map(|n| cp.class(n)).collect();
+
     // invokestatic 的 owner 用真实类名补齐（此前占位 <SELF>）
     let cp_entries = fix_self_refs(cp, &self_name);
 
@@ -230,10 +329,11 @@ pub(crate) fn compile_type(
         minor_version: 0,
         major_version: 69,
         constant_pool: cp_entries,
-        access_flags: ACC_PUBLIC | ACC_SUPER,
+        // 接口：public interface abstract，且**不能**带 ACC_SUPER
+        access_flags: if is_iface { ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT } else { ACC_PUBLIC | ACC_SUPER },
         this_class,
         super_class,
-        interfaces: Vec::new(),
+        interfaces: iface_idxs,
         fields,
         methods,
         attributes: Vec::new(),
@@ -287,15 +387,15 @@ pub(crate) fn fix_self_refs(cp: CpBuilder, self_name: &str) -> Vec<Option<CpEntr
 
 /// 构造器第一条语句的情况
 struct CtorCallPos {
-    /// 第一条语句就是 `super(...)`
-    first_is_super: bool,
+    /// 第一条语句就是 `super(...)` 或 `this(...)`
+    first_is_ctor_call: bool,
     /// `super(...)` / `this(...)` 出现在了非首位（javac 也不允许）
     not_first: bool,
 }
 
-/// 判断构造器体里 `super(...)` 的**位置**
+/// 判断构造器体里 `super(...)` / `this(...)` 的**位置**
 fn ctor_call_position(body: Option<&Stmt>) -> CtorCallPos {
-    let mut pos = CtorCallPos { first_is_super: false, not_first: false };
+    let mut pos = CtorCallPos { first_is_ctor_call: false, not_first: false };
     let list: Vec<&Stmt> = match body {
         Some(Stmt::Block(items)) => items.iter().collect(),
         Some(s) => vec![s],
@@ -308,8 +408,8 @@ fn ctor_call_position(body: Option<&Stmt>) -> CtorCallPos {
         }
         if !first_seen {
             first_seen = true;
-            if is_super_call_stmt(s) {
-                pos.first_is_super = true;
+            if is_ctor_call_stmt(s) {
+                pos.first_is_ctor_call = true;
                 continue;
             }
         }
@@ -323,6 +423,12 @@ fn ctor_call_position(body: Option<&Stmt>) -> CtorCallPos {
 fn is_super_call_stmt(s: &Stmt) -> bool {
     matches!(s, Stmt::Expr(Expr::Call { recv: Some(r), name, .. })
         if name == "super" && matches!(**r, Expr::Super))
+}
+
+/// 这条语句是不是 `super(...)` / `this(...)`（构造器委托）
+fn is_ctor_call_stmt(s: &Stmt) -> bool {
+    is_super_call_stmt(s)
+        || matches!(s, Stmt::Expr(Expr::Call { recv: None, name, .. }) if name == "this")
 }
 
 /// 语句（含嵌套）里有没有 `super(...)` / `this(...)`

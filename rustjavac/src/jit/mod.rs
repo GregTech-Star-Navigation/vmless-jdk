@@ -34,6 +34,10 @@ pub struct Jit {
     classes: ClassSet,
     /// 待登记的虚方法实现（函数地址要等 finalize 之后才有）
     pending_v: Vec<(u32, u32, cranelift_module::FuncId, u8)>,
+    /// 待登记的 `<clinit>`：(类标签, 函数 id)
+    pending_clinit: Vec<(u32, cranelift_module::FuncId)>,
+    /// 已经安排编译过 `<clinit>` 的类标签（防递归）
+    clinit_started: std::collections::HashSet<u32>,
 }
 
 #[derive(Debug)]
@@ -53,6 +57,10 @@ impl Jit {
         let mut builder = JITBuilder::with_isa(isa, default_libcall_names());
         builder.symbol("vmless_new_object", rt::new_object as *const u8);
         builder.symbol("vmless_new_array", rt::new_array as *const u8);
+        builder.symbol("vmless_new_multi_array", rt::new_multi_array as *const u8);
+        builder.symbol("vmless_get_static", rt::get_static as *const u8);
+        builder.symbol("vmless_put_static", rt::put_static as *const u8);
+        builder.symbol("vmless_clinit", rt::clinit as *const u8);
         builder.symbol("vmless_println_int", rt::println_int as *const u8);
         builder.symbol("vmless_println_bool", rt::println_bool as *const u8);
         builder.symbol("vmless_println_long", rt::println_long as *const u8);
@@ -76,6 +84,8 @@ impl Jit {
             compiled: std::collections::HashMap::new(),
             classes: ClassSet::new(),
             pending_v: Vec::new(),
+            pending_clinit: Vec::new(),
+            clinit_started: std::collections::HashSet::new(),
         }
     }
 
@@ -114,6 +124,8 @@ impl Jit {
             self.classes.build_layout(&c);
         }
         let (func_id, max_locals, _) = self.compile_into(&cname, name, desc)?;
+        // 入口类的 <clinit> 要在 main 之前跑（JVM 的语义），所以先把它编出来
+        self.ensure_clinit(&cname)?;
         self.module
             .finalize_definitions()
             .map_err(|e| JitError(e.to_string()))?;
@@ -123,6 +135,13 @@ impl Jit {
             let p = self.module.get_finalized_function(fid) as usize;
             rt::register_vmethod(tag, sig, p, ret);
         }
+        let pending_clinit = std::mem::take(&mut self.pending_clinit);
+        for (tag, fid) in pending_clinit {
+            let p = self.module.get_finalized_function(fid) as usize;
+            rt::register_clinit(tag, p);
+        }
+        // 入口类静态初始化：JVM 在调 main 之前就会做这件事
+        rt::clinit(rt::class_tag(&cname));
         let ptr = self.module.get_finalized_function(func_id);
         let code: JitFn = unsafe { std::mem::transmute(ptr) };
         Ok(CompiledMethod {
