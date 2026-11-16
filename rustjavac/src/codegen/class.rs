@@ -168,6 +168,8 @@ pub(crate) fn compile_type(
         in_ctor: false,
         break_labels: Vec::new(),
         cont_labels: Vec::new(),
+        tmp_seq: 0,
+        pending_label: None,
     };
 
     for m in &t.members {

@@ -27,11 +27,12 @@ impl Parser {
         self.skip_annotations()?;
         let _ = self.eat_kw("final");
         if let Tok::Ident(lbl) = self.cur() {
-            let _ = lbl;
+            let lbl = lbl.clone();
             if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Colon)) {
                 self.advance();
                 self.advance();
-                return self.parse_statement();
+                let body = Box::new(self.parse_statement()?);
+                return Ok(Stmt::Labeled { label: lbl, body });
             }
         }
 

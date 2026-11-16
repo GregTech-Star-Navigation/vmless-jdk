@@ -11,6 +11,7 @@ rm -rf "$OUT" 2>/dev/null; mkdir -p "$OUT"
 ALL="InhBasic InhOverride InhChain InhSuperCall InhImplicitSuper InhInstanceof InhWide
 Iface Iface2 CtorThis Multi Multi2 Multi3 Static2
 Cmp1 Cmp2 Cmp3 Enum1 Enum2 Enum3 IfaceDef1 IfaceDef2
+ForEach1 ForEach2 ForEach3 Ternary1 Ternary2 Label1 Label2 Nest1 Nest2 Nest3 Concat1 Concat2 Concat3 Mix2
 Lg Db Point Loop Sw Obj2 ObjArr Arr Demo Perf2 LongEdge Doubles Mix DblCorpus Ret
 RefArr ObjRef ArrType RefFld RefCmp NullChk WideFld WideArr BitOps PrintObj PrintObj2
 TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2 TryUncaught"

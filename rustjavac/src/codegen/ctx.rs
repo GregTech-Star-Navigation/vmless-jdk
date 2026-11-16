@@ -8,6 +8,16 @@
 use crate::ast::*;
 use std::collections::HashMap;
 
+/// 一个 `break` / `continue` 的落点，外加它的**语句标签**（`outer: for (…)` 里的 `outer`）。
+///
+/// 带标签的 `break outer` 从内向外找第一个 `label == Some("outer")` 的落点，
+/// 不带标签的取最内层 —— 两者走同一张栈，只是查找规则不同。
+#[derive(Clone, Debug)]
+pub(crate) struct JumpTarget {
+    pub(crate) label: Option<String>,
+    pub(crate) target: usize,
+}
+
 #[derive(Clone)]
 pub(crate) struct Ctx {
     pub(crate) locals: HashMap<String, u8>,
@@ -50,13 +60,23 @@ pub(crate) struct Ctx {
     /// 当前方法是不是构造器（`super(...)` 只允许出现在构造器里）
     pub(crate) in_ctor: bool,
     /// 外层循环/switch 的跳出标签（`break` 跳到最内层的那个）
-    pub(crate) break_labels: Vec<usize>,
+    pub(crate) break_labels: Vec<JumpTarget>,
     /// 外层循环的下一轮标签（`continue`；switch 不产生 continue 目标）
-    pub(crate) cont_labels: Vec<usize>,
+    pub(crate) cont_labels: Vec<JumpTarget>,
+    /// 降糖用的临时名字计数器（for-each → 下标/迭代器变量要有唯一名字）
+    pub(crate) tmp_seq: u32,
+    /// `label: for (...)` 里刚读到、还没交给循环体的标签名
+    pub(crate) pending_label: Option<String>,
 }
 
 impl Ctx {
     pub(crate) fn lookup(&self, name: &str) -> Option<u8> {
         self.locals.get(name).copied()
+    }
+
+    /// 拿一个独一无二的临时名字后缀（for-each 降糖 / 带标签的语句用）
+    pub(crate) fn next_tmp(&mut self) -> u32 {
+        self.tmp_seq += 1;
+        self.tmp_seq
     }
 }

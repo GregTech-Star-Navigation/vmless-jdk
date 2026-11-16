@@ -3,7 +3,7 @@
 use crate::ast::*;
 
 use super::constpool::CpBuilder;
-use super::ctx::Ctx;
+use super::ctx::{Ctx, JumpTarget};
 use super::emit::{Emit, SCRATCH_SLOT};
 use super::error::*;
 use super::expr::*;
@@ -247,7 +247,8 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
 
             // 依次发射各 case 体（自然贯穿）
             let scope = em.local_types.clone();
-            ctx.break_labels.push(end_label);
+            let lbl = ctx.pending_label.take();
+            ctx.break_labels.push(JumpTarget { label: lbl, target: end_label });
             for (i, c) in cases.iter().enumerate() {
                 em.local_types = scope.clone();
                 em.bind(body_labels[i]);
@@ -263,21 +264,52 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             Ok(false)
         }
         Stmt::Break(None) => {
-            let Some(l) = ctx.break_labels.last().copied() else {
+            let Some(t) = ctx.break_labels.last() else {
                 return err("`break` 不在循环或 switch 里");
             };
-            em.goto(l);
+            em.goto(t.target);
             Ok(true)
         }
         Stmt::Continue(None) => {
-            let Some(l) = ctx.cont_labels.last().copied() else {
+            let Some(t) = ctx.cont_labels.last() else {
                 return err("`continue` 不在循环里");
             };
-            em.goto(l);
+            em.goto(t.target);
             Ok(true)
         }
-        Stmt::Break(Some(l)) | Stmt::Continue(Some(l)) => {
-            err(format!("暂不支持带标签的 `{l}`（break/continue 后跟标签）"))
+        // 带标签的 break/continue：从内向外找第一个同名落点（Java 的标签作用域规则）
+        Stmt::Break(Some(l)) => {
+            let Some(t) = find_target(&ctx.break_labels, l) else {
+                return err(format!("`break {l}` 找不到同名标签"));
+            };
+            em.goto(t);
+            Ok(true)
+        }
+        Stmt::Continue(Some(l)) => {
+            let Some(t) = find_target(&ctx.cont_labels, l) else {
+                return err(format!("`continue {l}` 找不到同名循环标签"));
+            };
+            em.goto(t);
+            Ok(true)
+        }
+        // `outer: <语句>` —— 循环体的标签交给循环自己（break/continue 都要用），
+        // 非循环语句只能被 `break label` 跳到语句末尾。
+        Stmt::Labeled { label, body } => {
+            if is_loop_stmt(body) {
+                let prev = ctx.pending_label.replace(label.clone());
+                let r = compile_stmt(body, em, ctx, cp)?;
+                ctx.pending_label = prev;
+                return Ok(r);
+            }
+            let end = em.new_label();
+            let scope = em.local_types.clone();
+            ctx.break_labels.push(JumpTarget { label: Some(label.clone()), target: end });
+            let r = compile_stmt(body, em, ctx, cp)?;
+            ctx.break_labels.pop();
+            let _ = r;
+            em.local_types = scope;
+            em.bind(end);
+            Ok(false)
         }
         Stmt::For { init, cond, update, body } => {
             let scope = em.local_types.clone();
@@ -292,8 +324,9 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             if let Some(c) = cond {
                 compile_cond_false(c, em, ctx, cp, end)?;
             }
-            ctx.break_labels.push(end);
-            ctx.cont_labels.push(cont);
+            let lbl = ctx.pending_label.take();
+            ctx.break_labels.push(JumpTarget { label: lbl.clone(), target: end });
+            ctx.cont_labels.push(JumpTarget { label: lbl, target: cont });
             compile_stmt(body, em, ctx, cp)?;
             ctx.break_labels.pop();
             ctx.cont_labels.pop();
@@ -315,8 +348,9 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             let end = em.new_label();
             em.bind(start);
             compile_cond_false(cond, em, ctx, cp, end)?;
-            ctx.break_labels.push(end);
-            ctx.cont_labels.push(start);
+            let lbl = ctx.pending_label.take();
+            ctx.break_labels.push(JumpTarget { label: lbl.clone(), target: end });
+            ctx.cont_labels.push(JumpTarget { label: lbl, target: start });
             compile_stmt(body, em, ctx, cp)?;
             ctx.break_labels.pop();
             ctx.cont_labels.pop();
@@ -325,6 +359,9 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             em.bind(end);
             Ok(false)
         }
+        // for-each 降糖成已有的 for / while：数组走「长度 + 下标」，
+        // 其余按 `iterator()` / `hasNext()` / `next()` 协议（Iterable 的契约）。
+        Stmt::ForEach { ty, name, iter, body } => compile_for_each(ty, name, iter, body, em, ctx, cp),
         Stmt::If { cond, then, els } => {
             let l_else = em.new_label();
             let l_end = em.new_label();
@@ -477,3 +514,135 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
     }
 }
 
+
+/// 带标签的跳转：从内向外找第一个同名落点
+fn find_target(stack: &[JumpTarget], name: &str) -> Option<usize> {
+    stack
+        .iter()
+        .rev()
+        .find(|t| t.label.as_deref() == Some(name))
+        .map(|t| t.target)
+}
+
+/// `label:` 后面跟的是不是循环（只有循环的标签能当 `continue` 目标）
+fn is_loop_stmt(s: &Stmt) -> bool {
+    matches!(
+        s,
+        Stmt::For { .. } | Stmt::While { .. } | Stmt::DoWhile { .. } | Stmt::ForEach { .. } | Stmt::Labeled { .. }
+    )
+}
+
+/// `for (T x : iter)` 降糖。
+///
+/// **数组**（`T[]`）→
+/// ```text
+/// T[] $a = iter;  for (int $i = 0; $i < $a.length; $i++) { T x = $a[$i]; body }
+/// ```
+/// 下标循环用 `for` 而不是 `while`，`continue` 才会落到 `$i++` 上。
+///
+/// **其它**（Iterable 契约）→
+/// ```text
+/// java.util.Iterator $it = iter.iterator();
+/// while ($it.hasNext()) { T x = (T) $it.next(); body }
+/// ```
+/// 这两段用的都是已有的语句形态，数组读写/强制转换/跳转全走原来那套已验证的路径。
+fn compile_for_each(
+    ty: &Type,
+    name: &str,
+    iter: &Expr,
+    body: &Stmt,
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<bool, CompileError> {
+    let seq = ctx.next_tmp();
+    // 被迭代的表达式只求值一次（`for (int v : getArr())` 不能每轮调一次）
+    let arr_ty = match expr_type(iter, ctx) {
+        Some(t @ Type::Array(_)) => Some(t),
+        _ => None,
+    };
+    match arr_ty {
+        Some(arr_ty) => {
+            let a_name = format!("$fe{seq}a");
+            let i_name = format!("$fe{seq}i");
+            let arr = Expr::Ident(a_name.clone());
+            let idx = Expr::Ident(i_name.clone());
+            let init = vec![
+                Stmt::LocalVar { ty: arr_ty, name: a_name.clone(), init: Some(iter.clone()) },
+                Stmt::LocalVar {
+                    ty: Type::Prim("int"),
+                    name: i_name.clone(),
+                    init: Some(Expr::IntLit("0".into())),
+                },
+            ];
+            let cond = Expr::Binary {
+                op: BinOp::Lt,
+                lhs: Box::new(idx.clone()),
+                rhs: Box::new(Expr::Field(Box::new(arr.clone()), "length".into())),
+            };
+            let step = Expr::Assign {
+                op: None,
+                lhs: Box::new(idx.clone()),
+                rhs: Box::new(Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(idx.clone()),
+                    rhs: Box::new(Expr::IntLit("1".into())),
+                }),
+            };
+            let elem = Stmt::LocalVar {
+                ty: ty.clone(),
+                name: name.to_string(),
+                init: Some(Expr::ArrayAccess { array: Box::new(arr), index: Box::new(idx) }),
+            };
+            let for_stmt = Stmt::For {
+                init,
+                cond: Some(cond),
+                update: vec![step],
+                body: Box::new(Stmt::Block(vec![elem, body.clone()])),
+            };
+            return compile_stmt(&for_stmt, em, ctx, cp);
+        }
+        None => {}
+    }
+    // 迭代器协议：`iterator()` 的返回类型从接收者的类元数据里查
+    let it_name = format!("$fe{seq}it");
+    let Some(iter_desc) = call_desc(Some(iter), "iterator", ctx) else {
+        return err(format!(
+            "for-each 的被迭代表达式不是数组，也找不到 `iterator()` 方法（元素类型 `{ty:?}`）"
+        ));
+    };
+    let ret = iter_desc.rsplit(')').next().unwrap_or("").to_string();
+    let it_ty = type_from_desc(&ret);
+    let iter_call = Expr::Call {
+        recv: Some(Box::new(iter.clone())),
+        name: "iterator".into(),
+        args: Vec::new(),
+        type_args: Vec::new(),
+    };
+    let next_call = Expr::Call {
+        recv: Some(Box::new(Expr::Ident(it_name.clone()))),
+        name: "next".into(),
+        args: Vec::new(),
+        type_args: Vec::new(),
+    };
+    // `next()` 的静态类型是 Object（raw Iterator）：元素类型不是 Object 时要插 checkcast
+    let want_cast = kind_of(ty) == K_REF
+        && !matches!(ty, Type::Named { path, .. } if path.last().map(|s| s.as_str()) == Some("Object"));
+    let elem_init = if want_cast {
+        Expr::Cast { ty: ty.clone(), expr: Box::new(next_call) }
+    } else {
+        next_call
+    };
+    let has_next = Expr::Call {
+        recv: Some(Box::new(Expr::Ident(it_name.clone()))),
+        name: "hasNext".into(),
+        args: Vec::new(),
+        type_args: Vec::new(),
+    };
+    let elem = Stmt::LocalVar { ty: ty.clone(), name: name.to_string(), init: Some(elem_init) };
+    let block = Stmt::Block(vec![
+        Stmt::LocalVar { ty: it_ty, name: it_name, init: Some(iter_call) },
+        Stmt::While { cond: has_next, body: Box::new(Stmt::Block(vec![elem, body.clone()])) },
+    ]);
+    compile_stmt(&block, em, ctx, cp)
+}

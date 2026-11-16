@@ -684,6 +684,23 @@ impl Vm {
                             _ => None,
                         };
                         frame.push(Slot::I(if a.is_some() && a == b { 1 } else { 0 }));
+                    } else if info.class == "java/lang/StringBuilder" {
+                        // 内置：字符串拼接（`StringBuilder` 没有 .class，走不到 resolve_method）
+                        if info.name == "append" {
+                            let arg = frame.pop()?;
+                            let recv = frame.pop()?.as_i32();
+                            let v = self.sb_append(recv, &info.desc, arg)?;
+                            frame.push(v); // append 返回 this，调用点会 pop 掉
+                        } else if info.name == "toString" {
+                            let recv = frame.pop()?.as_i32();
+                            let h = self.sb_finish(recv);
+                            frame.push(Slot::I(h));
+                        } else {
+                            return Err(VmError {
+                                msg: format!("java.lang.StringBuilder 没有方法 `{}`", info.name),
+                                exc: None,
+                            });
+                        }
                     } else {
                         let argc = count_args(&info.desc)?;
                         let mut args = Vec::with_capacity(argc + 1);

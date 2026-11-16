@@ -16,6 +16,7 @@ mod frame;
 mod heap;
 mod load;
 mod natives;
+mod rt;
 mod slot;
 
 pub use slot::Slot;
@@ -59,6 +60,9 @@ pub struct Vm {
     array_class: Vec<String>,
     /// 字符串常量堆；句柄 = STR_BASE + 下标
     strings: Vec<String>,
+    /// `java/lang/StringBuilder` 的缓冲：对象句柄 → 已拼好的文本
+    /// （`toString()` 之后从表里移除）
+    sb_bufs: std::collections::HashMap<i32, String>,
     /// (类下标, 常量池索引) → 字符串句柄（同一常量必须拿到同一句柄，否则引用相等会错）
     string_handles: HashMap<(usize, u16), i32>,
     /// 异常对象句柄 → 构造函数里那个 message 的字符串句柄。
@@ -87,6 +91,7 @@ impl Vm {
             arrays: Vec::new(),
             array_class: Vec::new(),
             strings: Vec::new(),
+            sb_bufs: HashMap::new(),
             string_handles: HashMap::new(),
             exc_msgs: HashMap::new(),
             statics: HashMap::new(),

@@ -896,3 +896,103 @@ pub fn gc_count() -> u64 {
         s.minor_count + s.major_count
     })
 }
+
+
+// ---------- 字符串拼接：内建 `java/lang/StringBuilder` ----------
+//
+// 编译器把 `"a" + b` 编成标准调用链 `new java/lang/StringBuilder` + `append(…)` +
+// `toString()`（见 `codegen::expr::emit_concat`）—— 这样 HotSpot 那一路上跑的就是
+// 真 StringBuilder。我们没有它的字节码，于是这里内建：
+//
+// - 对象注册成「一个 int 字段」的类，字段 0 存**缓冲编号**（GC 搬对象时字段跟着走，
+//   所以不能用指针做键）；
+// - 文本本身留在 Rust 侧的 `SB_BUFS[编号]` 里；
+// - `toString()` 把缓冲一次性分配成堆上的 String 对象。
+
+static SB_BUFS: Mutex<Vec<Vec<u8>>> = Mutex::new(Vec::new());
+
+/// 字段 0 的偏移（字段按 8 字节槽排：偏移 = HEADER + 8*下标）
+const SB_ID_OFF: usize = HEADER;
+
+fn sb_buf_id(obj: i64) -> usize {
+    let p = base_ptr().wrapping_add(obj as usize + SB_ID_OFF);
+    unsafe { std::ptr::read_unaligned(p as *const u32) as usize }
+}
+
+/// 分配一个 StringBuilder 对象（字段 0 = 新的缓冲编号）
+pub extern "C" fn sb_new() -> i64 {
+    let tag = class_tag("java/lang/StringBuilder");
+    let cid = register_class(tag, "java/lang/StringBuilder", &["I".to_string()]);
+    let id = {
+        let mut g = SB_BUFS.lock().unwrap();
+        g.push(Vec::new());
+        (g.len() - 1) as u32
+    };
+    let obj = new_object(cid);
+    let p = base_ptr().wrapping_add(obj as usize + SB_ID_OFF);
+    unsafe { std::ptr::write_unaligned(p as *mut u32, id) };
+    obj
+}
+
+fn sb_push(obj: i64, text: &[u8]) {
+    let i = sb_buf_id(obj);
+    let mut g = SB_BUFS.lock().unwrap();
+    if g.len() <= i {
+        g.resize(i + 1, Vec::new());
+    }
+    g[i].extend_from_slice(text);
+}
+
+pub extern "C" fn sb_append_int(obj: i64, v: i32) {
+    sb_push(obj, v.to_string().as_bytes());
+}
+
+pub extern "C" fn sb_append_bool(obj: i64, v: i32) {
+    sb_push(obj, if v != 0 { b"true" } else { b"false" });
+}
+
+pub extern "C" fn sb_append_long(obj: i64, v: i64) {
+    sb_push(obj, v.to_string().as_bytes());
+}
+
+pub extern "C" fn sb_append_double(obj: i64, v: f64) {
+    sb_push(obj, crate::java_double_to_string(v).as_bytes());
+}
+
+/// 引用实参：null → "null"，String → 内容，其它对象 → 类名
+/// （真正的 Java 会打 `Klass@hash`，我们没有 hashCode，这里给类型名）
+pub extern "C" fn sb_append_obj(obj: i64, v: i64) {
+    if v == 0 {
+        sb_push(obj, b"null");
+        return;
+    }
+    let tag = class_tag_at(v);
+    if tag == 1 {
+        // tag 1 = java/lang/String（`class_name_of` 给的是带点的名字，别拿它比）
+        let p = base_ptr().wrapping_add(v as usize);
+        let len = unsafe { std::ptr::read_unaligned(p.add(HEADER) as *const u32) } as usize;
+        let bytes = unsafe { std::slice::from_raw_parts(p.add(ARRAY_HEADER), len) };
+        let owned = bytes.to_vec();
+        sb_push(obj, &owned);
+    } else {
+        let text = class_internal_of(tag);
+        sb_push(obj, text.replace('/', ".").as_bytes());
+    }
+}
+
+/// `toString()`：缓冲 → 堆上的 String 对象（1 字节元素、不追踪引用）
+pub extern "C" fn sb_to_string(obj: i64) -> i64 {
+    let i = sb_buf_id(obj);
+    // 取走缓冲（不清空就会随每次拼接一直涨）
+    let bytes = {
+        let mut g = SB_BUFS.lock().unwrap();
+        g.get_mut(i).map(std::mem::take).unwrap_or_default()
+    };
+    let cid = string_class_id();
+    let hd = new_array(cid, bytes.len() as u32);
+    if !bytes.is_empty() {
+        let p = base_ptr().wrapping_add(hd as u32 as usize + ARRAY_HEADER);
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+    }
+    hd
+}

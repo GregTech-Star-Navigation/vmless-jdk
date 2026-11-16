@@ -117,6 +117,66 @@ pub fn descriptor(ty: &Type) -> String {
     }
 }
 
+/// 类型是不是 `String`（`java.lang.String` 简写成 `String` 也算）
+pub(crate) fn is_string_type(ty: &Type) -> bool {
+    matches!(ty, Type::Named { path, .. } if path.last().map(|s| s.as_str()) == Some("String"))
+}
+
+/// 表达式作为**值**是不是 String：字符串拼接的判定就靠它
+/// （Java 的规则：`+` 任意一侧是 String 就是拼接，左结合的）
+pub(crate) fn is_string_val(e: &Expr, ctx: &Ctx) -> bool {
+    match e {
+        Expr::StrLit(_) | Expr::TextBlock(_) => true,
+        Expr::Binary { op: BinOp::Add, lhs, rhs } => is_string_val(lhs, ctx) || is_string_val(rhs, ctx),
+        Expr::Cond { then, els, .. } => is_string_val(then, ctx) || is_string_val(els, ctx),
+        Expr::Cast { ty, .. } => is_string_type(ty),
+        _ => expr_type(e, ctx).map(|t| is_string_type(&t)).unwrap_or(false),
+    }
+}
+
+/// 描述符 → 参数占的**槽数**（long/double 各占 2 槽；不含接收者）。
+///
+/// 栈深记账必须用它而不是参数个数：`f(true, 7, 10000000000L)` 是 3 个参数、
+/// 4 个槽，按参数个数弹会把深度永久算少 1，后面任何一个「比较结果当值」的
+/// `bool_from_branch` 就会误判「栈不空」而报错。
+pub(crate) fn desc_slots(desc: &str) -> u16 {
+    let bytes = desc.as_bytes();
+    let mut i = 1;
+    let mut n = 0u16;
+    while i < bytes.len() && bytes[i] != b')' {
+        match bytes[i] {
+            b'[' => {
+                while i < bytes.len() && bytes[i] == b'[' {
+                    i += 1;
+                }
+                if i < bytes.len() && bytes[i] == b'L' {
+                    while i < bytes.len() && bytes[i] != b';' {
+                        i += 1;
+                    }
+                }
+                i += 1;
+                n += 1;
+            }
+            b'L' => {
+                while i < bytes.len() && bytes[i] != b';' {
+                    i += 1;
+                }
+                i += 1;
+                n += 1;
+            }
+            b'J' | b'D' => {
+                i += 1;
+                n += 2;
+            }
+            _ => {
+                i += 1;
+                n += 1;
+            }
+        }
+    }
+    n
+}
+
 pub(crate) fn method_descriptor(params: &[Param], ret: &Option<Type>) -> String {
     let mut s = String::from("(");
     for p in params {
@@ -198,7 +258,10 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
             .local_ty
             .get(n)
             .cloned()
-            .or_else(|| ctx.static_fields.get(n).map(|(_, d)| type_from_desc(d))),
+            .or_else(|| ctx.static_fields.get(n).map(|(_, d)| type_from_desc(d)))
+            // 裸名字也可能是隐式 this 的字段（`new NameIter(data)` 里的 data）：
+            // 漏了它，实参/字段的描述符会退化成「String」这种瞎猜
+            .or_else(|| ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).cloned()),
         Expr::Field(r, n) => {
             // 静态字段：`ClassName.f`
             if let Some((_, d)) = static_field_access(e, ctx) {
@@ -229,6 +292,15 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
                 Some(type_from_desc(ret))
             }
         }
+        // 三元：两侧一致就用它，否则按 `cond_type` 的规则挑一个
+        Expr::Cond { then, els, .. } => super::expr::cond_type(then, els, ctx),
+        // 字符串拼接的结果类型是 String（描述符/println 重载都靠它）
+        Expr::Binary { op: BinOp::Add, .. } if is_string_val(e, ctx) => {
+            Some(Type::Named { path: vec!["String".into()], args: vec![] })
+        }
+        // 字符串字面量的类型是 String：三元的结果类型、实参描述符都要靠它，
+        // 漏了会让「引用槽」被声明成 integer（HotSpot: Inconsistent stackmap frames）
+        Expr::StrLit(_) => Some(Type::Named { path: vec!["String".into()], args: vec![] }),
         _ => None,
     }
 }
@@ -281,6 +353,8 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
                 .unwrap_or(K_INT)
         }),
         Expr::Binary { op, lhs, rhs } => match op {
+            // 字符串拼接：任意一侧是 String，结果就是 String（不看数值提升）
+            BinOp::Add if is_string_val(e, ctx) => K_REF,
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne | BinOp::And
             | BinOp::Or => K_BOOL,
             _ => promote(expr_kind(lhs, ctx), expr_kind(rhs, ctx)),
@@ -292,6 +366,18 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
             .unwrap_or(K_INT),
         Expr::StrLit(_) | Expr::This | Expr::Super | Expr::New { .. } | Expr::ArrayNew { .. } | Expr::Null => K_REF,
         Expr::InstanceOf { .. } | Expr::BoolLit(_) => K_BOOL,
+        // 三元：两侧都是 boolean 才保持 boolean，否则按数值提升（引用任一侧即引用）
+        Expr::Cond { then, els, .. } => {
+            let kt = expr_kind(then, ctx);
+            let ke = expr_kind(els, ctx);
+            if kt == K_REF || ke == K_REF {
+                K_REF
+            } else if kt == K_BOOL && ke == K_BOOL {
+                K_BOOL
+            } else {
+                promote(kt, ke)
+            }
+        }
         Expr::Field(r, name) => {
             // 静态字段按它的描述符定种类（否则 long/double/String 会被当成 int）
             if let Some((_, desc)) = static_field_access(e, ctx) {
@@ -343,7 +429,16 @@ pub(crate) fn type_internal(ty: &Type) -> Option<String> {
 /// 加新方法时三处要一起加：这里、`vm::exec` 的分支、`jit::translate` 的调用点。
 const BUILTIN_METHODS: &[(&str, &str, &str)] = &[
     ("java/lang/String", "equals", "(Ljava/lang/Object;)Z"),
+    // for-each 的迭代器协议（`for (T x : iterable)` 会调它们；见 `stmt::compile_for_each`）
+    ("java/util/Iterator", "hasNext", "()Z"),
+    ("java/util/Iterator", "next", "()Ljava/lang/Object;"),
+    ("java/lang/Iterable", "iterator", "()Ljava/util/Iterator;"),
 ];
+
+/// 内置的**接口**（没有 .class 在 classpath 上，但调用点该发 invokeinterface）
+pub(crate) fn is_builtin_iface(owner: &str) -> bool {
+    matches!(owner, "java/lang/Iterable" | "java/util/Iterator")
+}
 
 /// `java.lang.*` 内置方法的描述符
 pub(crate) fn builtin_method_desc(owner: &str, name: &str) -> Option<String> {

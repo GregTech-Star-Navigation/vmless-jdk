@@ -320,7 +320,17 @@ impl Resolver {
             self.own.borrow_mut().insert(class.to_string(), o.clone());
             return Ok(o);
         }
-        Err(format!("找不到类 `{}`（cannot find symbol: class {}）", class.replace('/', "."), class.replace('/', ".")))
+        // java.* 的类/接口我们一个字节码文件都没有（运行时内建，见 `vm::builtin_super`
+        // 与 `codegen::types::BUILTIN_METHODS`）。按**空元数据**放行，别让
+        // `class Names implements Iterable {}` 这种声明在毫无关系的地方炸掉。
+        if class.starts_with("java/") {
+            return Ok(Own::default());
+        }
+        Err(format!(
+            "找不到类 `{}`（cannot find symbol: class {}）",
+            class.replace('/', "."),
+            class.replace('/', ".")
+        ))
     }
 
     fn load_from_disk(&self, class: &str) -> Option<Own> {

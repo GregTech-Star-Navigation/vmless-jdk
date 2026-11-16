@@ -191,6 +191,39 @@ impl Jit {
             .declare_function("vmless_drem", Linkage::Import, &sig_ff)
             .map_err(|e| JitError(e.to_string()))?;
 
+        // 字符串拼接的内建 `java/lang/StringBuilder`（没有 .class 文件）。
+        // 对象里存一个 int 缓冲编号，文本本身留在运行时侧的 Vec<Vec<u8>> 里。
+        let mut sig_sb_new = self.module.make_signature();
+        sig_sb_new.returns.push(AbiParam::new(types::I64));
+        let sb_new_id = self
+            .module
+            .declare_function("vmless_sb_new", Linkage::Import, &sig_sb_new)
+            .map_err(|e| JitError(e.to_string()))?;
+        let mut mk_sb_app = |name: &str, val: cranelift_codegen::ir::Type| -> Result<_, cranelift_module::ModuleError> {
+            let mut s = self.module.make_signature();
+            s.params.push(AbiParam::new(types::I64)); // builder 对象
+            s.params.push(AbiParam::new(val));
+            self.module.declare_function(name, Linkage::Import, &s)
+        };
+        let sb_app_int_id =
+            mk_sb_app("vmless_sb_append_int", types::I32).map_err(|e| JitError(e.to_string()))?;
+        let sb_app_bool_id =
+            mk_sb_app("vmless_sb_append_bool", types::I32).map_err(|e| JitError(e.to_string()))?;
+        let sb_app_long_id =
+            mk_sb_app("vmless_sb_append_long", types::I64).map_err(|e| JitError(e.to_string()))?;
+        let sb_app_obj_id =
+            mk_sb_app("vmless_sb_append_obj", types::I64).map_err(|e| JitError(e.to_string()))?;
+        let sb_app_dbl_id =
+            mk_sb_app("vmless_sb_append_double", types::F64).map_err(|e| JitError(e.to_string()))?;
+        let mut sig_sb_str = self.module.make_signature();
+        sig_sb_str.params.push(AbiParam::new(types::I64));
+        sig_sb_str.returns.push(AbiParam::new(types::I64));
+        let sb_to_str_id = self
+            .module
+            .declare_function("vmless_sb_to_string", Linkage::Import, &sig_sb_str)
+            .map_err(|e| JitError(e.to_string()))?;
+
+
         // 异常机制：pending 标志 / 取异常对象 / 清标志 / catch 类型匹配 / 抛 / 记消息
         let mut sig_i0 = self.module.make_signature();
         sig_i0.returns.push(AbiParam::new(types::I32));
@@ -1086,6 +1119,54 @@ impl Jit {
                         let v = convert_to(&mut fb, v, want);
                         let fref = self.module.declare_func_in_func(fid, fb.func);
                         fb.ins().call(fref, &[v]);
+                    } else if cls == "java/lang/StringBuilder" {
+                        // 内置：字符串拼接（`StringBuilder` 没有 .class，进不了虚方法表）
+                        if name == "toString" {
+                            let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                            let obj = convert_to(&mut fb, recv, types::I64);
+                            let op_pc = pc - if op == 0xb9 { 5 } else { 3 };
+                            let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                            spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                            if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
+                            let fref = self.module.declare_func_in_func(sb_to_str_id, fb.func);
+                            let c = fb.ins().call(fref, &[obj]);
+                            if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+        }
+                            reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                            stack.push(fb.inst_results(c)[0]);
+                        } else if name == "append" {
+                            let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                            let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                            let obj = convert_to(&mut fb, recv, types::I64);
+                            let want = if desc.starts_with("(J)") || desc.starts_with("(L") {
+                                types::I64
+                            } else if desc.starts_with("(D)") {
+                                types::F64
+                            } else {
+                                types::I32
+                            };
+                            let fid = if desc.starts_with("(D)") {
+                                sb_app_dbl_id
+                            } else if desc.starts_with("(J)") {
+                                sb_app_long_id
+                            } else if desc.starts_with("(L") {
+                                sb_app_obj_id
+                            } else if desc.starts_with("(Z)") {
+                                sb_app_bool_id
+                            } else {
+                                sb_app_int_id
+                            };
+                            let v = convert_to(&mut fb, v, want);
+                            let fref = self.module.declare_func_in_func(fid, fb.func);
+                            fb.ins().call(fref, &[obj, v]);
+                            // append 返回 this：编译器在调用点 pop 掉
+                            stack.push(recv);
+                        } else {
+                            return Err(JitError(format!("StringBuilder 没有方法 `{name}`")));
+                        }
                     } else if cls == "java/lang/String"
                         && name == "equals"
                         && desc == "(Ljava/lang/Object;)Z"
@@ -1187,6 +1268,22 @@ impl Jit {
                         }
                         other => return Err(JitError(format!("new 的操作数不是类: {other:?}"))),
                     };
+                    // 内置：字符串拼接用的 StringBuilder（没有 .class，布局由运行时定）
+                    if cls == "java/lang/StringBuilder" {
+                        let refs_pc = refs.at.get(&(pc - 3)).cloned().unwrap_or_default();
+                        spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                        if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+        }
+                        let fref = self.module.declare_func_in_func(sb_new_id, fb.func);
+                        let c = fb.ins().call(fref, &[]);
+                        if has_refs {
+            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+        }
+                        reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                        stack.push(fb.inst_results(c)[0]);
+                        continue;
+                    }
                     let tag = rt::class_tag(&cls);
                     // 类布局进 LayoutTable：GC 靠它知道哪些字段是引用（每字段两槽）
                     let descs = self.classes.field_descs(&cls);

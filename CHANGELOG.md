@@ -460,3 +460,20 @@ ALLOC_NS=188.4  GC_COUNT=6  LIVE_AFTER=4026528  HEAP_MB=3.84
 **验证：60 个样例三路一致**（新增 `Cmp1-3 Enum1-3 IfaceDef1-2` + 多单元 `Import1/2`）；`cargo test` 34 passed。
 
 **已知不支持**：嵌套枚举（明确报错）、带标签 break/continue、`?:`、for-each、`import static`。
+
+## 0.41.0 — 2026-11-17 · for-each、三元、标签跳转、嵌套类型、字符串拼接
+
+- **for-each**：降糖成已有语句形态（数组走下标循环，`Iterable` 走 `iterator()/hasNext()/next()`）
+- **三元 `?:`**：分叉 + 脏槽汇合（跳转点栈恒空）；顺带修了**栈深记账 bug**
+  （按参数个数弹而不是槽数，`f(true,7,10L)` 之后深度永久少 1）
+- **带标签 `break`/`continue`**：`Stmt::Labeled` + `JumpTarget` 标签栈
+- **嵌套类型**：新增 `sema/nested.rs`，`Outer.Inner` → `Outer$Inner` 拍平（在枚举降级之前跑，
+  嵌套枚举因此复用同一条 values/valueOf 路径）
+- **字符串拼接**：走真 `java/lang/StringBuilder`（new/append/toString）；
+  解释器新增 `vm/rt.rs`，JIT 侧 `sb_new/sb_append*/to_string`（缓冲在对象里，GC 搬动安全）
+
+**验证：74 个样例三路一致**（新增 `ForEach1-3 Ternary1-2 Label1-2 Nest1-3 Concat1-3 Mix2`）；
+`cargo test` 34 passed；GC 压测 `VMLESS_HEAP_MB=2` 下 20 万次拼接 `minor=1 major=1 回收 201319 对象`。
+
+**已知不支持**：非 static 内部类（`this$0`）、`do-while`、跨单元的嵌套类型引用、
+拼接非 String 的 Object（JVM 打 `Klass@hash`，我们没有 hashCode）。

@@ -7,11 +7,13 @@
 //! 符号表本体在 `symbols`，本模块只做导出。
 
 pub mod enums;
+pub mod nested;
 pub mod qualify;
 pub mod resolve;
 pub mod symbols;
 
 pub use enums::desugar_unit;
+pub use nested::flatten_unit;
 pub use qualify::qualify_unit;
 pub use resolve::Resolver;
 pub use symbols::*;

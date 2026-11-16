@@ -144,6 +144,7 @@ impl Qualifier<'_> {
                     self.stmt(it);
                 }
             }
+            Stmt::Labeled { body, .. } => self.stmt(body),
             Stmt::LocalVar { ty, init, .. } => {
                 self.ty(ty);
                 if let Some(e) = init {
@@ -209,8 +210,7 @@ impl Qualifier<'_> {
                     self.stmt(f);
                 }
             }
-            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}
-        }
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}        }
     }
 
     fn expr(&self, e: &mut Expr) {

@@ -83,6 +83,17 @@ impl Emit {
         self.local_types.get(slot as usize).copied().unwrap_or(u16::MAX)
     }
 
+    /// 确保 `max_locals` 覆盖 `SCRATCH_SLOT`（只增不减）。
+    ///
+    /// `wide` 时槽里可能放 long/double：它占两个槽，而栈图里的 ITEM_Long 会被
+    /// HotSpot 展开成两个，`max_locals` 少一个就报 ClassFormatError: bad type array size。
+    pub(crate) fn reserve_scratch_slot(&mut self, wide: bool) {
+        let need = SCRATCH_SLOT as u16 + 1 + if wide { 1 } else { 0 };
+        if self.max_locals < need {
+            self.max_locals = need;
+        }
+    }
+
     pub(crate) fn push(&mut self, n: u16) {
         self.depth += n;
         if self.depth > self.max_depth {

@@ -93,6 +93,8 @@ pub enum Stmt {
     Throw(Expr),
     Break(Option<String>),
     Continue(Option<String>),
+    /// 带标签的语句（`outer: for (...) { … }`）。标签只对 `break`/`continue` 可见。
+    Labeled { label: String, body: Box<Stmt> },
     Switch { selector: Expr, cases: Vec<SwitchCase> },
     Try { body: Box<Stmt>, catches: Vec<Catch>, finally: Option<Box<Stmt>> },
     Empty,

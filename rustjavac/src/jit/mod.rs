@@ -84,6 +84,14 @@ impl Jit {
         builder.symbol("vmless_exc_set_msg", rt::exc_set_msg as *const u8);
         builder.symbol("vmless_catch_match", rt::catch_match as *const u8);
         builder.symbol("vmless_vcall", rt::vcall as *const u8);
+        // 字符串拼接的内建 StringBuilder
+        builder.symbol("vmless_sb_new", rt::sb_new as *const u8);
+        builder.symbol("vmless_sb_append_int", rt::sb_append_int as *const u8);
+        builder.symbol("vmless_sb_append_bool", rt::sb_append_bool as *const u8);
+        builder.symbol("vmless_sb_append_long", rt::sb_append_long as *const u8);
+        builder.symbol("vmless_sb_append_double", rt::sb_append_double as *const u8);
+        builder.symbol("vmless_sb_append_obj", rt::sb_append_obj as *const u8);
+        builder.symbol("vmless_sb_to_string", rt::sb_to_string as *const u8);
         let module = JITModule::new(builder);
         Jit {
             module,

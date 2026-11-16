@@ -4,7 +4,7 @@ use crate::ast::*;
 
 use super::constpool::CpBuilder;
 use super::ctx::Ctx;
-use super::emit::Emit;
+use super::emit::{Emit, SCRATCH_SLOT};
 use super::error::*;
 use super::types::*;
 
@@ -297,8 +297,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             let init = cp.method_ref(&owner, "<init>", &ctor_desc);
             em.op_u2(0xB7, init); // invokespecial
-            let n = args.len() as u16 + 1;
-            em.pop(n);
+            em.pop(desc_slots(&ctor_desc) + 1);
             Ok(())
         }
         Expr::Cast { ty, expr } => {
@@ -434,7 +433,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             let idx = cp.method_ref(&ctx.class_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
-            em.pop(args.len() as u16 + 1);
+            em.pop(desc_slots(&desc) + 1);
             Ok(())
         }
         // super(...) → invokespecial 父类 <init>（父类构造器）
@@ -451,7 +450,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             let idx = cp.method_ref(&ctx.super_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
-            em.pop(args.len() as u16 + 1);
+            em.pop(desc_slots(&desc) + 1);
             Ok(())
         }
         // super.m() → invokespecial 父类实现（owner 必须是父类，否则解析到自己）
@@ -465,8 +464,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             let idx = cp.method_ref(&ctx.super_name, name, &desc);
             em.op_u2(0xB7, idx); // invokespecial
-            let n = args.len() as u16 + 1;
-            em.pop(n);
+            em.pop(desc_slots(&desc) + 1);
             if !desc.ends_with(")V") {
                 em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
             }
@@ -488,7 +486,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                     cp.method_ref(&owner, name, &desc)
                 };
                 em.op_u2(0xB8, idx); // invokestatic
-                em.pop(args.len() as u16);
+                em.pop(desc_slots(&desc));
                 if !desc.ends_with(")V") {
                     em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
                 }
@@ -505,7 +503,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             // 分派本身按运行时类走（虚方法覆写），引用类只决定从哪条链开始解析。
             let owner = expr_type(r, ctx).as_ref().and_then(type_internal).unwrap_or_else(|| ctx.class_name.clone());
             let n = args.len() as u16 + 1;
-            if ctx.iface_types.contains(&owner) {
+            if ctx.iface_types.contains(&owner) || is_builtin_iface(&owner) {
                 // 接口方法调用必须是 invokeinterface：index, count(含 this), 0
                 let idx = cp.interface_method_ref(&owner, name, &desc);
                 em.op(0xB9);
@@ -516,7 +514,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 let idx = cp.method_ref(&owner, name, &desc);
                 em.op_u2(0xB6, idx); // invokevirtual
             }
-            em.pop(n);
+            em.pop(desc_slots(&desc) + 1);
             // 返回值占的槽数：long/double 占 2 槽
             if !desc.ends_with(")V") {
                 em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
@@ -532,8 +530,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 }
                 let idx = cp.method_ref("<SELF>", name, &desc);
                 em.op_u2(0xB8, idx);
-                let argc = args.len() as u16;
-                em.pop(argc);
+                em.pop(desc_slots(&desc));
                 if !desc.ends_with(")V") {
                     // 返回值占的槽数：long/double 占 2 槽
                     em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
@@ -566,12 +563,14 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 let idx = cp.method_ref(&ctx.class_name, name, &desc);
                 em.op_u2(0xB6, idx); // invokevirtual
             }
-            em.pop(n);
+            em.pop(desc_slots(&desc) + 1);
             if !desc.ends_with(")V") {
                 em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
             }
             Ok(())
         }
+        // 字符串拼接：`"a" + b + "c"` —— 任一操作数是 String 就走这里（Java 语义）
+        Expr::Binary { op: BinOp::Add, .. } if is_string_val(e, ctx) => emit_concat(e, em, ctx, cp),
         // `&&` / `||` 作为值：短路求值成 0/1
         Expr::Binary { op: lop @ (BinOp::And | BinOp::Or), lhs, rhs } => {
             compile_logical(*lop, lhs, rhs, em, ctx, cp)
@@ -676,6 +675,9 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             em.bool_from_branch(0x9A)?; // ifne → 「假」= 原值非零
             Ok(())
         }
+        // `c ? a : b`：分叉求值 → 各自写进同一个脏槽 → 汇合点取回。
+        // 两个跳转点（假分支入口、汇合点）操作数栈都是空的。
+        Expr::Cond { cond, then, els } => compile_cond(cond, then, els, em, ctx, cp),
         other => err(format!("暂不支持的表达式: {other:?}")),
     }
 }
@@ -849,5 +851,208 @@ pub(crate) fn compile_cond_false(
     compile_expr(e, em, ctx, cp)?;
     em.pop(1);
     em.branch(0x99, label); // ifeq
+    Ok(())
+}
+
+/// 三元运算符的类型：两侧一致就用它；一侧是 null 字面量就用另一侧；
+/// 一侧是 Object 就用 Object；都不是就按「前一个分支」的类型
+/// （另一侧会补一条 checkcast，保证字节码能过验证）。
+pub(crate) fn cond_type(then: &Expr, els: &Expr, ctx: &Ctx) -> Option<Type> {
+    let tt = expr_type(then, ctx);
+    let et = expr_type(els, ctx);
+    let is_object = |t: &Type| matches!(t, Type::Named { path, .. } if path.last().map(|s| s.as_str()) == Some("Object"));
+    match (tt, et) {
+        (Some(a), Some(b)) => {
+            if a == b {
+                Some(a)
+            } else if is_object(&a) {
+                Some(a)
+            } else if is_object(&b) {
+                Some(b)
+            } else if matches!(a, Type::Prim(_)) || matches!(b, Type::Prim(_)) {
+                // 数值两侧类型不同：种类层面已经提升过，这里给个 int 只是为了占位
+                Some(a)
+            } else {
+                Some(a)
+            }
+        }
+        (Some(a), None) => Some(a),
+        (None, Some(b)) => Some(b),
+        (None, None) => None,
+    }
+}
+
+/// 把栈顶的值强制成 `ty`（引用类型才发 checkcast；两侧声明类型不同时补一条）
+fn cast_to(ty: &Type, from: Option<&Type>, em: &mut Emit, cp: &mut CpBuilder) -> Result<(), CompileError> {
+    if let Some(f) = from {
+        if f == ty {
+            return Ok(());
+        }
+    }
+    match ty {
+        Type::Named { .. } | Type::Array(_) => {
+            let cls = ver_type(cp, ty);
+            em.op_u2(0xC0, cls); // checkcast
+            Ok(())
+        }
+        _ => Ok(()),
+    }
+}
+
+/// `cond ? then : els`
+fn compile_cond(
+    cond: &Expr,
+    then: &Expr,
+    els: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let kt = expr_kind(then, ctx);
+    let ke = expr_kind(els, ctx);
+    // 结果种类：只要有一侧是引用就按引用处理；两侧都是 boolean 时保持 boolean
+    // （否则 `println(flag ? true : false)` 会打成 1/0）
+    let k = if kt == K_REF || ke == K_REF {
+        K_REF
+    } else if kt == K_BOOL && ke == K_BOOL {
+        K_BOOL
+    } else {
+        promote(kt, ke)
+    };
+    let res_ty = if k == K_REF { cond_type(then, els, ctx) } else { None };
+    let vt = match (&res_ty, k) {
+        (Some(t), _) => ver_type(cp, t),
+        (None, K_LONG) => 0xFFFE,
+        (None, K_DOUBLE) => 0xFFFD,
+        // 引用但推不出静态类型：按 Object 声明（和 `spill` 的兜底一致）
+        (None, K_REF) => cp.class("java/lang/Object"),
+        (None, _) => 0,
+    };
+
+    // 脏槽：和 `bool_from_branch` 用同一个（SCRATCH_SLOT）——它的帧声明规则
+    // 已经被现有样例验证过，不用再造一套池槽的按路径声明。
+    let slot = SCRATCH_SLOT;
+    em.reserve_scratch_slot(kind_wide(k));
+    let l_false = em.new_label();
+    let l_end = em.new_label();
+
+    compile_cond_false(cond, em, ctx, cp, l_false)?;
+    compile_expr(then, em, ctx, cp)?;
+    coerce(kt, k, em)?;
+    if let Some(t) = res_ty.as_ref().filter(|_| k == K_REF) {
+        cast_to(t, expr_type(then, ctx).as_ref(), em, cp)?;
+    }
+    em.store_slot(slot, k)?;
+    // 注意：**不**改全局的 `local_types` —— 分支里还可能绑别的帧（嵌套三元/比较），
+    // 全局值会被它们快照进去，造成「这条路径上没写的槽被声明成已写」。
+    // 这个槽的验证类型只在下面两处按路径显式声明。
+    em.goto(l_end);
+
+    // 假分支：这个槽在这里还没写过（Top 接受往后的任何赋值）
+    em.bind_t(l_false, Some(u16::MAX));
+    compile_expr(els, em, ctx, cp)?;
+    coerce(ke, k, em)?;
+    if let Some(t) = res_ty.as_ref().filter(|_| k == K_REF) {
+        cast_to(t, expr_type(els, ctx).as_ref(), em, cp)?;
+    }
+    em.store_slot(slot, k)?;
+
+    // 汇合点：两条路径都存过同一个类型
+    em.bind_t(l_end, Some(vt));
+    em.load_slot(slot, k)?;
+    Ok(())
+}
+
+// ---------- 字符串拼接 ----------
+
+/// 拼接编译成 `java/lang/StringBuilder` 的调用链（javac 的老做法）。
+///
+/// 为什么是**真的** StringBuilder 而不是自造运行时：三路一致性要求
+/// `javac 编的类` / 解释器 / JIT 输出一致，而 `java` 那一路上跑的就是**我们生成
+/// 的字节码** —— 自造的类名在 HotSpot 里根本解析不到。所以这里只发标准调用，
+/// 把 `StringBuilder` 做成侧面内建的是解释器与 JIT（`vm::rt` / `jit::rt`）。
+///
+/// 形状（每步操作数栈都收回到 0，跳转点永远是空栈）：
+///
+/// ```text
+///   new java/lang/StringBuilder; dup; invokespecial <init>()V; astore s
+///   aload s; <第 1 段>; invokevirtual append(X)Ljava/lang/StringBuilder; pop
+///   …
+///   aload s; invokevirtual toString()Ljava/lang/String;
+/// ```
+fn concat_parts<'a>(e: &'a Expr, ctx: &Ctx, out: &mut Vec<&'a Expr>) {
+    // 左结合展开：只有**本身是字符串**的那一侧才继续拆（`1 + 2 + "a"` 的左边是数字，不能拆）
+    if let Expr::Binary { op: BinOp::Add, lhs, rhs } = e {
+        if is_string_val(lhs, ctx) {
+            concat_parts(lhs, ctx, out);
+        } else {
+            out.push(lhs);
+        }
+        if is_string_val(rhs, ctx) {
+            concat_parts(rhs, ctx, out);
+        } else {
+            out.push(rhs);
+        }
+    } else {
+        out.push(e);
+    }
+}
+
+/// `append` 的重载：按操作数种类挑描述符（boolean 必须 `(Z)`，否则会打成 1/0）
+fn append_desc(e: &Expr, kind: u8, ctx: &Ctx) -> &'static str {
+    match kind {
+        K_LONG => "(J)Ljava/lang/StringBuilder;",
+        K_DOUBLE => "(D)Ljava/lang/StringBuilder;",
+        K_BOOL => "(Z)Ljava/lang/StringBuilder;",
+        K_REF => {
+            if is_string_val(e, ctx) {
+                "(Ljava/lang/String;)Ljava/lang/StringBuilder;"
+            } else {
+                "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
+            }
+        }
+        _ => "(I)Ljava/lang/StringBuilder;",
+    }
+}
+
+fn emit_concat(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
+    let mut parts = Vec::new();
+    concat_parts(e, ctx, &mut parts);
+
+    let sb_cls = cp.class("java/lang/StringBuilder");
+    let slot = em.alloc_scratch()?;
+    let saved = em.local_type_of(slot);
+
+    em.op_u2(0xBB, sb_cls); // new
+    em.push(1);
+    em.op(0x59); // dup
+    em.push(1);
+    let init = cp.method_ref("java/lang/StringBuilder", "<init>", "()V");
+    em.op_u2(0xB7, init); // invokespecial
+    em.pop(1);
+    em.store_slot(slot, K_REF)?;
+    // 这个槽从这一刻起就是 StringBuilder（分支里的帧照它声明才不会被判 top）
+    em.set_local_type(slot as usize, sb_cls);
+
+    for p in parts {
+        // 会分叉的操作数先算进脏槽：`aload` 已经把 builder 压上栈了，跳转点就不能有别的值
+        let sp = if needs_scratch(p) { Some(spill(p, em, ctx, cp)?) } else { None };
+        em.load_slot(slot, K_REF)?;
+        emit_val(p, &sp, em, ctx, cp)?;
+        let desc = append_desc(p, expr_kind(p, ctx), ctx);
+        let idx = cp.method_ref("java/lang/StringBuilder", "append", desc);
+        em.op_u2(0xB6, idx); // invokevirtual
+        em.pop(desc_slots(desc) + 1); // 接收者 + 实参
+        em.push(1); // append 返回 this
+        em.op(0x57); // pop
+        em.pop(1);
+    }
+    em.load_slot(slot, K_REF)?;
+    let to_s = cp.method_ref("java/lang/StringBuilder", "toString", "()Ljava/lang/String;");
+    em.op_u2(0xB6, to_s); // invokevirtual
+    em.pop(1);
+    em.push(1);
+    em.set_local_type(slot as usize, saved);
+    em.free_scratch(slot);
     Ok(())
 }
