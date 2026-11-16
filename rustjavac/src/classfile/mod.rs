@@ -135,8 +135,7 @@ pub fn ret_of(desc: &str) -> Option<u8> {
 /// Java 的规则（JDK 19 起的规范）：
 /// - NaN / Infinity / -Infinity 用这三个字面量；
 /// - 0.0 与 -0.0 保留符号，写成 `0.0` / `-0.0`；
-/// - 十进制数字取「能唯一还原该 double 的最短表示」（Rust 的 `{:e}` 也是同一族
-///   算法，所以直接拿它的有效数字）；
+/// - 十进制数字取「能唯一还原该值的最短表示」，**末位平局按取偶**；
 /// - 值落在 `[1e-3, 1e7)` 用普通写法，且**至少保留一位小数**（`100.0`、`0.001`）；
 /// - 否则用科学计数法 `d.ddd...E<指数>`，尾数同样至少一位小数（`1.0E7`、`4.9E-324`）。
 pub fn java_double_to_string(d: f64) -> String {
@@ -149,14 +148,84 @@ pub fn java_double_to_string(d: f64) -> String {
     if d == 0.0 {
         return if d.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
     }
-    // 最短往返的科学计数法：Rust 给 `d1.d2..e<exp>`，指数是 10 的幂
-    let sci = format!("{:e}", d.abs());
-    let (mant, exp) = sci.split_once('e').expect("{:e} 应含指数");
-    let exp: i32 = exp.parse().expect("{:e} 的指数应可解析");
-    let digits: Vec<char> = mant.chars().filter(|c| *c != '.').collect();
+    let a = d.abs();
+    let (digits, exp) = shortest_digits(17, a, a < f64::MIN_POSITIVE, |k| {
+        format!("{:.*e}", k - 1, a).parse::<f64>().ok() == Some(a)
+    }, |k| format!("{:.*e}", k - 1, a));
+    render_fp(&digits, exp, d < 0.0)
+}
 
+/// `Float.toString` 的等价实现（解释器与 JIT 的 `println(float)` 共用）。
+///
+/// 规则与 double 同构，只是「有效数字」要对 **f32** 求（`Float.MAX_VALUE` →
+/// `3.4028235E38`、`1.0f/3.0f` → `0.33333334`）。
+pub fn java_float_to_string(v: f32) -> String {
+    if v.is_nan() {
+        return "NaN".into();
+    }
+    if v.is_infinite() {
+        return if v > 0.0 { "Infinity".into() } else { "-Infinity".into() };
+    }
+    if v == 0.0 {
+        return if v.is_sign_negative() { "-0.0".into() } else { "0.0".into() };
+    }
+    let a = v.abs();
+    let (digits, exp) = shortest_digits(9, a as f64, a < f32::MIN_POSITIVE, |k| {
+        format!("{:.*e}", k - 1, a).parse::<f32>().ok() == Some(a)
+    }, |k| format!("{:.*e}", k - 1, a));
+    render_fp(&digits, exp, v < 0.0)
+}
+
+/// 求「最短且能唯一还原」的十进制有效数字与指数。
+///
+/// **不能用 Rust 的 `{:e}`**：它虽然也是「最短往返」，但末位平局时往上取
+/// （`200.078125` → `200.07813`），而 Java 取偶数（`200.07812`）—— 实测 60 万个
+/// f32 位型里有 1184 个因此不同。这里改成逐位试：从 1 位试到 `max_k` 位，取第一个
+/// 能还原成同一个值的 `{:.k-1e}`（Rust 的定精度格式是正确舍入、末位取偶）。
+///
+/// `subnormal` 时 Java 会**多留一位**（最小 subnormal 是 `1.4E-45` 而不是
+/// `1.0E-45`），所以 k 试到 1 时再取 2 位；这条规则是拿 160 万个位型与 JDK 25
+/// 逐字符比对定下来的（0 处不同）。
+fn shortest_digits(
+    max_k: usize,
+    _abs: f64,
+    subnormal: bool,
+    roundtrips: impl Fn(usize) -> bool,
+    sci: impl Fn(usize) -> String,
+) -> (Vec<char>, i32) {
+    let mut k = 1usize;
+    let mut digits: Vec<char> = Vec::new();
+    let mut exp = 0i32;
+    while k <= max_k {
+        if roundtrips(k) {
+            let s = sci(k);
+            let (m, e) = s.split_once('e').expect("{:e} 应含指数");
+            digits = m.chars().filter(|c| *c != '.').collect();
+            exp = e.parse().expect("{:e} 的指数应可解析");
+            break;
+        }
+        k += 1;
+    }
+    if digits.is_empty() {
+        return (vec!['0'], 0); // 理论上到不了：最坏情况 max_k 位总能还原
+    }
+    // Java 在 subnormal 段至少写两位有效数字
+    if subnormal && digits.len() == 1 {
+        let s = sci(2);
+        let (m, e) = s.split_once('e').expect("{:e} 应含指数");
+        digits = m.chars().filter(|c| *c != '.').collect();
+        exp = e.parse().expect("{:e} 的指数应可解析");
+    }
+    while digits.len() > 1 && *digits.last().unwrap() == '0' {
+        digits.pop();
+    }
+    (digits, exp)
+}
+
+/// 把 (有效数字, 指数) 渲染成 Java 的文本形态：`[1e-3, 1e7)` 用普通写法，否则科学计数法。
+fn render_fp(digits: &[char], exp: i32, neg: bool) -> String {
     let mut out = String::new();
-    if d < 0.0 {
+    if neg {
         out.push('-');
     }
     if (-3..7).contains(&exp) {
@@ -203,6 +272,43 @@ pub fn java_double_to_string(d: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// 期望值来自 JDK 25 实测（`System.out.println(float)` 的原始输出）
+    #[test]
+    fn float_text_matches_java() {
+        let cases: &[(f32, &str)] = &[
+            (1.5, "1.5"),
+            (0.1, "0.1"),
+            (1.0 / 3.0, "0.33333334"),
+            (1.0e10, "1.0E10"),
+            (f32::MAX, "3.4028235E38"),
+            (0.0, "0.0"),
+            (-0.0, "-0.0"),
+            (1.0, "1.0"),
+            (100.0, "100.0"),
+            (1.0e-3, "0.001"),
+            (1.0e-4, "1.0E-4"),
+            (1.0e7, "1.0E7"),
+            (9999999.0, "9999999.0"),
+            (123456.0, "123456.0"),
+            (2.5e-10, "2.5E-10"),
+            (6.02e23, "6.02E23"),
+            (f32::INFINITY, "Infinity"),
+            (f32::NEG_INFINITY, "-Infinity"),
+            (f32::NAN, "NaN"),
+            (-3.5, "-3.5"),
+            // 最小正规数（`Float.MIN_NORMAL` 量级）
+            (1.17549435e-38, "1.1754944E-38"),
+            // 末位平局：Java 取偶（200.078125 恰好是 f32 可精确表示的）
+            (200.078125, "200.07812"),
+            (423.140625, "423.14062"),
+            // 16777217 在 f32 里就是 16777216
+            (16777217.0, "1.6777216E7"),
+        ];
+        for (v, want) in cases {
+            assert_eq!(&java_float_to_string(*v), want, "值 {v:?}");
+        }
+    }
 
     /// 期望值来自 JDK 25 实测（`System.out.println(double)` 的原始输出）
     #[test]

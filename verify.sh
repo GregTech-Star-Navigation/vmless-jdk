@@ -30,7 +30,8 @@ Lg Db Point Loop Sw Obj2 ObjArr Arr Demo Perf2 LongEdge Doubles Mix DblCorpus Re
 RefArr ObjRef ArrType RefFld RefCmp NullChk WideFld WideArr BitOps PrintObj PrintObj2
 TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2 TryUncaught
 Gen1 Gen2 Gen3 Gen4 Gen5 Vararg1 Vararg2 Vararg3 Vararg4 DoWhile1 SwitchStr1 MultiCatch1 Twr1
-Box1 Box2 Box3 Str1 Str2 Obj3 Arr2"
+Box1 Box2 Box3 Str1 Str2 Obj3 Arr2
+Float1 Float2 Float3 FloatMath FloatPrint Cast1"
 
 # 跑一遍三方，回填全局 jo/io/to/je/ie/te
 run_three() {

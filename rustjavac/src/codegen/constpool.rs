@@ -121,6 +121,11 @@ impl CpBuilder {
         self.push(CpEntry::Double(v.to_bits()))
     }
 
+    /// float 常量（占一个槽，ldc/ldc_w 取用）
+    pub fn float(&mut self, v: f32) -> u16 {
+        self.push(CpEntry::Float(v.to_bits()))
+    }
+
     pub fn entries(self) -> Vec<Option<CpEntry>> {
         self.entries
     }

@@ -72,6 +72,7 @@ impl Jit {
         builder.symbol("vmless_println_char", rt::println_char as *const u8);
         builder.symbol("vmless_println_long", rt::println_long as *const u8);
         builder.symbol("vmless_println_double", rt::println_double as *const u8);
+        builder.symbol("vmless_println_float", rt::println_float as *const u8);
         builder.symbol("vmless_instanceof", rt::instanceof as *const u8);
         builder.symbol("vmless_checkcast", rt::checkcast as *const u8);
         builder.symbol("vmless_println_str", rt::println_str as *const u8);
@@ -79,6 +80,7 @@ impl Jit {
         builder.symbol("vmless_str_equals", strtab::str_equals as *const u8);
         builder.symbol("vmless_println_obj", strtab::println_str as *const u8);
         builder.symbol("vmless_drem", rt::drem as *const u8);
+        builder.symbol("vmless_frem", rt::frem as *const u8);
         builder.symbol("vmless_exc_throw", rt::exc_throw as *const u8);
         builder.symbol("vmless_exc_pending", rt::exc_pending as *const u8);
         builder.symbol("vmless_exc_get", rt::exc_get as *const u8);
@@ -92,6 +94,7 @@ impl Jit {
         builder.symbol("vmless_sb_append_bool", rt::sb_append_bool as *const u8);
         builder.symbol("vmless_sb_append_long", rt::sb_append_long as *const u8);
         builder.symbol("vmless_sb_append_double", rt::sb_append_double as *const u8);
+        builder.symbol("vmless_sb_append_float", rt::sb_append_float as *const u8);
         builder.symbol("vmless_sb_append_obj", rt::sb_append_obj as *const u8);
         builder.symbol("vmless_sb_to_string", rt::sb_to_string as *const u8);
         builder.symbol("vmless_sb_append_char", rt::sb_append_char as *const u8);

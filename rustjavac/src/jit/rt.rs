@@ -555,12 +555,25 @@ pub extern "C" fn println_double(v: f64) {
     println!("{}", crate::java_double_to_string(v));
 }
 
+/// 打印一个 float（对应 System.out.println(float)）：**f32 的十进制形态与 double 不同**
+pub extern "C" fn println_float(v: f32) {
+    println!("{}", crate::java_float_to_string(v));
+}
+
 /// double 取余（drem 没有对应的 cranelift 指令，走 CRT 的 fmod）
 pub extern "C" fn drem(a: f64, b: f64) -> f64 {
     unsafe extern "C" {
         fn fmod(a: f64, b: f64) -> f64;
     }
     unsafe { fmod(a, b) }
+}
+
+/// float 取余（frem 同理，走 CRT 的 fmodf）
+pub extern "C" fn frem(a: f32, b: f32) -> f32 {
+    unsafe extern "C" {
+        fn fmodf(a: f32, b: f32) -> f32;
+    }
+    unsafe { fmodf(a, b) }
 }
 
 /// 打印一段 UTF-8 文本（指针 + 长度，缓冲常驻、不归 GC 管）
@@ -699,6 +712,9 @@ static VMETHODS: Mutex<Vec<((u32, u32), (usize, u8))>> = Mutex::new(Vec::new());
 pub const RET_I32: u8 = 0;
 pub const RET_I64: u8 = 1;
 pub const RET_F64: u8 = 2;
+/// float 的返回走独立的 ABI 种类：Cranelift 的 F32 返回值在 xmm0 低 4 字节，
+/// 按 RET_F64 还原会把高 4 字节的垃圾一起读进来
+pub const RET_F32: u8 = 3;
 
 /// 登记一个用户类的父类名
 pub fn register_super(class: &str, super_name: &str) {
@@ -859,6 +875,11 @@ pub extern "C" fn vcall(locals: *mut i64, sig: u32) -> i64 {
                 let f: unsafe extern "C" fn(*mut i64) -> f64 = std::mem::transmute(ptr);
                 f(locals).to_bits() as i64
             }
+            RET_F32 => {
+                // float 的位模式放低 32 位（调用点按 F32 位风格还原，高 32 位无意义）
+                let f: unsafe extern "C" fn(*mut i64) -> f32 = std::mem::transmute(ptr);
+                f(locals).to_bits() as i64
+            }
             _ => {
                 let f: unsafe extern "C" fn(*mut i64) -> i32 = std::mem::transmute(ptr);
                 f(locals) as i64
@@ -961,6 +982,11 @@ pub extern "C" fn sb_append_long(obj: i64, v: i64) {
 
 pub extern "C" fn sb_append_double(obj: i64, v: f64) {
     sb_push(obj, crate::java_double_to_string(v).as_bytes());
+}
+
+/// `append(float)`：十进制形态按 f32 规则（与 `println(float)` 同一套）
+pub extern "C" fn sb_append_float(obj: i64, v: f32) {
+    sb_push(obj, crate::java_float_to_string(v).as_bytes());
 }
 
 /// `append(char)`：按 UTF-8 字节接上（char 码点不是十进制数字）

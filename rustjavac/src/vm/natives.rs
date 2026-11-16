@@ -19,7 +19,9 @@ impl Vm {
     pub(super) fn println_text(&self, desc: &str, v: Slot) -> String {
         match desc {
             "(J)V" => v.as_i64().to_string(),
-            "(D)V" | "(F)V" => crate::java_double_to_string(v.as_f64()),
+            "(D)V" => crate::java_double_to_string(v.as_f64()),
+            // float 的十进制形态与 double 不同（`1.0f/3.0f` → 0.33333334），必须用 f32 规则
+            "(F)V" => crate::java_float_to_string(v.as_f32()),
             "(Z)V" => (if v.as_i32() != 0 { "true" } else { "false" }).to_string(),
             "(C)V" => char::from_u32(v.as_i32() as u32).unwrap_or('\0').to_string(),
             "(Ljava/lang/String;)V" | "(Ljava/lang/Object;)V" => self.obj_to_string(v.as_i32()),
@@ -52,6 +54,7 @@ impl Vm {
                 if let Some(v) = self.wrapper_value(h) {
                     return match v {
                         Slot::F(d) => crate::java_double_to_string(d),
+                        Slot::Fl(f) => crate::java_float_to_string(f),
                         Slot::L(n) => n.to_string(),
                         Slot::I(n) => {
                             if cls == "java/lang/Boolean" {
@@ -354,6 +357,7 @@ impl Vm {
     fn wrapper_op(&mut self, cls: &str, name: &str, v: Slot, a: Slot) -> Result<Slot, VmError> {
         let text = || match v {
             Slot::F(d) => crate::java_double_to_string(d),
+            Slot::Fl(f) => crate::java_float_to_string(f),
             Slot::L(n) => n.to_string(),
             Slot::I(n) => {
                 if cls == "java/lang/Boolean" {
@@ -386,6 +390,7 @@ impl Vm {
                     let bits = d.to_bits();
                     (bits ^ (bits >> 32)) as i32
                 }
+                Slot::Fl(f) => f.to_bits() as i32,
                 Slot::L(n) => (n ^ (n as u64 >> 32) as i64) as i32,
                 Slot::I(n) => {
                     if cls == "java/lang/Boolean" {
@@ -494,8 +499,11 @@ impl Vm {
             ("java/lang/Long", "MAX_VALUE") => Slot::L(i64::MAX),
             ("java/lang/Long", "MIN_VALUE") => Slot::L(i64::MIN),
             ("java/lang/Double", "MAX_VALUE") => Slot::F(f64::MAX),
-            ("java/lang/Double", "MIN_VALUE") => Slot::F(f64::MIN_POSITIVE),
+            ("java/lang/Double", "MIN_VALUE") => Slot::F(f64::from_bits(1)), // Java 的 MIN_VALUE 是最小 **subnormal**
             ("java/lang/Double", "NaN") => Slot::F(f64::NAN),
+            ("java/lang/Float", "MAX_VALUE") => Slot::Fl(f32::MAX),
+            ("java/lang/Float", "MIN_VALUE") => Slot::Fl(f32::from_bits(1)), // 同上：最小 subnormal（1.4E-45）
+            ("java/lang/Float", "NaN") => Slot::Fl(f32::NAN),
             ("java/lang/Character", "MAX_VALUE") => Slot::I(u16::MAX as i32),
             ("java/lang/Character", "MIN_VALUE") => Slot::I(0),
             ("java/lang/Boolean", "TRUE") => {

@@ -38,12 +38,12 @@ pub(super) fn field_ref_of(cf: &ClassFile, index: u16) -> Result<(String, String
 
 /// 字段描述符 → (访存用的机器类型, 栈上应保持的类型)
 ///
-/// 字段槽统一 8 字节，所以 float 也按 F64 存取（本编译器不产 float 字段）。
+/// 字段槽统一 8 字节，float 按 **F32** 存低 4 字节（与栈上的机器类型一致）。
 pub(super) fn field_slot_type(desc: &str) -> (cranelift_codegen::ir::Type, cranelift_codegen::ir::Type) {
     match desc.as_bytes().first().copied() {
         Some(b'J') => (types::I64, types::I64),
         Some(b'D') => (types::F64, types::F64),
-        Some(b'F') => (types::F64, types::F64),
+        Some(b'F') => (types::F32, types::F32),
         Some(b'L') | Some(b'[') => (types::I64, types::I64),
         _ => (types::I32, types::I32),
     }

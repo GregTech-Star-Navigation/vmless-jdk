@@ -1,6 +1,7 @@
 //! 方法体字节码发射器：字节缓冲、栈深跟踪、标签/回填、栈图帧、异常表、局部变量验证类型。
 
 use crate::Attribute;
+use super::constpool::CpBuilder;
 use super::error::*;
 use super::types::*;
 
@@ -185,11 +186,40 @@ impl Emit {
         Ok(())
     }
 
+    /// float 的读取（fload）
+    pub(crate) fn fload(&mut self, slot: u8) -> Result<(), CompileError> {
+        if slot <= 3 { self.op(0x22 + slot); } else { self.op(0x17); self.bytes.push(slot); }
+        self.push(1);
+        Ok(())
+    }
+
+    /// float 的存储（fstore）
+    pub(crate) fn fstore(&mut self, slot: u8) -> Result<(), CompileError> {
+        if slot <= 3 { self.op(0x43 + slot); } else { self.op(0x38); self.bytes.push(slot); }
+        self.pop(1);
+        Ok(())
+    }
+
+    /// 压一个 float 常量：0.0/1.0/2.0 走 fconst_*，其余走 ldc_w（常量池 Float 项）
+    pub(crate) fn const_float(&mut self, v: f32, cp: &mut CpBuilder) {
+        match v {
+            0.0 if !v.is_sign_negative() => self.op(0x0B), // fconst_0
+            1.0 => self.op(0x0C),                          // fconst_1
+            2.0 => self.op(0x0D),                          // fconst_2
+            _ => {
+                let idx = cp.float(v);
+                self.op_u2(0x13, idx); // ldc_w
+            }
+        }
+        self.push(1);
+    }
+
     /// 按种类发射 load
     pub(crate) fn load_slot(&mut self, slot: u8, kind: u8) -> Result<(), CompileError> {
         match kind {
             K_LONG => self.lload(slot),
             K_DOUBLE => self.dload(slot),
+            K_FLOAT => self.fload(slot),
             K_REF => self.aload(slot),
             _ => self.iload(slot),
         }
@@ -200,6 +230,7 @@ impl Emit {
         match kind {
             K_LONG => self.lstore(slot),
             K_DOUBLE => self.dstore(slot),
+            K_FLOAT => self.fstore(slot),
             K_REF => self.astore(slot),
             _ => self.istore(slot),
         }
@@ -380,6 +411,9 @@ impl Emit {
                 } else if t == 0xFFFD {
                     entries.push(3); // ITEM_Double，吃掉第 2 槽
                     slot += 2;
+                } else if t == 0xFFFC {
+                    entries.push(2); // ITEM_Float，占 1 槽
+                    slot += 1;
                 } else if t == u16::MAX {
                     entries.push(0); // ITEM_Top（尚未初始化）
                     slot += 1;

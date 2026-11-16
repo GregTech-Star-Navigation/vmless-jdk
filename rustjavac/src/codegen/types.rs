@@ -15,9 +15,16 @@ pub(crate) const K_DOUBLE: u8 = 3;
 /// boolean：JVM 里与 int 同一套 load/store/算术字节码，只有 println 的重载不同
 /// （println(Z) 打 "true"/"false"）
 pub(crate) const K_BOOL: u8 = 4;
+/// float：占 1 槽（与 int 同宽），但走 f* 指令与 ITEM_Float 验证类型
+pub(crate) const K_FLOAT: u8 = 5;
 
 pub(crate) fn kind_wide(k: u8) -> bool {
     k == K_LONG || k == K_DOUBLE
+}
+
+/// 浮点字面量是不是 `1.5f` 这种 float 形态（`1.5` / `1.5d` 是 double）
+pub(crate) fn is_float_suffix(s: &str) -> bool {
+    s.ends_with('f') || s.ends_with('F')
 }
 
 /// 类型 → 种类
@@ -25,6 +32,7 @@ pub(crate) fn kind_of(ty: &Type) -> u8 {
     match ty {
         Type::Prim("long") => K_LONG,
         Type::Prim("double") => K_DOUBLE,
+        Type::Prim("float") => K_FLOAT,
         Type::Prim("boolean") => K_BOOL,
         Type::Prim(_) => K_INT,
         _ => K_REF,
@@ -36,16 +44,19 @@ pub(crate) fn kind_from_desc(desc: &str) -> u8 {
     match desc.as_bytes().first().copied() {
         Some(b'J') => K_LONG,
         Some(b'D') => K_DOUBLE,
+        Some(b'F') => K_FLOAT,
         Some(b'Z') => K_BOOL,
         Some(b'L') | Some(b'[') => K_REF,
         _ => K_INT,
     }
 }
 
-/// 二元/比较运算的公共类型：double > long > int
+/// 二元/比较运算的公共类型：按 JLS 的数值提升链 double > float > long > int
 pub(crate) fn promote(a: u8, b: u8) -> u8 {
     if a == K_DOUBLE || b == K_DOUBLE {
         K_DOUBLE
+    } else if a == K_FLOAT || b == K_FLOAT {
+        K_FLOAT
     } else if a == K_LONG || b == K_LONG {
         K_LONG
     } else {
@@ -400,11 +411,12 @@ pub(crate) fn method_descriptor(params: &[Param], ret: &Option<Type>) -> String 
 }
 
 
-/// 类型的验证类型编码：int → 0，对象/数组 → 常量池里的类索引
+/// 类型的验证类型编码：int → 0，float → 0xFFFC，对象/数组 → 常量池里的类索引
 pub(crate) fn ver_type(cp: &mut CpBuilder, ty: &Type) -> u16 {
     match ty {
         Type::Prim("long") => 0xFFFE, // 栈图里要写 ITEM_Long
         Type::Prim("double") => 0xFFFD, // 栈图里要写 ITEM_Double
+        Type::Prim("float") => 0xFFFC, // 栈图里要写 ITEM_Float（占 1 槽）
         Type::Prim(_) => 0,
         Type::Array(inner) => {
             let d = descriptor(&Type::Array(inner.clone()));
@@ -436,17 +448,36 @@ pub(crate) fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError
             em.op(0x85); // i2l
             em.push(1);
         }
+        (K_INT, K_FLOAT) => {
+            em.op(0x86); // i2f
+        }
         (K_INT, K_DOUBLE) => {
             em.op(0x87); // i2d
             em.push(1);
+        }
+        (K_LONG, K_INT) => {
+            em.op(0x88); // l2i
+            em.pop(1);
+        }
+        (K_LONG, K_FLOAT) => {
+            em.op(0x89); // l2f
+            em.pop(1);
         }
         (K_LONG, K_DOUBLE) => {
             em.op(0x8A); // l2d
             em.push(0);
         }
-        (K_LONG, K_INT) => {
-            em.op(0x88); // l2i
-            em.pop(1);
+        // f2i / f2l / f2d：float 只占 1 槽，所以出栈/入栈按目标宽度记账
+        (K_FLOAT, K_INT) => {
+            em.op(0x8B); // f2i
+        }
+        (K_FLOAT, K_LONG) => {
+            em.op(0x8C); // f2l
+            em.push(1);
+        }
+        (K_FLOAT, K_DOUBLE) => {
+            em.op(0x8D); // f2d
+            em.push(1);
         }
         (K_DOUBLE, K_INT) => {
             em.op(0x8E); // d2i
@@ -455,6 +486,10 @@ pub(crate) fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError
         (K_DOUBLE, K_LONG) => {
             em.op(0x8F); // d2l
             em.push(0);
+        }
+        (K_DOUBLE, K_FLOAT) => {
+            em.op(0x90); // d2f
+            em.pop(1);
         }
         _ => return err(format!("暂不支持的类型转换（种类 {from} → {to}）")),
     }
@@ -496,7 +531,11 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
         } else {
             Type::Prim("int")
         }),
-        Expr::FloatLit(_) => Some(Type::Prim("double")),
+        Expr::FloatLit(s) => Some(if is_float_suffix(s) {
+            Type::Prim("float")
+        } else {
+            Type::Prim("double")
+        }),
         Expr::BoolLit(_) => Some(Type::Prim("boolean")),
         Expr::CharLit(_) => Some(Type::Prim("char")),
         Expr::ArrayNew { elem, .. } => Some(Type::Array(Box::new(elem.clone()))),
@@ -562,7 +601,9 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
         Expr::IntLit(s) => {
             if s.ends_with('L') || s.ends_with('l') { K_LONG } else { K_INT }
         }
-        Expr::FloatLit(_) => K_DOUBLE,
+        Expr::FloatLit(s) => {
+            if is_float_suffix(s) { K_FLOAT } else { K_DOUBLE }
+        }
         Expr::Cast { ty, .. } => kind_of(ty),
         // 裸名字既可能是局部变量，也可能是隐式 this 的字段（`return d * 2.0;`）：
         // 不查字段表的话 long/double 字段会被当成 int，多插一条 i2d 直接 VerifyError

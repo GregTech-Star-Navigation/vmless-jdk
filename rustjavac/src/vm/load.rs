@@ -1,12 +1,15 @@
 //! 多类加载与运行期类元数据：继承链、字段布局、方法表。
 //!
-//! 解释器原来只能跑「一个 class 文件」。继承要求同时知道父类，所以这里把
-//! `main` 所在目录里所有 `.class` 都读进来（我们的编译器一个编译单元产出多个类，
-//! 都落在同一个目录），建成一张按类名索引的表。
+//! 类不再靠「扫一个目录」得到，而是沿 `load::ClassPath` **按需查找**：从入口类出发，
+//! 顺着它常量池里的 `Class` 项（父类、接口、字段/方法的参数与返回类型都在里面）一个个
+//! `find` 回来，形成一个闭包。没被任何已加载类引用到的类不加载 —— 这也是以后跑 jimage
+//! 时不会把三万个 java.base 类全解出来的原因。每个名字只查一次，`ClassPath` 内部还有
+//! 字节缓存。
 //!
 //! 字段布局与编译期 `sema::Resolver` 保持一致：**父类字段在前、本类字段在后**。
 
-use crate::ClassFile;
+use crate::load::ClassPath;
+use crate::{ClassFile, CpEntry};
 use std::collections::HashMap;
 use std::rc::Rc;
 
@@ -35,22 +38,6 @@ fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
     Err(VmError { msg: msg.into(), exc: None })
 }
 
-/// 递归收集目录下的 `.class`（包名就是子目录层级）
-fn collect_class_files(dir: &std::path::Path, depth: usize, out: &mut Vec<std::path::PathBuf>) {
-    if depth > 8 {
-        return;
-    }
-    let Ok(entries) = std::fs::read_dir(dir) else { return };
-    for e in entries.flatten() {
-        let p = e.path();
-        if p.is_dir() {
-            collect_class_files(&p, depth + 1, out);
-        } else if p.extension().and_then(|s| s.to_str()) == Some("class") {
-            out.push(p);
-        }
-    }
-}
-
 /// 类的直接父类：已加载的类看 `super_class`，其余靠 java.* 写死的表
 fn super_of_of(classes: &[Rc<ClassFile>], by_name: &HashMap<String, usize>, class: &str) -> Option<String> {
     if let Some(&i) = by_name.get(class) {
@@ -63,21 +50,90 @@ fn super_of_of(classes: &[Rc<ClassFile>], by_name: &HashMap<String, usize>, clas
     builtin_super(class).map(|s| s.to_string())
 }
 
+/// `java.*` 的语义目前由 `natives` 写死（String / Object / 包装类 / 异常 / System …）。
+/// 真实 JDK 的字节码一旦进了类表就会**盖掉** natives（`resolve_method` 先查类表），
+/// 紧接着撞上解释器还不认识的那部分字节码 —— 所以闭包里不拉 `java.*`。
+///
+/// 想读这些类的结构请直接走 `load::ClassPath`（`examples/run_jimage.rs`）；
+/// 等哪天要真执行 JDK 字节码，去掉这一层限制，同时处理 natives 与真实实现的去重。
+fn is_jdk_runtime(name: &str) -> bool {
+    name.starts_with("java/")
+}
+
 impl ClassStore {
-    /// 从一个目录里的所有 `.class` 建表；`main` 是入口类名
-    pub(super) fn load_dir(dir: &std::path::Path, main_class: &str) -> Result<Self, VmError> {
+    /// 沿 classpath 按需加载入口类 + 它引用到的类。
+    ///
+    /// 从 `main_class` 出发，按 `Class` 常量池项把父类/接口/签名里出现的类型一个个
+    /// `find` 回来（闭包）。找不到的类不报错 —— 那是 `java.*` 之类，靠 `builtin_super`
+    /// 与 natives 兜；只有**入口类**找不到才算错。
+    pub(super) fn load_path(cp: &ClassPath, main_class: &str) -> Result<Self, VmError> {
         let mut files: Vec<ClassFile> = Vec::new();
-        // 递归：带包名的类分布在子目录里（`app/X.class` + `lib/Y.class` 要一起加载）
-        let mut paths = Vec::new();
-        collect_class_files(dir, 0, &mut paths);
-        for p in paths {
-            if let Ok(bytes) = std::fs::read(&p) {
-                if let Ok(cf) = crate::parse(&bytes) {
-                    files.push(cf);
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut queue: Vec<String> = vec![main_class.to_string()];
+        while let Some(name) = queue.pop() {
+            if name.is_empty() || name.starts_with('[') || !seen.insert(name.clone()) {
+                continue;
+            }
+            let bytes = cp.find(&name).map_err(|e| VmError { msg: e, exc: None })?;
+            let Some(bytes) = bytes else {
+                if name == main_class {
+                    return err(format!("classpath 里找不到主类 {main_class}"));
+                }
+                continue;
+            };
+            let cf = crate::parse(&bytes)
+                .map_err(|e| VmError { msg: format!("解析 {name} 失败: {e}"), exc: None })?;
+            // 引用到的类型都在 `Class` 常量池项里（含 super_class 与 interfaces 指过去的那两个）。
+            // `<SELF>` 是我们编译器写常量池时用的占位符（字节码生成完会被改写成真实类名），
+            // 它不是类，别拿它去 classpath 里找。
+            for e in &cf.constant_pool {
+                if let Some(CpEntry::Class(ix)) = e {
+                    if let Some(raw) = cf.utf8(*ix) {
+                        let n = String::from_utf8_lossy(raw).into_owned();
+                        if !n.starts_with('[') && !n.contains('<') && !n.contains(';') && !is_jdk_runtime(&n)
+                        {
+                            queue.push(n);
+                        }
+                    }
                 }
             }
+            files.push(cf);
+        }
+        if files.is_empty() {
+            return err("没有可执行的 class");
         }
         Self::new(files, Some(main_class))
+    }
+
+    /// 运行期加入一个类（`ClassLoader.defineClass` 的雏形）：同名的换掉，然后重建
+    /// 方法表与字段布局（父类新加字段会移动子类字段的偏移，所以只能整体重建）。
+    pub(super) fn add_class(&mut self, cf: ClassFile) -> usize {
+        let name = cf.this_class_name().unwrap_or_default();
+        let idx = match self.by_name.get(&name) {
+            Some(&i) => {
+                self.classes[i] = Rc::new(cf);
+                i
+            }
+            None => {
+                self.classes.push(Rc::new(cf));
+                self.classes.len() - 1
+            }
+        };
+        self.by_name.insert(name, idx);
+        self.rebuild_methods();
+        self.build_metas();
+        idx
+    }
+
+    fn rebuild_methods(&mut self) {
+        self.methods.clear();
+        for (ci, cf) in self.classes.iter().enumerate() {
+            for (mi, m) in cf.methods.iter().enumerate() {
+                let name = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
+                let desc = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
+                self.methods.insert((cf.this_class_name().unwrap_or_default(), name, desc), (ci, mi));
+            }
+        }
     }
 
     /// 用一批已解析的类建表
@@ -192,6 +248,13 @@ impl ClassStore {
 
     pub(crate) fn meta(&self, class: &str) -> Option<&ClassMeta> {
         self.metas.get(class)
+    }
+
+    /// 已加载的类名（诊断用）
+    pub(super) fn class_names(&self) -> Vec<String> {
+        let mut v: Vec<String> = self.by_name.keys().cloned().collect();
+        v.sort();
+        v
     }
 
     /// 从 `from` 开始沿继承链解析方法；类链上找不到再找接口的 **default 实现**

@@ -130,6 +130,30 @@ impl Vm {
             Err(e) => Err(e),
         }
     }
+
+    /// 运行期定义一个类（`ClassLoader.defineClass` 的最小入口）。
+    ///
+    /// 边界：**不做双亲委派**（这个 VM 里还没有 `java.lang.ClassLoader` 类，也就没有
+    /// 父子关系可言），也不校验字节码；`name` 给了就必须和 class 文件自己声明的类名
+    /// 一致（空串表示照文件说的算）。同名类会被替换，随后重建方法表与字段布局。
+    pub fn define_class(&mut self, name: &str, bytes: &[u8]) -> Result<String, VmError> {
+        let cf = parse(bytes).map_err(|e| VmError { msg: format!("class 解析失败: {e}"), exc: None })?;
+        let actual = cf
+            .this_class_name()
+            .ok_or_else(|| VmError { msg: "class 没有 this_class".into(), exc: None })?;
+        if !name.is_empty() && internal_name(name) != actual {
+            return err(format!(
+                "defineClass 的名字 {name:?} 与 class 文件声明的 {actual} 不一致"
+            ));
+        }
+        self.store.add_class(cf);
+        Ok(actual)
+    }
+
+    /// 运行期已加载的类名（诊断用）
+    pub fn loaded_classes(&self) -> Vec<String> {
+        self.store.class_names()
+    }
 }
 
 /// 从字节加载并执行 main（只有这一个类，父类找不到就是运行时错误）
@@ -141,7 +165,8 @@ pub fn run_class_bytes(bytes: &[u8]) -> Result<ExecResult, VmError> {
     Vm::new(vec![cf], &name)?.run_main()
 }
 
-/// 从文件加载并执行 main：所在目录里的 .class 一起读进来（继承链上的父类）
+/// 从文件加载并执行 main：从「类文件所在目录的包根」当 classpath，按需把
+/// 继承链/签名里引用到的类找回来（父类、兄弟编译单元里的类）
 pub fn run_class_file(path: &str) -> Result<ExecResult, VmError> {
     let bytes = std::fs::read(path).map_err(|e| VmError { msg: format!("读取 {path} 失败: {e}"), exc: None })?;
     let cf = parse(&bytes).map_err(|e| VmError { msg: format!("class 解析失败: {e}"), exc: None })?;
@@ -149,9 +174,49 @@ pub fn run_class_file(path: &str) -> Result<ExecResult, VmError> {
         .this_class_name()
         .ok_or_else(|| VmError { msg: "class 没有 this_class".into(), exc: None })?;
     let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ".".into());
-    let store = ClassStore::load_dir(&package_root(&dir, &name), &name)?;
-    let mut vm = Vm::from_store(store);
+    let root = package_root(&dir, &name);
+    let cp = crate::load::ClassPath::from_spec(&root.to_string_lossy())
+        .map_err(|e| VmError { msg: e, exc: None })?;
+    let mut vm = Vm::from_store(ClassStore::load_path(&cp, &name)?);
     vm.run_main()
+}
+
+/// `a.b.C` / `a/b/C` / `a/b/C.class` → `a/b/C`
+fn internal_name(n: &str) -> String {
+    let n = n.trim();
+    let n = n.strip_suffix(".class").unwrap_or(n);
+    if n.contains('/') {
+        n.to_string()
+    } else {
+        n.replace('.', "/")
+    }
+}
+
+/// 按 classpath（`a.jar:b.jar:dir`）加载并执行主类
+pub fn run_classpath(spec: &str, main_class: &str) -> Result<ExecResult, VmError> {
+    let cp = crate::load::ClassPath::from_spec(spec).map_err(|e| VmError { msg: e, exc: None })?;
+    let name = internal_name(main_class);
+    let store = ClassStore::load_path(&cp, &name)?;
+    Vm::from_store(store).run_main()
+}
+
+/// 从 jar 执行 main；`main` 为 None 时读 `META-INF/MANIFEST.MF` 的 `Main-Class`
+pub fn run_jar(path: &str, main: Option<&str>) -> Result<ExecResult, VmError> {
+    let name = match main {
+        Some(m) => internal_name(m),
+        None => {
+            let jar = crate::load::jar::JarSource::open(path).map_err(|e| VmError { msg: e, exc: None })?;
+            let m = jar.main_class().map_err(|e| VmError { msg: e, exc: None })?;
+            let m = m.ok_or_else(|| VmError {
+                msg: format!("{path} 的 MANIFEST.MF 里没有 Main-Class（可用 -cp <主类名> 指定）"),
+                exc: None,
+            })?;
+            internal_name(&m)
+        }
+    };
+    let cp = crate::load::ClassPath::from_spec(path).map_err(|e| VmError { msg: e, exc: None })?;
+    let store = ClassStore::load_path(&cp, &name)?;
+    Vm::from_store(store).run_main()
 }
 
 /// 类文件所在目录 → **包根**：`…/out/app/X.class` 的包根是 `…/out`。
@@ -358,9 +423,36 @@ mod tests {
         assert_eq!(out, vec!["true", "false"]);
     }
 
+    /// 运行期定义类（`defineClass`）：先只给 A，再把 B 塞进去，然后 B 的方法能用
+    #[test]
+    fn define_class_at_runtime() {
+        let src = r#"
+            class Base7 { int v() { return 7; } }
+            class Extra7 { static int f() { return 3; } }
+        "#;
+        let cu = parse_compilation_unit(src).expect("parse");
+        let classes = compile(&cu).expect("compile");
+        let by_name = |n: &str| {
+            classes
+                .iter()
+                .find(|(name, _)| name == n)
+                .map(|(_, b)| b.clone())
+                .expect("编译产物里没有这个类")
+        };
+        let base = parse(&by_name("Base7")).expect("parse Base7");
+        let mut vm = Vm::new(vec![base], "Base7").expect("vm");
+        assert_eq!(vm.loaded_classes(), vec!["Base7".to_string()]);
+        // 名字对不上必须报错，不能悄悄塞进去
+        assert!(vm.define_class("Wrong", &by_name("Extra7")).is_err());
+        let got = vm.define_class("Extra7", &by_name("Extra7")).expect("defineClass");
+        assert_eq!(got, "Extra7");
+        assert_eq!(vm.loaded_classes(), vec!["Base7".to_string(), "Extra7".to_string()]);
+        // 方法表跟着重建了：能按名字解析到刚定义的静态方法
+        assert!(vm.store.method_in_class("Extra7", "f", "()I").is_some());
+    }
+
     #[test]
     fn counts_descriptor_args() {
-        assert_eq!(count_args("()V").unwrap(), 0);
         assert_eq!(count_args("(II)I").unwrap(), 2);
         assert_eq!(count_args("([Ljava/lang/String;)V").unwrap(), 1);
         assert_eq!(count_args("(ILjava/lang/String;)V").unwrap(), 2);

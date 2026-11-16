@@ -84,11 +84,14 @@ pub struct CompiledMethod {
     Ok((class, name, desc))
 }
 
-/// 方法返回值的机器类型：long → I64，double → F64，其余（含 void）→ I32
+/// 方法返回值的机器类型：long → I64，double → F64，float → F32，其余（含 void）→ I32
     pub(super) fn ret_type(desc: &str) -> cranelift_codegen::ir::Type {
     match crate::ret_of(desc) {
         Some(b'J') => types::I64,
-        Some(b'D') | Some(b'F') => types::F64,
+        Some(b'D') => types::F64,
+        // float 用 F32 而不是 F64：f32 的舍入语义要由指令本身保证，
+        // 拿 F64 代替会让 `1.0f/3.0f` 打出 double 的十进制形态
+        Some(b'F') => types::F32,
         // 引用是 8 字节指针，必须按 I64 返回，否则会被截断成 i32
         Some(b'L') | Some(b'[') => types::I64,
         _ => types::I32,
@@ -105,11 +108,21 @@ pub struct CompiledMethod {
         fb.ins().sextend(types::I64, v)
     } else if from == types::I64 && ty == types::I32 {
         fb.ins().ireduce(types::I32, v)
+    } else if ty == types::F64 && from == types::F32 {
+        fb.ins().fpromote(types::F64, v)
+    } else if ty == types::F32 && from == types::F64 {
+        fb.ins().fdemote(types::F32, v)
     } else if ty == types::F64 {
         fb.ins().fcvt_from_sint(types::F64, v)
+    } else if ty == types::F32 {
+        fb.ins().fcvt_from_sint(types::F32, v)
     } else if from == types::F64 && ty == types::I64 {
         fb.ins().fcvt_to_sint_sat(types::I64, v)
     } else if from == types::F64 {
+        fb.ins().fcvt_to_sint_sat(types::I32, v)
+    } else if from == types::F32 && ty == types::I64 {
+        fb.ins().fcvt_to_sint_sat(types::I64, v)
+    } else if from == types::F32 {
         fb.ins().fcvt_to_sint_sat(types::I32, v)
     } else {
         v
@@ -120,6 +133,8 @@ pub struct CompiledMethod {
     pub(super) fn zero_of(fb: &mut FunctionBuilder, ty: cranelift_codegen::ir::Type) -> Value {
     if ty == types::F64 {
         fb.ins().f64const(0.0)
+    } else if ty == types::F32 {
+        fb.ins().f32const(0.0)
     } else if ty == types::I64 {
         fb.ins().iconst(types::I64, 0)
     } else {
@@ -260,6 +275,9 @@ impl CompiledMethod {
         let r = unsafe {
             if ty == types::F64 {
                 let f: unsafe extern "C" fn(*mut i64) -> f64 = std::mem::transmute(self.code);
+                f(p) as i32
+            } else if ty == types::F32 {
+                let f: unsafe extern "C" fn(*mut i64) -> f32 = std::mem::transmute(self.code);
                 f(p) as i32
             } else if ty == types::I64 {
                 let f: unsafe extern "C" fn(*mut i64) -> i64 = std::mem::transmute(self.code);

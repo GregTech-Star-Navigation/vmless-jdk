@@ -523,3 +523,22 @@ ALLOC_NS=188.4  GC_COUNT=6  LIVE_AFTER=4026528  HEAP_MB=3.84
 
 **验证**：`rustjavac` 94 个样例三路一致、单测 42；`librustjrt` 单测 51 + doc-test 2。
 **基准**：压缩后碎片率 0.500→0.000、跨度 15.3MB→7.6MB；增量最大单步 **0.683 ms**（全停顿 26.9 ms，≈39×）。
+
+## 0.44.0 — 2026-11-17 · jimage / jar 类来源、ClassLoader 骨架、float
+
+### jimage / jar / 类路径（「跑真实 Java 程序」的地基）
+- 新增 `src/load/`：`ClassSource` 三态（目录 / jar / **jimage 真二进制格式**），统一 `find(内部名)`
+- **zip 自己解**（中央目录 + 本地头 + stored/**deflate 自己写的 inflate**，零依赖）；
+  `src.zip` 52MB / 15058 条目全量解出与 `jar xf` 零差异
+- `jimage` 解真格式：30482 条索引，读 `java/lang/Object`/`String`/`HashMap`/`Unsafe` 的结构
+  **与 `javap -v` 逐项相等**，字节与 `jimage extract` 一致
+- `vm/load.rs`：从主类出发沿常量池 Class 项建引用闭包按需加载；`define_class` 运行期加类
+- `rustjava -cp <a.jar;b.jar;dir> <主类>` / `-jar <jar>`（读 MANIFEST `Main-Class`）
+
+### float
+- 字面量、`fconst_*`、`f*` 算术、`fcmpl/fcmpg`、转换、`freturn`、`println(float)`、栈图 `ITEM_Float`
+
+**验证**：`verify.sh` **100/100 三路一致**；`cargo test` 44 passed。
+
+**已知边界**：jimage 的压缩条目（`jlink --compress`）明确报错（本机 JDK 的 30482 条 compressed=0，不受影响）；
+zip64/加密不支持；`-jar` 暂不支持给 main 传参；**`java.*` 故意不进执行闭包**（真字节码会盖掉内建实现）。

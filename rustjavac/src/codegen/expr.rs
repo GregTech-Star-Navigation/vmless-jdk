@@ -113,6 +113,7 @@ pub(crate) fn spill(
         (Some(t), _) => ver_type(cp, &t),
         (None, K_LONG) => 0xFFFE,
         (None, K_DOUBLE) => 0xFFFD,
+        (None, K_FLOAT) => 0xFFFC,
         (None, K_REF) => cp.class("java/lang/Object"),
         (None, _) => 0,
     };
@@ -501,6 +502,14 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         }
         Expr::FloatLit(s) => {
             let raw = s.trim_end_matches(['d', 'D', 'f', 'F']);
+            if is_float_suffix(s) {
+                // Float 常量：精度必须按 f32 收（`1.0f/3.0f` 的十进制形态与 double 不同）
+                let v: f32 = raw
+                    .parse()
+                    .map_err(|_| CompileError { msg: format!("float 字面量 `{s}` 解析失败") })?;
+                em.const_float(v, cp);
+                return Ok(());
+            }
             let v: f64 = raw
                 .parse()
                 .map_err(|_| CompileError { msg: format!("浮点字面量 `{s}` 解析失败") })?;
@@ -574,6 +583,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                             match expr_kind(&args[0], ctx) {
                                 K_LONG => ("(J)V", 2u16),
                                 K_DOUBLE => ("(D)V", 2),
+                                K_FLOAT => ("(F)V", 1),
                                 K_REF => (ref_println_desc(&args[0], ctx), 1),
                                 K_BOOL => ("(Z)V", 1),
                                 _ => ("(I)V", 1),
@@ -779,6 +789,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 (BinOp::Mul, K_DOUBLE) => 0x6B,
                 (BinOp::Div, K_DOUBLE) => 0x6F,
                 (BinOp::Rem, K_DOUBLE) => 0x73,
+                (BinOp::Add, K_FLOAT) => 0x62,
+                (BinOp::Sub, K_FLOAT) => 0x66,
+                (BinOp::Mul, K_FLOAT) => 0x6A,
+                (BinOp::Div, K_FLOAT) => 0x6E,
+                (BinOp::Rem, K_FLOAT) => 0x72,
                 (BinOp::Add, _) => 0x60u8,
                 (BinOp::Sub, _) => 0x64,
                 (BinOp::Mul, _) => 0x68,
@@ -802,6 +817,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             match k {
                 K_LONG => em.op(0x75),   // lneg
                 K_DOUBLE => em.op(0x77), // dneg
+                K_FLOAT => em.op(0x76),  // fneg
                 _ => em.op(0x74),        // ineg
             }
             Ok(())
@@ -963,16 +979,18 @@ pub(crate) fn compile_cmp_operands(
     coerce(kl, k, em)?;
     emit_num_val(rhs, &sr, em, ctx, cp)?;
     coerce(kr, k, em)?;
-    // long/double 要先 lcmp / dcmpl(dcmpg) 压成 int，再用单值比较
+    // long/double/float 要先 lcmp / dcmpl(dcmpg) / fcmpl(fcmpg) 压成 int，再用单值比较
     let widen = match k {
         K_LONG => Some(0x94u8), // lcmp
-        // NaN 语义：< 和 <= 用 dcmpg，其余用 dcmpl
+        // NaN 语义：< 和 <= 用 xxcmpg（NaN → +1，比较结果为假），其余用 xxcmpl
         K_DOUBLE => Some(if matches!(op, BinOp::Lt | BinOp::Le) { 0x98 } else { 0x97 }),
+        K_FLOAT => Some(if matches!(op, BinOp::Lt | BinOp::Le) { 0x96 } else { 0x95 }),
         _ => None,
     };
     if let Some(c) = widen {
         em.op(c);
-        em.pop(3); // 两个宽值 4 槽 → 1 槽 int
+        // long/double 是两个宽值 4 槽 → 1 槽 int；float 是 2 槽 → 1 槽
+        em.pop(if k == K_FLOAT { 1 } else { 3 });
         let ops = match op {
             BinOp::Lt => (0x9C, 0x9B), // ifge / iflt
             BinOp::Ge => (0x9B, 0x9C), // iflt / ifge
@@ -1091,6 +1109,7 @@ fn compile_cond(
         (Some(t), _) => ver_type(cp, t),
         (None, K_LONG) => 0xFFFE,
         (None, K_DOUBLE) => 0xFFFD,
+        (None, K_FLOAT) => 0xFFFC,
         // 引用但推不出静态类型：按 Object 声明（和 `spill` 的兜底一致）
         (None, K_REF) => cp.class("java/lang/Object"),
         (None, _) => 0,
@@ -1170,6 +1189,7 @@ fn append_desc(e: &Expr, kind: u8, ctx: &Ctx) -> &'static str {
     match kind {
         K_LONG => "(J)Ljava/lang/StringBuilder;",
         K_DOUBLE => "(D)Ljava/lang/StringBuilder;",
+        K_FLOAT => "(F)Ljava/lang/StringBuilder;", // 浮点拼接的十进制形态按 f32 规则
         K_BOOL => "(Z)Ljava/lang/StringBuilder;",
         K_REF => {
             if is_string_val(e, ctx) {

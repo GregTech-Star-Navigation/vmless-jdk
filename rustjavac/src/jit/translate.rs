@@ -148,6 +148,13 @@ impl Jit {
             .declare_function("vmless_println_double", Linkage::Import, &sig_pd)
             .map_err(|e| JitError(e.to_string()))?;
 
+        let mut sig_pf = self.module.make_signature();
+        sig_pf.params.push(AbiParam::new(types::F32));
+        let println_float_id = self
+            .module
+            .declare_function("vmless_println_float", Linkage::Import, &sig_pf)
+            .map_err(|e| JitError(e.to_string()))?;
+
         // 登记常量池里的字符串常量（ldc 用）
         let mut str_ids: std::collections::HashMap<u16, u32> = std::collections::HashMap::new();
         for (i, e) in cf.constant_pool.iter().enumerate() {
@@ -197,6 +204,16 @@ impl Jit {
             .declare_function("vmless_drem", Linkage::Import, &sig_ff)
             .map_err(|e| JitError(e.to_string()))?;
 
+        // frem（0x72）：Cranelift 没有浮点取余指令，走 CRT 的 fmodf（F32 版）
+        let mut sig_fff = self.module.make_signature();
+        sig_fff.params.push(AbiParam::new(types::F32));
+        sig_fff.params.push(AbiParam::new(types::F32));
+        sig_fff.returns.push(AbiParam::new(types::F32));
+        let frem_id = self
+            .module
+            .declare_function("vmless_frem", Linkage::Import, &sig_fff)
+            .map_err(|e| JitError(e.to_string()))?;
+
         // 字符串拼接的内建 `java/lang/StringBuilder`（没有 .class 文件）。
         // 对象里存一个 int 缓冲编号，文本本身留在运行时侧的 Vec<Vec<u8>> 里。
         let mut sig_sb_new = self.module.make_signature();
@@ -221,6 +238,8 @@ impl Jit {
             mk_sb_app("vmless_sb_append_obj", types::I64).map_err(|e| JitError(e.to_string()))?;
         let sb_app_dbl_id =
             mk_sb_app("vmless_sb_append_double", types::F64).map_err(|e| JitError(e.to_string()))?;
+        let sb_app_flt_id =
+            mk_sb_app("vmless_sb_append_float", types::F32).map_err(|e| JitError(e.to_string()))?;
         let sb_app_char_id =
             mk_sb_app("vmless_sb_append_char", types::I32).map_err(|e| JitError(e.to_string()))?;
         let mut sig_sb_str = self.module.make_signature();
@@ -535,7 +554,7 @@ impl Jit {
                         let p = fb.inst_results(call)[0];
                         stack.push(p);
                     } else {
-                        stack.push(fb.ins().iconst(types::I32, const_int(&cf, idx)));
+                        const_load(&mut fb, &mut stack, &cf, idx);
                     }
                 }
                 0x13 => {
@@ -548,7 +567,7 @@ impl Jit {
                         let p = fb.inst_results(call)[0];
                         stack.push(p);
                     } else {
-                        stack.push(fb.ins().iconst(types::I32, const_int(&cf, idx)));
+                        const_load(&mut fb, &mut stack, &cf, idx);
                     }
                 }
                 0x15 => {
@@ -556,6 +575,27 @@ impl Jit {
                     pc += 1;
                     let v = load_local(&mut fb, locals_ptr, slot);
                     stack.push(v);
+                }
+                // fload / fload_0..3：局部变量按 F32 读（槽是 8 字节，只读低 4 字节）
+                0x17 => {
+                    let slot = body[pc] as usize;
+                    pc += 1;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    let v = fb.ins().load(types::F32, MemFlags::new(), addr, 0);
+                    stack.push(v);
+                }
+                0x22..=0x25 => {
+                    let slot = (op - 0x22) as usize;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    let v = fb.ins().load(types::F32, MemFlags::new(), addr, 0);
+                    stack.push(v);
+                }
+                0x43..=0x46 => {
+                    // fstore_0..3
+                    let slot = (op - 0x43) as usize;
+                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
+                    fb.ins().store(MemFlags::new(), v, addr, 0);
                 }
                 0x1a..=0x1d => {
                     let slot = (op - 0x1a) as usize;
@@ -585,6 +625,95 @@ impl Jit {
                 0x57 | 0x58 => {
                     // pop / pop2：栈上一个条目就是一个 JVM 值，宽值也只占一条
                     stack.pop();
+                    if op == 0x58 {
+                        // pop2：宽值只弹一个，否则再弹一个
+                        let top_is_wide = stack
+                            .last()
+                            .map(|v| is_wide_ty(fb.func.dfg.value_type(*v)))
+                            .unwrap_or(false);
+                        if !top_is_wide {
+                            stack.pop();
+                        }
+                    }
+                }
+                // dup / dup_x1 / dup_x2 / dup2 / dup2_x1 / dup2_x2 / swap
+                0x59 => {
+                    let v = *stack.last().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(v);
+                }
+                0x5a => {
+                    // … v2, v1 → … v1, v2, v1
+                    let n = stack.len();
+                    if n >= 2 {
+                        let v1 = stack[n - 1];
+                        stack.insert(n - 2, v1);
+                    }
+                }
+                0x5b => {
+                    // dup_x2
+                    let n = stack.len();
+                    if n >= 2 {
+                        let v1 = stack[n - 1];
+                        let w2 = is_wide_ty(fb.func.dfg.value_type(stack[n - 2]));
+                        if w2 {
+                            stack.insert(n - 2, v1); // 形式 2
+                        } else if n >= 3 {
+                            stack.insert(n - 3, v1); // 形式 1
+                        }
+                    }
+                }
+                0x5c => {
+                    // dup2
+                    let n = stack.len();
+                    let top = *stack.last().ok_or_else(|| JitError("栈下溢".into()))?;
+                    if is_wide_ty(fb.func.dfg.value_type(top)) {
+                        stack.push(top);
+                    } else if n >= 2 {
+                        let a = stack[n - 2];
+                        stack.push(a);
+                        stack.push(top);
+                    }
+                }
+                0x5d => {
+                    // dup2_x1
+                    let n = stack.len();
+                    if n >= 2 {
+                        let v1 = stack[n - 1];
+                        if is_wide_ty(fb.func.dfg.value_type(v1)) {
+                            stack.insert(n - 2, v1); // 形式 2
+                        } else if n >= 3 {
+                            let v2 = stack[n - 2];
+                            stack.insert(n - 3, v2);
+                            stack.insert(n - 2, v1);
+                        }
+                    }
+                }
+                0x5e => {
+                    // dup2_x2
+                    let n = stack.len();
+                    if n >= 2 {
+                        let v1 = stack[n - 1];
+                        let w2 = is_wide_ty(fb.func.dfg.value_type(stack[n - 2]));
+                        if w2 {
+                            stack.insert(n - 2, v1); // 形式 2 / 4
+                        } else if n >= 3 {
+                            let v2 = stack[n - 2];
+                            if is_wide_ty(fb.func.dfg.value_type(stack[n - 3])) {
+                                stack.insert(n - 3, v2); // 形式 3
+                                stack.insert(n - 2, v1);
+                            } else if n >= 4 {
+                                stack.insert(n - 4, v2); // 形式 1
+                                stack.insert(n - 3, v1);
+                            }
+                        }
+                    }
+                }
+                0x5f => {
+                    // swap：两个 1 槽值互换
+                    let n = stack.len();
+                    if n >= 2 {
+                        stack.swap(n - 1, n - 2);
+                    }
                 }
                 0x60 => bin(&mut fb, &mut stack, |f, a, b| f.ins().iadd(a, b))?,
                 0x64 => bin(&mut fb, &mut stack, |f, a, b| f.ins().isub(a, b))?,
@@ -983,6 +1112,10 @@ impl Jit {
                         _ => stack.push(fb.ins().iconst(types::I64, 0)),
                     }
                 }
+                0x0b..=0x0d => {
+                    // fconst_0 / fconst_1 / fconst_2
+                    stack.push(fb.ins().f32const((op - 0x0b) as f32));
+                }
                 0x0e | 0x0f => {
                     // dconst_0 / dconst_1
                     let v = if op == 0x0e { 0.0 } else { 1.0 };
@@ -1072,6 +1205,23 @@ impl Jit {
                     let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     stack.push(fb.ins().fneg(b));
                 }
+                // float 算术 / 取反（F32 指令，f32 舍入由指令本身保证）
+                0x62 => lng(&mut fb, &mut stack, |f, a, b| f.ins().fadd(a, b))?,
+                0x66 => lng(&mut fb, &mut stack, |f, a, b| f.ins().fsub(a, b))?,
+                0x6a => lng(&mut fb, &mut stack, |f, a, b| f.ins().fmul(a, b))?,
+                0x6e => lng(&mut fb, &mut stack, |f, a, b| f.ins().fdiv(a, b))?,
+                0x72 => {
+                    // frem：cranelift 没有 frem 指令，调 CRT 的 fmodf
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let fref = self.module.declare_func_in_func(frem_id, fb.func);
+                    let c = fb.ins().call(fref, &[a, b]);
+                    stack.push(fb.inst_results(c)[0]);
+                }
+                0x76 => {
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().fneg(b));
+                }
                 // 数值类型转换
                 0x87 => {
                     // i2d
@@ -1121,6 +1271,22 @@ impl Jit {
                     let d = fb.ins().isub(gt, lt);
                     stack.push(d);
                 }
+                0x95 | 0x96 => {
+                    // fcmpl(0x95: NaN → -1) / fcmpg(0x96: NaN → +1)
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let (cc_lt, cc_gt) = if op == 0x95 {
+                        (FloatCC::UnorderedOrLessThan, FloatCC::GreaterThan)
+                    } else {
+                        (FloatCC::LessThan, FloatCC::UnorderedOrGreaterThan)
+                    };
+                    let lt = fb.ins().fcmp(cc_lt, a, b);
+                    let gt = fb.ins().fcmp(cc_gt, a, b);
+                    let lt = fb.ins().uextend(types::I32, lt);
+                    let gt = fb.ins().uextend(types::I32, gt);
+                    let d = fb.ins().isub(gt, lt);
+                    stack.push(d);
+                }
                 0x88 => {
                     // l2i
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
@@ -1130,6 +1296,52 @@ impl Jit {
                     // i2l
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     stack.push(fb.ins().sextend(types::I64, a));
+                }
+                // float 与其它数值类型的互转（F32 参与，位宽按目标类型走）
+                0x86 => {
+                    // i2f
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().fcvt_from_sint(types::F32, a));
+                }
+                0x89 => {
+                    // l2f
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().fcvt_from_sint(types::F32, a));
+                }
+                0x8b => {
+                    // f2i（Rust/Cranelift 的饱和转换与 Java 语义一致：NaN → 0，超界钳到边界）
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().fcvt_to_sint_sat(types::I32, a));
+                }
+                0x8c => {
+                    // f2l
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().fcvt_to_sint_sat(types::I64, a));
+                }
+                0x8d => {
+                    // f2d
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().fpromote(types::F64, a));
+                }
+                0x90 => {
+                    // d2f
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().fdemote(types::F32, a));
+                }
+                // i2b / i2c / i2s：截断到目标宽度后**符号扩展**回 int
+                0x91 => {
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = fb.ins().ireduce(types::I8, a);
+                    stack.push(fb.ins().sextend(types::I32, a));
+                }
+                0x92 => {
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    stack.push(fb.ins().band_imm(a, 0xFFFF));
+                }
+                0x93 => {
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = fb.ins().ireduce(types::I16, a);
+                    stack.push(fb.ins().sextend(types::I32, a));
                 }
                 // getstatic：静态字段（System.out 仍是 PrintStream 占位）
                 0xb2 => {
@@ -1215,7 +1427,8 @@ impl Jit {
                         // 按重载选运行时函数：(I)V / (J)V / (D)V / (Ljava/lang/String;)V
                         let (fid, want) = match desc.as_str() {
                             "(J)V" => (println_long_id, types::I64),
-                            "(D)V" | "(F)V" => (println_double_id, types::F64),
+                            "(D)V" => (println_double_id, types::F64),
+                            "(F)V" => (println_float_id, types::F32),
                             "(Z)V" => (println_bool_id, types::I32),
                             "(C)V" => (println_char_id, types::I32),
                             "(Ljava/lang/String;)V" | "(Ljava/lang/Object;)V" => {
@@ -1252,11 +1465,15 @@ impl Jit {
                                 types::I64
                             } else if desc.starts_with("(D)") {
                                 types::F64
+                            } else if desc.starts_with("(F)") {
+                                types::F32
                             } else {
                                 types::I32
                             };
                             let fid = if desc.starts_with("(D)") {
                                 sb_app_dbl_id
+                            } else if desc.starts_with("(F)") {
+                                sb_app_flt_id
                             } else if desc.starts_with("(C)") {
                                 sb_app_char_id
                             } else if desc.starts_with("(J)") {
@@ -1374,6 +1591,10 @@ impl Jit {
                             let want = ret_type(&desc);
                             let v = if want == types::F64 {
                                 fb.ins().bitcast(types::F64, MemFlags::new(), raw)
+                            } else if want == types::F32 {
+                                // float 的位模式在低 32 位
+                                let lo = fb.ins().ireduce(types::I32, raw);
+                                fb.ins().bitcast(types::F32, MemFlags::new(), lo)
                             } else {
                                 convert_to(&mut fb, raw, want)
                             };
@@ -1622,10 +1843,11 @@ impl Jit {
                 // iaload / laload / faload / daload / aaload / baload / caload / saload
                 // （元素宽度按指令选；boolean/byte/char/short 与 int 一样是 4 字节）
                 0x2e | 0x2f | 0x30 | 0x31 | 0x32 | 0x33 | 0x34 | 0x35 => {
-                    let esize: i64 = if matches!(op, 0x2f | 0x30 | 0x31) { 8 } else { 4 };
+                    let esize: i64 = if matches!(op, 0x2f | 0x31) { 8 } else { 4 };
                     let ty = match op {
                         0x2f => types::I64,
-                        0x30 | 0x31 => types::F64,
+                        0x31 => types::F64,
+                        0x30 => types::F32, // faload：元素 4 字节
                         0x32 => types::I64,
                         _ => types::I32,
                     };
@@ -1644,10 +1866,11 @@ impl Jit {
                 }
                 // iastore / lastore / fastore / dastore / aastore / bastore / castore / sastore
                 0x4f | 0x50 | 0x51 | 0x52 | 0x53 | 0x54 | 0x55 | 0x56 => {
-                    let esize: i64 = if matches!(op, 0x50 | 0x51 | 0x52) { 8 } else { 4 };
+                    let esize: i64 = if matches!(op, 0x50 | 0x52) { 8 } else { 4 };
                     let want = match op {
                         0x50 => types::I64,
-                        0x51 | 0x52 => types::F64,
+                        0x52 => types::F64,
+                        0x51 => types::F32, // fastore：元素 4 字节
                         0x53 => types::I64,
                         _ => types::I32,
                     };
@@ -1852,6 +2075,8 @@ impl Jit {
         let rty = ret_type(desc);
         let ret_kind = if rty == types::F64 {
             rt::RET_F64
+        } else if rty == types::F32 {
+            rt::RET_F32
         } else if rty == types::I64 {
             rt::RET_I64
         } else {
@@ -1883,26 +2108,39 @@ impl Jit {
 /// 内建 ABI 的实参：统一转成 i64（double/float 走位模式）
 fn abi_arg(fb: &mut FunctionBuilder, v: Value, desc: &str) -> Value {
     match desc.as_bytes().first().copied() {
-        Some(b'D') | Some(b'F') => fb.ins().bitcast(types::I64, MemFlags::new(), v),
+        Some(b'D') => fb.ins().bitcast(types::I64, MemFlags::new(), v),
+        // float：位模式塞进 i64 的低 32 位（运行时按 i64 收，解码时只取低 32 位）
+        Some(b'F') => {
+            let b = fb.ins().bitcast(types::I32, MemFlags::new(), v);
+            fb.ins().uextend(types::I64, b)
+        }
         _ => convert_to(fb, v, types::I64),
     }
 }
 
-/// 内建 ABI 的返回值：i64 → 描述符要求的机器类型（double 走位模式还原）
+/// 内建 ABI 的返回值：i64 → 描述符要求的机器类型（double/float 走位模式还原）
 fn abi_result(fb: &mut FunctionBuilder, raw: Value, ret: &str) -> Value {
     match ret.as_bytes().first().copied() {
-        Some(b'D') | Some(b'F') => fb.ins().bitcast(types::F64, MemFlags::new(), raw),
+        Some(b'D') => fb.ins().bitcast(types::F64, MemFlags::new(), raw),
+        Some(b'F') => {
+            let lo = fb.ins().ireduce(types::I32, raw);
+            fb.ins().bitcast(types::F32, MemFlags::new(), lo)
+        }
         Some(b'J') | Some(b'L') | Some(b'[') => raw,
         _ => convert_to(fb, raw, types::I32),
     }
+}
+
+/// 这个机器类型是不是 JVM 意义上的 cat-2（long/double 占两个栈槽；F32 不算）
+fn is_wide_ty(ty: cranelift_codegen::ir::Type) -> bool {
+    ty == types::I64 || ty == types::F64
 }
 
 fn bin(
     fb: &mut FunctionBuilder,
     stack: &mut Vec<Value>,
     f: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
-) -> Result<(), JitError> {
-    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+) -> Result<(), JitError> {    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
     let v = f(fb, a, b);
     stack.push(v);
@@ -1913,6 +2151,24 @@ fn const_int(cf: &ClassFile, idx: u16) -> i64 {
     match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
         Some(CpEntry::Integer(v)) => *v as i32 as i64,
         _ => 0,
+    }
+}
+
+/// `ldc`/`ldc_w` 的非字符串常量：Float 压 F32，其余（Integer 等）压 I32
+fn const_load(
+    fb: &mut FunctionBuilder,
+    stack: &mut Vec<Value>,
+    cf: &ClassFile,
+    idx: u16,
+) {
+    match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::Float(bits)) => {
+            stack.push(fb.ins().f32const(f32::from_bits(*bits)));
+        }
+        _ => {
+            let v = const_int(cf, idx);
+            stack.push(fb.ins().iconst(types::I32, v));
+        }
     }
 }
 

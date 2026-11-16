@@ -22,6 +22,10 @@ pub(crate) fn emit_xreturn(em: &mut Emit, kind: u8) {
             em.op(0xAF); // dreturn
             em.pop(2);
         }
+        K_FLOAT => {
+            em.op(0xAE); // freturn（占 1 槽，但验证类型是 float）
+            em.pop(1);
+        }
         K_REF => {
             em.op(0xB0); // areturn
             em.pop(1);

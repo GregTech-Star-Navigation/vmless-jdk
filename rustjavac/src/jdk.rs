@@ -164,6 +164,10 @@ pub const FIELDS: &[(&str, &str, &str)] = &[
     ("java/lang/Character", "MIN_VALUE", "C"),
     ("java/lang/Boolean", "TRUE", "Ljava/lang/Boolean;"),
     ("java/lang/Boolean", "FALSE", "Ljava/lang/Boolean;"),
+    // float 的边界值：验 `println(float)` 的十进制形态要用（**只能追加**，下标即 op 号）
+    ("java/lang/Float", "MAX_VALUE", "F"),
+    ("java/lang/Float", "MIN_VALUE", "F"),
+    ("java/lang/Float", "NaN", "F"),
 ];
 
 /// 虚方法的 op 号（没登记就是 None）

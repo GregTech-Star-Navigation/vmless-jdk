@@ -6,6 +6,8 @@
 //! 本文件只剩模块声明与顶层 re-export —— 具体实现见各模块目录。
 
 pub mod classfile;
+/// 类来源：目录 / jar / jimage（JDK 的 `lib/modules`）
+pub mod load;
 pub mod front;
 pub mod jdk;
 pub mod sema;
@@ -17,7 +19,7 @@ pub mod jit;
 
 // 旧路径保持可用：`classfile::parse` / `classfile::write` / `classfile::Error` / `classfile::Result`
 pub use crate::classfile::{parse, write, Error, Result};
-pub use crate::classfile::{java_double_to_string, ret_of};
+pub use crate::classfile::{java_double_to_string, java_float_to_string, ret_of};
 pub use crate::classfile::{Attribute, ClassFile, CpEntry, Member};
 // 旧路径保持可用：`classfile::ast::*` / `classfile::lexer::*` / `classfile::parser::*`
 pub use crate::front::{ast, lexer, parser};

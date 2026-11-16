@@ -14,11 +14,13 @@ use super::Vm;
 use super::VmError;
 
 impl Vm {
-    pub(super) fn ldc_int(&mut self, class: usize, index: u16) -> Result<i32, VmError> {
+    /// `ldc` / `ldc_w`：int / float / String 常量（都只占一个槽）
+    pub(super) fn ldc(&mut self, class: usize, index: u16) -> Result<Slot, VmError> {
         let cf = self.store.classes[class].clone();
         match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
-            Some(CpEntry::Integer(v)) => Ok(*v as i32),
-            Some(CpEntry::String(_)) => Ok(self.string_handle(class, index)), // 句柄进字符串堆
+            Some(CpEntry::Integer(v)) => Ok(Slot::I(*v as i32)),
+            Some(CpEntry::Float(bits)) => Ok(Slot::Fl(f32::from_bits(*bits))),
+            Some(CpEntry::String(_)) => Ok(Slot::I(self.string_handle(class, index))), // 句柄进字符串堆
             other => err(format!("ldc 不支持的类型: {other:?}")),
         }
     }
@@ -100,6 +102,7 @@ impl Vm {
                 0x02 => frame.push(Slot::I(-1)),
                 0x03..=0x08 => frame.push(Slot::I(op as i32 - 0x03)),
                 0x09 | 0x0a => frame.push(Slot::L(op as i64 - 0x09)), // lconst_0/1
+                0x0b..=0x0d => frame.push(Slot::Fl(op as f32 - 0x0b as f32)), // fconst_0/1/2
                 0x0e | 0x0f => frame.push(Slot::F(if op == 0x0e { 0.0 } else { 1.0 })),
                 0x10 => {
                     let v = body[pc] as i8 as i32;
@@ -114,14 +117,14 @@ impl Vm {
                 0x12 => {
                     let idx = body[pc] as u16;
                     pc += 1;
-                    let v = self.ldc_int(class, idx)?;
-                    frame.push(Slot::I(v));
+                    let v = self.ldc(class, idx)?;
+                    frame.push(v);
                 }
                 0x13 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let v = self.ldc_int(class, idx)?;
-                    frame.push(Slot::I(v));
+                    let v = self.ldc(class, idx)?;
+                    frame.push(v);
                 }
                 0x14 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
@@ -202,6 +205,27 @@ impl Vm {
                     let v = *frame.stack.last().unwrap_or(&Slot::I(0));
                     frame.push(v);
                 }
+                // dup_x1：… v2, v1 → … v1, v2, v1（两个都是 1 槽）
+                0x5a => {
+                    let n = frame.stack.len();
+                    if n >= 2 {
+                        let top = frame.stack[n - 1];
+                        frame.stack.insert(n - 2, top);
+                    }
+                }
+                // dup_x2：形式 1 = 全 1 槽（… v3,v2,v1 → … v1,v3,v2,v1）；
+                //         形式 2 = 下面那个是宽值（… v2,v1 → … v1,v2,v1）
+                0x5b => {
+                    let n = frame.stack.len();
+                    if n >= 2 {
+                        let top = frame.stack[n - 1];
+                        if frame.stack[n - 2].is_wide() {
+                            frame.stack.insert(n - 2, top);
+                        } else if n >= 3 {
+                            frame.stack.insert(n - 3, top);
+                        }
+                    }
+                }
                 // dup2：复制一个宽值，或栈顶两个普通值
                 0x5c => {
                     let n = frame.stack.len();
@@ -213,6 +237,60 @@ impl Vm {
                         frame.push(a);
                         frame.push(top);
                     }
+                }
+                // dup2_x1：形式 1 = 全 1 槽（… v3,v2,v1 → … v2,v1,v3,v2,v1）；
+                //          形式 2 = 栈顶是宽值（… v2,v1 → … v1,v2,v1）
+                0x5d => {
+                    let n = frame.stack.len();
+                    if n >= 2 {
+                        let top = frame.stack[n - 1];
+                        if top.is_wide() {
+                            frame.stack.insert(n - 2, top);
+                        } else if n >= 3 {
+                            let below = frame.stack[n - 2];
+                            frame.stack.insert(n - 3, below);
+                            frame.stack.insert(n - 2, top);
+                        }
+                    }
+                }
+                // dup2_x2：四个形式，按「栈顶两项的槽宽」区分
+                0x5e => {
+                    let n = frame.stack.len();
+                    if n >= 2 {
+                        let top = frame.stack[n - 1];
+                        if frame.stack[n - 2].is_wide() {
+                            // 形式 2 / 4：… v2(宽), v1 → … v1, v2, v1
+                            frame.stack.insert(n - 2, top);
+                        } else if n >= 3 {
+                            let below = frame.stack[n - 2];
+                            let at = if frame.stack[n - 3].is_wide() {
+                                Some(n - 3) // 形式 3：… v3(宽), v2, v1
+                            } else if n >= 4 {
+                                Some(n - 4) // 形式 1：… v4, v3, v2, v1
+                            } else {
+                                None
+                            };
+                            if let Some(at) = at {
+                                frame.stack.insert(at, below);
+                                frame.stack.insert(at + 1, top);
+                            }
+                        }
+                    }
+                }
+                // swap：交换栈顶两个 1 槽值
+                0x5f => {
+                    let n = frame.stack.len();
+                    if n >= 2 {
+                        frame.stack.swap(n - 1, n - 2);
+                    }
+                }
+                0x84 => {
+                    // iinc：局部变量按常量就地加减（索引与常量各 1 字节，都可为负）
+                    let slot = body[pc] as usize;
+                    let delta = body[pc + 1] as i8 as i32;
+                    pc += 2;
+                    let v = frame.load(slot).as_i32().wrapping_add(delta);
+                    frame.store(slot, Slot::I(v));
                 }
                 // int 算术
                 0x60 | 0x64 | 0x68 | 0x6c | 0x70 => {
@@ -273,6 +351,19 @@ impl Vm {
                     };
                     frame.push(Slot::F(r));
                 }
+                // float 算术：**必须按 f32 算再收成 f32**（f64 中间结果会让 `1.0f/3.0f` 变成 double）
+                0x62 | 0x66 | 0x6a | 0x6e | 0x72 => {
+                    let b = frame.pop()?.as_f32();
+                    let a = frame.pop()?.as_f32();
+                    let r = match op {
+                        0x62 => a + b,
+                        0x66 => a - b,
+                        0x6a => a * b,
+                        0x6e => a / b,
+                        _ => a % b, // frem：与 fmodf 一致
+                    };
+                    frame.push(Slot::Fl(r));
+                }
                 0x74 => {
                     let a = frame.pop_i()?;
                     frame.push(Slot::I(a.wrapping_neg()));
@@ -280,6 +371,10 @@ impl Vm {
                 0x75 => {
                     let a = frame.pop()?.as_i64();
                     frame.push(Slot::L(a.wrapping_neg()));
+                }
+                0x76 => {
+                    let a = frame.pop()?.as_f32();
+                    frame.push(Slot::Fl(-a));
                 }
                 0x77 => {
                     let a = frame.pop()?.as_f64();
@@ -292,7 +387,7 @@ impl Vm {
                 }
                 0x86 => {
                     let a = frame.pop_i()?;
-                    frame.push(Slot::F(a as f32 as f64)); // i2f
+                    frame.push(Slot::Fl(a as f32)); // i2f
                 }
                 0x87 => {
                     let a = frame.pop_i()?;
@@ -304,23 +399,23 @@ impl Vm {
                 }
                 0x89 => {
                     let a = frame.pop()?.as_i64();
-                    frame.push(Slot::F(a as f32 as f64)); // l2f
+                    frame.push(Slot::Fl(a as f32)); // l2f
                 }
                 0x8a => {
                     let a = frame.pop()?.as_i64();
                     frame.push(Slot::F(a as f64)); // l2d
                 }
                 0x8b => {
-                    let a = frame.pop()?.as_f64();
+                    let a = frame.pop()?.as_f32();
                     frame.push(Slot::I(a as i32)); // f2i（Rust 的 as 与 Java 一样饱和）
                 }
                 0x8c => {
-                    let a = frame.pop()?.as_f64();
+                    let a = frame.pop()?.as_f32();
                     frame.push(Slot::L(a as i64)); // f2l
                 }
                 0x8d => {
-                    let a = frame.pop()?.as_f64();
-                    frame.push(Slot::F(a)); // f2d
+                    let a = frame.pop()?.as_f32();
+                    frame.push(Slot::F(a as f64)); // f2d（f32 → f64 是精确的）
                 }
                 0x8e => {
                     let a = frame.pop()?.as_f64();
@@ -332,7 +427,7 @@ impl Vm {
                 }
                 0x90 => {
                     let a = frame.pop()?.as_f64();
-                    frame.push(Slot::F(a as f32 as f64)); // d2f
+                    frame.push(Slot::Fl(a as f32)); // d2f
                 }
                 0x91 => {
                     let a = frame.pop_i()?;
@@ -406,7 +501,7 @@ impl Vm {
                 }
                 0xac => return Ok(Slot::I(frame.pop_i()?)),
                 0xad => return Ok(Slot::L(frame.pop()?.as_i64())),
-                0xae => return Ok(Slot::F(frame.pop()?.as_f64())),
+                0xae => return Ok(Slot::Fl(frame.pop()?.as_f32())), // freturn
                 0xaf => return Ok(Slot::F(frame.pop()?.as_f64())),
                 0xb0 => return Ok(Slot::I(frame.pop_i()?)),
                 0xb1 => return Ok(Slot::I(0)),
@@ -438,7 +533,7 @@ impl Vm {
                     frame.push(match op {
                         0x2f => Slot::L(v.as_i64()),   // laload
                         0x31 => Slot::F(v.as_f64()),   // daload
-                        0x30 => Slot::F(v.as_f64()),   // faload
+                        0x30 => Slot::Fl(v.as_f32()),  // faload
                         _ => Slot::I(v.as_i32()),      // iaload / aaload
                     });
                 }
@@ -453,7 +548,7 @@ impl Vm {
                             a[idx as usize] = match op {
                                 0x50 => Slot::L(v.as_i64()),  // lastore
                                 0x52 => Slot::F(v.as_f64()),  // dastore
-                                0x51 => Slot::F(v.as_f64()),  // fastore
+                                0x51 => Slot::Fl(v.as_f32()), // fastore
                                 _ => Slot::I(v.as_i32()),     // iastore / aastore
                             };
                         }
@@ -476,7 +571,7 @@ impl Vm {
                     let (desc, zero) = match atype {
                         11 => ("[J", Slot::L(0)),
                         7 => ("[D", Slot::F(0.0)),
-                        6 => ("[F", Slot::F(0.0)),
+                        6 => ("[F", Slot::Fl(0.0)),
                         4 => ("[Z", Slot::I(0)),
                         5 => ("[C", Slot::I(0)),
                         8 => ("[B", Slot::I(0)),

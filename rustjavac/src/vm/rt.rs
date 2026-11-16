@@ -17,6 +17,7 @@ impl Vm {
         let text = match desc {
             "(J)Ljava/lang/StringBuilder;" => arg.as_i64().to_string(),
             "(D)Ljava/lang/StringBuilder;" => crate::java_double_to_string(arg.as_f64()),
+            "(F)Ljava/lang/StringBuilder;" => crate::java_float_to_string(arg.as_f32()),
             "(Z)Ljava/lang/StringBuilder;" => (if arg.as_i32() != 0 { "true" } else { "false" }).to_string(),
             "(C)Ljava/lang/StringBuilder;" => {
                 char::from_u32(arg.as_i32() as u32).unwrap_or(0 as char).to_string()

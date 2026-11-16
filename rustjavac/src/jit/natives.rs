@@ -584,8 +584,12 @@ pub extern "C" fn builtin_sfield(op: u32) -> i64 {
         ("java/lang/Long", "MAX_VALUE") => i64::MAX,
         ("java/lang/Long", "MIN_VALUE") => i64::MIN,
         ("java/lang/Double", "MAX_VALUE") => f64::MAX.to_bits() as i64,
-        ("java/lang/Double", "MIN_VALUE") => f64::MIN_POSITIVE.to_bits() as i64,
+        ("java/lang/Double", "MIN_VALUE") => f64::from_bits(1).to_bits() as i64, // 最小 subnormal
         ("java/lang/Double", "NaN") => f64::NAN.to_bits() as i64,
+        // float 的位模式放低 32 位（调用点按 F32 位风格还原）
+        ("java/lang/Float", "MAX_VALUE") => f32::MAX.to_bits() as i64,
+        ("java/lang/Float", "MIN_VALUE") => f32::from_bits(1).to_bits() as i64, // 最小 subnormal
+        ("java/lang/Float", "NaN") => f32::NAN.to_bits() as i64,
         ("java/lang/Character", "MAX_VALUE") => u16::MAX as i64,
         ("java/lang/Character", "MIN_VALUE") => 0,
         ("java/lang/Boolean", "TRUE") => bool_singleton(1),
