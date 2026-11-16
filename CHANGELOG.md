@@ -320,3 +320,13 @@
 **验证：7 个异常样例 + 26 个回归样例，HotSpot / 解释器 / JIT 三路逐字节一致**
 （`TryThrow TryFinally TryNested TryCross TryCatch2 TryProbe TryProbe2` + 未捕获退出码 1/1/1）；
 `cargo test --lib` 29 passed。
+
+## 0.33.0 — 2026-11-16 · 前端模块化（纯结构重构）
+
+- `lib.rs` 从 567 行降到 22 行，只剩模块声明与 re-export
+- 拆出 `classfile/{mod,pool,attr,read,write}`、`front/{ast,lexer/,parser/{decl,stmt,expr}}`、
+  `sema/{mod,symbols}`、`lower/`
+- **零逻辑改动**：只新增 `pub mod`/`pub use`/`use` 与跨文件调用必需的 `pub(crate)`；
+  逐行多重集合比对，丢失 0 行、新增 0 行逻辑
+- 公开 API 全兼容，`examples/` 零改动；`cargo test` 29 passed；样例 **34/34 三路一致**
+- 新增 `docs/模块结构.md`

@@ -2,97 +2,12 @@
 //!
 //! 先按 JLS §3.3 处理 unicode 转义（`\uXXXX`），再切 token。
 //! 支持：标识符、全部关键字、各类字面量（含文本块）、注释、全部运算符。
+//!
+//! token 种类与关键字表在 `token` 子模块，本模块只放词法主循环。
 
-use std::fmt;
+pub mod token;
 
-#[derive(Clone, Debug, PartialEq)]
-pub enum Tok {
-    Ident(String),
-    Kw(&'static str),
-    IntLit(String),
-    FloatLit(String),
-    CharLit(String),
-    StrLit(String),
-    TextBlock(String),
-
-    LParen,
-    RParen,
-    LBrace,
-    RBrace,
-    LBracket,
-    RBracket,
-    Semi,
-    Comma,
-    Dot,
-    Ellipsis,
-    At,
-    ColonColon,
-    Colon,
-
-    Assign,
-    Plus,
-    Minus,
-    Star,
-    Slash,
-    Percent,
-    Amp,
-    Bar,
-    Caret,
-    Bang,
-    Tilde,
-    Lt,
-    Gt,
-    Le,
-    Ge,
-    EqEq,
-    Ne,
-    AndAnd,
-    OrOr,
-    Shl,
-    Shr,
-    Ushr,
-
-    PlusAssign,
-    MinusAssign,
-    StarAssign,
-    SlashAssign,
-    PercentAssign,
-    AmpAssign,
-    BarAssign,
-    CaretAssign,
-    ShlAssign,
-    ShrAssign,
-    UshrAssign,
-
-    PlusPlus,
-    MinusMinus,
-    Question,
-    Arrow,
-    Eof,
-}
-
-impl fmt::Display for Tok {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        match self {
-            Tok::Ident(s) => write!(f, "标识符 `{s}`"),
-            Tok::Kw(k) => write!(f, "关键字 `{k}`"),
-            Tok::IntLit(s) | Tok::FloatLit(s) => write!(f, "数字 `{s}`"),
-            Tok::StrLit(s) => write!(f, "字符串 `{s}`"),
-            Tok::TextBlock(_) => write!(f, "文本块"),
-            Tok::CharLit(s) => write!(f, "字符 `{s}`"),
-            other => write!(f, "{other:?}"),
-        }
-    }
-}
-
-pub const KEYWORDS: &[&str] = &[
-    "abstract", "assert", "boolean", "break", "byte", "case", "catch", "char", "class", "const",
-    "continue", "default", "do", "double", "else", "enum", "extends", "final", "finally", "float",
-    "for", "goto", "if", "implements", "import", "instanceof", "int", "interface", "long", "native",
-    "new", "package", "private", "protected", "public", "return", "short", "static", "strictfp",
-    "super", "switch", "synchronized", "this", "throw", "throws", "transient", "try", "void",
-    "volatile", "while", "true", "false", "null",
-];
+pub use token::*;
 
 #[derive(Debug)]
 pub struct LexError {
@@ -133,11 +48,6 @@ pub struct Lexer {
     src: Vec<char>,
     pos: usize,
     line: u32,
-}
-
-pub struct Token {
-    pub tok: Tok,
-    pub line: u32,
 }
 
 impl Lexer {
