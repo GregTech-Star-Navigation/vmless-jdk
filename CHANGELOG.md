@@ -542,3 +542,14 @@ ALLOC_NS=188.4  GC_COUNT=6  LIVE_AFTER=4026528  HEAP_MB=3.84
 
 **已知边界**：jimage 的压缩条目（`jlink --compress`）明确报错（本机 JDK 的 30482 条 compressed=0，不受影响）；
 zip64/加密不支持；`-jar` 暂不支持给 main 传参；**`java.*` 故意不进执行闭包**（真字节码会盖掉内建实现）。
+
+## 0.44.1 — 2026-11-17 · Minecraft 缺口量化清单
+
+新增 `docs/MINECRAFT-需要什么.md`（分析文档，不含实现）：
+
+- **MC 本体 0 个 native、0 处 `java.lang.foreign`**；native 债务全在
+  **`java.base` 自己（748 个 native / 107 个类）** 和 **LWJGL（~5,345 个 JNI 入口）** 上
+- **`invokedynamic` 命中 5,665/11,383 个 MC 类**；`tableswitch` 321 类、`fconst_*` 942 类、`monitorenter` 22 类
+- **FFM 替代 JNI 已证伪**：`GL11C` 仍是 62 个 `native`，opengl 模块 2,278 个 native、`java/lang/foreign` 引用 0 处
+- P0 四块（反射 / `java.lang.invoke` / JNI / 线程 + 类加载模块）合计 **2.0–2.8 万行 / 32–48 人周**
+- 推荐路线：补 9 条指令 → **先跑服务端**（7,762 类、零 LWJGL）→ 客户端再上 JNI+GL
