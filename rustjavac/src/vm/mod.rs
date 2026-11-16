@@ -6,21 +6,21 @@
 //! `System.out.println(int|long|double|String)`、invokestatic、各 xreturn。
 //!
 //! 本文件只剩入口与 `Vm` 的定义 —— 具体实现按职责分散在同目录各模块里。
-
 use crate::{parse, ClassFile};
 use std::collections::HashMap;
-
 mod call;
 mod class;
 mod exception;
 mod exec;
 mod frame;
 mod heap;
+mod load;
 mod natives;
 mod slot;
 
 pub use slot::Slot;
 pub(crate) use class::builtin_super;
+use load::ClassStore;
 
 #[derive(Debug)]
 pub struct VmError {
@@ -43,63 +43,43 @@ pub struct ExecResult {
     pub exception: Option<String>,
 }
 
-pub struct Vm<'a> {
-    class: &'a ClassFile,
-    methods: HashMap<(String, String), &'a crate::Member>,
+pub struct Vm {
+    /// 所有已加载的类 + 继承/字段/方法元数据
+    store: ClassStore,
     output: Vec<String>,
     depth: usize,
     /// 对象堆：每个对象是一组字段槽（Slot 自带宽度，long/double 不会被截断）；
     /// 引用 = 下标 + 1（0 表示 null）
     objects: Vec<Vec<Slot>>,
-    /// 对象堆的运行时类型名（instanceof / checkcast 用）
+    /// 对象堆的运行时类型名（instanceof / checkcast / 虚分派用）
     object_class: Vec<String>,
-    /// 实例字段名 → 下标
-    field_index: HashMap<String, usize>,
-    /// 本类实例字段个数
-    field_count: usize,
     /// 数组堆：每个数组是一组元素槽；句柄 = -(下标 + 1)
     arrays: Vec<Vec<Slot>>,
     /// 数组堆的类描述符，如 `[I` / `[Ljava/lang/String;`
     array_class: Vec<String>,
     /// 字符串常量堆；句柄 = STR_BASE + 下标
     strings: Vec<String>,
-    /// 常量池索引 → 字符串句柄（同一常量必须拿到同一句柄，否则引用相等会错）
-    string_handles: HashMap<u16, i32>,
+    /// (类下标, 常量池索引) → 字符串句柄（同一常量必须拿到同一句柄，否则引用相等会错）
+    string_handles: HashMap<(usize, u16), i32>,
     /// 异常对象句柄 → 构造函数里那个 message 的字符串句柄。
     /// `new RuntimeException("boom")` 的构造器在 java.* 里（我们没有它的字节码），
     /// 所以构造时只把消息记下来，抛出来时再拼。
     exc_msgs: HashMap<i32, i32>,
 }
 
-impl<'a> Vm<'a> {
-    pub fn new(class: &'a ClassFile) -> Self {
-        let mut methods = HashMap::new();
-        for m in &class.methods {
-            let name = String::from_utf8_lossy(class.utf8(m.name_index).unwrap_or_default()).into_owned();
-            let desc =
-                String::from_utf8_lossy(class.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
-            methods.insert((name, desc), m);
-        }
-        let mut field_index = HashMap::new();
-        let mut idx = 0usize;
-        for f in &class.fields {
-            let name = String::from_utf8_lossy(class.utf8(f.name_index).unwrap_or_default()).into_owned();
-            let is_static = f.access_flags & 0x0008 != 0;
-            if !is_static {
-                field_index.insert(name, idx);
-                idx += 1;
-            }
-        }
-        let n_fields = idx;
+impl Vm {
+    /// 用一批已解析的类建解释器（`main_class` 是入口类名）
+    pub fn new(classes: Vec<ClassFile>, main_class: &str) -> Result<Self, VmError> {
+        Ok(Self::from_store(ClassStore::new(classes, Some(main_class))?))
+    }
+
+    pub(crate) fn from_store(store: ClassStore) -> Self {
         Vm {
-            class,
-            methods,
+            store,
             output: Vec::new(),
             depth: 0,
             objects: Vec::new(),
             object_class: Vec::new(),
-            field_index,
-            field_count: n_fields,
             arrays: Vec::new(),
             array_class: Vec::new(),
             strings: Vec::new(),
@@ -110,11 +90,12 @@ impl<'a> Vm<'a> {
 
     /// 跑 main([Ljava/lang/String;)V
     pub fn run_main(&mut self) -> Result<ExecResult, VmError> {
-        let m = *self
-            .methods
-            .get(&("main".to_string(), "([Ljava/lang/String;)V".to_string()))
+        let mi = self
+            .store
+            .main_method()
             .ok_or_else(|| VmError { msg: "找不到 main([Ljava/lang/String;)V".into(), exc: None })?;
-        match self.execute(m, "([Ljava/lang/String;)V", &[Slot::I(0)], false) {
+        let main_class = self.store.main;
+        match self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false) {
             Ok(r) => Ok(ExecResult {
                 return_value: r.as_i32(),
                 output: std::mem::take(&mut self.output),
@@ -134,10 +115,25 @@ impl<'a> Vm<'a> {
     }
 }
 
-/// 从字节加载并执行 main
+/// 从字节加载并执行 main（只有这一个类，父类找不到就是运行时错误）
 pub fn run_class_bytes(bytes: &[u8]) -> Result<ExecResult, VmError> {
     let cf = parse(bytes).map_err(|e| VmError { msg: format!("class 解析失败: {e}"), exc: None })?;
-    let mut vm = Vm::new(&cf);
+    let name = cf
+        .this_class_name()
+        .ok_or_else(|| VmError { msg: "class 没有 this_class".into(), exc: None })?;
+    Vm::new(vec![cf], &name)?.run_main()
+}
+
+/// 从文件加载并执行 main：所在目录里的 .class 一起读进来（继承链上的父类）
+pub fn run_class_file(path: &str) -> Result<ExecResult, VmError> {
+    let bytes = std::fs::read(path).map_err(|e| VmError { msg: format!("读取 {path} 失败: {e}"), exc: None })?;
+    let cf = parse(&bytes).map_err(|e| VmError { msg: format!("class 解析失败: {e}"), exc: None })?;
+    let name = cf
+        .this_class_name()
+        .ok_or_else(|| VmError { msg: "class 没有 this_class".into(), exc: None })?;
+    let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ".".into());
+    let store = ClassStore::load_dir(&dir, &name)?;
+    let mut vm = Vm::from_store(store);
     vm.run_main()
 }
 

@@ -423,7 +423,14 @@ impl Parser {
                 self.advance();
                 if matches!(self.cur(), Tok::LParen) {
                     let args = self.parse_args()?;
-                    return Ok(Expr::Call { recv: None, name: "super".into(), args, type_args: vec![] });
+                    // `super(...)` 是父类构造器调用（不是普通方法调用）：
+                    // 用 recv = Super 与 `super.m()` 统一表示
+                    return Ok(Expr::Call {
+                        recv: Some(Box::new(Expr::Super)),
+                        name: "super".into(),
+                        args,
+                        type_args: vec![],
+                    });
                 }
                 Ok(Expr::Super)
             }

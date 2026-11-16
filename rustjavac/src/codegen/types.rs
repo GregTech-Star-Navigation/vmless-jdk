@@ -195,7 +195,15 @@ pub(crate) fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError
 pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
     match e {
         Expr::Ident(n) => ctx.local_ty.get(n).cloned(),
-        Expr::Field(_, n) => ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).cloned(),
+        Expr::Field(r, n) => {
+            // 接收者静态类型已知就按它的字段表查（含继承）
+            if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
+                if let Some(d) = ctx.type_fields.get(&owner).and_then(|f| f.get(n)) {
+                    return Some(type_from_desc(d));
+                }
+            }
+            ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).cloned()
+        }
         Expr::Cast { ty, .. } => Some(ty.clone()),
         Expr::New { ty, .. } => Some(ty.clone()),
         Expr::ArrayNew { elem, .. } => Some(Type::Array(Box::new(elem.clone()))),
@@ -223,7 +231,15 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
         }
         Expr::FloatLit(_) => K_DOUBLE,
         Expr::Cast { ty, .. } => kind_of(ty),
-        Expr::Ident(n) => ctx.local_kind.get(n).copied().unwrap_or(K_INT),
+        // 裸名字既可能是局部变量，也可能是隐式 this 的字段（`return d * 2.0;`）：
+        // 不查字段表的话 long/double 字段会被当成 int，多插一条 i2d 直接 VerifyError
+        Expr::Ident(n) => ctx.local_kind.get(n).copied().unwrap_or_else(|| {
+            ctx.fields
+                .get(n)
+                .and_then(|i| ctx.field_descs.get(*i))
+                .map(|d| kind_from_desc(d))
+                .unwrap_or(K_INT)
+        }),
         Expr::Binary { op, lhs, rhs } => match op {
             BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne | BinOp::And
             | BinOp::Or => K_BOOL,
@@ -231,23 +247,90 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
         },
         Expr::Unary { expr, .. } => expr_kind(expr, ctx),
         Expr::ArrayAccess { array, .. } => elem_kind(array, ctx),
-        Expr::Call { recv, name, .. } => {
-            let desc = if recv.is_some() {
-                ctx.instance_methods.get(name.as_str())
-            } else {
-                ctx.static_methods.get(name.as_str())
-            };
-            desc.map(|d| kind_from_ret(d)).unwrap_or(K_INT)
-        }
-        Expr::StrLit(_) | Expr::This | Expr::New { .. } | Expr::ArrayNew { .. } | Expr::Null => K_REF,
-        Expr::InstanceOf { .. } | Expr::BoolLit(_) => K_BOOL,
-        Expr::Field(_, name) => ctx
-            .fields
-            .get(name)
-            .and_then(|i| ctx.field_descs.get(*i))
-            .map(|d| kind_from_desc(d))
+        Expr::Call { recv, name, .. } => call_desc(recv.as_deref(), name, ctx)
+            .map(|d| kind_from_ret(&d))
             .unwrap_or(K_INT),
+        Expr::StrLit(_) | Expr::This | Expr::Super | Expr::New { .. } | Expr::ArrayNew { .. } | Expr::Null => K_REF,
+        Expr::InstanceOf { .. } | Expr::BoolLit(_) => K_BOOL,
+        Expr::Field(r, name) => {
+            let (_, desc) = field_access(r, name, ctx);
+            kind_from_desc(&desc)
+        }
         _ => K_INT,
     }
 }
 
+
+// ---------- 继承相关的解析辅助 ----------
+
+/// 描述符 → AST 类型。继承来的字段只有描述符（没有 AST），要还原成类型。
+pub(crate) fn type_from_desc(desc: &str) -> Type {
+    match desc.as_bytes().first().copied() {
+        Some(b'I') => Type::Prim("int"),
+        Some(b'J') => Type::Prim("long"),
+        Some(b'S') => Type::Prim("short"),
+        Some(b'B') => Type::Prim("byte"),
+        Some(b'C') => Type::Prim("char"),
+        Some(b'Z') => Type::Prim("boolean"),
+        Some(b'F') => Type::Prim("float"),
+        Some(b'D') => Type::Prim("double"),
+        Some(b'V') => Type::Prim("void"),
+        Some(b'[') => Type::Array(Box::new(type_from_desc(&desc[1..]))),
+        _ => {
+            let inner = desc.trim_start_matches('L').trim_end_matches(';');
+            Type::Named { path: inner.split('/').map(|s| s.to_string()).collect(), args: vec![] }
+        }
+    }
+}
+
+/// 类型 → 内部类名（数组给描述符，原始类型给 None）
+pub(crate) fn type_internal(ty: &Type) -> Option<String> {
+    match ty {
+        Type::Named { path, .. } => Some(internal_name(path)),
+        Type::Array(_) => Some(descriptor(ty)),
+        _ => None,
+    }
+}
+
+/// 一次方法调用的描述符。
+///
+/// 接收者的静态类型能推出来就用它查（`P p = ...; p.get()` 沿 P 的继承链），
+/// 推不出来就退回本类链 —— 后者是历史行为，`this.f()` / 隐式 this 都走这里。
+pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, ctx: &Ctx) -> Option<String> {
+    let Some(r) = recv else {
+        // 无接收者：先看本类静态方法，再看（含继承的）实例方法 —— 后者等于 `this.m()`
+        if let Some(d) = ctx.static_methods.get(name) {
+            return Some(d.clone());
+        }
+        return ctx.instance_methods.get(name).cloned();
+    };
+    // super.m()：从**父类**开始解析（否则会调到自己，覆写就成了死循环）
+    if matches!(r, Expr::Super) {
+        return ctx.type_methods.get(&ctx.super_name).and_then(|m| m.get(name)).cloned();
+    }
+    if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
+        if let Some(d) = ctx.type_methods.get(&owner).and_then(|m| m.get(name)) {
+            return Some(d.clone());
+        }
+    }
+    ctx.instance_methods.get(name).cloned()
+}
+
+/// 一次字段访问的 (引用类, 描述符)。
+///
+/// 引用类用**接收者的静态类型**（拿不到就本类）：`getfield P.x` 作用在 Q 实例上，
+/// 偏移沿 P 的继承链算出来，与 Q 的布局一致（父类字段在前）。
+pub(crate) fn field_access(recv: &Expr, name: &str, ctx: &Ctx) -> (String, String) {
+    if let Some(owner) = expr_type(recv, ctx).as_ref().and_then(type_internal) {
+        if let Some(d) = ctx.type_fields.get(&owner).and_then(|f| f.get(name)) {
+            return (owner, d.clone());
+        }
+    }
+    let desc = ctx
+        .fields
+        .get(name)
+        .and_then(|i| ctx.field_descs.get(*i))
+        .cloned()
+        .unwrap_or_else(|| "I".to_string());
+    (ctx.class_name.clone(), desc)
+}

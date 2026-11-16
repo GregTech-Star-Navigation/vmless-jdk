@@ -383,3 +383,21 @@
 
 `cargo test`：28 passed + 1 doc-test（含随机图压力测试，逐对象校验 payload 与引用）；
 rustjavac 重编后样例仍 **34/34 三路一致**。
+
+## 0.37.0 — 2026-11-17 · 继承体系与跨类虚分派
+
+- **`extends`**：`super_class` 写出真实父类；新增 `sema/resolve.rs` 做继承链/字段布局/方法表解析
+  （同一编译单元从 AST 取，否则从 classpath 读 `.class`）
+- **`super(...)` / `super.m()`**：parser 产出 `Call{recv:Super}`，codegen 发 `invokespecial` 到父类；
+  构造器隐式 `super()` 自动补，父类无无参构造器则报错（与 javac 一致）
+- **字段与方法继承**：父类字段在前、子类在后；子类没有的方法落到父类实现
+- **虚分派**：解释器按运行时类沿链解析；JIT 用 `(类标签, 签名) → 实现` 的方法表 `vcall`
+- **`instanceof`/`checkcast`/`catch` 匹配**：改成沿继承链判定（`is_subclass`）
+- **跨编译单元**：`compile_with_path(cu, dirs)` 与 `jit.load_class_path()`，输出目录即 classpath
+- 修两个既有 bug：`expr_kind` 不查字段表导致 double 运算插 `i2d` → VerifyError；
+  隐式 `this` 字段 `getfield` 不记栈深 → `max_stack` 少 1
+
+**验证：42 个样例三路一致**（新增 `InhBasic InhOverride InhChain InhSuperCall InhImplicitSuper
+InhInstanceof InhWide` + 跨单元 `InhUnit`）；`cargo test` 29 passed。
+
+**已知不支持**：接口（`implements` 仍忽略）、`this(...)` 委托、带包名的继承（现已明确报错）。

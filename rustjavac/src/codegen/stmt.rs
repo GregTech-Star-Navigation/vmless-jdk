@@ -101,17 +101,21 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 Expr::Field(r, n) => (r.clone(), n.clone()),
                 _ => unreachable!(),
             };
-            compile_expr(&recv, em, ctx, cp)?;
+            let is_super = matches!(*recv, Expr::Super);
+            if is_super {
+                em.op(0x2A); // aload_0
+                em.push(1);
+            } else {
+                compile_expr(&recv, em, ctx, cp)?;
+            }
             compile_expr(rhs, em, ctx, cp)?;
-            let idx = *ctx
-                .fields
-                .get(&fname)
-                .ok_or_else(|| CompileError { msg: format!("未知字段 `{fname}`") })?;
-            let desc = ctx.field_descs[idx].clone();
-            let owner = ctx.class_name.clone();
+            let (mut owner, desc) = field_access(&recv, &fname, ctx);
+            if is_super {
+                owner = ctx.super_name.clone();
+            }
             let f = cp.field_ref(&owner, &fname, &desc);
             em.op_u2(0xB5, f); // putfield
-            em.pop(if kind_wide(kind_of(&ctx.field_tys[idx])) { 3 } else { 2 });
+            em.pop(if kind_wide(kind_from_desc(&desc)) { 3 } else { 2 });
             Ok(false)
         }
         Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) => {
@@ -119,9 +123,20 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 Expr::Ident(n) => n.clone(),
                 _ => return err("只支持给局部变量赋值"),
             };
-            let slot = ctx
-                .lookup(&name)
-                .ok_or_else(|| CompileError { msg: format!("未定义的变量 `{name}`") })?;
+            let Some(slot) = ctx.lookup(&name) else {
+                // 不是局部变量 → 隐式 this 字段（`x = v;` 这种写法）
+                let (owner, desc) = field_access(&Expr::This, &name, ctx);
+                let Some(_) = ctx.fields.get(&name) else {
+                    return err(format!("未定义的变量 `{name}`"));
+                };
+                em.op(0x2A); // aload_0
+                em.push(1);
+                compile_expr(rhs, em, ctx, cp)?;
+                let f = cp.field_ref(&owner, &name, &desc);
+                em.op_u2(0xB5, f); // putfield
+                em.pop(if kind_wide(kind_from_desc(&desc)) { 3 } else { 2 });
+                return Ok(false);
+            };
             let kind = *ctx.local_kind.get(&name).unwrap_or(&K_INT);
             compile_expr(rhs, em, ctx, cp)?;
             em.store_slot(slot, kind)?;

@@ -73,25 +73,11 @@ pub extern "C" fn catch_match(obj: i64, tag: u32) -> i32 {
     if obj == 0 {
         return 0;
     }
+    if tag == 0 {
+        return 1; // catch-all（finally）
+    }
     let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
-    if actual == tag || tag == 0 {
-        return 1;
-    }
-    let a = class_internal_of(actual);
-    let t = class_internal_of(tag);
-    let mut cur = a;
-    for _ in 0..32 {
-        match crate::vm::builtin_super(&cur) {
-            Some(s) => {
-                if s == t {
-                    return 1;
-                }
-                cur = s.to_string();
-            }
-            None => return 0,
-        }
-    }
-    0
+    i32::from(is_subclass_tag(actual, tag))
 }
 
 /// 未捕获异常：按 JVM 的格式打到 stderr 并结束进程（退出码 1）
@@ -182,14 +168,14 @@ pub extern "C" fn instanceof(obj: i64, tag: u32) -> i32 {
         return 1;
     }
     let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
-    i32::from(actual == tag)
+    i32::from(is_subclass_tag(actual, tag))
 }
 
 /// `checkcast`：类型不符时按 ClassCastException 退出（JIT 还没有异常机制）
 pub extern "C" fn checkcast(obj: i64, tag: u32) -> i64 {
     if obj != 0 && tag != 0 {
         let actual = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
-        if actual != tag {
+        if !is_subclass_tag(actual, tag) {
             eprintln!(
                 "ClassCastException: 类型标签 {actual} 的对象不能转换成标签 {tag}（checkcast 失败）"
             );
@@ -252,4 +238,121 @@ unsafe fn alloc_zeroed(size: usize) -> *mut u8 {
 /// 让 `strtab` 也能用同一个分配器/标签表
 pub(super) fn string_tag() -> u32 {
     tag_of("java/lang/String")
+}
+
+// ---------- 继承：父类表、虚方法表、虚分派 ----------
+
+/// 我们自己 JIT 出来的类的父类（instanceof / checkcast / 虚分派都要沿链走）
+static SUPERS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+/// (方法名, 描述符) → 签名号（调用点只传一个 u32）
+static SIG_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
+/// (类型标签, 签名号) → (函数指针, 返回种类)
+static VMETHODS: Mutex<Vec<((u32, u32), (usize, u8))>> = Mutex::new(Vec::new());
+
+/// 返回值种类
+pub const RET_I32: u8 = 0;
+pub const RET_I64: u8 = 1;
+pub const RET_F64: u8 = 2;
+
+/// 登记一个用户类的父类名
+pub fn register_super(class: &str, super_name: &str) {
+    let mut g = SUPERS.lock().unwrap();
+    if let Some(e) = g.iter_mut().find(|(c, _)| c == class) {
+        e.1 = super_name.to_string();
+    } else {
+        g.push((class.to_string(), super_name.to_string()));
+    }
+}
+
+/// 直接父类：先看登记过的用户类，再看写死的 java.* 链
+fn super_of_name(class: &str) -> Option<String> {
+    if let Some((_, s)) = SUPERS.lock().unwrap().iter().find(|(c, _)| c == class) {
+        return Some(s.clone());
+    }
+    crate::vm::builtin_super(class).map(|s| s.to_string())
+}
+
+/// actual 是不是 target 本身或它的子类
+fn is_subclass_tag(actual: u32, target: u32) -> bool {
+    if actual == target {
+        return true;
+    }
+    if target == tag_of("java/lang/Object") {
+        return true;
+    }
+    let mut cur = class_internal_of(actual);
+    let t = class_internal_of(target);
+    for _ in 0..64 {
+        match super_of_name(&cur) {
+            Some(s) => {
+                if s == t {
+                    return true;
+                }
+                cur = s;
+            }
+            None => return false,
+        }
+    }
+    false
+}
+
+/// (方法名, 描述符) → 签名号（同一个签名永远同号）
+pub fn intern_sig(name: &str, desc: &str) -> u32 {
+    let key = format!("{name}{desc}");
+    let mut g = SIG_IDS.lock().unwrap();
+    if let Some(i) = g.iter().position(|s| *s == key) {
+        return i as u32;
+    }
+    g.push(key);
+    g.len() as u32 - 1
+}
+
+/// 登记一个虚方法实现：`class_tag` 的实例调用 `sig` 时进 `ptr`
+pub fn register_vmethod(class_tag: u32, sig: u32, ptr: usize, ret: u8) {
+    let mut g = VMETHODS.lock().unwrap();
+    if let Some(e) = g.iter_mut().find(|(k, _)| *k == (class_tag, sig)) {
+        e.1 = (ptr, ret);
+    } else {
+        g.push(((class_tag, sig), (ptr, ret)));
+    }
+}
+
+/// 虚方法分派：`locals[0]` 是接收者，按它的**运行时类型标签**查表再间接调用。
+///
+/// 返回值统一按 i64 传回（f64 走位模式、i32 零扩展），调用点再转成真类型。
+pub extern "C" fn vcall(locals: *mut i64, sig: u32) -> i64 {
+    if locals.is_null() {
+        eprintln!("vcall: locals 指针为空");
+        std::process::exit(1);
+    }
+    let obj = unsafe { *locals };
+    if obj == 0 {
+        eprintln!("NullPointerException: 在 null 上调用虚方法（sig {sig}）");
+        std::process::exit(1);
+    }
+    let tag = unsafe { std::ptr::read_unaligned((obj as *const u8).add(4) as *const u32) };
+    let entry = VMETHODS.lock().unwrap().iter().find(|(k, _)| *k == (tag, sig)).map(|(_, v)| *v);
+    let Some((ptr, ret)) = entry else {
+        eprintln!(
+            "NoSuchMethodError: 类 {} 没有虚方法（sig {sig}）",
+            class_internal_of(tag)
+        );
+        std::process::exit(1);
+    };
+    unsafe {
+        match ret {
+            RET_I64 => {
+                let f: unsafe extern "C" fn(*mut i64) -> i64 = std::mem::transmute(ptr);
+                f(locals)
+            }
+            RET_F64 => {
+                let f: unsafe extern "C" fn(*mut i64) -> f64 = std::mem::transmute(ptr);
+                f(locals).to_bits() as i64
+            }
+            _ => {
+                let f: unsafe extern "C" fn(*mut i64) -> i32 = std::mem::transmute(ptr);
+                f(locals) as i64
+            }
+        }
+    }
 }

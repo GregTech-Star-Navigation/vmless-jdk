@@ -4,7 +4,8 @@ fn main() {
     let out_dir = std::env::args().nth(2).expect("用法: compile_src <源文件> <输出目录>");
     let src = std::fs::read_to_string(&src_path).expect("读源码");
     let cu = classfile::parser::parse_compilation_unit(&src).expect("解析失败");
-    let classes = classfile::compiler::compile(&cu).expect("编译失败");
+    // 输出目录同时当 classpath：父类在别的编译单元时从这里读它的 .class
+    let classes = classfile::compiler::compile_with_path(&cu, &[out_dir.clone().into()]).expect("编译失败");
     for (name, bytes) in &classes {
         let file = format!("{}/{}.class", out_dir, name.replace('/', "_"));
         std::fs::write(&file, bytes).expect("写出");

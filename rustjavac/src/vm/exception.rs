@@ -8,7 +8,7 @@ use super::VmError;
     VmError { msg: format!("未捕获的 Java 异常（句柄 {h}）"), exc: Some(h) }
 }
 
-impl<'a> Vm<'a> {
+impl Vm {
     /// 异常对象 → 打印用的 `类名: message`
     pub(super) fn exc_text(&self, handle: i32) -> String {
         let class = self.type_name(handle);
@@ -21,6 +21,7 @@ impl<'a> Vm<'a> {
     /// 按顺序在异常表里找能接住这个异常的 handler（返回 handler 的字节码偏移）
     pub(super) fn find_handler(
         &self,
+        cf: &crate::ClassFile,
         table: &[(u16, u16, u16, u16)],
         pc: usize,
         handle: i32,
@@ -30,7 +31,7 @@ impl<'a> Vm<'a> {
                 if catch_type == 0 {
                     return Ok(Some(handler as usize)); // catch-all（finally）
                 }
-                let name = self.class_name_of(catch_type)?;
+                let name = super::class::class_name_of(cf, catch_type)?;
                 if self.is_instance(handle, &name) {
                     return Ok(Some(handler as usize));
                 }

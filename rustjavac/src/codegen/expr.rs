@@ -12,6 +12,20 @@ pub(crate) fn is_println_call(e: &Expr) -> bool {
     matches!(e, Expr::Call { name, .. } if name == "println")
 }
 
+/// 实参列表 → 参数描述符串（`new T(...)` 与 `super(...)` 共用）
+pub(crate) fn args_desc(args: &[Expr], ctx: &Ctx) -> String {
+    args.iter()
+        .map(|a| match expr_kind(a, ctx) {
+            K_LONG => "J".to_string(),
+            K_DOUBLE => "D".to_string(),
+            K_REF => expr_type(a, ctx)
+                .map(|t| descriptor(&t))
+                .unwrap_or_else(|| "Ljava/lang/String;".to_string()),
+            _ => "I".to_string(),
+        })
+        .collect()
+}
+
 /// println 的引用重载：声明类型确实是 String（或推不出来）才用 println(String)。
 ///
 /// 声明成 `Object` 的局部变量，在有栈图的帧里验证器眼里就是 Object，
@@ -34,12 +48,11 @@ pub(crate) fn ref_println_desc(e: &Expr, ctx: &Ctx) -> &'static str {
 /// 这个表达式是不是一次返回 void 的方法调用（语句位置上不能弹返回值）
 pub(crate) fn is_void_call(e: &Expr, ctx: &Ctx) -> bool {
     let Expr::Call { recv, name, .. } = e else { return false };
-    let desc = if recv.is_some() {
-        ctx.instance_methods.get(name.as_str())
-    } else {
-        ctx.static_methods.get(name.as_str())
-    };
-    matches!(desc, Some(d) if d.ends_with(")V"))
+    // super(...) / super.m() 都是 invokespecial，没有返回值可弹
+    if name == "super" {
+        return true;
+    }
+    matches!(call_desc(recv.as_deref(), name, ctx), Some(d) if d.ends_with(")V"))
 }
 
 pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
@@ -72,23 +85,29 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             em.push(1);
             Ok(())
         }
+        Expr::Super => err("super 只能用在 super(...)、super.m()、super.x 里"),
         Expr::Field(recv, name) if name == "length" && !ctx.fields.contains_key(name) => {
             compile_expr(recv, em, ctx, cp)?;
             em.op(0xBE); // arraylength
             Ok(())
         }
         Expr::Field(recv, name) => {
-            compile_expr(recv, em, ctx, cp)?;
-            let idx = *ctx
-                .fields
-                .get(name)
-                .ok_or_else(|| CompileError { msg: format!("未知字段 `{name}`") })?;
-            let desc = ctx.field_descs[idx].clone();
-            let owner = ctx.class_name.clone();
+            // super.x → 读父类字段，接收者还是 this
+            let is_super = matches!(**recv, Expr::Super);
+            if is_super {
+                em.op(0x2A); // aload_0
+                em.push(1);
+            } else {
+                compile_expr(recv, em, ctx, cp)?;
+            }
+            let (mut owner, desc) = field_access(recv, name, ctx);
+            if is_super {
+                owner = ctx.super_name.clone();
+            }
             let f = cp.field_ref(&owner, name, &desc);
             em.op_u2(0xB4, f); // getfield
             em.pop(1);
-            em.push(if kind_wide(kind_of(&ctx.field_tys[idx])) { 2 } else { 1 });
+            em.push(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
             Ok(())
         }
         Expr::ArrayNew { elem, dims } => {
@@ -140,18 +159,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 Type::Named { path, .. } => internal_name(path),
                 _ => return err("只支持创建对象"),
             };
-            let arg_desc: String = args
-                .iter()
-                .map(|a| match expr_kind(a, ctx) {
-                    K_LONG => "J".to_string(),
-                    K_DOUBLE => "D".to_string(),
-                    K_REF => expr_type(a, ctx)
-                        .map(|t| descriptor(&t))
-                        .unwrap_or_else(|| "Ljava/lang/String;".to_string()),
-                    _ => "I".to_string(),
-                })
-                .collect();
-            let ctor_desc = format!("({arg_desc})V");
+            let ctor_desc = format!("({})V", args_desc(args, ctx));
             let cls = cp.class(&owner);
             em.op_u2(0xBB, cls); // new
             em.push(1);
@@ -237,7 +245,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 let desc = ctx.field_descs[idx].clone();
                 let owner = ctx.class_name.clone();
                 let f = cp.field_ref(&owner, name, &desc);
-                em.op_u2(0xB4, f);
+                em.op_u2(0xB4, f); // getfield
+                // 栈深要按字段宽度记账：少算一槽会让 max_stack 偏小（VerifyError）
+                em.pop(1);
+                em.push(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
                 return Ok(());
             }
             err(format!("未定义的变量 `{name}`"))
@@ -272,18 +283,51 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             err(format!("不支持的 println 形态: {name}"))
         }
+        // super(...) → invokespecial 父类 <init>（父类构造器）
+        Expr::Call { recv: Some(r), name, args, .. } if name == "super" && matches!(**r, Expr::Super) => {
+            if !ctx.in_ctor {
+                return err("super(...) 只能出现在构造器里");
+            }
+            let desc = format!("({})V", args_desc(args, ctx));
+            em.op(0x2A); // aload_0
+            em.push(1);
+            for a in args {
+                compile_expr(a, em, ctx, cp)?;
+            }
+            let idx = cp.method_ref(&ctx.super_name, "<init>", &desc);
+            em.op_u2(0xB7, idx); // invokespecial
+            em.pop(args.len() as u16 + 1);
+            Ok(())
+        }
+        // super.m() → invokespecial 父类实现（owner 必须是父类，否则解析到自己）
+        Expr::Call { recv: Some(r), name, args, .. } if matches!(**r, Expr::Super) => {
+            let desc = call_desc(Some(r), name, ctx)
+                .ok_or_else(|| CompileError { msg: format!("父类里未找到方法 `{name}`") })?;
+            em.op(0x2A); // aload_0
+            em.push(1);
+            for a in args {
+                compile_expr(a, em, ctx, cp)?;
+            }
+            let idx = cp.method_ref(&ctx.super_name, name, &desc);
+            em.op_u2(0xB7, idx); // invokespecial
+            let n = args.len() as u16 + 1;
+            em.pop(n);
+            if !desc.ends_with(")V") {
+                em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
+            }
+            Ok(())
+        }
         // 调用对象方法 a.get()
         Expr::Call { recv: Some(r), name, args, .. } => {
-            let desc = ctx
-                .instance_methods
-                .get(name.as_str())
-                .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`") })?
-                .clone();
+            let desc = call_desc(Some(r), name, ctx)
+                .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`") })?;
             compile_expr(r, em, ctx, cp)?;
             for a in args {
                 compile_expr(a, em, ctx, cp)?;
             }
-            let owner = ctx.class_name.clone();
+            // 引用类用接收者的**静态类型**：验证器要求接收者可赋给引用类。
+            // 分派本身按运行时类走（虚方法覆写），引用类只决定从哪条链开始解析。
+            let owner = expr_type(r, ctx).as_ref().and_then(type_internal).unwrap_or_else(|| ctx.class_name.clone());
             let idx = cp.method_ref(&owner, name, &desc);
             em.op_u2(0xB6, idx); // invokevirtual
             let n = args.len() as u16 + 1;
@@ -294,28 +338,38 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             Ok(())
         }
-        // 调用本类的静态方法 add(a, b)
+        // 调用本类（或父类）的方法：静态走 invokestatic，实例走 this 的 invokevirtual
         Expr::Call { name, args, .. } => {
+            if let Some(desc) = ctx.static_methods.get(name.as_str()).cloned() {
+                for a in args {
+                    compile_expr(a, em, ctx, cp)?;
+                }
+                let idx = cp.method_ref("<SELF>", name, &desc);
+                em.op_u2(0xB8, idx);
+                let argc = args.len() as u16;
+                em.pop(argc);
+                if !desc.ends_with(")V") {
+                    // 返回值占的槽数：long/double 占 2 槽
+                    em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
+                }
+                return Ok(());
+            }
+            // 无接收者的实例方法调用 = `this.m()`（父类的实现也算本类的可见方法）
             let desc = ctx
-                .static_methods
+                .instance_methods
                 .get(name.as_str())
                 .ok_or_else(|| CompileError { msg: format!("未找到方法 `{name}`") })?
                 .clone();
+            em.op(0x2A); // aload_0
+            em.push(1);
             for a in args {
                 compile_expr(a, em, ctx, cp)?;
             }
-            let owner = ctx
-                .locals
-                .get("<this-class>")
-                .map(|_| String::new())
-                .unwrap_or_default();
-            let _ = owner;
-            let idx = cp.method_ref("<SELF>", name, &desc);
-            em.op_u2(0xB8, idx);
-            let argc = args.len() as u16;
-            em.pop(argc);
+            let idx = cp.method_ref(&ctx.class_name, name, &desc);
+            em.op_u2(0xB6, idx); // invokevirtual
+            let n = args.len() as u16 + 1;
+            em.pop(n);
             if !desc.ends_with(")V") {
-                // 返回值占的槽数：long/double 占 2 槽
                 em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
             }
             Ok(())

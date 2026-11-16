@@ -6,7 +6,7 @@ use super::heap::STR_BASE;
 use super::slot::Slot;
 use super::Vm;
 
-impl<'a> Vm<'a> {
+impl Vm {
     /// `System.out.println(...)` 的文本：按重载（参数类型）决定怎么格式化
     pub(super) fn println_text(&self, desc: &str, v: Slot) -> String {
         match desc {

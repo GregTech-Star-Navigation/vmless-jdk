@@ -41,9 +41,18 @@ use self::class::compile_type;
 
 /// 编译一个编译单元，返回 (类名, class 字节)
 pub fn compile(cu: &CompilationUnit) -> Result<Vec<(String, Vec<u8>)>, CompileError> {
+    compile_with_path(cu, &[])
+}
+
+/// 编译一个编译单元，父类不在本单元时从 `classpath` 目录里读 `.class`
+pub fn compile_with_path(
+    cu: &CompilationUnit,
+    classpath: &[std::path::PathBuf],
+) -> Result<Vec<(String, Vec<u8>)>, CompileError> {
+    let res = crate::sema::Resolver::new(cu, classpath);
     let mut out = Vec::new();
     for t in &cu.types {
-        out.push((t.name.clone(), compile_type(&cu.package, t)?));
+        out.push((t.name.clone(), compile_type(&cu.package, t, &res)?));
     }
     Ok(out)
 }

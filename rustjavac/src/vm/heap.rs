@@ -16,16 +16,16 @@ pub(super) enum RefKind {
     Arr(String),
 }
 
-impl<'a> Vm<'a> {
-    /// 字符串常量 → 句柄（同一常量池项复用同一句柄）
-    pub(super) fn string_handle(&mut self, cp_index: u16) -> i32 {
-        if let Some(h) = self.string_handles.get(&cp_index) {
+impl Vm {
+    /// 字符串常量 → 句柄（同一常量池项复用同一句柄；不同类要分开记，索引会撞）
+    pub(super) fn string_handle(&mut self, class: usize, cp_index: u16) -> i32 {
+        if let Some(h) = self.string_handles.get(&(class, cp_index)) {
             return *h;
         }
-        let text = self.string_at(cp_index).unwrap_or_default();
+        let text = self.string_at(class, cp_index).unwrap_or_default();
         self.strings.push(text);
         let h = STR_BASE + self.strings.len() as i32 - 1;
-        self.string_handles.insert(cp_index, h);
+        self.string_handles.insert((class, cp_index), h);
         h
     }
 
@@ -45,11 +45,10 @@ impl<'a> Vm<'a> {
         }
     }
 
-    pub(super) fn string_at(&self, index: u16) -> Option<String> {
-        match self.class.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
-            Some(CpEntry::String(u)) => {
-                self.class.utf8(*u).map(|b| String::from_utf8_lossy(b).into_owned())
-            }
+    pub(super) fn string_at(&self, class: usize, index: u16) -> Option<String> {
+        let cf = self.store.classes.get(class)?;
+        match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
+            Some(CpEntry::String(u)) => cf.utf8(*u).map(|b| String::from_utf8_lossy(b).into_owned()),
             _ => None,
         }
     }

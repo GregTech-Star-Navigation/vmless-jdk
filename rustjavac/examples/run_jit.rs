@@ -4,6 +4,8 @@ fn main() {
     let bytes = std::fs::read(&path).expect("read");
     let cf = classfile::parse(&bytes).expect("parse");
     let mut jit = classfile::jit::Jit::new();
+    // 继承：把同目录的其它 .class 也读进来（父类/子类的方法都要编）
+    jit.load_class_path(&path);
     let t = std::time::Instant::now();
     let m = jit.compile_static(&cf, "main", "([Ljava/lang/String;)V").expect("JIT main");
     eprintln!("JIT 编译耗时: {:.2} ms", t.elapsed().as_secs_f64() * 1e3);

@@ -10,14 +10,7 @@ fn main() {
             std::process::exit(2);
         }
     };
-    let bytes = match std::fs::read(&path) {
-        Ok(b) => b,
-        Err(e) => {
-            eprintln!("读取 {path} 失败: {e}");
-            std::process::exit(1);
-        }
-    };
-    match classfile::vm::run_class_bytes(&bytes) {
+    match classfile::vm::run_class_file(&path) {
         Ok(r) => {
             for line in &r.output {
                 println!("{line}");

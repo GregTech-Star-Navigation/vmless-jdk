@@ -16,39 +16,34 @@ use super::strtab;
 use super::{Jit, JitError};
 
 impl Jit {
-    /// 编译（或复用）一个静态方法，返回 (函数 id, max_locals, 参数个数)
+    /// 编译（或复用）某个类里声明的一个方法，返回 (函数 id, max_locals, 参数个数)
+    ///
+    /// 缓存按 **(类名, 方法名, 描述符)** 区分 —— 父子类同名方法必须编成两个函数。
     pub fn compile_into(
         &mut self,
-        cf: &ClassFile,
+        class: &str,
         name: &str,
         desc: &str,
     ) -> Result<(cranelift_module::FuncId, usize, i32), JitError> {
-        if let Some(v) = self.compiled.get(&(name.to_string(), desc.to_string())) {
+        if let Some(v) = self.compiled.get(&(class.to_string(), name.to_string(), desc.to_string())) {
             return Ok(*v);
         }
-        let m = cf
-            .methods
-            .iter()
-            .find(|m| {
-                let n = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default());
-                let d = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default());
-                n == name && d == desc
-            })
-            .ok_or_else(|| JitError(format!("找不到方法 {name}{desc}")))?;
-        let (max_locals, body, exc_table) = code_of(cf, m)?;
-        let self_class_name = cf.this_class_name().unwrap_or_default();
-
-        // 实例字段名 → 下标
-        let mut fields: std::collections::HashMap<String, usize> = std::collections::HashMap::new();
-        let mut field_count = 0usize;
-        for f in &cf.fields {
-            if f.access_flags & 0x0008 != 0 {
-                continue;
-            }
-            let n = String::from_utf8_lossy(cf.utf8(f.name_index).unwrap_or_default()).into_owned();
-            fields.insert(n, field_count);
-            field_count += 1;
-        }
+        let cf = self
+            .classes
+            .get(class)
+            .ok_or_else(|| JitError(format!("类 {class} 没有加载")))?;
+        let (max_locals, body, exc_table) = {
+            let m = cf
+                .methods
+                .iter()
+                .find(|m| {
+                    let n = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default());
+                    let d = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default());
+                    n == name && d == desc
+                })
+                .ok_or_else(|| JitError(format!("{class} 里找不到方法 {name}{desc}")))?;
+            code_of(&cf, m)?
+        };
 
         // 方法签名：(locals_ptr: i64) -> 返回值
         // 返回值必须按描述符给出真类型：long → i64、double → f64。
@@ -58,13 +53,15 @@ impl Jit {
         sig.params.push(AbiParam::new(types::I64));
         sig.returns.push(AbiParam::new(ret_ty));
 
+        // 函数名必须按类区分：父子类同名方法要编成两个函数
+        let fname = format!("{}_{}_{}", class.replace('/', "_"), name, desc.replace(['(', ')', ';', '/', '[', ']'], "_"));
         let func_id = self
             .module
-            .declare_function(&format!("{name}_{}", desc.replace(['(', ')'], "")), Linkage::Export, &sig)
+            .declare_function(&fname, Linkage::Export, &sig)
             .map_err(|e| JitError(e.to_string()))?;
         // 先登记，递归调用（fib 调 fib）才能命中缓存而不是无限递归
         self.compiled.insert(
-            (name.to_string(), desc.to_string()),
+            (class.to_string(), name.to_string(), desc.to_string()),
             (func_id, max_locals, argc_of(desc)),
         );
 
@@ -200,6 +197,15 @@ impl Jit {
             .module
             .declare_function("vmless_catch_match", Linkage::Import, &sig_li2)
             .map_err(|e| JitError(e.to_string()))?;
+        // 虚方法分派：vcall(locals: i64, sig: i32) -> i64
+        let mut sig_vc = self.module.make_signature();
+        sig_vc.params.push(AbiParam::new(types::I64));
+        sig_vc.params.push(AbiParam::new(types::I32));
+        sig_vc.returns.push(AbiParam::new(types::I64));
+        let vcall_id = self
+            .module
+            .declare_function("vmless_vcall", Linkage::Import, &sig_vc)
+            .map_err(|e| JitError(e.to_string()))?;
         let helpers = ExcHelpers {
             pending: exc_pending_id,
             clear: exc_clear_id,
@@ -211,7 +217,7 @@ impl Jit {
         // 本**类**有没有用到异常：没有就不发任何检查，避免拖慢不带异常的代码。
         // 注意必须按类判定 —— 只按方法判定的话，`a()` 里不含 try 但被调方抛异常时
         // 就没有检查点，异常会跑到 main 结束之后才被顶层发现（中间的语句照常执行）。
-        let uses_exc = class_uses_exceptions(cf);
+        let uses_exc = class_uses_exceptions(&cf);
         let mut bctx = FunctionBuilderContext::new();
         let mut fb = FunctionBuilder::new(&mut ctx.func, &mut bctx);
 
@@ -280,15 +286,14 @@ impl Jit {
                 let len = insn_len(op);
                 if (op == 0xb8 || op == 0xb7) && len == 3 {
                     let idx = u16::from_be_bytes([body[q + 1], body[q + 2]]);
-                    if let Ok(info) = method_ref_of(cf, idx) {
-                        // 外部类（如 Object.<init>）不编译，调用时当空操作
-                        if info.0 != self_class_name {
-                            q += len;
-                            continue;
+                    if let Ok(info) = method_ref_of(&cf, idx) {
+                        // 从引用类沿继承链找**声明类**：父类里的方法也要能调到
+                        if let Some((owner, _)) = self.classes.resolve_method(&info.0, &info.1, &info.2) {
+                            let (fid, ml, argc) = self.compile_into(&owner, &info.1, &info.2)?;
+                            let extra = if op == 0xb7 { 1 } else { 0 };
+                            call_targets.insert(idx, (fid, ml, argc + extra));
                         }
-                        let (fid, ml, argc) = self.compile_into(cf, &info.1, &info.2)?;
-                        let extra = if op == 0xb7 { 1 } else { 0 };
-                        call_targets.insert(idx, (fid, ml, argc + extra));
+                        // 找不到（java.* 的方法 / 构造器）就当作外部调用，按空操作处理
                     }
                 }
                 q += len;
@@ -358,7 +363,7 @@ impl Jit {
                         let p = fb.inst_results(call)[0];
                         stack.push(p);
                     } else {
-                        stack.push(fb.ins().iconst(types::I32, const_int(cf, idx)));
+                        stack.push(fb.ins().iconst(types::I32, const_int(&cf, idx)));
                     }
                 }
                 0x13 => {
@@ -371,7 +376,7 @@ impl Jit {
                         let p = fb.inst_results(call)[0];
                         stack.push(p);
                     } else {
-                        stack.push(fb.ins().iconst(types::I32, const_int(cf, idx)));
+                        stack.push(fb.ins().iconst(types::I32, const_int(&cf, idx)));
                     }
                 }
                 0x15 => {
@@ -548,7 +553,7 @@ impl Jit {
                     let v = convert_to(&mut fb, v, types::I64);
                     let f = self.module.declare_func_in_func(helpers.throw_, fb.func);
                     fb.ins().call(f, &[v]);
-                    self.emit_dispatch(&mut fb, cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                    self.emit_dispatch(&mut fb, &cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
                     terminated = true;
                     open.pop();
                     let dead = fb.create_block();
@@ -574,7 +579,7 @@ impl Jit {
                         2,
                     ));
                     // 按 JVM 槽位放参数：long/double 占两槽，后面那个参数要跳过一槽
-                    let callee_desc = method_ref_of(cf, idx)?.2;
+                    let callee_desc = method_ref_of(&cf, idx)?.2;
                     let pslots = param_slots(&callee_desc);
                     for (i, v) in args.iter().enumerate() {
                         let off = (pslots.get(i).copied().unwrap_or(i) * 8) as i32;
@@ -598,7 +603,7 @@ impl Jit {
                         let flag = fb.inst_results(pcx)[0];
                         fb.ins().brif(flag, disp, &[], cont, &[]);
                         fb.switch_to_block(disp);
-                        self.emit_dispatch(&mut fb, cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                        self.emit_dispatch(&mut fb, &cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
                         fb.switch_to_block(cont);
                     }
                 }
@@ -639,7 +644,7 @@ impl Jit {
                     let Some(&(fid, callee_max_locals, argc)) = call_targets.get(&idx) else {
                         // 外部构造器（Object.<init> / RuntimeException.<init>）：没有它的
                         // 字节码，只把 message 记到异常对象上（打印未捕获异常要用）
-                        let desc = method_ref_of(cf, idx)?.2;
+                        let desc = method_ref_of(&cf, idx)?.2;
                         if desc == "(Ljava/lang/String;)V" && stack.len() >= 2 {
                             let msg = stack.pop().unwrap();
                             let obj = stack.pop().unwrap();
@@ -663,7 +668,7 @@ impl Jit {
                         3,
                     ));
                     let mut pslots = vec![0usize];
-                    pslots.extend(param_slots(&method_ref_of(cf, idx)?.2).iter().map(|s| s + 1));
+                    pslots.extend(param_slots(&method_ref_of(&cf, idx)?.2).iter().map(|s| s + 1));
                     for (i, v) in args.iter().enumerate() {
                         let off = (pslots.get(i).copied().unwrap_or(i) * 8) as i32;
                         let addr = fb.ins().stack_addr(types::I64, slot, off);
@@ -672,7 +677,11 @@ impl Jit {
                     let ptr = fb.ins().stack_addr(types::I64, slot, 0);
                     let fref = self.module.declare_func_in_func(fid, fb.func);
                     let c = fb.ins().call(fref, &[ptr]);
-                    let _ = c;
+                    // super.m() 有返回值：直接调用，被调方返回的就是真类型
+                    let callee_desc = method_ref_of(&cf, idx)?.2;
+                    if !callee_desc.ends_with(")V") {
+                        stack.push(fb.inst_results(c)[0]);
+                    }
                 }
                 // long：常量
                 0x09 | 0x0a => {
@@ -849,7 +858,7 @@ impl Jit {
                 0xb6 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let (cls, name, desc) = method_ref_of(cf, idx)?;
+                    let (cls, name, desc) = method_ref_of(&cf, idx)?;
                     if name == "println" {
                         // 栈上顺序是 [接收者, 参数]，先弹参数
                         let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
@@ -868,20 +877,24 @@ impl Jit {
                         let fref = self.module.declare_func_in_func(fid, fb.func);
                         fb.ins().call(fref, &[v]);
                     } else {
-                        let _ = cls;
+                        // 虚方法：按**运行时类**分派。编译期把所有可能是接收者的类
+                        // （静态类型 C 及其子类）的实现都编出来并登记进运行时表，
+                        // 调用点只发一次 `vcall(locals, sig)` —— 这就是一张内联缓存
+                        // 之前的方法表查找：多一次间接跳转，但没有分支预测失误。
+                        let sig = rt::intern_sig(&name, &desc);
                         let argc = argc_of(&desc) + 1;
-                        let (fid, ml, _) = self.compile_into(cf, &name, &desc)?;
                         let mut args = Vec::new();
                         for _ in 0..argc {
                             args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
                         }
                         args.reverse();
+                        // 被调方法的 locals 布局：槽 0 是 this，参数从槽 1 起按描述符排
+                        let ml = self.vcall_max_locals(&cls, &name, &desc)?;
                         let slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
                             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
                             (ml.max(1) * 8) as u32,
                             3,
                         ));
-                        // 槽 0 是 this，参数从槽 1 起按描述符排
                         let mut pslots = vec![0usize];
                         pslots.extend(param_slots(&desc).iter().map(|s| s + 1));
                         for (i, v) in args.iter().enumerate() {
@@ -890,11 +903,19 @@ impl Jit {
                             fb.ins().store(MemFlags::new(), *v, addr, 0);
                         }
                         let ptr = fb.ins().stack_addr(types::I64, slot, 0);
-                        let fref = self.module.declare_func_in_func(fid, fb.func);
-                        let c = fb.ins().call(fref, &[ptr]);
+                        let key = fb.ins().iconst(types::I32, sig as i64);
+                        let fref = self.module.declare_func_in_func(vcall_id, fb.func);
+                        let c = fb.ins().call(fref, &[ptr, key]);
                         if !desc.ends_with(")V") {
-                            // 被调方已按自己的返回类型返回，直接上栈
-                            stack.push(fb.inst_results(c)[0]);
+                            // vcall 统一按 i64 回来，按真实返回类型转一次
+                            let raw = fb.inst_results(c)[0];
+                            let want = ret_type(&desc);
+                            let v = if want == types::F64 {
+                                fb.ins().bitcast(types::F64, MemFlags::new(), raw)
+                            } else {
+                                convert_to(&mut fb, raw, want)
+                            };
+                            stack.push(v);
                         }
                         if uses_exc {
                             let op_pc = pc - 3;
@@ -905,7 +926,7 @@ impl Jit {
                             let flag = fb.inst_results(pcx)[0];
                             fb.ins().brif(flag, disp, &[], cont, &[]);
                             fb.switch_to_block(disp);
-                            self.emit_dispatch(&mut fb, cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
+                            self.emit_dispatch(&mut fb, &cf, &exc_table, &blocks, exc_slot, &helpers, op_pc, ret_ty)?;
                             fb.switch_to_block(cont);
                         }
                     }
@@ -921,7 +942,8 @@ impl Jit {
                         other => return Err(JitError(format!("new 的操作数不是类: {other:?}"))),
                     };
                     let tag = rt::class_tag(&cls);
-                    let nf = fb.ins().iconst(types::I32, field_count as i64);
+                    // 字段个数按**被创建的那个类**的布局（含父类字段）算，不是本类的
+                    let nf = fb.ins().iconst(types::I32, self.classes.field_count(&cls) as i64);
                     let tg = fb.ins().iconst(types::I32, tag as i64);
                     let fref = self.module.declare_func_in_func(new_obj_id, fb.func);
                     let c = fb.ins().call(fref, &[nf, tg]);
@@ -932,8 +954,12 @@ impl Jit {
                 0xb4 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let (_, name, desc) = field_ref_of(cf, idx)?;
-                    let f = *fields.get(&name).ok_or_else(|| JitError(format!("未知字段 {name}")))?;
+                    let (owner, name, desc) = field_ref_of(&cf, idx)?;
+                    // 偏移沿引用类的继承链算（父类字段在前，子类看到的偏移与父类一致）
+                    let f = self
+                        .classes
+                        .field_offset(&owner, &name)
+                        .ok_or_else(|| JitError(format!("未知字段 {owner}.{name}")))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let off = (8 + 8 * f) as i32;
                     let (ty, want) = field_slot_type(&desc);
@@ -944,8 +970,11 @@ impl Jit {
                 0xb5 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let (_, name, desc) = field_ref_of(cf, idx)?;
-                    let f = *fields.get(&name).ok_or_else(|| JitError(format!("未知字段 {name}")))?;
+                    let (owner, name, desc) = field_ref_of(&cf, idx)?;
+                    let f = self
+                        .classes
+                        .field_offset(&owner, &name)
+                        .ok_or_else(|| JitError(format!("未知字段 {owner}.{name}")))?;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let (ty, want) = field_slot_type(&desc);
@@ -1027,7 +1056,7 @@ impl Jit {
                 0xc1 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let tag = class_const_tag(cf, idx)?;
+                    let tag = class_const_tag(&cf, idx)?;
                     let obj = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let obj = convert_to(&mut fb, obj, types::I64);
                     let tg = fb.ins().iconst(types::I32, tag as i64);
@@ -1038,7 +1067,7 @@ impl Jit {
                 0xc0 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let tag = class_const_tag(cf, idx)?;
+                    let tag = class_const_tag(&cf, idx)?;
                     let obj = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let obj = convert_to(&mut fb, obj, types::I64);
                     let tg = fb.ins().iconst(types::I32, tag as i64);
@@ -1122,9 +1151,47 @@ impl Jit {
             .map_err(|e| JitError(format!("{e:?}")))?;
         self.module.clear_context(&mut ctx);
         let argc = argc_of(desc);
-        self.compiled
-            .insert((name.to_string(), desc.to_string()), (func_id, max_locals, argc));
+        self.compiled.insert(
+            (class.to_string(), name.to_string(), desc.to_string()),
+            (func_id, max_locals, argc),
+        );
         Ok((func_id, max_locals, argc))
+    }
+
+    /// 准备一个虚调用点：
+    ///
+    /// 1. 把「静态类型 `static_class` 及其所有子类」对该方法的实现都编译出来
+    /// 2. 登记到运行时表 `(类的类型标签, 签名) → 函数地址`
+    /// 3. 返回被调方法需要的 locals 槽数（各实现里最大的那个）
+    ///
+    /// 这样就得到一张**按类标签的完整方法表** —— 调用点一次查表 + 间接调用，
+    /// 没有逐帧的字符串比较。
+    fn vcall_max_locals(&mut self, static_class: &str, name: &str, desc: &str) -> Result<usize, JitError> {
+        let sig = rt::intern_sig(name, desc);
+        let rty = ret_type(desc);
+        let ret_kind = if rty == types::F64 {
+            rt::RET_F64
+        } else if rty == types::I64 {
+            rt::RET_I64
+        } else {
+            rt::RET_I32
+        };
+        let mut ml_max = 1usize;
+        let mut names = self.classes.names();
+        names.sort();
+        for k in names {
+            if !self.classes.is_subclass(&k, static_class) {
+                continue;
+            }
+            let Some((owner, _)) = self.classes.resolve_method(&k, name, desc) else { continue };
+            let (fid, ml, _) = self.compile_into(&owner, name, desc)?;
+            ml_max = ml_max.max(ml);
+            let tag = rt::class_tag(&k);
+            if !self.pending_v.iter().any(|(t, s, _, _)| *t == tag && *s == sig) {
+                self.pending_v.push((tag, sig, fid, ret_kind));
+            }
+        }
+        Ok(ml_max)
     }
 }
 

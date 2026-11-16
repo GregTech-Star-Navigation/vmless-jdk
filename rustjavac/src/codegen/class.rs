@@ -1,6 +1,7 @@
 //! 类级装配：字段表、方法表、常量池收尾、写出。
 
 use crate::ast::*;
+use crate::sema::Resolver;
 use crate::{write, ClassFile, CpEntry, Member as CfMember};
 use std::collections::HashMap;
 
@@ -17,10 +18,19 @@ pub const ACC_STATIC: u16 = 0x0008;
 pub const ACC_SUPER: u16 = 0x0020;
 
 
-pub(crate) fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec<u8>, CompileError> {
+pub(crate) fn compile_type(
+    package: &Option<String>,
+    t: &TypeDecl,
+    res: &Resolver,
+) -> Result<Vec<u8>, CompileError> {
     let self_name = match package {
         Some(p) => format!("{}/{}", p.replace('.', "/"), t.name),
         None => t.name.clone(),
+    };
+    // 父类：AST 里写了 extends 就用它，否则就是 Object
+    let super_name = match res.super_of(&self_name)? {
+        Some(s) => s,
+        None => "java/lang/Object".to_string(),
     };
 
     // 第一遍：收集静态方法签名（供 invokestatic 使用）
@@ -33,34 +43,34 @@ pub(crate) fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec
         }
     }
 
-    // 实例方法：名字 → 描述符
-    let mut inst_methods: HashMap<String, String> = HashMap::new();
-    for m in &t.members {
-        if let Member::Method(md) = m {
-            if !md.modifiers.iter().any(|x| x == "static") && !(md.ret.is_none() && md.name == t.name) {
-                inst_methods.insert(md.name.clone(), method_descriptor(&md.params, &md.ret));
-            }
-        }
-    }
+    // 实例方法：名字 → 描述符（含继承：子类没写的方法调用时落到父类实现）
+    let inst_methods = res.instance_methods(&self_name)?;
 
-    // 实例字段：名字 → 下标，以及每个下标的描述符
+    // 实例字段布局：父类字段在前、本类字段在后（解释器/JIT 用的是同一套规则）
     let mut field_index: HashMap<String, usize> = HashMap::new();
     let mut field_desc_list: Vec<String> = Vec::new();
     let mut field_ty_list: Vec<Type> = Vec::new();
-    for m in &t.members {
-        if let Member::Field(f) = m {
-            if f.modifiers.iter().any(|x| x == "static") {
-                continue;
-            }
-            field_index.insert(f.name.clone(), field_desc_list.len());
-            field_desc_list.push(descriptor(&f.ty));
-            field_ty_list.push(f.ty.clone());
+    for f in res.layout(&self_name)? {
+        field_index.insert(f.name.clone(), field_desc_list.len());
+        field_ty_list.push(type_from_desc(&f.desc));
+        field_desc_list.push(f.desc);
+    }
+
+    // 任意一个类的字段/方法表：接收者静态类型可能不是本类（`P p = ...; p.get()`）
+    let mut type_fields: HashMap<String, HashMap<String, String>> = HashMap::new();
+    let mut type_methods: HashMap<String, HashMap<String, String>> = HashMap::new();
+    for c in res.unit_classes() {
+        if let Ok(f) = res.field_types(&c) {
+            type_fields.insert(c.clone(), f);
+        }
+        if let Ok(m) = res.instance_methods(&c) {
+            type_methods.insert(c, m);
         }
     }
 
     let mut cp = CpBuilder::new();
     let this_class = cp.class(&self_name);
-    let super_class = cp.class("java/lang/Object");
+    let super_class = cp.class(&super_name);
     let code_name = cp.utf8("Code");
     let stack_map_name = cp.utf8("StackMapTable");
 
@@ -84,13 +94,20 @@ pub(crate) fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec
         }
     }
 
-    let obj_init = cp.method_ref("java/lang/Object", "<init>", "()V");
+    let super_init = cp.method_ref(&super_name, "<init>", "()V");
     if !has_ctor {
-        // 默认构造器
+        // 默认构造器：隐式调用父类无参构造器（父类没有就报错，和 javac 一致）
+        if !res.has_default_ctor(&super_name)? {
+            return err(format!(
+                "类 `{}` 的构造器隐式调用了 super()，但父类 `{}` 没有无参构造器",
+                t.name,
+                super_name.replace('/', ".")
+            ));
+        }
         let mut ctor = Emit::new(1);
         ctor.op(0x2A); // aload_0
         ctor.push(1);
-        ctor.op_u2(0xB7, obj_init);
+        ctor.op_u2(0xB7, super_init);
         ctor.pop(1);
         ctor.op(0xB1);
         let ctor_name = cp.utf8("<init>");
@@ -115,11 +132,29 @@ pub(crate) fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec
         let mut em = Emit::new(if is_static { param_slots } else { param_slots + 1 });
         let is_ctor_m = md.ret.is_none() && md.name == t.name;
         if is_ctor_m {
-            // 构造器必须先调用父类构造器
-            em.op(0x2A);
-            em.push(1);
-            em.op_u2(0xB7, obj_init);
-            em.pop(1);
+            // 构造器第一条语句必须是 this(...) / super(...)：
+            // 显式写了 super(...) 就交给语句编译去发（不能发两次，否则 VerifyError）；
+            // 没写就补一条隐式 super()，父类没有无参构造器时按 javac 的行为报错。
+            let ctor_call = ctor_call_position(md.body.as_ref());
+            if ctor_call.not_first {
+                return err(format!(
+                    "类 `{}` 的构造器里 super(...)/this(...) 必须是第一条语句",
+                    t.name
+                ));
+            }
+            if !ctor_call.first_is_super {
+                if !res.has_default_ctor(&super_name)? {
+                    return err(format!(
+                        "类 `{}` 的构造器隐式调用了 super()，但父类 `{}` 没有无参构造器",
+                        t.name,
+                        super_name.replace('/', ".")
+                    ));
+                }
+                em.op(0x2A); // aload_0
+                em.push(1);
+                em.op_u2(0xB7, super_init);
+                em.pop(1);
+            }
         }
         let mut ctx = Ctx {
             locals: HashMap::new(),
@@ -132,8 +167,12 @@ pub(crate) fn compile_type(package: &Option<String>, t: &TypeDecl) -> Result<Vec
             local_kind: HashMap::new(),
             local_ty: HashMap::new(),
             class_name: self_name.clone(),
+            super_name: super_name.clone(),
+            type_fields: type_fields.clone(),
+            type_methods: type_methods.clone(),
             finally_stack: Vec::new(),
             ret_ty: md.ret.clone(),
+            in_ctor: is_ctor_m,
         };
         ctx.locals.insert("<this-class>".to_string(), 0);
         if !is_static {
@@ -245,3 +284,62 @@ pub(crate) fn fix_self_refs(cp: CpBuilder, self_name: &str) -> Vec<Option<CpEntr
     entries
 }
 
+
+/// 构造器第一条语句的情况
+struct CtorCallPos {
+    /// 第一条语句就是 `super(...)`
+    first_is_super: bool,
+    /// `super(...)` / `this(...)` 出现在了非首位（javac 也不允许）
+    not_first: bool,
+}
+
+/// 判断构造器体里 `super(...)` 的**位置**
+fn ctor_call_position(body: Option<&Stmt>) -> CtorCallPos {
+    let mut pos = CtorCallPos { first_is_super: false, not_first: false };
+    let list: Vec<&Stmt> = match body {
+        Some(Stmt::Block(items)) => items.iter().collect(),
+        Some(s) => vec![s],
+        None => return pos,
+    };
+    let mut first_seen = false;
+    for s in &list {
+        if matches!(s, Stmt::Empty) {
+            continue;
+        }
+        if !first_seen {
+            first_seen = true;
+            if is_super_call_stmt(s) {
+                pos.first_is_super = true;
+                continue;
+            }
+        }
+        if contains_ctor_call(s) {
+            pos.not_first = true;
+        }
+    }
+    pos
+}
+
+fn is_super_call_stmt(s: &Stmt) -> bool {
+    matches!(s, Stmt::Expr(Expr::Call { recv: Some(r), name, .. })
+        if name == "super" && matches!(**r, Expr::Super))
+}
+
+/// 语句（含嵌套）里有没有 `super(...)` / `this(...)`
+fn contains_ctor_call(s: &Stmt) -> bool {
+    match s {
+        Stmt::Block(items) => items.iter().any(contains_ctor_call),
+        Stmt::If { then, els, .. } => contains_ctor_call(then) || els.as_ref().is_some_and(|e| contains_ctor_call(e)),
+        Stmt::While { body, .. } | Stmt::DoWhile { body, .. } | Stmt::For { body, .. } | Stmt::ForEach { body, .. } => {
+            contains_ctor_call(body)
+        }
+        Stmt::Try { body, catches, finally } => {
+            contains_ctor_call(body)
+                || catches.iter().any(|c| contains_ctor_call(&c.body))
+                || finally.as_ref().is_some_and(|f| contains_ctor_call(f))
+        }
+        Stmt::Switch { cases, .. } => cases.iter().any(|c| c.body.iter().any(contains_ctor_call)),
+        Stmt::Expr(Expr::Call { recv: None, name, .. }) => name == "this",
+        other => is_super_call_stmt(other),
+    }
+}

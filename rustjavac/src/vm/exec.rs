@@ -4,35 +4,41 @@ use crate::jit::param_slots;
 use crate::CpEntry;
 
 use super::call::count_args;
+use super::class::class_name_of;
 use super::err;
+use super::heap::RefKind;
 use super::exception::thrown;
 use super::frame::Frame;
 use super::slot::Slot;
 use super::Vm;
 use super::VmError;
 
-impl<'a> Vm<'a> {
-    pub(super) fn ldc_int(&mut self, index: u16) -> Result<i32, VmError> {
-        match self.class.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
+impl Vm {
+    pub(super) fn ldc_int(&mut self, class: usize, index: u16) -> Result<i32, VmError> {
+        let cf = self.store.classes[class].clone();
+        match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
             Some(CpEntry::Integer(v)) => Ok(*v as i32),
-            Some(CpEntry::String(_)) => Ok(self.string_handle(index)), // 句柄进字符串堆
+            Some(CpEntry::String(_)) => Ok(self.string_handle(class, index)), // 句柄进字符串堆
             other => err(format!("ldc 不支持的类型: {other:?}")),
         }
     }
 
     /// `ldc2_w`：long / double 常量
-    pub(super) fn ldc2_w(&self, index: u16) -> Result<Slot, VmError> {
-        match self.class.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
+    pub(super) fn ldc2_w(&self, class: usize, index: u16) -> Result<Slot, VmError> {
+        let cf = &self.store.classes[class];
+        match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
             Some(CpEntry::Long(v)) => Ok(Slot::L(*v as i64)),
             Some(CpEntry::Double(bits)) => Ok(Slot::F(f64::from_bits(*bits))),
             other => err(format!("ldc2_w 不支持的类型: {other:?}")),
         }
     }
 
-    /// 执行一个方法：desc 形如 `(II)I`；`receiver` 表示 args[0] 是 this（实例方法）
+    /// 执行一个方法：`class`/`method` 是它在类表里的位置；desc 形如 `(II)I`；
+    /// `receiver` 表示 args[0] 是 this（实例方法）
     pub(super) fn execute(
         &mut self,
-        m: &'a crate::Member,
+        class: usize,
+        method: usize,
         desc: &str,
         args: &[Slot],
         receiver: bool,
@@ -40,8 +46,10 @@ impl<'a> Vm<'a> {
         if self.depth > 64 {
             return err("调用深度超限（可能递归过深）");
         }
-        let code = self.code_of(m)?;
-        let (max_locals, body, exc_table) = code;
+        // 每次调用先把「当前类」钉住：常量池、Code 属性都按它取（继承后方法来自不同类）
+        let cf = self.store.classes[class].clone();
+        let m = &cf.methods[method];
+        let (max_locals, body, exc_table) = code_of(&cf, m)?;
 
         let mut frame = Frame::new(max_locals);
         // 参数按 JVM 槽位落位：this 在 0，long/double 占两槽，后面的参数要跳过一槽
@@ -68,7 +76,7 @@ impl<'a> Vm<'a> {
                 match $res {
                     Ok(v) => CallOutcome::Value(v),
                     Err(e) => match e.exc {
-                        Some(h) => match self.find_handler(&exc_table, $op_pc, h)? {
+                        Some(h) => match self.find_handler(&cf, &exc_table, $op_pc, h)? {
                             Some(t) => CallOutcome::Handler(t, h),
                             None => return Err(e),
                         },
@@ -106,19 +114,19 @@ impl<'a> Vm<'a> {
                 0x12 => {
                     let idx = body[pc] as u16;
                     pc += 1;
-                    let v = self.ldc_int(idx)?;
+                    let v = self.ldc_int(class, idx)?;
                     frame.push(Slot::I(v));
                 }
                 0x13 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let v = self.ldc_int(idx)?;
+                    let v = self.ldc_int(class, idx)?;
                     frame.push(Slot::I(v));
                 }
                 0x14 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let v = self.ldc2_w(idx)?;
+                    let v = self.ldc2_w(class, idx)?;
                     frame.push(v);
                 }
                 // 局部变量读取（显式下标）
@@ -406,7 +414,7 @@ impl<'a> Vm<'a> {
                 0xbf => {
                     let op_pc = pc - 1;
                     let h = frame.pop_i()?;
-                    match self.find_handler(&exc_table, op_pc, h)? {
+                    match self.find_handler(&cf, &exc_table, op_pc, h)? {
                         Some(target) => {
                             pc = target;
                             // handler 入口的约定：操作数栈上就是那个异常对象
@@ -480,7 +488,7 @@ impl<'a> Vm<'a> {
                 0xbd => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let comp = self.class_name_of(idx)?;
+                    let comp = class_name_of(&cf, idx)?;
                     let desc = if comp.starts_with('[') {
                         format!("[{comp}") // 元素本身是数组：[[I 之类
                     } else {
@@ -495,12 +503,14 @@ impl<'a> Vm<'a> {
                     let handle = -((self.arrays.len() as i32));
                     frame.push(Slot::I(handle));
                 }
-                // new：按本类字段个数分配，并记下运行时类型名
+                // new：字段个数按**被创建的那个类**的布局（含父类字段）算
                 0xbb => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    self.objects.push(vec![Slot::I(0); self.field_count.max(1)]);
-                    self.object_class.push(self.class_name_of(idx)?);
+                    let cls = class_name_of(&cf, idx)?;
+                    let n = self.store.field_count(&cls);
+                    self.objects.push(vec![Slot::I(0); n.max(1)]);
+                    self.object_class.push(cls);
                     let handle = self.objects.len() as i32;
                     frame.push(Slot::I(handle));
                 }
@@ -508,9 +518,10 @@ impl<'a> Vm<'a> {
                 0xb4 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(idx)?;
+                    let info = self.method_ref(&cf, idx)?;
                     let obj = frame.pop_i()?;
-                    let f = *self.field_index.get(&info.name).unwrap_or(&0);
+                    // 偏移沿引用类的继承链解析；布局是「父类在前」，子类偏移与父类一致
+                    let f = self.field_offset(obj, &info.class, &info.name)?;
                     let v = if obj > 0 {
                         *self.objects[obj as usize - 1].get(f).unwrap_or(&Slot::I(0))
                     } else {
@@ -522,10 +533,10 @@ impl<'a> Vm<'a> {
                 0xb5 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(idx)?;
+                    let info = self.method_ref(&cf, idx)?;
                     let value = frame.pop()?;
                     let obj = frame.pop_i()?;
-                    let f = *self.field_index.get(&info.name).unwrap_or(&0);
+                    let f = self.field_offset(obj, &info.class, &info.name)?;
                     if obj > 0 {
                         let slots = &mut self.objects[obj as usize - 1];
                         if f < slots.len() {
@@ -537,7 +548,7 @@ impl<'a> Vm<'a> {
                 0xc1 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let target = self.class_name_of(idx)?;
+                    let target = class_name_of(&cf, idx)?;
                     let v = frame.pop_i()?;
                     frame.push(Slot::I(if self.is_instance(v, &target) { 1 } else { 0 }));
                 }
@@ -545,7 +556,7 @@ impl<'a> Vm<'a> {
                 0xc0 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let target = self.class_name_of(idx)?;
+                    let target = class_name_of(&cf, idx)?;
                     let v = frame.pop_i()?;
                     if v != 0 && !self.is_instance(v, &target) {
                         return err(format!(
@@ -615,22 +626,17 @@ impl<'a> Vm<'a> {
                     pc += 2;
                     frame.push(Slot::I(0));
                 }
-                // invokevirtual：只处理 PrintStream.println
+                // invokevirtual：println 走内建；其余按**接收者的运行时类**虚分派
                 0xb6 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(idx)?;
+                    let info = self.method_ref(&cf, idx)?;
                     if info.name == "println" {
                         let arg = frame.pop()?;
                         let _recv = frame.pop()?;
                         let text = self.println_text(&info.desc, arg);
                         self.output.push(text);
-                    } else if let Some(target) = self
-                        .methods
-                        .get(&(info.name.clone(), info.desc.clone()))
-                        .copied()
-                    {
-                        // 本类方法的虚调用：接收者当第 0 个参数
+                    } else {
                         let argc = count_args(&info.desc)?;
                         let mut args = Vec::with_capacity(argc + 1);
                         for _ in 0..argc {
@@ -640,9 +646,23 @@ impl<'a> Vm<'a> {
                         args.reverse();
                         let mut all = vec![recv];
                         all.extend(args);
+                        // 从对象的**实际类**开始解析（这就是覆写的分派点）；
+                        // 拿不到运行时类才退回引用类，再不行才报错。
+                        let actual = match self.ref_kind(recv.as_i32()) {
+                            RefKind::Obj(c) => Some(c),
+                            _ => None,
+                        };
+                        let target = actual
+                            .as_deref()
+                            .and_then(|c| self.store.resolve_method(c, &info.name, &info.desc))
+                            .or_else(|| self.store.resolve_method(&info.class, &info.name, &info.desc))
+                            .ok_or_else(|| VmError {
+                                msg: format!("找不到方法 {}.{}{}", info.class, info.name, info.desc),
+                                exc: None,
+                            })?;
                         self.depth += 1;
                         let op_pc = pc - 3;
-                        let r = call_or_handle!(self.execute(target, &info.desc, &all, true), op_pc);
+                        let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &all, true), op_pc);
                         self.depth -= 1;
                         match r {
                             CallOutcome::Value(v) => {
@@ -657,48 +677,53 @@ impl<'a> Vm<'a> {
                                 continue;
                             }
                         }
-                    } else {
-                        return err(format!("不支持的 invokevirtual: {}.{}", info.class, info.name));
                     }
                 }
-                // invokespecial：本类构造器真的执行
+                // invokespecial：构造器 / super.m()，从**引用类**（不是运行时类）开始解析
                 0xb7 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(idx)?;
-                    if info.name == "<init>" {
-                        let argc = count_args(&info.desc)?;
-                        let mut args = Vec::with_capacity(argc + 1);
-                        for _ in 0..argc {
-                            args.push(frame.pop()?);
-                        }
-                        let obj = frame.pop()?;
-                        args.reverse();
-                        let mut all = vec![obj];
-                        all.extend(args);
-                        if let Some(target) = self.methods.get(&(info.name.clone(), info.desc.clone())).copied() {
+                    let info = self.method_ref(&cf, idx)?;
+                    let argc = count_args(&info.desc)?;
+                    let mut args = Vec::with_capacity(argc + 1);
+                    for _ in 0..argc {
+                        args.push(frame.pop()?);
+                    }
+                    let obj = frame.pop()?;
+                    args.reverse();
+                    let mut all = vec![obj];
+                    all.extend(args);
+                    match self.store.resolve_method(&info.class, &info.name, &info.desc) {
+                        Some((ci, mi)) => {
                             self.depth += 1;
-                            let _ = self.execute(target, &info.desc, &all, true);
+                            let r = self.execute(ci, mi, &info.desc, &all, true);
                             self.depth -= 1;
-                        } else if info.desc == "(Ljava/lang/String;)V" {
+                            // super.m() 有返回值（构造器没有）：要压回栈上
+                            if info.name != "<init>" && !info.desc.ends_with(")V") {
+                                frame.push(r?);
+                            }
+                        }
+                        None if info.desc == "(Ljava/lang/String;)V" => {
                             // java.* 的构造器（`new RuntimeException("boom")`）我们没有字节码：
                             // 只把消息记在异常对象上，打印未捕获异常时才用得到。
                             if let Some(msg) = all.get(1) {
                                 self.exc_msgs.insert(all[0].as_i32(), msg.as_i32());
                             }
                         }
-                    } else {
-                        let argc = count_args(&info.desc)?;
-                        for _ in 0..argc + 1 {
-                            frame.pop()?;
+                        None if info.name == "<init>" => {}
+                        None => {
+                            return Err(VmError {
+                                msg: format!("找不到方法 {}.{}{}", info.class, info.name, info.desc),
+                                exc: None,
+                            })
                         }
                     }
                 }
-                // invokestatic
+                // invokestatic：沿引用类的继承链解析（静态方法也算继承来的）
                 0xb8 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(idx)?;
+                    let info = self.method_ref(&cf, idx)?;
                     let argc = count_args(&info.desc)?;
                     let mut args = Vec::with_capacity(argc);
                     for _ in 0..argc {
@@ -706,13 +731,12 @@ impl<'a> Vm<'a> {
                     }
                     args.reverse();
                     let target = self
-                        .methods
-                        .get(&(info.name.clone(), info.desc.clone()))
-                        .copied()
+                        .store
+                        .resolve_method(&info.class, &info.name, &info.desc)
                         .ok_or_else(|| VmError { msg: format!("找不到方法 {}{}", info.name, info.desc), exc: None })?;
                     self.depth += 1;
                     let op_pc = pc - 3;
-                    let r = call_or_handle!(self.execute(target, &info.desc, &args, false), op_pc);
+                    let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &args, false), op_pc);
                     self.depth -= 1;
                     match r {
                         CallOutcome::Value(v) => {
@@ -736,41 +760,59 @@ impl<'a> Vm<'a> {
         Ok(Slot::I(0))
     }
 
-    /// 返回 (max_locals, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，
-    /// catch_type = 0 表示 catch-all（finally）。
-    pub(super) fn code_of(&self, m: &'a crate::Member) -> Result<(usize, &'a [u8], Vec<(u16, u16, u16, u16)>), VmError> {
-        let code_name = self.class.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
-            Some(CpEntry::Utf8(b)) if b == b"Code" => Some(i as u16),
-            _ => None,
-        });
-        let code_name = match code_name {
-            Some(c) => c,
-            None => return err("常量池里没有 Code"),
-        };
-        for a in &m.attributes {
-            if a.name_index == code_name && a.info.len() >= 8 {
-                let max_locals = u16::from_be_bytes([a.info[2], a.info[3]]) as usize;
-                let code_len = u32::from_be_bytes([a.info[4], a.info[5], a.info[6], a.info[7]]) as usize;
-                let start = 8;
-                let end = (start + code_len).min(a.info.len());
-                // 异常表紧跟在字节码后面：u2 个数 + 每项 4 个 u2
-                let mut table = Vec::new();
-                let mut q = end;
-                if q + 2 <= a.info.len() {
-                    let n = u16::from_be_bytes([a.info[q], a.info[q + 1]]) as usize;
-                    q += 2;
-                    for _ in 0..n {
-                        if q + 8 > a.info.len() {
-                            break;
-                        }
-                        let rd = |i: usize| u16::from_be_bytes([a.info[i], a.info[i + 1]]);
-                        table.push((rd(q), rd(q + 2), rd(q + 4), rd(q + 6)));
-                        q += 8;
-                    }
-                }
-                return Ok((max_locals, &a.info[start..end], table));
-            }
-        }
-        err("方法没有 Code 属性（抽象方法？）")
+    /// 字段偏移：先按引用类的继承链找，找不到再按对象的**运行时类**找
+    fn field_offset(&self, obj: i32, owner: &str, name: &str) -> Result<usize, VmError> {
+        self.field_index_of_object(obj, name)
+            .or_else(|| self.store.field_index(owner, name))
+            .ok_or_else(|| VmError { msg: format!("未知字段 {owner}.{name}"), exc: None })
     }
+
+    fn field_index_of_object(&self, obj: i32, name: &str) -> Option<usize> {
+        if obj <= 0 {
+            return None;
+        }
+        let c = self.object_class.get(obj as usize - 1)?;
+        self.store.field_index(c, name)
+    }
+}
+
+/// 返回 (max_locals, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，
+/// catch_type = 0 表示 catch-all（finally）。
+pub(super) fn code_of<'a>(
+    cf: &crate::ClassFile,
+    m: &'a crate::Member,
+) -> Result<(usize, &'a [u8], Vec<(u16, u16, u16, u16)>), VmError> {
+    let code_name = cf.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
+        Some(CpEntry::Utf8(b)) if b == b"Code" => Some(i as u16),
+        _ => None,
+    });
+    let code_name = match code_name {
+        Some(c) => c,
+        None => return err("常量池里没有 Code"),
+    };
+    for a in &m.attributes {
+        if a.name_index == code_name && a.info.len() >= 8 {
+            let max_locals = u16::from_be_bytes([a.info[2], a.info[3]]) as usize;
+            let code_len = u32::from_be_bytes([a.info[4], a.info[5], a.info[6], a.info[7]]) as usize;
+            let start = 8;
+            let end = (start + code_len).min(a.info.len());
+            // 异常表紧跟在字节码后面：u2 个数 + 每项 4 个 u2
+            let mut table = Vec::new();
+            let mut q = end;
+            if q + 2 <= a.info.len() {
+                let n = u16::from_be_bytes([a.info[q], a.info[q + 1]]) as usize;
+                q += 2;
+                for _ in 0..n {
+                    if q + 8 > a.info.len() {
+                        break;
+                    }
+                    let rd = |i: usize| u16::from_be_bytes([a.info[i], a.info[i + 1]]);
+                    table.push((rd(q), rd(q + 2), rd(q + 4), rd(q + 6)));
+                    q += 8;
+                }
+            }
+            return Ok((max_locals, &a.info[start..end], table));
+        }
+    }
+    err("方法没有 Code 属性（抽象方法？）")
 }

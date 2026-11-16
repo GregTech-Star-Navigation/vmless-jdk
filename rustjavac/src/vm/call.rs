@@ -12,10 +12,9 @@ pub(super) struct MethodRefInfo {
     pub(super) desc: String,
 }
 
-impl<'a> Vm<'a> {
-    pub(super) fn method_ref(&self, index: u16) -> Result<MethodRefInfo, VmError> {
-        let e = self
-            .class
+impl Vm {
+    pub(super) fn method_ref(&self, cf: &crate::ClassFile, index: u16) -> Result<MethodRefInfo, VmError> {
+        let e = cf
             .constant_pool
             .get(index as usize)
             .and_then(|e| e.as_ref())
@@ -25,16 +24,16 @@ impl<'a> Vm<'a> {
             CpEntry::FieldRef(c, n) => (*c, *n),
             other => return err(format!("索引 {index} 不是方法/字段引用: {other:?}")),
         };
-        let class_name = match self.class.constant_pool.get(class_idx as usize).and_then(|e| e.as_ref()) {
+        let class_name = match cf.constant_pool.get(class_idx as usize).and_then(|e| e.as_ref()) {
             Some(CpEntry::Class(n)) => {
-                String::from_utf8_lossy(self.class.utf8(*n).unwrap_or_default()).into_owned()
+                String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned()
             }
             _ => return err("方法引用的类名解析失败"),
         };
-        let (name, desc) = match self.class.constant_pool.get(nat_idx as usize).and_then(|e| e.as_ref()) {
+        let (name, desc) = match cf.constant_pool.get(nat_idx as usize).and_then(|e| e.as_ref()) {
             Some(CpEntry::NameAndType(n, d)) => (
-                String::from_utf8_lossy(self.class.utf8(*n).unwrap_or_default()).into_owned(),
-                String::from_utf8_lossy(self.class.utf8(*d).unwrap_or_default()).into_owned(),
+                String::from_utf8_lossy(cf.utf8(*n).unwrap_or_default()).into_owned(),
+                String::from_utf8_lossy(cf.utf8(*d).unwrap_or_default()).into_owned(),
             ),
             _ => return err("NameAndType 解析失败"),
         };

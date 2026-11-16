@@ -14,6 +14,7 @@ use cranelift_module::default_libcall_names;
 use crate::{parse, ClassFile};
 
 mod call;
+mod classes;
 mod exc;
 mod insn;
 mod layout;
@@ -23,11 +24,16 @@ mod translate;
 
 pub use call::CompiledMethod;
 pub(crate) use call::param_slots;
+use classes::ClassSet;
 
 pub struct Jit {
     module: JITModule,
-    /// (方法名, 描述符) → 已声明/已编译的函数 id
-    compiled: std::collections::HashMap<(String, String), (cranelift_module::FuncId, usize, i32)>,
+    /// (类名, 方法名, 描述符) → 已声明/已编译的函数 id
+    compiled: std::collections::HashMap<(String, String, String), (cranelift_module::FuncId, usize, i32)>,
+    /// 已加载的类：继承链、字段布局、方法解析
+    classes: ClassSet,
+    /// 待登记的虚方法实现（函数地址要等 finalize 之后才有）
+    pending_v: Vec<(u32, u32, cranelift_module::FuncId, u8)>,
 }
 
 #[derive(Debug)]
@@ -63,8 +69,33 @@ impl Jit {
         builder.symbol("vmless_exc_clear", rt::exc_clear as *const u8);
         builder.symbol("vmless_exc_set_msg", rt::exc_set_msg as *const u8);
         builder.symbol("vmless_catch_match", rt::catch_match as *const u8);
+        builder.symbol("vmless_vcall", rt::vcall as *const u8);
         let module = JITModule::new(builder);
-        Jit { module, compiled: std::collections::HashMap::new() }
+        Jit {
+            module,
+            compiled: std::collections::HashMap::new(),
+            classes: ClassSet::new(),
+            pending_v: Vec::new(),
+        }
+    }
+
+    /// 把一个目录里的 .class 都读进来（继承链上的父类必须在这里）
+    pub fn add_class_dir(&mut self, dir: &std::path::Path) {
+        self.classes.load_dir(dir);
+    }
+
+    /// 便捷：从主类文件路径加载它和同目录的其它类
+    pub fn load_class_path(&mut self, class_file: &str) {
+        if let Ok(bytes) = std::fs::read(class_file) {
+            if let Ok(cf) = parse(&bytes) {
+                self.classes.insert(cf);
+            }
+        }
+        let dir = std::path::Path::new(class_file)
+            .parent()
+            .map(|p| p.to_path_buf())
+            .unwrap_or_else(|| ".".into());
+        self.add_class_dir(&dir);
     }
 
     pub fn compile_static(
@@ -73,10 +104,25 @@ impl Jit {
         name: &str,
         desc: &str,
     ) -> Result<CompiledMethod, JitError> {
-        let (func_id, max_locals, _) = self.compile_into(cf, name, desc)?;
+        // 主类也进类表（examples 只给一个 cf，同目录的类由 load_class_path/add_class_dir 补）
+        let cname = cf
+            .this_class_name()
+            .ok_or_else(|| JitError("class 没有 this_class".into()))?;
+        self.classes.insert(cf.clone());
+        // 布局要一次性全部建好：翻译 getfield 时任何类的偏移都可能要查
+        for c in self.classes.names() {
+            self.classes.build_layout(&c);
+        }
+        let (func_id, max_locals, _) = self.compile_into(&cname, name, desc)?;
         self.module
             .finalize_definitions()
             .map_err(|e| JitError(e.to_string()))?;
+        // finalize 之后才知道函数地址：把攒下的虚方法实现登记进运行时表
+        let pending = std::mem::take(&mut self.pending_v);
+        for (tag, sig, fid, ret) in pending {
+            let p = self.module.get_finalized_function(fid) as usize;
+            rt::register_vmethod(tag, sig, p, ret);
+        }
         let ptr = self.module.get_finalized_function(func_id);
         let code: JitFn = unsafe { std::mem::transmute(ptr) };
         Ok(CompiledMethod {
