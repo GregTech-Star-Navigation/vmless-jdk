@@ -79,21 +79,53 @@ pub(super) fn class_name_of(cf: &ClassFile, index: u16) -> Result<String, VmErro
 impl Vm {
     /// 静态初始化：先父类、再自己，只跑一次（JVM 的 `<clinit>` 语义）
     pub(super) fn ensure_init(&mut self, class: &str) -> Result<(), VmError> {
-        if self.initialized.contains(class) {
-            return Ok(());
+        let me = super::thread::cur_tid();
+        // JVMS 5.5：同一个类在同一时刻只能由**一个**线程初始化，别的线程要**阻塞等**。
+        // 不做这件事的后果很具体：`<clinit>` 跑到一半（在 safepoint 上让出 GIL）时，
+        // 另一个线程 getstatic 会读到默认值 0 —— `TimeUnit.MILLISECONDS` 变成 null、
+        // `Thread.sleep(ms)` 的 `toNanos` 在 null 上取字段，最后是操作数栈下溢。
+        loop {
+            if self.initialized.contains(class) {
+                return Ok(());
+            }
+            match self.initializing.get(class).copied() {
+                // 别的线程正在初始化 → 挂进等待队列，被唤醒后重新判定
+                Some(owner) if owner != me => {
+                    self.init_waiters.entry(class.to_string()).or_default().push(me);
+                    self.set_state(me, super::thread::ST_BLOCKED);
+                    self.park_block(None);
+                    self.set_state(me, super::thread::ST_RUNNABLE);
+                }
+                // **自己**正在初始化（`<clinit>` 里又引用了自己的静态字段）→ 直接返回，
+                // 不能再跑一遍（会一直递归到深度上限）
+                Some(_) => return Ok(()),
+                None => break, // 没人做 → 我来
+            }
         }
-        // 先标记：`<clinit>` 里引用自己的静态字段时不能无限递归
-        self.initialized.insert(class.to_string());
-        if let Some(s) = self.store.super_of(class) {
-            self.ensure_init(&s)?;
+        self.initializing.insert(class.to_string(), me);
+        let r = (|| -> Result<(), VmError> {
+            if let Some(s) = self.store.super_of(class) {
+                self.ensure_init(&s)?;
+            }
+            if let Some((ci, mi)) = self.store.method_in_class(class, "<clinit>", "()V") {
+                self.depth += 1;
+                let r = self.execute(ci, mi, "()V", &[], false);
+                self.depth -= 1;
+                r?;
+            }
+            Ok(())
+        })();
+        self.initializing.remove(class);
+        if r.is_ok() {
+            // **完成之后**才记进 initialized：先记会让别的线程看到「已完成」却读到默认值
+            self.initialized.insert(class.to_string());
         }
-        if let Some((ci, mi)) = self.store.method_in_class(class, "<clinit>", "()V") {
-            self.depth += 1;
-            let r = self.execute(ci, mi, "()V", &[], false);
-            self.depth -= 1;
-            r?;
+        if let Some(waiters) = self.init_waiters.remove(class) {
+            for w in waiters {
+                self.wake(w);
+            }
         }
-        Ok(())
+        r
     }
 
     /// actual 是不是 target 或它的子类（**接口也算**：实际类 implements 它即成立）

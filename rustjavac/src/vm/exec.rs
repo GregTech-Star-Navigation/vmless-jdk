@@ -16,6 +16,9 @@ use super::VmError;
 /// 方法访问标志：`native`（没有 Code 属性，实现由 VM 提供）
 pub(super) const ACC_NATIVE: u16 = 0x0100;
 
+/// 方法访问标志：`synchronized`（进入/退出时自动加解对象监视器）
+pub(super) const ACC_SYNCHRONIZED: u16 = 0x0020;
+
 /// 这个句柄是不是字符串堆里的（而不是对象堆 / 数组堆 / 类对象）
 fn is_str_handle(h: i32) -> bool {
     h >= STR_BASE
@@ -55,8 +58,48 @@ impl Vm {
     }
 
     /// 执行一个方法：`class`/`method` 是它在类表里的位置；desc 形如 `(II)I`；
-    /// `receiver` 表示 args[0] 是 this（实例方法）
+    /// `receiver` 表示 args[0] 是 this（实例方法）。
+    ///
+    /// `ACC_SYNCHRONIZED` 的方法在这里成对加解锁 —— 放在这一层是因为**每个**调用点
+    /// （virtual/special/static/interface/indy/lambda/反射）最终都走 `execute`，
+    /// 在这里做一次就不会漏；异常路径同样会解锁（JVMS：监视器随帧弹出释放）。
     pub(super) fn execute(
+        &mut self,
+        class: usize,
+        method: usize,
+        desc: &str,
+        args: &[Slot],
+        receiver: bool,
+    ) -> Result<Slot, VmError> {
+        let sync = {
+            let cf = &self.store.classes[class];
+            cf.methods[method].access_flags & ACC_SYNCHRONIZED != 0
+        };
+        let lock = if !sync {
+            0
+        } else if receiver {
+            args.first().map(|s| s.as_i32()).unwrap_or(0)
+        } else {
+            // 静态 synchronized 方法锁的是**声明类**的类对象
+            let name = self.store.classes[class].this_class_name().unwrap_or_default();
+            self.class_obj(&name)
+        };
+        if lock != 0 {
+            self.monitor_enter(lock)?;
+        }
+        let r = self.execute_body(class, method, desc, args, receiver);
+        if lock != 0 {
+            match self.monitor_exit(lock) {
+                Ok(()) => {}
+                // 方法体已经抛异常时，解锁失败不能盖掉原来的异常
+                Err(_) if r.is_err() => {}
+                Err(e) => return Err(e),
+            }
+        }
+        r
+    }
+
+    fn execute_body(
         &mut self,
         class: usize,
         method: usize,
@@ -70,6 +113,23 @@ impl Vm {
         // 每次调用先把「当前类」钉住：常量池、Code 属性都按它取（继承后方法来自不同类）
         let cf = self.store.classes[class].clone();
         let m = &cf.methods[method];
+        // VM 接管的 JDK 方法（`Thread.<init>` / `Thread.start` 之类）：它们**不是** native，
+        // 但真字节码要拖进 ThreadGroup / ClassLoader / ThreadContainers 一整条链，
+        // 而这一层语义本该由 VM 提供（HotSpot 也是 native/内建）。先查接管表。
+        //
+        // 代价必须压住：`execute_body` 是解释器最热的函数，所以先用**不分配**的类名
+        // 比较挡一道，只有命中接管清单里的类才去做真正的查表。
+        if self.natives.has_overrides() && is_override_owner(&cf) {
+            let owner = cf.this_class_name().unwrap_or_default();
+            let name = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
+            let odesc = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
+            if let Some(f) = self.natives.lookup_override(&owner, &name, &odesc) {
+                let mut frame =
+                    Frame::new(crate::jit::param_slots(&odesc).last().map(|s| s + 2).unwrap_or(1));
+                native_reg::place_args(&mut frame, &odesc, args, receiver);
+                return f(self, &mut frame);
+            }
+        }
         // native 方法没有 Code 属性：先查注册表，命中就交出去；没命中报 UnsatisfiedLinkError
         if m.access_flags & ACC_NATIVE != 0 {
             let owner = cf.this_class_name().unwrap_or_default();
@@ -119,6 +179,14 @@ impl Vm {
         let trace = std::env::var_os("VMLESS_TRACE").is_some();
         let mut pc = 0usize;
         while pc < body.len() {
+            // 抢占点：多线程时定期交还 GIL。没有它，一个死循环（或长计算）线程会把
+            // 别的 Java 线程饿死 —— `Thread.start` 之后对方永远跑不上来。
+            // 单线程时这里只是一次整数比较，不进函数。
+            self.tick += 1;
+            if self.tick >= super::thread::SAFEPOINT_EVERY {
+                self.tick = 0;
+                self.safepoint();
+            }
             let op = body[pc];
             if trace {
                 eprintln!("  pc={pc} op={op:02x} stack={:?} locals={:?}", frame.stack, frame.locals);
@@ -761,6 +829,25 @@ impl Vm {
                     }
                     frame.push(Slot::I(v));
                 }
+                // monitorenter / monitorexit（对象监视器；语义见 vm/thread.rs）
+                0xc2 | 0xc3 => {
+                    let op_pc = pc - 1;
+                    let obj = frame.pop_i()?;
+                    let r = if op == 0xc2 {
+                        self.monitor_enter(obj)
+                    } else {
+                        self.monitor_exit(obj)
+                    };
+                    // IllegamMonitorStateException / NullPointerException 是**本方法**里抛的，
+                    // 要先过自己的异常表（javac 给 synchronized 块生成的 monitorexit 就在
+                    // handler 里 —— 这一步没做对，异常路径上的锁就永远不释放）
+                    if let Err(e) = r {
+                        let (target, h) = self.local_handler(&cf, &exc_table, op_pc, e)?;
+                        pc = target;
+                        frame.stack.clear();
+                        frame.push(Slot::I(h));
+                    }
+                }
                 // ifnull / ifnonnull
                 0xc6 | 0xc7 => {
                     let op_pc = pc - 1;
@@ -1287,6 +1374,33 @@ impl Vm {
         let c = self.object_class.get(obj as usize - 1)?;
         self.store.field_index(c, name)
     }
+
+    /// 主循环里的同步异常处理：本方法的异常表接得住就返回 handler 偏移 + 异常句柄，
+    /// 接不住就把原错误原样往外抛（交给调用方那层的 handler）。
+    fn local_handler(
+        &mut self,
+        cf: &crate::ClassFile,
+        table: &[(u16, u16, u16, u16)],
+        op_pc: usize,
+        e: VmError,
+    ) -> Result<(usize, i32), VmError> {
+        match e.exc {
+            Some(h) => match self.find_handler(cf, table, op_pc, h)? {
+                Some(t) => Ok((t, h)),
+                None => Err(e),
+            },
+            None => Err(e),
+        }
+    }
+}
+
+/// 这个类的内部名是不是「VM 接管清单」里的那几个（**不分配字符串**，热路径友好）
+fn is_override_owner(cf: &crate::ClassFile) -> bool {
+    let bytes = match cf.constant_pool.get(cf.this_class as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::Class(n)) => cf.utf8(*n).unwrap_or_default(),
+        _ => return false,
+    };
+    matches!(bytes, b"java/lang/Thread")
 }
 
 /// 返回 (max_locals, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，

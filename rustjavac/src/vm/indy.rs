@@ -200,11 +200,15 @@ impl Vm {
     /// 一处 Java 异常（返回 `VmError`，交给调用方的异常表）
     pub(super) fn java_exception(&mut self, class: &str, msg: impl Into<String>) -> VmError {
         let msg = msg.into();
-        self.objects.push(vec![Slot::I(0)]);
+        let n = self.store.field_count(class).max(1);
+        self.objects.push(vec![Slot::I(0); n]);
         self.object_class.push(class.to_string());
         let h = self.objects.len() as i32;
         let m = self.str_new(msg.clone());
         self.exc_msgs.insert(h, m);
+        // `getMessage()` 读的是 `Throwable.detailMessage` 字段 —— 只记在 `exc_msgs` 里的话，
+        // Java 代码 catch 到之后 `e.getMessage()` 会拿到 null（与 HotSpot 不一致）
+        self.put_named(h, class, "detailMessage", Slot::I(m));
         VmError { msg: format!("{}: {msg}", class.replace('/', ".")), exc: Some(h) }
     }
 

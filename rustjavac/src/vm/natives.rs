@@ -105,6 +105,13 @@ impl Vm {
 
     // ---------- 堆上新值 ----------
 
+    /// 把已缓冲的输出刷到 stdout（`System.exit` 前必须调：缓冲在 Vm 里，进程退出会丢）
+    pub(super) fn flush_output(&mut self) {
+        for line in self.output.drain(..) {
+            println!("{line}");
+        }
+    }
+
     pub(super) fn str_new(&mut self, s: String) -> i32 {
         self.strings.push(s);
         STR_BASE + self.strings.len() as i32 - 1

@@ -835,3 +835,37 @@ Math、Integer/Long 进制、Character、Arrays）；解释器与 JIT 侧的集�
 `jhsdb` 只服务 VMless VM（Windows 无 ptrace），提供 `jmap --histo` / `--heap` / `jstack` / `jinfo` 等价能力。
 
 **边界**：全量 `print` 3.3M 事件占 2.6GB（未逐 chunk flush）；`--xml` 未实现；多 chunk 按结束时间统一出队。
+
+## 0.55.0 — 2026-11-17 · 线程 + `monitorenter`/`monitorexit` + 真同步
+
+**这是「Minecraft 起不来」的首要原因，也是 195/202 里最后两条字节码缺口。**
+
+新增 `src/vm/thread.rs`（1091 行）：GIL + 线程表 + 监视器
+- **票据锁（FIFO）** 做 GIL —— 非公平锁会让 safepoint 上「释放后重抢」把别的线程饿死
+- `monitor_enter/exit/wait/notify`：**可重入、FIFO、归零移交**（防插队）、下溢抛 `IllegalMonitorStateException`、
+  `wait` 完整释放并还原重入计数
+- 每 Java 线程一个 OS 线程；`ACC_SYNCHRONIZED` 放在**每个调用点都必经的那一层**（异常也解锁）
+- `safepoint`：每 512 字节码交还一次 GIL；单线程零成本
+- `<clinit>` 按 JVMS 5.5 **串行化** —— 多线程下不串行会读到半初始化的静态字段（最隐蔽的一个 bug）
+- `debug_threads` / `debug_deadlocks`：锁图 + `jstack` 风格死锁报告
+
+**JIT 侧明确拒绝**：`synchronized`/`monitorenter`/`monitorexit` 一律报错并整体退回解释器，
+`run_jit` 的降级判据已含这三条（**不许静默不加锁**）。
+
+**实测（16 个用例 × 3 轮，与 JDK 25 逐字节一致）**
+| 用例 | 结果 |
+|---|---|
+| T1 4 线程 × 10 万 `synchronized` 计数 | `400000 true` |
+| T3 `wait`/`notifyAll` 1 万元素 | `0 0`（无丢失无重复）|
+| T5 线程状态 | `TIMED_WAITING / BLOCKED / RUNNABLE / TERMINATED` |
+| T6/T6b daemon 与非 daemon | `true main done` / `false main done worker finished` |
+| T7 `volatile` 可见性 100 万次 | `saw ready 42 1000000 true` |
+| T4 故意死锁 | 报 `Found 1 deadlock.`，环与谁等谁一致 |
+
+**opcode 覆盖：解释器 197/202**（`monitorenter`/`monitorexit` 转 ✅），JIT 195/202
+（监视器不实现，明确拒绝）。只剩 `jsr ret wide goto_w jsr_w`（本编译器不产）。
+
+**回归**：`verify.sh` 103/103、`cargo test` 50 passed、corpus 40/45，全部无退化。
+
+**边界**：**不并行执行字节码**（一把 GIL，代价是多核用不上）；解释器堆没有 GC（只增不减，但不会回收错）；
+`jstack` 只给锁图不给帧列表；虚拟线程不做。

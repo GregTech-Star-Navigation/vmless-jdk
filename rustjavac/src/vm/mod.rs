@@ -21,6 +21,7 @@ mod native_reg;
 mod natives;
 mod rt;
 mod slot;
+mod thread;
 
 pub use slot::Slot;
 pub(crate) use class::builtin_super;
@@ -124,8 +125,12 @@ pub struct Vm {
     exc_msgs: HashMap<i32, i32>,
     /// 静态字段：(声明类, 字段名) → 值（没有条目就是默认值 0/null）
     statics: HashMap<(String, String), Slot>,
-    /// 已经跑过 `<clinit>` 的类（静态初始化只跑一次，且先跑父类）
+    /// 已经跑完 `<clinit>` 的类（静态初始化只跑一次，且先跑父类）
     initialized: std::collections::HashSet<String>,
+    /// 正在跑 `<clinit>` 的类 → 初始化它的线程 id（JVMS 5.5：一个类同时只许一个线程初始化）
+    initializing: HashMap<String, u64>,
+    /// 等某个类初始化完成的线程
+    init_waiters: HashMap<String, Vec<u64>>,
     /// 类对象：句柄 → 它代表的类描述符（`X.class` / `getClass()` 的轻量句柄）
     class_objs: HashMap<i32, String>,
     /// 类描述符 → 类对象句柄（同一个类必须永远同一个句柄，`X.class == X.class` 靠它）
@@ -162,6 +167,18 @@ pub struct Vm {
     indy_calls: usize,
     /// 已生成的 lambda 类序号
     lambda_seq: usize,
+    /// Java 线程表：tid → 记录（parker / 状态 / 对应的 `Thread` 对象）
+    threads: HashMap<u64, thread::ThreadRec>,
+    /// 对象监视器表：对象句柄 → 锁状态（owner / 重入计数 / entry 与 cond 两个队列）
+    monitors: HashMap<i32, thread::Monitor>,
+    /// 存活的 Java 线程数（1 = 单线程，safepoint 什么都不用做）
+    nthreads: u32,
+    /// 距上一次 safepoint 已经跑了多少条字节码
+    tick: u32,
+    /// 自动起名计数器（`Thread-N`）
+    thread_seq: u32,
+    /// 死锁 watchdog 的停滞计数（连续几次 tick 所有线程都不在 RUNNABLE）
+    stalled: u32,
 }
 
 impl Vm {
@@ -187,6 +204,8 @@ impl Vm {
             exc_msgs: HashMap::new(),
             statics: HashMap::new(),
             initialized: std::collections::HashSet::new(),
+            initializing: HashMap::new(),
+            init_waiters: HashMap::new(),
             class_objs: HashMap::new(),
             class_obj_cache: HashMap::new(),
             str_fields: HashMap::new(),
@@ -209,6 +228,12 @@ impl Vm {
             indy_resolved: 0,
             indy_calls: 0,
             lambda_seq: 0,
+            threads: HashMap::new(),
+            monitors: HashMap::new(),
+            nthreads: 0,
+            tick: 0,
+            thread_seq: 0,
+            stalled: 0,
         }
     }
 
@@ -255,13 +280,23 @@ impl Vm {
         // JVM 在调 main 之前会先初始化入口类
         let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
         self.ensure_init(&main_name)?;
+        // 主线程进 VM：登记 tid=1 + 拿到 GIL（此后 main 的一切都在锁里跑）
+        thread::set_vm_ptr(self as *mut Vm);
+        thread::set_main_tid();
+        thread::gil_lock();
+        self.thread_register(1, 0, "main", false);
         let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);
+        // 主线程返回 ≠ 进程退出：非 daemon 线程要继续跑完（`System.exit` 已经在 native 里直接退）
+        self.wait_non_daemon();
+        self.thread_terminate_main();
         // `-Dvmless.indy.stats`：调用点解析次数（「同一调用点只解析一次」的证据）
         if self.indy_stats {
             for line in self.indy_stats_lines() {
                 eprintln!("{line}");
             }
         }
+        thread::clear_vm_ptr();
+        thread::gil_unlock();
         match r {
             Ok(r) => Ok(ExecResult {
                 return_value: r.as_i32(),

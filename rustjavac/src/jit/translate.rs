@@ -38,7 +38,7 @@ impl Jit {
             .classes
             .get(class)
             .ok_or_else(|| JitError(format!("类 {class} 没有加载")))?;
-        let (max_locals, max_stack, body, exc_table, is_static) = {
+        let (max_locals, max_stack, body, exc_table, is_static, is_sync) = {
             let m = cf
                 .methods
                 .iter()
@@ -49,8 +49,9 @@ impl Jit {
                 })
                 .ok_or_else(|| JitError(format!("{class} 里找不到方法 {name}{desc}")))?;
             let is_static = m.access_flags & 0x0008 != 0;
+            let is_sync = m.access_flags & 0x0020 != 0;
             let (ml, ms, body, table) = code_of(&cf, m)?;
-            (ml, ms, body, table, is_static)
+            (ml, ms, body, table, is_static, is_sync)
         };
 
         // `invokedynamic` 在**进任何分析之前**就挡住：这个方法整体交给解释器执行，
@@ -60,6 +61,21 @@ impl Jit {
             return Err(JitError(format!(
                 "JIT 不支持 invokedynamic（0xba@{pc}）：{class}.{name}{desc} 里的 lambda / \
                  字符串拼接只能由解释器执行（JIT 未接入调用点缓存）"
+            )));
+        }
+        // `synchronized` 是**绝不能静默放过**的一类：JIT 拿到监视器表的入口是解释器那条路，
+        // 它自己既不会加锁也不会解锁。放过去 = 悄悄丢掉互斥语义（比拒绝更糟）。
+        if is_sync {
+            return Err(JitError(format!(
+                "JIT 不支持 synchronized 方法（ACC_SYNCHRONIZED）：{class}.{name}{desc} 
+                 只能由解释器执行（JIT 未接入对象监视器）"
+            )));
+        }
+        if let Some((pc, op)) = find_monitor(&body) {
+            let what = if op == 0xc2 { "monitorenter" } else { "monitorexit" };
+            return Err(JitError(format!(
+                "JIT 不支持同步指令 {what}（0x{op:02x}@{pc}）：{class}.{name}{desc} 
+                 只能由解释器执行（JIT 未接入对象监视器）"
             )));
         }
         // 同一个道理：`java.lang.invoke.*` 的调用 JIT 也没有接手的地方
@@ -2400,6 +2416,20 @@ fn find_invokedynamic(body: &[u8]) -> Option<usize> {
     while pc < body.len() {
         if body[pc] == 0xba {
             return Some(pc);
+        }
+        pc += insn_len_at(body, pc).max(1);
+    }
+    None
+}
+
+/// 方法体里第一条 `monitorenter`(0xc2) / `monitorexit`(0xc3)。
+///
+/// 按指令长度走，不会把操作数里的 0xc2 当成指令。
+fn find_monitor(body: &[u8]) -> Option<(usize, u8)> {
+    let mut pc = 0usize;
+    while pc < body.len() {
+        if body[pc] == 0xc2 || body[pc] == 0xc3 {
+            return Some((pc, body[pc]));
         }
         pc += insn_len_at(body, pc).max(1);
     }

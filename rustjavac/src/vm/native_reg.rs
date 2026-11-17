@@ -27,17 +27,35 @@ pub(crate) type NativeFn = fn(&mut Vm, &mut Frame) -> Result<Slot, VmError>;
 
 pub(crate) struct NativeRegistry {
     map: HashMap<(&'static str, &'static str, &'static str), NativeFn>,
+    /// **VM 接管的 JDK 方法**：这些方法在 OpenJDK 里不是 `native`（有字节码），
+    /// 但它们的字节码要实现的是 VM 内部语义（线程/监视器/内存序），
+    /// 只能由 VM 提供 —— 与 HotSpot 里「VM 内建 + 内联」的位置等价。
+    /// 查表的时机在**执行字节码之前**（见 `exec::execute_body`）。
+    overrides: HashMap<(&'static str, &'static str, &'static str), NativeFn>,
 }
 
 impl NativeRegistry {
     pub(super) fn new() -> Self {
-        let mut r = NativeRegistry { map: HashMap::new() };
+        let mut r = NativeRegistry { map: HashMap::new(), overrides: HashMap::new() };
         register_all(&mut r);
         r
     }
 
     fn add(&mut self, class: &'static str, name: &'static str, desc: &'static str, f: NativeFn) {
         self.map.insert((class, name, desc), f);
+    }
+
+    /// 登记一个「VM 接管」的方法（非 native，执行前拦下来）
+    fn add_override(&mut self, class: &'static str, name: &'static str, desc: &'static str, f: NativeFn) {
+        self.overrides.insert((class, name, desc), f);
+    }
+
+    pub(super) fn has_overrides(&self) -> bool {
+        !self.overrides.is_empty()
+    }
+
+    pub(super) fn lookup_override(&self, class: &str, name: &str, desc: &str) -> Option<NativeFn> {
+        self.overrides.get(&(class, name, desc)).copied()
     }
 
     pub(crate) fn lookup(&self, class: &str, name: &str, desc: &str) -> Option<NativeFn> {
@@ -100,10 +118,13 @@ fn register_all(r: &mut NativeRegistry) {
     r.add("java/lang/Object", "getClass", "()Ljava/lang/Class;", obj_get_class);
     r.add("java/lang/Object", "hashCode", "()I", obj_hash_code);
     r.add("java/lang/Object", "clone", "()Ljava/lang/Object;", obj_clone);
-    r.add("java/lang/Object", "notify", "()V", no_op);
-    r.add("java/lang/Object", "notifyAll", "()V", no_op);
-    r.add("java/lang/Object", "wait", "(J)V", no_op);
-    r.add("java/lang/Object", "wait", "(JI)V", no_op);
+    // ---- 对象监视器（`wait`/`notify` 是 `synchronized` 的语义本体，见 `vm/thread.rs`）----
+    // JDK 21+ 里 `wait()`/`wait(long)` 是 Java 包装，真正的 native 是 `wait0(J)V`。
+    r.add("java/lang/Object", "notify", "()V", obj_notify);
+    r.add("java/lang/Object", "notifyAll", "()V", obj_notify_all);
+    r.add("java/lang/Object", "wait0", "(J)V", obj_wait0);
+    r.add("java/lang/Object", "wait", "(J)V", obj_wait0);
+    r.add("java/lang/Object", "wait", "(JI)V", obj_wait_millis_nanos);
 
     // ---- java.lang.Class ----
     // `<clinit>` 第一句就是 `registerNatives()`，不接住它连类都初始化不了
@@ -138,6 +159,13 @@ fn register_all(r: &mut NativeRegistry) {
         sys_arraycopy,
     );
     r.add("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I", sys_identity_hash);
+
+    // ---- java.lang.Shutdown（System.exit 的落地：刷输出 + 立刻退出）----
+    r.add("java/lang/Shutdown", "beforeHalt", "()V", no_op);
+    r.add("java/lang/Shutdown", "halt0", "(I)V", shutdown_halt0);
+
+    // ---- jdk.internal.reflect.Reflection ----
+    r.add("jdk/internal/reflect/Reflection", "getCallerClass", "()Ljava/lang/Class;", reflection_caller);
 
     // ---- java.lang.Runtime ----
     // `ArrayList.sort` → `Arrays.sort` 一族的路径上会问到 CPU 数（并行排序的门槛判断）。
@@ -179,10 +207,65 @@ fn register_all(r: &mut NativeRegistry) {
     r.add("jdk/internal/misc/CDS", "isDumpingArchive0", "()Z", |_, _| Ok(Slot::I(0)));
     r.add("jdk/internal/misc/CDS", "isSharingEnabled0", "()Z", |_, _| Ok(Slot::I(0)));
     r.add("jdk/internal/misc/CDS", "getCorchestra", "()Ljava/lang/Object;", |_, _| Ok(Slot::I(0)));
+    r.add("jdk/internal/misc/CDS", "getRandomSeedForDumping", "()J", |_, _| Ok(Slot::L(0)));
     r.add("jdk/internal/misc/CDS", "initializeFromArchive", "(Ljava/lang/Class;)V", no_op);
 
     // ---- jdk.internal.misc.Unsafe ----
     register_unsafe(r);
+
+    // ---- java.lang.Thread ----
+    register_thread(r);
+}
+
+/// `java.lang.Thread`：native 部分 + **VM 接管**的构造器 / `start()`。
+///
+/// 接管判据：真字节码里这几步要实现的是 VM 内部语义（建 OS 线程、维护
+/// `eetop`/`threadStatus`），而 HotSpot 自己也是 native 实现；照字节码跑则会被拖进
+/// `ThreadGroup` → `ClassLoader.getSystemClassLoader()` → `ServiceLoader` 一整条链，
+/// 而那条链对本 VM 没有任何意义。**接管的只有「建/起线程」，其余全走真字节码**：
+/// `run` / `join` / `getState` / `isAlive` / `sleep` / `wait` 的语义都在 Java 里。
+fn register_thread(r: &mut NativeRegistry) {
+    let t = "java/lang/Thread";
+    // `<clinit>` 第一句
+    r.add(t, "registerNatives", "()V", no_op);
+    // 当前线程的 Thread 对象（懒建）
+    r.add(t, "currentThread", "()Ljava/lang/Thread;", thread_current);
+    r.add(t, "currentCarrierThread", "()Ljava/lang/Thread;", thread_current);
+    r.add(t, "setCurrentThread", "(Ljava/lang/Thread;)V", no_op);
+    // `sleep` 全族最终落到它（`sleep(long)` / `sleep(long,int)` / `sleep(Duration)`）
+    r.add(t, "sleepNanos0", "(J)V", thread_sleep_nanos0);
+    r.add(t, "interrupt0", "()V", thread_interrupt0);
+    r.add(t, "clearInterruptEvent", "()V", no_op);
+    r.add(t, "holdsLock", "(Ljava/lang/Object;)Z", thread_holds_lock);
+    r.add(t, "yield0", "()V", thread_yield0);
+    // 作用域值（JDK 21+ 的 ScopedValue）：本 VM 不支持，返回 null 即可 ——
+    // `Thread.runWith` 只是把它原样传给 `ensureMaterializedForStackWalk`
+    r.add(t, "findScopedValueBindings", "()Ljava/lang/Object;", |_, _| Ok(Slot::I(0)));
+    r.add(t, "scopedValueCache", "()[Ljava/lang/Object;", |_, _| Ok(Slot::I(0)));
+    r.add(t, "setScopedValueCache", "([Ljava/lang/Object;)V", no_op);
+    r.add(t, "ensureMaterializedForStackWalk", "(Ljava/lang/Object;)V", no_op);
+    // 栈轨迹：本 VM 没有调用栈模型（与 `Throwable.getStackTraceDepth` 一致）
+    r.add(t, "getStackTrace0", "()Ljava/lang/Object;", |_, _| Ok(Slot::I(0)));
+    r.add(t, "dumpThreads", "([Ljava/lang/Thread;)[[Ljava/lang/StackTraceElement;", |_, _| {
+        Ok(Slot::I(0))
+    });
+    r.add(t, "getThreads", "()[Ljava/lang/Thread;", |_, _| Ok(Slot::I(0)));
+    r.add(t, "setPriority0", "(I)V", no_op);
+    r.add(t, "setNativeName", "(Ljava/lang/String;)V", no_op);
+    r.add(t, "getNextThreadIdOffset", "()J", |_, _| Ok(Slot::L(0)));
+
+    // 构造器：**全部**由 VM 接管（任何一个漏了都会把 ThreadGroup 那条链拖进来）
+    r.add_override(t, "<init>", "()V", thread_ctor_0);
+    r.add_override(t, "<init>", "(Ljava/lang/Runnable;)V", thread_ctor_r);
+    r.add_override(t, "<init>", "(Ljava/lang/String;)V", thread_ctor_s);
+    r.add_override(t, "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;)V", thread_ctor_gr);
+    r.add_override(t, "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/String;)V", thread_ctor_gs);
+    r.add_override(t, "<init>", "(Ljava/lang/Runnable;Ljava/lang/String;)V", thread_ctor_rs);
+    r.add_override(t, "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;)V", thread_ctor_grs);
+    r.add_override(t, "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;J)V", thread_ctor_grsj);
+    r.add_override(t, "<init>", "(Ljava/lang/ThreadGroup;Ljava/lang/Runnable;Ljava/lang/String;JZ)V", thread_ctor_grsjz);
+    // `start()`：`ThreadContainers.root()` 那一层对我们是空的，直接建线程
+    r.add_override(t, "start", "()V", thread_start_override);
 }
 
 /// `jdk/internal/misc/Unsafe`：java.base 的 `<clinit>` 与 `StringUTF16`/`Class` 大量依赖它。
@@ -227,25 +310,25 @@ fn register_unsafe(r: &mut NativeRegistry) {
     r.add(u, "putFloat", "(Ljava/lang/Object;JF)V", unsafe_put_float);
     r.add(u, "putDouble", "(Ljava/lang/Object;JD)V", unsafe_put_double);
     r.add(u, "putReference", "(Ljava/lang/Object;JLjava/lang/Object;)V", unsafe_put);
-    // volatile / ordered 变体：单线程下与普通读写同义
+    // volatile 变体：读/写前后加 SeqCst 栅栏（D 项：内存可见性）
     r.add(u, "getBooleanVolatile", "(Ljava/lang/Object;J)Z", unsafe_get8);
     r.add(u, "getByteVolatile", "(Ljava/lang/Object;J)B", unsafe_get8);
     r.add(u, "getCharVolatile", "(Ljava/lang/Object;J)C", unsafe_get16);
     r.add(u, "getShortVolatile", "(Ljava/lang/Object;J)S", unsafe_get16);
-    r.add(u, "getIntVolatile", "(Ljava/lang/Object;J)I", unsafe_get32);
-    r.add(u, "getLongVolatile", "(Ljava/lang/Object;J)J", unsafe_get64);
+    r.add(u, "getIntVolatile", "(Ljava/lang/Object;J)I", unsafe_get32_v);
+    r.add(u, "getLongVolatile", "(Ljava/lang/Object;J)J", unsafe_get64_v);
     r.add(u, "getFloatVolatile", "(Ljava/lang/Object;J)F", unsafe_get_float);
     r.add(u, "getDoubleVolatile", "(Ljava/lang/Object;J)D", unsafe_get_double);
-    r.add(u, "getReferenceVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;", unsafe_get);
+    r.add(u, "getReferenceVolatile", "(Ljava/lang/Object;J)Ljava/lang/Object;", unsafe_get_v);
     r.add(u, "putBooleanVolatile", "(Ljava/lang/Object;JZ)V", unsafe_put8);
     r.add(u, "putByteVolatile", "(Ljava/lang/Object;JB)V", unsafe_put8);
     r.add(u, "putCharVolatile", "(Ljava/lang/Object;JC)V", unsafe_put16);
     r.add(u, "putShortVolatile", "(Ljava/lang/Object;JS)V", unsafe_put16);
-    r.add(u, "putIntVolatile", "(Ljava/lang/Object;JI)V", unsafe_put32);
-    r.add(u, "putLongVolatile", "(Ljava/lang/Object;JJ)V", unsafe_put64);
+    r.add(u, "putIntVolatile", "(Ljava/lang/Object;JI)V", unsafe_put32_v);
+    r.add(u, "putLongVolatile", "(Ljava/lang/Object;JJ)V", unsafe_put64_v);
     r.add(u, "putFloatVolatile", "(Ljava/lang/Object;JF)V", unsafe_put_float);
     r.add(u, "putDoubleVolatile", "(Ljava/lang/Object;JD)V", unsafe_put_double);
-    r.add(u, "putReferenceVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V", unsafe_put);
+    r.add(u, "putReferenceVolatile", "(Ljava/lang/Object;JLjava/lang/Object;)V", unsafe_put_v);
     r.add(u, "putIntRelease", "(Ljava/lang/Object;JI)V", unsafe_put32);
     r.add(u, "putReferenceRelease", "(Ljava/lang/Object;JLjava/lang/Object;)V", unsafe_put);
     r.add(u, "putIntOrdered", "(Ljava/lang/Object;JI)V", unsafe_put32);
@@ -260,18 +343,161 @@ fn register_unsafe(r: &mut NativeRegistry) {
     // 对象/类
     r.add(u, "allocateInstance", "(Ljava/lang/Class;)Ljava/lang/Object;", unsafe_allocate);
     r.add(u, "throwException", "(Ljava/lang/Throwable;)V", unsafe_throw);
-    // 线程/屏障：这个 VM 是单线程的，全是空操作
-    r.add(u, "park", "(ZJ)V", no_op);
-    r.add(u, "unpark", "(Ljava/lang/Object;)V", no_op);
-    r.add(u, "fullFence", "()V", no_op);
-    r.add(u, "acquireFence", "()V", no_op);
-    r.add(u, "releaseFence", "()V", no_op);
-    r.add(u, "loadFence", "()V", no_op);
-    r.add(u, "storeFence", "()V", no_op);
+    // 线程停靠：`LockSupport` → `Unsafe.park/unpark`（AQS 与并发容器的底座，必须真阻塞）
+    r.add(u, "park", "(ZJ)V", unsafe_park);
+    r.add(u, "unpark", "(Ljava/lang/Object;)V", unsafe_unpark);
+    r.add(u, "fullFence", "()V", fence_seqcst);
+    r.add(u, "acquireFence", "()V", fence_seqcst);
+    r.add(u, "releaseFence", "()V", fence_seqcst);
+    r.add(u, "loadFence", "()V", fence_seqcst);
+    r.add(u, "storeFence", "()V", fence_seqcst);
 }
 // ---------------------------------------------------------------- 实现
 
+/// `Shutdown.halt0(int)`：把已经缓冲的输出刷出去再立刻退出进程。
+///
+/// 为什么在这里退：`System.exit` 的语义是「**不**等非 daemon 线程」（与 `main` 返回不同）。
+/// 输出是本 VM 的缓冲（`Vm::output`），不刷就丢 —— HotSpot 的 exit 也会 flush。
+fn shutdown_halt0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let code = f.arg_i(0);
+    vm.flush_output();
+    std::process::exit(code);
+}
+
+/// `Reflection.getCallerClass()`：本 VM 没有调用栈模型，返回 `Object` 的类对象。
+/// 它只被「有 SecurityManager 时」的分支用到（我们没有 SecurityManager，值用不上）。
+fn reflection_caller(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(vm.class_obj("java/lang/Object")))
+}
+
 fn no_op(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    void()
+}
+
+// ---- 对象监视器：wait / notify / notifyAll（语义在 `vm/thread.rs`，这里只做参数搬运）----
+
+fn obj_notify(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    vm.monitor_notify(this, false)?;
+    void()
+}
+
+fn obj_notify_all(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    vm.monitor_notify(this, true)?;
+    void()
+}
+
+/// `wait0(long millis)` / `wait(long)`：0 = 无限期
+fn obj_wait0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    let millis = f.arg_l(0);
+    let timeout = if millis <= 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_millis(millis as u64))
+    };
+    vm.monitor_wait(this, timeout)?;
+    void()
+}
+
+/// `wait(long millis, int nanos)`
+fn obj_wait_millis_nanos(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    let total = f
+        .arg_l(0)
+        .saturating_mul(1_000_000)
+        .saturating_add(f.arg_i(1).max(0) as i64);
+    let timeout = if total <= 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_nanos(total as u64))
+    };
+    vm.monitor_wait(this, timeout)?;
+    void()
+}
+
+// ---- java.lang.Thread ----
+
+fn thread_current(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(vm.current_thread_obj()))
+}
+
+fn thread_sleep_nanos0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let nanos = f.arg_l(0).max(0) as u64;
+    if nanos == 0 {
+        return void();
+    }
+    vm.thread_sleep(std::time::Duration::from_nanos(nanos))?;
+    void()
+}
+
+fn thread_interrupt0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    vm.thread_interrupt(this);
+    void()
+}
+
+fn thread_holds_lock(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(i32::from(vm.monitor_holds(f.arg_i(0)))))
+}
+
+fn thread_yield0(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    vm.safepoint();
+    void()
+}
+
+/// `Thread.<init>` 的接管体：`name` = String 句柄（0 → 自动起名 "Thread-N"），`task` = Runnable
+fn thread_init(vm: &mut Vm, f: &mut Frame, name: i32, task: i32) -> Result<Slot, VmError> {
+    let this = f.this();
+    let nm = if name != 0 { vm.obj_to_string(name) } else { vm.next_thread_name() };
+    vm.thread_fill(this, &nm, task)?;
+    void()
+}
+
+fn thread_ctor_0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    thread_init(vm, f, 0, 0)
+}
+fn thread_ctor_r(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let task = f.arg_i(0);
+    thread_init(vm, f, 0, task)
+}
+fn thread_ctor_s(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let name = f.arg_i(0);
+    thread_init(vm, f, name, 0)
+}
+fn thread_ctor_gr(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let task = f.arg_i(1);
+    thread_init(vm, f, 0, task)
+}
+fn thread_ctor_gs(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let name = f.arg_i(1);
+    thread_init(vm, f, name, 0)
+}
+fn thread_ctor_rs(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let task = f.arg_i(0);
+    let name = f.arg_i(1);
+    thread_init(vm, f, name, task)
+}
+fn thread_ctor_grs(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let task = f.arg_i(1);
+    let name = f.arg_i(2);
+    thread_init(vm, f, name, task)
+}
+fn thread_ctor_grsj(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let task = f.arg_i(1);
+    let name = f.arg_i(2);
+    thread_init(vm, f, name, task)
+}
+fn thread_ctor_grsjz(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let task = f.arg_i(1);
+    let name = f.arg_i(2);
+    thread_init(vm, f, name, task)
+}
+
+fn thread_start_override(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    vm.thread_start(this)?;
     void()
 }
 
@@ -548,6 +774,72 @@ fn unsafe_get_double(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 fn unsafe_get(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let off = f.arg_l(1);
     Ok(unsafe_slot(vm, f.arg_i(0), off).unwrap_or(Slot::I(0)))
+}
+
+// ---- volatile 变体：读后面 / 写前面各一道 SeqCst 栅栏 ----
+//
+// 本 VM 的堆只在持有 GIL 时访问，而 GIL 的每一次交接都是互斥锁的 acquire/release
+// （本身就是全屏障），所以这里再加栅栏是**双保险 + 明确的编译器屏障**：
+// `volatile` 的语义要求「不重排、立即可见」，不能靠「反正单线程」的隐式结论。
+fn fence() {
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+}
+
+fn fence_seqcst(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    fence();
+    void()
+}
+
+fn unsafe_get32_v(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let r = unsafe_get32(vm, f)?;
+    fence();
+    Ok(r)
+}
+
+fn unsafe_get64_v(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let r = unsafe_get64(vm, f)?;
+    fence();
+    Ok(r)
+}
+
+fn unsafe_get_v(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let r = unsafe_get(vm, f)?;
+    fence();
+    Ok(r)
+}
+
+fn unsafe_put32_v(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    fence();
+    unsafe_put32(vm, f)
+}
+
+fn unsafe_put64_v(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    fence();
+    unsafe_put64(vm, f)
+}
+
+fn unsafe_put_v(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    fence();
+    unsafe_put(vm, f)
+}
+
+/// `Unsafe.park(isAbsolute, time)`：真阻塞（见 `Vm::thread_park`）
+fn unsafe_park(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let nanos = f.arg_l(1);
+    let t = if nanos <= 0 {
+        None
+    } else {
+        Some(std::time::Duration::from_nanos(nanos as u64))
+    };
+    vm.thread_park(t)?;
+    void()
+}
+
+/// `Unsafe.unpark(thread)`（null = 当前线程）
+fn unsafe_unpark(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let t = f.arg_i(0);
+    vm.thread_unpark(t);
+    void()
 }
 
 fn unsafe_put8(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {

@@ -19,10 +19,15 @@ fn main() {
     let compiled = jit.compile_static(&cf, "main", "([Ljava/lang/String;)V");
     let m = match compiled {
         Ok(m) => m,
-        Err(e) if e.0.contains("invokedynamic") || e.0.contains("java.lang.invoke") => {
+        Err(e) if e.0.contains("invokedynamic")
+            || e.0.contains("java.lang.invoke")
+            || e.0.contains("synchronized")
+            || e.0.contains("monitorenter")
+            || e.0.contains("monitorexit") =>
+        {
             // JIT 不支持的字节码：退回解释器（不是把错误吞掉，而是换一条已实现的路径）
             eprintln!("JIT 跳过：{}", e.0);
-            eprintln!("→ 退回解释器执行（invokedynamic / java.lang.invoke 由解释器实现）");
+            eprintln!("→ 退回解释器执行（invokedynamic / java.lang.invoke / 对象监视器由解释器实现）");
             match classfile::vm::run_class_file(&path) {
                 Ok(r) => {
                     for line in &r.output {
