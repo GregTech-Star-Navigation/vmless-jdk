@@ -79,40 +79,40 @@ bash scripts/verify-samples.sh --all    # samples/ 下全部样例
 | `float` 算术 | ❌（相关指令一条没实现）|
 | 包名 + `import` 跨编译单元 | ❌（当前提交上解析有 bug，见支持矩阵）|
 
-## 现在的边界与路线
+## 当前状态（2026-11-17 · 65,055 行 Rust / 8 个 crate / 57 次提交）
 
-下面这五项是「**现在还没有，但为了跑真实 Java 程序必须补**」的，不是不打算有：
+### 已完成
 
-| 缺口 | 现状 | 为什么必须补 |
+| 能力 | 实测 |
+|---|---|
+| **字节码覆盖** | 解释器 **195/202**、JIT **195/202**（两边完全一致）；缺的 7 条是 `jsr ret wide goto_w jsr_w`（本编译器不产）+ `monitorenter/monitorexit` |
+| **解释器 + JIT + HotSpot 三路一致** | `verify.sh` **103/103** 逐字节比对（含退出码）|
+| **`invokedynamic`** | `StringConcatFactory`（`\u0001`/`\u0002` 语义）、`LambdaMetafactory`（含 `altMetafactory`）、`ConstantBootstraps`；调用点缓存实测 `解析 2 次 / 执行 100001 次` |
+| **执行真 OpenJDK 字节码** | `VMLESS_JDK=<lib/modules>` 后，`String` / `ArrayList` / `HashMap` 走 **OpenJDK 自己的字节码**（`String.hashCode("hello")` = `99162322`，`ArrayList`/`HashMap` 零新增 native）|
+| **native 方法机制** | `ACC_NATIVE` 注册表（102 条）；未命中报 `UnsatisfiedLinkError: 类.名描述符 not registered` |
+| **类来源** | 目录 / **jar（自写 inflate，零依赖）** / **jimage 真二进制格式**（30482 条）；`-cp` / `-jar` |
+| **内存层** | 分代 + **压缩式老年代** + **增量标记**（最大单步 0.683ms vs 全停顿 26.9ms）+ 并发 TLAB + 弱引用/finalization；分配 10.2ns/对象 |
+| **工具** | `jimage jmod serialver jnativescan jdeprscan javaw jwebserver jlink jshell javadoc jpackage jrunscript rmiregistry jps jdb`（15 个真实现）|
+| **密码学** | 零依赖 SHA/RSA/ASN.1/X.509/PKCS#7/PKCS#12；**与真 `jarsigner`/`keytool` 双向互通**；50 万例 fuzz 0 panic |
+| **Kerberos** | `kinit`/`klist`/自写 KDC；**真 JDK 25 的 `kinit` 能登进我们的 KDC** |
+| **attach 协议** | perfdata 用 **HotSpot v2.0 二进制格式**，所以**真 `jps`/`jstat` 能直接读我们的 VM**；1000 次 attach 句柄零变化 |
+
+### 还没做（按优先级）
+
+| 缺口 | 影响 | 规模 |
 |---|---|---|
-| **jar / 模块** | 只吃 `.class` 文件 | 任何真实程序（含 Minecraft）都是 jar 形态 |
-| **类加载器** | 类路径 = 入口 `.class` 所在目录树 | ModLauncher / FML 靠自定义 ClassLoader 做字节码转换 |
-| **反射 + 注解** | 无 | FML、Jackson、Spring 这一层全靠它 |
-| **线程 + `synchronized`** | 语法接受但**不加锁**（不生成 `monitorenter`） | 游戏是渲染线程 + 逻辑线程 + 工作池 |
-| **JNI** | 无 | LWJGL 的 GLFW/OpenGL 绑定就是 JNI；没有它开不出窗口 |
+| **线程 + `monitorenter`/`monitorexit`** | Minecraft 起不来（渲染线程 + 逻辑线程 + 工作池）| 中 |
+| **反射 + 注解** | FML / Jackson 这一层全靠它 | 中 |
+| **JNI** | LWJGL 的 GLFW/OpenGL 绑定；没有它开不出窗口 | 大 |
+| **模块系统（JPMS）** | 带 mod 的路线是硬要求（`--add-opens`）| 中 |
+| **`java.desktop`** | `jconsole`/`jaccess*` 我们改用 Win32 原生 GUI 实现，不依赖它 | — |
+| **`SwitchBootstraps` / `ObjectMethods`** | `case null ->` 与 record 的 `equals/hashCode/toString` | 小 |
 
-### 跑 Minecraft 意味着什么（不粉饰）
+### 一句话
 
-`java.base` 有 **7350 个类**。自己写这套库是不可能的；
-**可行的路线是让我们的 VM 去执行 OpenJDK 自己的 class 文件** —— 那是 HotSpot 的活，不是重写 JDK 库的活。
-
-所以目标从那句「Rust 写的 javac + JVM」升级成：**一个能跑真 `java.base` 的 JVM**。七步，每步都能独立验收：
-
-1. **jimage/jar 读取** —— 从真 JDK 的 `lib/modules` 或任意 jar 里按名字取类
-2. **类加载器** —— `ClassLoader.defineClass` + 双亲委派 + 多 jar classpath
-3. **native 方法层** —— `java.base` 自己声明的 native（`System.arraycopy`、`Object.hashCode`、`FileInputStream`…），核心约 200 个
-4. **invokedynamic + MethodHandles** —— lambda 与字符串拼接的字节码形态，现代 Java 代码到处都是
-5. **线程 + monitor** —— `Thread` 映射到 OS 线程，`monitorenter/exit` 真加锁
-6. **反射 + 注解**
-7. **JNI** —— 实现 JNI 函数表里 LWJGL 用到的那部分，才能初始化 GLFW 开窗口
-
-前 3 步做完，「跑一个真 jar」就通了；4–6 做完，框架类代码能跑；第 7 步才轮到 Minecraft。
-
-### 和 HotSpot 仍有的差距
-
-- `switch` 分支数小时降级成比较链 —— 分支多时比 HotSpot 慢
-- 方法调用没有内联、没有去虚拟化；JIT 是「方法级一次编译」，不是分层热点编译
-- GC 是**分代但非并发**的：最大单步停顿很小，但不追求吞吐峰值
+**VM、JIT、GC、类加载、native 层、字节码层、工具链都是自研的**，
+JDK 的类库走「执行 OpenJDK 自己的 class 文件」这条路（`java.base` 7350 个类，自己重写不现实）。
+要跑 Minecraft，还差**线程/monitor、反射、JNI、JPMS** 四块。
 ## 基准（历史实测，出处逐条标）
 
 > 下列数字来自 `CHANGELOG.md` 里记录的实测，**本轮没有重测**；每次记录的机器状态与日期不同，比较的是同一次记录里的两个数。
