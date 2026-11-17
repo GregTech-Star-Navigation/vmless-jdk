@@ -9,7 +9,7 @@ use super::constpool::CpBuilder;
 use super::ctx::Ctx;
 use super::emit::Emit;
 use super::error::*;
-use super::expr::compile_expr;
+use super::expr::{compile_expr, emit_init, emit_val, needs_scratch, spill, unspill};
 use super::stmt::*;
 use super::types::*;
 
@@ -62,35 +62,16 @@ pub(crate) fn compile_type(
     }
 
     // 任意一个类的字段/方法表：接收者静态类型可能不是本类（`P p = ...; p.get()`）
-    let mut type_fields: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut type_methods: HashMap<String, HashMap<String, String>> = HashMap::new();
-    let mut type_static_fields: HashMap<String, HashMap<String, (String, String)>> = HashMap::new();
-    let mut type_static_methods: HashMap<String, HashMap<String, String>> = HashMap::new();
+    // 平台部分按 classpath 进程级缓存，本单元声明的类由 `world()` 覆盖上去 —— 每类型
+    // 从零重建这六张表在 classpath 有几千个类时是不可接受的。
+    let w = res.world();
+    let type_fields = w.type_fields;
+    let type_methods = w.type_methods;
+    let type_static_fields = w.type_static_fields;
+    let type_static_methods = w.type_static_methods;
     // 接口类型名集合：调用点据此选 invokeinterface（0xB9）而不是 invokevirtual
-    let mut iface_types: std::collections::HashSet<String> = std::collections::HashSet::new();
-    let mut type_ctors: HashMap<String, Vec<String>> = HashMap::new();
-    for c in res.all_classes() {
-        if let Ok(cs) = res.ctor_descs(&c) {
-            type_ctors.insert(c.clone(), cs);
-        }
-    }
-    for c in res.all_classes() {
-        if let Ok(f) = res.field_types(&c) {
-            type_fields.insert(c.clone(), f);
-        }
-        if let Ok(m) = res.instance_methods(&c) {
-            type_methods.insert(c.clone(), m);
-        }
-        if let Ok(sf) = res.static_fields(&c) {
-            type_static_fields.insert(c.clone(), sf);
-        }
-        if let Ok(sm) = res.static_methods(&c) {
-            type_static_methods.insert(c.clone(), sm.into_iter().map(|(k, (d, _))| (k, d)).collect());
-        }
-        if res.is_interface(&c) {
-            iface_types.insert(c.clone());
-        }
-    }
+    let iface_types = w.iface_types;
+    let type_ctors = w.type_ctors;
     // 本类（含继承）的静态字段：名字 → (声明类, 描述符)
     let static_fields_map = res.static_fields(&self_name)?;
 
@@ -100,57 +81,8 @@ pub(crate) fn compile_type(
     let code_name = cp.utf8("Code");
     let stack_map_name = cp.utf8("StackMapTable");
 
-    let has_ctor = t.members.iter().any(|m| matches!(m, Member::Method(md) if md.ret.is_none() && md.name == t.name));
-
-    let mut methods: Vec<CfMember> = Vec::new();
-    let mut fields: Vec<CfMember> = Vec::new();
-    for m in &t.members {
-        if let Member::Field(f) = m {
-            // 接口里的字段一律是 public static final
-            let is_static_f = f.modifiers.iter().any(|x| x == "static") || is_iface;
-            let n = cp.utf8(&f.name);
-            let d = cp.utf8(&descriptor(&f.ty));
-            // 静态字段也要写进字段表：getstatic/putstatic 靠它解析（值本身在 <clinit> 里初始化）
-            let mut flags = if is_static_f { ACC_PUBLIC | ACC_STATIC } else { 0x0000 };
-            if f.modifiers.iter().any(|x| x == "final") || is_iface {
-                flags |= 0x0010; // ACC_FINAL
-            }
-            fields.push(CfMember {
-                access_flags: flags,
-                name_index: n,
-                descriptor_index: d,
-                attributes: Vec::new(),
-            });
-        }
-    }
-
-    let super_init = cp.method_ref(&super_name, "<init>", "()V");
-    if !has_ctor && !is_iface {
-        // 默认构造器：隐式调用父类无参构造器（父类没有就报错，和 javac 一致）
-        if !res.has_default_ctor(&super_name)? {
-            return err(format!(
-                "类 `{}` 的构造器隐式调用了 super()，但父类 `{}` 没有无参构造器",
-                t.name,
-                super_name.replace('/', ".")
-            ));
-        }
-        let mut ctor = Emit::new(1);
-        ctor.op(0x2A); // aload_0
-        ctor.push(1);
-        ctor.op_u2(0xB7, super_init);
-        ctor.pop(1);
-        ctor.op(0xB1);
-        let ctor_name = cp.utf8("<init>");
-        let ctor_desc = cp.utf8("()V");
-        methods.push(CfMember {
-            access_flags: ACC_PUBLIC,
-            name_index: ctor_name,
-            descriptor_index: ctor_desc,
-            attributes: vec![ctor.to_attribute(code_name)],
-        });
-    }
-
-    // 方法/静态初始化块共用的上下文底板（每个方法 clone 一份再按需改）
+    // 方法/静态初始化块共用的上下文底板（每个方法 clone 一份再按需改）。
+    // 放在这里是因为**隐式默认构造器**（下面那段）也要用它编实例字段初始化式。
     let base_ctx = Ctx {
         locals: HashMap::new(),
         next_slot: 0,
@@ -178,6 +110,96 @@ pub(crate) fn compile_type(
         pending_label: None,
         type_ctors: type_ctors.clone(),
     };
+
+    let has_ctor = t.members.iter().any(|m| matches!(m, Member::Method(md) if md.ret.is_none() && md.name == t.name));
+
+    let mut methods: Vec<CfMember> = Vec::new();
+    let mut fields: Vec<CfMember> = Vec::new();
+    for m in &t.members {
+        if let Member::Field(f) = m {
+            // 接口里的字段一律是 public static final
+            let is_static_f = f.modifiers.iter().any(|x| x == "static") || is_iface;
+            let n = cp.utf8(&f.name);
+            let d = cp.utf8(&descriptor(&f.ty));
+            // 静态字段也要写进字段表：getstatic/putstatic 靠它解析（值本身在 <clinit> 里初始化）
+            let mut flags = if is_static_f { ACC_PUBLIC | ACC_STATIC } else { 0x0000 };
+            if f.modifiers.iter().any(|x| x == "final") || is_iface {
+                flags |= 0x0010; // ACC_FINAL
+            }
+            fields.push(CfMember {
+                access_flags: flags,
+                name_index: n,
+                descriptor_index: d,
+                attributes: Vec::new(),
+            });
+        }
+    }
+
+    // 实例字段的初始化式：要在每个构造器里、`super(...)` 之后执行（JLS 8.8.7）。
+    // 以前这里根本没编 —— `class W { long f = 5; }` 读出来是 0，且没有任何报错。
+    let instance_field_inits: Vec<(String, String, Expr)> = t
+        .members
+        .iter()
+        .filter_map(|m| match m {
+            Member::Field(f)
+                if f.init.is_some()
+                    && !f.modifiers.iter().any(|x| x == "static")
+                    && !is_iface =>
+            {
+                Some((f.name.clone(), descriptor(&f.ty), f.init.clone().unwrap()))
+            }
+            _ => None,
+        })
+        .collect();
+
+    let super_init = cp.method_ref(&super_name, "<init>", "()V");
+    if !has_ctor && !is_iface {
+        // 默认构造器：隐式调用父类无参构造器（父类没有就报错，和 javac 一致）
+        if !res.has_default_ctor(&super_name)? {
+            return err(format!(
+                "类 `{}` 的构造器隐式调用了 super()，但父类 `{}` 没有无参构造器",
+                t.name,
+                super_name.replace('/', ".")
+            ));
+        }
+        let mut ctor = Emit::new(1);
+        ctor.op(0x2A); // aload_0
+        ctor.push(1);
+        ctor.op_u2(0xB7, super_init);
+        ctor.pop(1);
+        // 隐式构造器同样要跑实例字段初始化（绝大多数类没有显式构造器，漏了这里
+        // 就等于「所有字段都只拿到默认值」）
+        {
+            let mut cctx = base_ctx.clone();
+            emit_instance_field_inits(&instance_field_inits, &mut ctor, &mut cctx, &mut cp)?;
+        }
+        ctor.op(0xB1);
+        let ctor_name = cp.utf8("<init>");
+        let ctor_desc = cp.utf8("()V");
+        methods.push(CfMember {
+            access_flags: ACC_PUBLIC,
+            name_index: ctor_name,
+            descriptor_index: ctor_desc,
+            attributes: vec![ctor.to_attribute(code_name)],
+        });
+    }
+
+    // 实例字段的初始化式：要在每个构造器里、`super(...)` 之后执行（JLS 8.8.7）。
+    // 以前这里根本没编 —— `class W { long f = 5; }` 读出来是 0，且没有任何报错。
+    let instance_field_inits: Vec<(String, String, Expr)> = t
+        .members
+        .iter()
+        .filter_map(|m| match m {
+            Member::Field(f)
+                if f.init.is_some()
+                    && !f.modifiers.iter().any(|x| x == "static")
+                    && !is_iface =>
+            {
+                Some((f.name.clone(), descriptor(&f.ty), f.init.clone().unwrap()))
+            }
+            _ => None,
+        })
+        .collect();
 
     for m in &t.members {
         let md = match m {
@@ -257,7 +279,14 @@ pub(crate) fn compile_type(
         // 方法体
         match &md.body {
             Some(body) => {
-                let terminated = compile_stmt(body, &mut em, &mut ctx, &mut cp)?;
+                // 构造器：实例字段的初始化式要在 `super(...)` / `this(...)` 之后、
+                // 构造器体之前执行（JLS 8.8.7）。`this(...)` 委托时由被委托的那个构造器
+                // 负责初始化，这里不能再做一遍。
+                let terminated = if is_ctor_m && !ctor_delegates_to_this(md.body.as_ref()) {
+                    compile_ctor_body(body, &instance_field_inits, &mut em, &mut ctx, &mut cp)?
+                } else {
+                    compile_stmt(body, &mut em, &mut ctx, &mut cp)?
+                };
                 if !terminated {
                     // 补一条默认返回。方法体里所有路径都 return 过时这里是死代码，
                     // 但字节码**必须**能通过验证（HotSpot: control flow falls through code end），
@@ -399,7 +428,11 @@ pub(crate) fn compile_type(
                         && (f.modifiers.iter().any(|x| x == "static") || is_iface) =>
                 {
                     let desc = descriptor(&f.ty);
-                    compile_expr(f.init.as_ref().unwrap(), &mut em, &ctx, &mut cp)?;
+                    let init = f.init.as_ref().unwrap();
+                    emit_init(&f.ty, init, &mut em, &ctx, &mut cp)?;
+                    // `static long X = 1;` / `static double D = 1;`：初始化式是 int，
+                    // 不插 i2l/i2d 就会写出 `bipush 1; putstatic long`（HotSpot VerifyError）
+                    coerce_to(&f.ty, init, &ctx, &mut em, &mut cp)?;
                     let idx = cp.field_ref(&self_name, &f.name, &desc);
                     em.op_u2(0xB3, idx); // putstatic
                     em.pop(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
@@ -497,6 +530,101 @@ struct CtorCallPos {
     first_is_ctor_call: bool,
     /// `super(...)` / `this(...)` 出现在了非首位（javac 也不允许）
     not_first: bool,
+}
+
+/// 发实例字段初始化：`aload_0; <初始化式>; coerce; putfield`，按源码顺序。
+/// 调用点必须在 `super(...)` 之后、构造器体之前。
+fn emit_instance_field_inits(
+    inits: &[(String, String, Expr)],
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    for (name, desc, init) in inits {
+        let ty = type_from_desc(desc);
+        let em_dir = if needs_scratch(init) { Some(spill(init, em, ctx, cp)?) } else { None };
+        em.op(0x2A); // aload_0
+        em.push(1);
+        match em_dir {
+            Some(sp) => unspill(&sp, em)?,
+            None => emit_init(&ty, init, em, ctx, cp)?,
+        }
+        coerce_to(&type_from_desc(desc), init, ctx, em, cp)?;
+        let f = cp.field_ref(&ctx.class_name, name, desc);
+        em.op_u2(0xB5, f); // putfield
+        em.pop(if kind_wide(kind_from_desc(desc)) { 3 } else { 2 });
+    }
+    Ok(())
+}
+
+/// 构造器体里有没有 `this(...)` 委托（有的话字段初始化交给被委托的构造器）
+fn ctor_delegates_to_this(body: Option<&Stmt>) -> bool {
+    let list: Vec<&Stmt> = match body {
+        Some(Stmt::Block(items)) => items.iter().collect(),
+        Some(s) => vec![s],
+        None => return false,
+    };
+    for s in list {
+        if matches!(s, Stmt::Empty) {
+            continue;
+        }
+        return matches!(s, Stmt::Expr(Expr::Call { recv: None, name, .. }) if name == "this");
+    }
+    false
+}
+
+/// 编译构造器体：`super(...)`（如果显式写了）→ 实例字段初始化 → 其余语句。
+///
+/// `inits` 是 `(字段名, 描述符, 初始化式)`，按源码顺序。字段初始化必须夹在
+/// `super(...)` 和构造器体之间 —— 提前会把父类字段还没就绪的对象写坏。
+fn compile_ctor_body(
+    body: &Stmt,
+    inits: &[(String, String, Expr)],
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<bool, CompileError> {
+    let mut pre: Vec<&Stmt> = Vec::new();
+    let mut post: Vec<&Stmt> = Vec::new();
+    match body {
+        Stmt::Block(items) => {
+            let mut seen = false;
+            for it in items {
+                if !seen && is_super_call_stmt(it) {
+                    pre.push(it);
+                    seen = true;
+                    continue;
+                }
+                let _ = seen;
+                post.push(it);
+            }
+        }
+        other => post.push(other),
+    }
+    // 前置部分（显式 super(...)）
+    for s in pre {
+        if compile_stmt(s, em, ctx, cp)? {
+            return Ok(true);
+        }
+    }
+    // 字段初始化
+    for (name, desc, init) in inits {
+        let sp = if needs_scratch(init) { Some(spill(init, em, ctx, cp)?) } else { None };
+        em.op(0x2A); // aload_0
+        em.push(1);
+        emit_val(init, &sp, em, ctx, cp)?;
+        coerce_to(&type_from_desc(desc), init, ctx, em, cp)?;
+        let f = cp.field_ref(&ctx.class_name, name, desc);
+        em.op_u2(0xB5, f); // putfield
+        em.pop(if kind_wide(kind_from_desc(desc)) { 3 } else { 2 });
+    }
+    // 其余语句
+    for s in post {
+        if compile_stmt(s, em, ctx, cp)? {
+            return Ok(true);
+        }
+    }
+    Ok(false)
 }
 
 /// 判断构造器体里 `super(...)` / `this(...)` 的**位置**

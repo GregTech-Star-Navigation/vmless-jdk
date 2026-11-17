@@ -123,6 +123,21 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             em.local_types = scope;
             Ok(false)
         }
+        // 语句位置的 `i++` / `--n` / `s += x` 的值没人要 —— 直接改写成等价的赋值语句，
+        // 赋值语句那三条 arm（数组元素 / 字段 / 局部变量）已经把「接收者只求值一次」做对了。
+        // 前提是 lvalue 的接收者/下标可重算（`a[i++]++` 这种要算两次，会被 `is_pure` 挡住）。
+        Stmt::Expr(Expr::Unary { op, expr })
+            if matches!(op, UnOp::PreInc | UnOp::PreDec | UnOp::PostInc | UnOp::PostDec) =>
+        {
+            let asg = inc_dec_to_assign(*op, expr)?;
+            compile_stmt(&Stmt::Expr(asg), em, ctx, cp)
+        }
+        Stmt::Expr(Expr::Assign { op: Some(op), lhs, rhs }) => {
+            let bin = compound_to_assign(*op, lhs, rhs)?;
+            compile_stmt(&Stmt::Expr(bin), em, ctx, cp)
+        }
+        // `;` / `assert ...`（开关关掉时）/ 块内局部类声明 —— 都降级成空语句
+        Stmt::Empty => Ok(false),
         Stmt::Return(None) => compile_return(&None, em, ctx, cp),
         Stmt::Return(Some(e)) => compile_return(&Some(e.clone()), em, ctx, cp),
         Stmt::Expr(e) if is_println_call(e) => {

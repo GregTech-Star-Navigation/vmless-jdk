@@ -78,7 +78,19 @@ impl ClassStore {
             if name.is_empty() || name.starts_with('[') || !seen.insert(name.clone()) {
                 continue;
             }
-            let bytes = cp.find(&name).map_err(|e| VmError { msg: e, exc: None })?;
+            let bytes = match cp.find(&name) {
+                Ok(b) => b,
+                Err(e) => {
+                    // 常量池里的 Class 项只是一笔**引用**，JVM 是"用到才加载"。
+                    // 这里为了字段布局/GC 位图做的是预扫描，扫到解不开的条目
+                    // （codegen 留下的 `<SELF>` 占位、Windows 上非法文件名…）就跳过，
+                    // 不能整个执行失败 —— 主类例外。
+                    if name == main_class {
+                        return Err(VmError { msg: e, exc: None });
+                    }
+                    continue;
+                }
+            };
             let Some(bytes) = bytes else {
                 if name == main_class {
                     return err(format!("classpath 里找不到主类 {main_class}"));

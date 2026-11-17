@@ -751,3 +751,32 @@ java: a1b2.5 / n=42, s=a1b2.5 / big=1234567890123 z=true c=x
 
 **已知缺口**：`SwitchBootstraps.typeSwitch/enumSwitch`（`case null ->`）、
 `ObjectMethods.bootstrap`（record 的 equals/hashCode/toString）、`Lookup.unreflect*`。
+
+## 0.52.0 — 2026-11-17 · 合并 java.base 编译成果与 JDK API 面
+
+两条分支（都基于 pre-float 的旧代码）合并进主干，**两边能力都不丢**。
+
+**并入 ①：让 javac 编 java.base**
+`i++`/`--n`/`x += e`、**实例字段初始化**（之前 `class W { long f = 5; }` 根本没编，读出来 0）、
+静态字段 `i2l`、十六进制/二进制/八进制/下划线字面量、`(int) -3.99` 的 cast 解析、
+隐式 `import java.lang.*`、空语句、`if ((n=next())>=0)` 赋值表达式、
+classpath 世界快照进程级缓存 + 包扫描深度 4→12 + Windows 只按 `;` 切
+
+**并入 ②：JDK API 面**
+`jdk.rs` 追加 190 条（Throwable 家族、ArrayList/HashMap/Iterator、String.format/valueOf、
+Math、Integer/Long 进制、Character、Arrays）；解释器与 JIT 侧的集合/映射/格式化实现；
+`jit/translate.rs` 的 **`pc == 0` 映射到 entry block** 修复（任何「方法体第一条就是 while」都会崩的 JIT bug）
+
+**合并冲突的取舍**（都留了更正确的那侧）：
+`fastore` 取主干的 F32（jbcov 是 pre-float 权宜）· `refmap` 的 `dup2_x2` 保主干（被 160 万位型 + indy 套件验证过）·
+`is_jdk_runtime` 与 `jdk_present` 保主干的后者（严格更强）· 数组初始化把两边语义合并（声明类型优先 + 无声明时取最宽）
+
+**实测**
+| 项 | 合并前 | 合并后 |
+|---|---|---|
+| `verify.sh` | 103/103 | **103/103** |
+| **java.base 编译通过率** | 20.4%（无 cp）/ 40.9% | **1254/3058 = 41.0%** |
+| corpus 三路一致 | 35/45 | **40/45** |
+| corpus/napi | — | **7 一致 + 1 两路，失败 0** |
+| 真 java.base M2 | 一致 | 一致 |
+| `cargo test` | 50 | 50 |

@@ -344,11 +344,29 @@ impl Resolver {
     /// 跨编译单元引用（`PkgB b = new PkgB(...)`）需要知道对方的字段/方法表，
     /// 而 codegen 的 `type_fields` / `type_methods` 是**一次性**建好的 —— 所以先把
     /// classpath 上的类都读进来，后面查表就不会缺项。
+    ///
+    /// classpath 可能很大（java.base 7384 个 `.class`），批量编译时每文件反解一遍
+    /// 是不可接受的 —— 所以结果按**classpath 列表**缓存在进程级，第二次起只克隆。
     pub fn preload(&self) {
+        let key = self.dirs.clone();
+        if let Ok(g) = platform_cache().lock() {
+            if let Some((k, m)) = g.as_ref() {
+                if *k == key {
+                    let mut own = self.own.borrow_mut();
+                    for (n, o) in m.iter() {
+                        if !own.contains_key(n) {
+                            own.insert(n.clone(), o.clone());
+                        }
+                    }
+                    return;
+                }
+            }
+        }
         let mut files: Vec<PathBuf> = Vec::new();
         for d in &self.dirs {
             collect_class_files(d, 0, &mut files);
         }
+        let mut loaded: HashMap<String, Own> = HashMap::with_capacity(files.len());
         for p in files {
             let Ok(bytes) = std::fs::read(&p) else { continue };
             let Some(o) = self.own_from_bytes(&bytes) else { continue };
@@ -356,8 +374,71 @@ impl Resolver {
             if self.own.borrow().contains_key(&name) {
                 continue;
             }
-            self.own.borrow_mut().insert(name, o);
+            loaded.insert(name, o);
         }
+        {
+            let mut own = self.own.borrow_mut();
+            for (n, o) in &loaded {
+                if !own.contains_key(n) {
+                    own.insert(n.clone(), o.clone());
+                }
+            }
+        }
+        if let Ok(mut g) = platform_cache().lock() {
+            *g = Some((key, loaded));
+        }
+    }
+
+    /// classpath 上预加载进来的类名集合（缓存里那份）
+    fn platform_names(&self) -> HashSet<String> {
+        if let Ok(g) = platform_cache().lock() {
+            if let Some((k, m)) = g.as_ref() {
+                if *k == self.dirs {
+                    return m.keys().cloned().collect();
+                }
+            }
+        }
+        HashSet::new()
+    }
+
+    /// 世界快照：平台部分走进程缓存，本编译单元声明的类覆盖上去（源码优先于
+    /// classpath 上的同名 `.class` —— 正在编译 `java/lang/String.java` 时不能用
+    /// 平台那份的 `String`）。
+    pub fn world(&self) -> World {
+        let key = self.dirs.clone();
+        let mut hit: Option<(HashSet<String>, World)> = None;
+        if let Ok(g) = world_cache().lock() {
+            if let Some((k, n, w)) = g.as_ref() {
+                if *k == key {
+                    hit = Some((n.clone(), w.clone()));
+                }
+            }
+        }
+        let (plat, mut w) = match hit {
+            Some(x) => x,
+            None => {
+                let names = self.platform_names();
+                let mut w = World::default();
+                for c in &names {
+                    w.add(self, c);
+                }
+                if let Ok(mut g) = world_cache().lock() {
+                    *g = Some((key, names.clone(), w.clone()));
+                }
+                (names, w)
+            }
+        };
+        let cu: Vec<String> = self
+            .own
+            .borrow()
+            .keys()
+            .filter(|k| *k != "java/lang/Object" && !plat.contains(*k))
+            .cloned()
+            .collect();
+        for c in &cu {
+            w.add(self, c);
+        }
+        w
     }
 
     /// 所有已知的类名：本编译单元的 + classpath 预加载进来的
@@ -435,9 +516,63 @@ impl Resolver {
     }
 }
 
-/// 递归收集目录里的 `.class`（包目录最多四层，够用且不会扫进奇怪的东西）
+/// 进程级平台类缓存：classpath 列表 → 反解好的元数据。批量编译 3000 个文件时
+/// classpath 不变，靠它把「7384 个 .class 反解一遍」从每文件一次降到整进程一次。
+fn platform_cache() -> &'static std::sync::Mutex<Option<(Vec<PathBuf>, HashMap<String, Own>)>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<(Vec<PathBuf>, HashMap<String, Own>)>>> =
+        std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 「世界快照」：所有已知类的成员表 —— codegen 的 `type_*` 表就是它。
+///
+/// 每编译一个类型都从零重建一遍，在 classpath 有几千个类时是灾难（java.base 7384 个），
+/// 所以**平台部分**按 classpath 缓存在进程级，每个编译单元只把自己的类覆盖上去。
+#[derive(Clone, Default)]
+pub struct World {
+    pub type_ctors: HashMap<String, std::sync::Arc<Vec<String>>>,
+    pub type_fields: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
+    pub type_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
+    pub type_static_fields: HashMap<String, std::sync::Arc<HashMap<String, (String, String)>>>,
+    pub type_static_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
+    pub iface_types: HashSet<String>,
+}
+
+impl World {
+    fn add(&mut self, res: &Resolver, c: &str) {
+        if let Ok(x) = res.ctor_descs(c) {
+            self.type_ctors.insert(c.to_string(), std::sync::Arc::new(x));
+        }
+        if let Ok(x) = res.field_types(c) {
+            self.type_fields.insert(c.to_string(), std::sync::Arc::new(x));
+        }
+        if let Ok(x) = res.instance_methods(c) {
+            self.type_methods.insert(c.to_string(), std::sync::Arc::new(x));
+        }
+        if let Ok(x) = res.static_fields(c) {
+            self.type_static_fields.insert(c.to_string(), std::sync::Arc::new(x));
+        }
+        if let Ok(x) = res.static_methods(c) {
+            self.type_static_methods
+                .insert(c.to_string(), std::sync::Arc::new(x.into_iter().map(|(k, (d, _))| (k, d)).collect()));
+        }
+        if res.is_interface(c) {
+            self.iface_types.insert(c.to_string());
+        }
+    }
+}
+
+type WorldSlot = (Vec<PathBuf>, HashSet<String>, World);
+
+fn world_cache() -> &'static std::sync::Mutex<Option<WorldSlot>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<WorldSlot>>> = std::sync::OnceLock::new();
+    C.get_or_init(|| std::sync::Mutex::new(None))
+}
+
+/// 递归收集目录里的 `.class`（包目录会深到 6 层，`jdk/internal/foreign/abi/aarch64/linux`
+/// 就是 —— 上限给小了会静默漏类，所以放到 12）
 fn collect_class_files(dir: &std::path::Path, depth: usize, out: &mut Vec<PathBuf>) {
-    if depth > 4 {
+    if depth > 12 {
         return;
     }
     let Ok(entries) = std::fs::read_dir(dir) else { return };

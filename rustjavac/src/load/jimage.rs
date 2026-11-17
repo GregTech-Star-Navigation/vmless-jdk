@@ -107,6 +107,12 @@ impl JImageSource {
         self.table_length
     }
 
+    /// 全部条目名（`java/lang/Object.class`，不带模块前缀的短名；
+    /// 另外给出 `/模块/...` 全名，调用方按需筛选）
+    pub fn entry_names(&self) -> Vec<String> {
+        self.with_entries(|m| m.keys().cloned().collect())
+    }
+
     fn offsets_at(&self) -> usize {
         self.table_length * 4
     }

@@ -26,9 +26,10 @@ impl DirSource {
             return Err(format!("非法条目路径: {entry}"));
         }
         let p = self.root.join(entry.replace('/', std::path::MAIN_SEPARATOR_STR));
-        if !p.is_file() {
-            return Ok(None);
+        match std::fs::read(&p) {
+            Ok(b) => Ok(Some(b)),
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("读 {} 失败: {e}", p.display())),
         }
-        std::fs::read(&p).map(Some).map_err(|e| format!("读 {} 失败: {e}", p.display()))
     }
 }

@@ -41,17 +41,17 @@ pub(crate) struct Ctx {
     /// 父类内部名（没有 extends 就是 java/lang/Object）
     pub(crate) super_name: String,
     /// 任意类的实例字段表：类内部名 → (字段名 → 描述符)，含继承
-    pub(crate) type_fields: HashMap<String, HashMap<String, String>>,
+    pub(crate) type_fields: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
     /// 任意类的实例方法表：类内部名 → (方法名 → 描述符)，含继承
-    pub(crate) type_methods: HashMap<String, HashMap<String, String>>,
+    pub(crate) type_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
     /// 接口类型（内部名）集合：调用点据此发 invokeinterface
     pub(crate) iface_types: std::collections::HashSet<String>,
     /// 本类（含继承）静态字段：名字 → (声明类, 描述符)
     pub(crate) static_fields: HashMap<String, (String, String)>,
     /// 任意类的静态字段表：类内部名 → (字段名 → (声明类, 描述符))
-    pub(crate) type_static_fields: HashMap<String, HashMap<String, (String, String)>>,
+    pub(crate) type_static_fields: HashMap<String, std::sync::Arc<HashMap<String, (String, String)>>>,
     /// 任意类的静态方法表：类内部名 → (方法名 → 描述符)
-    pub(crate) type_static_methods: HashMap<String, HashMap<String, String>>,
+    pub(crate) type_static_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
     /// 外层 `try { ... } finally { ... }` 的 finally 体，**外层在前**。
     /// `return` 要先把这些 finally 各编译一份（javac 的复制策略），再真正返回。
     pub(crate) finally_stack: Vec<Stmt>,
@@ -70,7 +70,7 @@ pub(crate) struct Ctx {
     /// 任意类的构造器描述符表：类内部名 → 所有 `<init>` 的描述符。
     /// `new GenBox<>("x")` 的真实描述符是 `(Ljava/lang/Object;)V`（泛型擦除），
     /// 不能拿实参类型现拼。
-    pub(crate) type_ctors: HashMap<String, Vec<String>>,
+    pub(crate) type_ctors: HashMap<String, std::sync::Arc<Vec<String>>>,
 }
 
 impl Ctx {

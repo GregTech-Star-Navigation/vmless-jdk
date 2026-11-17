@@ -105,32 +105,19 @@ impl ClassPath {
         Ok(())
     }
 
-    /// `a.jar:b.jar:dir`（Windows 上 `;` 也认）→ ClassPath。
+    /// `a.jar:b.jar:dir`（Windows 上 `;` 也认）→ ClassPath
     ///
-    /// Windows 路径里本身就带 `:`（`D:\x`、`C:/x`），所以切完之后要把「单个盘符」
-    /// 那一段和下一段用 `:` 拼回去，否则 `C:/jdk/lib/modules` 会被切成两半。
+    /// **Windows 上只能按 `;` 切**：`D:/x/classes` 里的 `:` 是盘符，按 `:` 切会把
+    /// 绝对路径切成 `D` + `/x/classes`（`打开 D 失败`）。
     pub fn from_spec(spec: &str) -> Result<Self, String> {
-        let parts: Vec<&str> = spec
-            .split([':', ';'])
-            .map(|p| p.trim())
-            .filter(|p| !p.is_empty())
-            .collect();
-        let mut joined: Vec<String> = Vec::new();
-        let mut i = 0;
-        while i < parts.len() {
-            let p = parts[i];
-            let is_drive = p.len() == 1 && p.as_bytes()[0].is_ascii_alphabetic();
-            if is_drive && i + 1 < parts.len() {
-                joined.push(format!("{p}:{}", parts[i + 1]));
-                i += 2;
-            } else {
-                joined.push(p.to_string());
-                i += 1;
-            }
-        }
         let mut cp = ClassPath::new();
-        for part in joined {
-            cp.push(&part)?;
+        let seps: &[char] = if cfg!(windows) { &[';'] } else { &[':', ';'] };
+        for part in spec.split(seps) {
+            let part = part.trim();
+            if part.is_empty() {
+                continue;
+            }
+            cp.push(part)?;
         }
         if cp.is_empty() {
             return Err(format!("classpath 为空: {spec:?}"));

@@ -87,85 +87,17 @@ pub(crate) fn needs_scratch(e: &Expr) -> bool {
     }
 }
 
-/// 长度已压在栈上时，发 newarray / anewarray（弹长度、压数组引用）。
+/// `{1, 2, 3}` / `new int[]{1, 2, 3}`：建数组 + 逐项写入，数组引用留在栈上。
 ///
-/// 调用方负责长度在栈上：本函数只发创建指令，不碰栈深账。
-fn emit_new_array(elem: &Type, em: &mut Emit, cp: &mut CpBuilder) -> Result<(), CompileError> {
-    let atype = match elem {
-        Type::Prim("int") => Some(10u8),    // T_INT
-        Type::Prim("long") => Some(11),     // T_LONG
-        Type::Prim("double") => Some(7),    // T_DOUBLE
-        Type::Prim("boolean") => Some(4),   // T_BOOLEAN
-        Type::Prim("char") => Some(5),      // T_CHAR
-        Type::Prim("float") => Some(6),     // T_FLOAT
-        Type::Prim("byte") => Some(8),      // T_BYTE
-        Type::Prim("short") => Some(9),     // T_SHORT
-        _ => None,
-    };
-    match atype {
-        Some(a) => {
-            em.op(0xBC); // newarray
-            em.bytes.push(a);
-        }
-        None => {
-            if kind_of(elem) != K_REF {
-                return err(format!("不支持的数组元素类型: {elem:?}"));
-            }
-            let cls = ver_type(cp, elem);
-            em.op_u2(0xBD, cls); // anewarray
-        }
+/// 元素类型优先用**声明处的类型**（`int[] a = {…}` 的 `int[]`）；AST 里
+/// `ArrayInit` 不带类型，所以拿不到声明类型时按元素字面量推断（`1` → int，
+/// `1.0` → double，`"s"` → String，`null`/其它 → Object）。
+pub(crate) fn array_init_elem(items: &[Expr], declared: Option<&Type>, ctx: &Ctx) -> Type {
+    if let Some(Type::Array(inner)) = declared {
+        return (**inner).clone();
     }
-    Ok(())
-}
-
-/// 数组初始化表达式 `{a, b, c}`：建数组 + 逐项赋值，栈上留数组引用。
-///
-/// 与 javac 同一套形态：`newarray` 之后每项 `dup / iconst_i / <值> / <x>astore`。
-fn compile_array_init(
-    items: &[Expr],
-    elem: &Type,
-    em: &mut Emit,
-    ctx: &Ctx,
-    cp: &mut CpBuilder,
-) -> Result<(), CompileError> {
-    let elem_kind = kind_of(elem);
-    let (_load, store) = (0u8, array_store_op_of(elem));
-    em.const_int(items.len() as i32);
-    emit_new_array(elem, em, cp)?;
-    for (i, it) in items.iter().enumerate() {
-        em.op(0x59); // dup（数组引用）
-        em.push(1);
-        em.const_int(i as i32);
-        compile_expr(it, em, ctx, cp)?;
-        // 元素类型转换：`double[] d = {1, 2.5}` 里的 1 要 i2d
-        let k = expr_kind(it, ctx);
-        if elem_kind != K_REF && k != K_REF {
-            coerce(k, elem_kind, em)?;
-        }
-        em.op(store);
-        // 弹掉 dup 出来的引用、下标、值（宽值占两槽）
-        em.pop(if kind_wide(elem_kind) { 4 } else { 3 });
-    }
-    Ok(())
-}
-
-/// 数组元素类型 → 写入指令（iastore/lastore/fastore/dastore/aastore/bastore/castore/sastore）
-fn array_store_op_of(elem: &Type) -> u8 {
-    match elem {
-        Type::Prim("long") => 0x50,
-        Type::Prim("float") => 0x51,
-        Type::Prim("double") => 0x52,
-        Type::Prim("boolean") | Type::Prim("byte") => 0x54,
-        Type::Prim("char") => 0x55,
-        Type::Prim("short") => 0x56,
-        _ if kind_of(elem) == K_REF => 0x53,
-        _ => 0x4F,
-    }
-}
-
-/// 裸 `{…}` 的元素类型推断：取所有元素里「最宽」的那个种类
-/// （声明处或 `new T[]{…}` 都会把类型带进来，这里是兜底）
-fn infer_array_elem(items: &[Expr], ctx: &Ctx) -> Type {
+    // 没有声明类型时按元素推断：取所有元素里「最宽」的那个种类
+    // （`{1, 2.5}` 是 double[]，只看第一个字面量会误判成 int[]）
     let mut k = K_INT;
     for it in items {
         let ik = num_kind(it, ctx);
@@ -186,8 +118,166 @@ fn infer_array_elem(items: &[Expr], ctx: &Ctx) -> Type {
     }
 }
 
+pub(crate) fn emit_array_init(
+    elem: &Type,
+    items: &[Expr],
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    em.const_int(items.len() as i32);
+    match elem {
+        Type::Prim(p) => {
+            let atype = match *p {
+                "boolean" => 4u8,
+                "char" => 5,
+                "float" => 6,
+                "double" => 7,
+                "byte" => 8,
+                "short" => 9,
+                "int" => 10,
+                "long" => 11,
+                _ => return err(format!("数组初始化不支持元素类型 `{p}`")),
+            };
+            em.op(0xBC); // newarray
+            em.bytes.push(atype);
+        }
+        _ => {
+            let Some(cls) = type_internal(elem) else {
+                return err(format!("数组初始化不支持的元素类型: {elem:?}"));
+            };
+            let idx = cp.class(&cls);
+            em.op_u2(0xBD, idx); // anewarray
+        }
+    }
+    em.pop(1); // newarray/anewarray 弹掉长度
+    em.push(1); // 压回数组引用
+    let store_op = match elem {
+        Type::Prim("long") => 0x50,
+        Type::Prim("float") => 0x51,
+        Type::Prim("double") => 0x52,
+        Type::Prim("boolean") | Type::Prim("byte") => 0x54,
+        Type::Prim("char") => 0x55,
+        Type::Prim("short") => 0x56,
+        Type::Prim(_) => 0x4F,
+        _ => 0x53, // aastore
+    };
+    let wide = matches!(elem, Type::Prim("long") | Type::Prim("double"));
+    for (i, item) in items.iter().enumerate() {
+        em.op(0x59); // dup（数组引用）
+        em.push(1);
+        em.const_int(i as i32);
+        let sp = if needs_scratch(item) { Some(spill(item, em, ctx, cp)?) } else { None };
+        emit_val(item, &sp, em, ctx, cp)?;
+        coerce_to(elem, item, ctx, em, cp)?;
+        em.op(store_op);
+        em.pop(if wide { 4 } else { 3 });
+    }
+    Ok(())
+}
+
+/// 在**已知声明类型**的位置编一个初始化表达式：`int[] a = {1,2,3};` 的元素类型
+/// 只能从声明处拿到（`ArrayInit` 本身不带类型），其余表达式照常编。
+pub(crate) fn emit_init(
+    ty: &Type,
+    e: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    if let (Type::Array(_), Expr::ArrayInit(items)) = (ty, e) {
+        let elem = array_init_elem(items, Some(ty), ctx);
+        return emit_array_init(&elem, items, em, ctx, cp);
+    }
+    compile_expr(e, em, ctx, cp)
+}
+
+/// Java 整数字面量 → i64：十进制 / `0x` 十六进制 / `0b` 二进制 / `0` 开头八进制，
+/// 允许 `_` 分隔符与 `L` 后缀。`0xFFFFFFFF` 这类「超出 int 但合法」的按位截断成 i32。
+pub(crate) fn parse_int_literal(s: &str) -> Option<i64> {
+    let t: String = s.trim().chars().filter(|c| *c != '_').collect();
+    let (body, radix) = if let Some(r) = t.strip_prefix("0x").or_else(|| t.strip_prefix("0X")) {
+        (r, 16)
+    } else if let Some(r) = t.strip_prefix("0b").or_else(|| t.strip_prefix("0B")) {
+        (r, 2)
+    } else if t.len() > 1 && t.starts_with('0') && t.chars().all(|c| c.is_ascii_digit() || c == 'L' || c == 'l') {
+        (&t[1..], 8)
+    } else {
+        (&t[..], 10)
+    };
+    let body = body.trim_end_matches(['L', 'l']);
+    if body.is_empty() {
+        return Some(0);
+    }
+    i64::from_str_radix(body, radix).ok()
+}
+
+/// 表达式可不可以「再算一次」：读-改-写要把 lvalue 的接收者算两遍（读一次、写一次），
+/// 只有纯表达式才等价于 Java 的「接收者只求值一次」。
+pub(crate) fn is_pure_readable(e: &Expr) -> bool {
+    match e {
+        Expr::Ident(_)
+        | Expr::This
+        | Expr::Super
+        | Expr::IntLit(_)
+        | Expr::FloatLit(_)
+        | Expr::StrLit(_)
+        | Expr::TextBlock(_)
+        | Expr::CharLit(_)
+        | Expr::BoolLit(_)
+        | Expr::Null => true,
+        Expr::Field(r, _) => is_pure_readable(r),
+        Expr::ArrayAccess { array, index } => is_pure_readable(array) && is_pure_readable(index),
+        _ => false,
+    }
+}
+
+/// `x++` / `--x` → `x = x ± 1`。值没人要的场景（语句、for 的 update）都走这里：
+/// 赋值语句那几条 arm 已经处理了「数组元素 / 字段 / 局部变量」三种 lvalue。
+pub(crate) fn inc_dec_to_assign(op: UnOp, target: &Expr) -> Result<Expr, CompileError> {
+    let bin = match op {
+        UnOp::PreInc | UnOp::PostInc => BinOp::Add,
+        UnOp::PreDec | UnOp::PostDec => BinOp::Sub,
+        _ => return err("inc_dec_to_assign：不是自增/自减"),
+    };
+    if !is_pure_readable(target) {
+        return err(format!(
+            "自增/自减的左侧要能重算一次（读一次写一次），这里做不到：{target:?}"
+        ));
+    }
+    Ok(Expr::Assign {
+        op: None,
+        lhs: Box::new(target.clone()),
+        rhs: Box::new(Expr::Binary {
+            op: bin,
+            lhs: Box::new(target.clone()),
+            rhs: Box::new(Expr::IntLit("1".into())),
+        }),
+    })
+}
+
+/// `x += e` → `x = x + e`。隐式窄化由赋值处的 `coerce_to` 负责（JLS 15.26.2 的语义），
+/// 字符串拼接则由 `Binary Add` 的 concat 分支负责。
+pub(crate) fn compound_to_assign(op: BinOp, lhs: &Expr, rhs: &Expr) -> Result<Expr, CompileError> {
+    if !is_pure_readable(lhs) {
+        return err(format!(
+            "复合赋值的左侧要能重算一次（读一次写一次），这里做不到：{lhs:?}"
+        ));
+    }
+    Ok(Expr::Assign {
+        op: None,
+        lhs: Box::new(lhs.clone()),
+        rhs: Box::new(Expr::Binary {
+            op,
+            lhs: Box::new(lhs.clone()),
+            rhs: Box::new(rhs.clone()),
+        }),
+    })
+}
+
 /// 一个「先算进脏槽、稍后再取回来」的值
-pub(crate) struct Spilled {    slot: u8,
+pub(crate) struct Spilled {
+    slot: u8,
     kind: u8,
     /// 借之前该槽的验证类型，还的时候恢复回去
     saved: u16,
@@ -395,7 +485,7 @@ fn pick_ctor(owner: &str, args: &[Expr], ctx: &Ctx) -> Option<String> {
         .map(|a| expr_type(a, ctx).map(|t| descriptor(&t)).unwrap_or_default())
         .collect();
     let mut best: Option<(i32, String)> = None;
-    for d in list {
+    for d in list.iter() {
         let ps = desc_params(d);
         let n = ps.len();
         let mut score = -1i32;
@@ -417,8 +507,11 @@ fn pick_ctor(owner: &str, args: &[Expr], ctx: &Ctx) -> Option<String> {
 pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
     match e {
         Expr::IntLit(s) => {
-            if s.ends_with('L') || s.ends_with('l') {
-                let v: i64 = s[..s.len() - 1].parse().map_err(|_| CompileError { msg: format!("long 字面量 `{s}` 解析失败") })?;
+            // 十进制 / 0x / 0b / 0 开头八进制、下划线分隔、L 后缀都在这里归一
+            let Some(v) = parse_int_literal(s) else {
+                return err(format!("整数字面量 `{s}` 解析失败"));
+            };
+            if s.ends_with(['L', 'l']) {
                 if v == 0 || v == 1 {
                     em.op(0x09 + v as u8); // lconst_0/1
                 } else {
@@ -428,12 +521,12 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 em.push(2);
                 return Ok(());
             }
-            let v: i32 = s.parse().map_err(|_| CompileError { msg: format!("整数字面量 `{s}` 解析失败") })?;
-            if (-32768..=32767).contains(&v) {
-                em.const_int(v);
+            let v32 = v as i32;
+            if (-32768..=32767).contains(&v32) {
+                em.const_int(v32);
             } else {
                 // 超出 sipush 范围，走常量池 ldc_w
-                let idx = cp.int(v);
+                let idx = cp.int(v32);
                 em.op_u2(0x13, idx);
                 em.push(1);
             }
@@ -504,16 +597,33 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 return Ok(());
             }
             // newarray 的操作数是元素类型码，引用元素走 anewarray（操作数是元素类）
-            emit_new_array(elem, em, cp)?;
+            let atype = match elem {
+                Type::Prim("int") => Some(10u8),    // T_INT
+                Type::Prim("long") => Some(11),     // T_LONG
+                Type::Prim("double") => Some(7),    // T_DOUBLE
+                Type::Prim("boolean") => Some(4),   // T_BOOLEAN
+                Type::Prim("char") => Some(5),      // T_CHAR
+                Type::Prim("float") => Some(6),     // T_FLOAT
+                Type::Prim("byte") => Some(8),      // T_BYTE
+                Type::Prim("short") => Some(9),     // T_SHORT
+                _ => None,
+            };
+            match atype {
+                Some(a) => {
+                    em.op(0xBC); // newarray
+                    em.bytes.push(a);
+                }
+                None => {
+                    if kind_of(elem) != K_REF {
+                        return err(format!("不支持的数组元素类型: {elem:?}"));
+                    }
+                    let cls = ver_type(cp, elem);
+                    em.op_u2(0xBD, cls); // anewarray
+                }
+            }
             em.pop(1);
             em.push(1);
             Ok(())
-        }
-        // 数组初始化表达式 `{1,2,3}`：元素类型从上下文来（声明处或 `new T[]{…}` 的 Cast），
-        // 没有类型信息时按元素推断
-        Expr::ArrayInit(items) => {
-            let elem = infer_array_elem(items, ctx);
-            compile_array_init(items, &elem, em, ctx, cp)
         }
         Expr::ArrayAccess { array, index } => {
             let k = elem_kind(array, ctx);
@@ -547,8 +657,8 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         }
         Expr::Cast { ty, expr } => {
             // `new T[]{…}`：Cast 只是把元素类型带进来（parser 的包装），不是数值转换
-            if let (Type::Array(elem), Expr::ArrayInit(items)) = (ty, &**expr) {
-                return compile_array_init(items, elem, em, ctx, cp);
+            if let (Type::Array(_), Expr::ArrayInit(_)) = (ty, &**expr) {
+                return emit_init(ty, expr, em, ctx, cp);
             }
             let from = expr_kind(expr, ctx);
             let to = kind_of(ty);
@@ -934,6 +1044,36 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             em.bool_from_branch(0x9A)?; // ifne → 「假」= 原值非零
             Ok(())
         }
+        // `i++` / `--i` 作为**值**用（`arr[i++]`、`return n--;`）：
+        // 局部变量重读一次是安全的，所以「旧值 dup → 加一 → 存回」就行
+        Expr::Unary { op: op @ (UnOp::PreInc | UnOp::PreDec | UnOp::PostInc | UnOp::PostDec), expr } => {
+            compile_inc_dec(*op, expr, em, ctx, cp)
+        }
+        // `{1,2,3}` / `new int[]{1,2,3}`：AST 里不带元素类型，按字面量推断
+        Expr::ArrayInit(items) => {
+            let elem = array_init_elem(items, None, ctx);
+            emit_array_init(&elem, items, em, ctx, cp)
+        }
+        // 赋值当**表达式**用：`if ((n = next()) >= 0)`、`x = y = z`。
+        // 局部变量好办（值留在栈上即可）；字段/数组元素要保证「接收者只求值一次」，
+        // 这里没做，所以那两种仍然报错 —— 报错比按错的顺序算要好。
+        Expr::Assign { op: None, lhs, rhs } => {
+            let Expr::Ident(name) = &**lhs else {
+                return err(format!("赋值作为表达式时只支持局部变量：{lhs:?}"));
+            };
+            let Some(slot) = ctx.lookup(name) else {
+                return err(format!("赋值作为表达式时目标不是局部变量：`{name}`"));
+            };
+            let kind = *ctx.local_kind.get(name).unwrap_or(&K_INT);
+            compile_expr(rhs, em, ctx, cp)?;
+            if let Some(t) = ctx.local_ty.get(name).cloned() {
+                coerce_to(&t, rhs, ctx, em, cp)?;
+            }
+            em.op(if kind_wide(kind) { 0x5C } else { 0x59 }); // dup2 / dup
+            em.push(if kind_wide(kind) { 2 } else { 1 });
+            em.store_slot(slot, kind)?;
+            Ok(())
+        }
         // `c ? a : b`：分叉求值 → 各自写进同一个脏槽 → 汇合点取回。
         // 两个跳转点（假分支入口、汇合点）操作数栈都是空的。
         Expr::Cond { cond, then, els } => compile_cond(cond, then, els, em, ctx, cp),
@@ -952,6 +1092,59 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
 /// L_end  : iload s
 /// ```
 /// 每处跳转指令前面都刚 `iload` 完、`ifeq` 已把它弹掉，所以跳转点上栈是空的。
+fn compile_inc_dec(
+    op: UnOp,
+    target: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let post = matches!(op, UnOp::PostInc | UnOp::PostDec);
+    let inc = matches!(op, UnOp::PreInc | UnOp::PostInc);
+    // 表达式位置只支持局部变量：它重读安全。字段/数组元素的自增在**语句**位置会由
+    // `compile_stmt` 降糖成赋值，那里接收者只求值一次；表达式位置（`a[i++]++`）没有
+    // 真实需求，报错比悄悄按错的顺序算要好。
+    let Expr::Ident(name) = target else {
+        return err(format!("自增/自减作为表达式时只支持局部变量：{target:?}"));
+    };
+    let Some(slot) = ctx.lookup(name) else {
+        return err(format!("自增/自减的目标不是局部变量：`{name}`"));
+    };
+    let kind = *ctx.local_kind.get(name).unwrap_or(&K_INT);
+    let wide = kind_wide(kind);
+    let (one, arith) = match kind {
+        K_LONG => (0x0Au8, if inc { 0x61 } else { 0x65 }), // lconst_1 / ladd / lsub
+        K_FLOAT => (0x0Cu8, if inc { 0x62 } else { 0x66 }), // fconst_1 / fadd / fsub
+        K_DOUBLE => (0x0Fu8, if inc { 0x63 } else { 0x67 }), // dconst_1 / dadd / dsub
+        K_INT => (0x04, if inc { 0x60 } else { 0x64 }),    // iconst_1 / iadd / isub
+        _ => return err(format!("自增/自减的目标不是数值：`{name}`")),
+    };
+    em.load_slot(slot, kind)?;
+    let dup = if wide { 0x5C } else { 0x59 }; // dup2 / dup
+    let push_slots = if wide { 2 } else { 1 };
+    if post {
+        // post（`i++` 的值是旧值）：[old] → dup → [old][old] → +1 → [old][new] → store → [old]
+        em.op(dup);
+        em.push(push_slots);
+        em.op(one);
+        em.push(push_slots);
+        em.op(arith);
+        em.pop(push_slots);
+        em.store_slot(slot, kind)?;
+        Ok(())
+    } else {
+        // pre（`++i` 的值是新值）：[old] → +1 → [new] → dup → [new][new] → store → [new]
+        em.op(one);
+        em.push(push_slots);
+        em.op(arith);
+        em.pop(push_slots);
+        em.op(dup);
+        em.push(push_slots);
+        em.store_slot(slot, kind)?;
+        Ok(())
+    }
+}
+
 fn compile_logical(
     op: BinOp,
     lhs: &Expr,

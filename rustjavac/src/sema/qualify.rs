@@ -46,6 +46,15 @@ impl Qualifier<'_> {
             Some(pfx.clone())
         } else if same_pkg() {
             Some(self.pkg.clone())
+        } else if self
+            .dirs
+            .iter()
+            .any(|d| d.join(format!("java/lang/{name}.class")).is_file())
+        {
+            // **隐式 `import java.lang.*;`**（JLS 7.3）：`Appendable` / `Readable` /
+            // `CharSequence` 这类不在 `is_java_lang` 白名单里的 java.lang 类型，
+            // 只要 classpath 上有就必须补成 `java/lang/X`。
+            Some("java/lang".to_string())
         } else {
             self.wildcards
                 .iter()

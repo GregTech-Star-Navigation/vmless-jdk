@@ -523,7 +523,7 @@ impl Jit {
         let mut open: Vec<cranelift_codegen::ir::Block> = vec![entry];
         let mut cur_block = entry;
         let mut terminated = false;
-        let mut cur_start = 0usize;
+        let mut cur_start = usize::MAX; // pc==0 也可能是跳转目标（`:loop` 回到方法开头），别和 entry 混为一谈
         let mut pc = 0usize;
         let mut returns = 0usize;
 

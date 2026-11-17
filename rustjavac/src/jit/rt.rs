@@ -490,8 +490,41 @@ pub extern "C" fn exc_clear() {
 
 /// 记下异常对象的消息（`new RuntimeException("boom")` 那一步）。
 /// 消息也进常驻根槽：GC 搬过之后 print_uncaught 还能读对。
-pub extern "C" fn exc_set_msg(_obj: i64, msg: i64) {
+pub extern "C" fn exc_set_msg(obj: i64, msg: i64) {
     set_reserved_root(ROOT_MSG, msg as u32);
+    exc_msg_remember(obj, msg);
+}
+
+static EXC_MSGS: Mutex<Vec<(i64, u32, String)>> = Mutex::new(Vec::new());
+
+/// 记下「这个异常对象的消息文本」。
+///
+/// **不能往根栈里插永久根**：`roots_pop(p, n)` 是按**个数**从栈顶弹的，
+/// 中途插进去的根会让帧的 pop 把别的槽弹掉（实测直接把 E01/E02/E04 三个
+/// 异常样例打成不一致）。所以这里只存**偏移快照 + 文本**：
+/// 快照命中就直接重建字符串，快照过期（GC 搬过）就退回「同类最近一条」。
+fn exc_msg_remember(obj: i64, msg: i64) {
+    // msg == 0（`RuntimeException((String) null)`）不记：Java 的 toString 此时只打类名
+    if obj == 0 || msg == 0 {
+        return;
+    }
+    let tag = super::natives::tag_of_obj(obj);
+    let text = super::natives::obj_to_string(msg);
+    EXC_MSGS.lock().unwrap().push((obj, tag, text));
+}
+
+/// `Throwable.getMessage()` 的文本：按对象偏移快照匹配。
+///
+/// **不做「同类最近一条」兜底**：`throw new RuntimeException()` 没有消息，
+/// 兜底会把上一条同类的 "boom" 借过来（实测 `getMessage()==null` 变成 false）。
+/// 代价是构造与读取之间若发生过 GC（对象被搬动）消息会丢，退化成 null ——
+/// 这是已知限制，比给错消息好。
+pub fn exc_msg_text(recv: i64) -> Option<String> {
+    if recv == 0 {
+        return None;
+    }
+    let g = EXC_MSGS.lock().unwrap();
+    g.iter().rev().find(|(o, _, _)| *o == recv).map(|(_, _, t)| t.clone())
 }
 
 fn set_reserved_root(idx: usize, val: u32) {

@@ -219,8 +219,11 @@ impl Parser {
             self.pending = save_pending;
             return Ok(None);
         }
-        // `(a) + b` 这类要回退：cast 的操作数不能是二元运算符开头
+        // `(a) + b` 这类要回退：cast 的操作数不能是二元运算符开头。
+        // **基本类型的 cast 例外**（JLS 15.15）：`(int) -3.99`、`(long) +1` 都是合法 cast。
+        let prim_cast = matches!(ty, Type::Prim(_));
         match self.cur() {
+            Tok::Plus | Tok::Minus if prim_cast => {}
             Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Semi
             | Tok::RParen | Tok::Comma | Tok::Dot | Tok::LBracket | Tok::EqEq | Tok::AndAnd
             | Tok::OrOr | Tok::Question | Tok::Shl | Tok::Shr | Tok::Ushr
