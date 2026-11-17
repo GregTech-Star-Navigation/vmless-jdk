@@ -193,9 +193,14 @@ impl Vm {
                     bytes.push(Slot::I(c as i32));
                 }
             } else {
+                // **JDK 25 的 `StringUTF16` 用本机字节序（小端）存 UTF-16** —— 不是早期版本的
+                // 大端。实测：真 JDK 里 `"中"` 的 `value` 是 `2d 4e`（U+4E2D 低字节在前）。
+                // 写错字节序的症状很隐蔽：ASCII 完全正常（高低字节都是 0x00），
+                // 只有非 ASCII 会「字符值被字节对调」（U+4E2D 读成 U+2D4E），
+                // 一路表现为 `getBytes("UTF-8")` 出来是乱码、CRC 对不上。
                 for u in text.encode_utf16() {
-                    bytes.push(Slot::I((u >> 8) as i32)); // UTF16 是大端（StringUTF16.getChar）
                     bytes.push(Slot::I((u & 0xFF) as i32));
+                    bytes.push(Slot::I((u >> 8) as i32));
                 }
             }
             let arr = self.sh.heap.new_array(bytes, "[B").unwrap_or(0);
