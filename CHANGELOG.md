@@ -665,3 +665,29 @@ crypto(1) / kerberos(2) / attach+JFR(8) / GUI 无障碍(4) / 其它(2)。
 
 **已知边界**：`jlink` 写的是目录形式的 `lib/modules`（不写 jimage 容器，`--compress` 无效）；
 `jdb` 是记录-回放（`Vm` 未暴露暂停原语）；`javadoc` 无 doclet 体系；`rmiregistry` 是行协议不是 JRMP。
+
+## 0.49.0 — 2026-11-17 · attach 协议 + 性能计数器（jps/jcmd/jinfo/jmap/jstack/jstat/jstatd）
+
+新增 `jdk-attach/`（14 个模块 + 9 个 bin，8239 行，零依赖，42 单测）。
+
+**关键决策：perfdata 用 HotSpot v2.0 的二进制格式**（`%TEMP%\hsperfdata_<用户>\<pid>`），
+所以**真 JDK 的 `jps`/`jstat` 能直接读我们的 VM**。控制通道走回环 TCP + 8 字节头帧
+（版本参与握手、1MiB 分块、128 位令牌）；端点信息写成 perfdata 的两个计数器，不留第二个文件。
+
+**实测**
+| 项 | 结果 |
+|---|---|
+| `jps -l` | `40696 com.example.Main`，与真 jps 同秒一致；`-q/-m/-v` 全对 |
+| `jstat -gc` | **19 列表头逐字符相同、行宽同为 200**；`-gcutil/-class/-compiler` 亦一致 |
+| `jcmd` | 14 条命令；`VM.version`→`VMless Server VM version 0.1.0`；`PerfCounter.print` 119 行 |
+| `jmap -histo` | 表头与真 jmap 一致；`-dump` 20340 字节，`hprofcheck` 结构合法 |
+| `jstack -l` | `Found one Java-level deadlock:` + 两条 `which is held by` |
+| 错误矩阵 | pid 不存在=2 / 坏 hostid=1 / 错令牌=3 / 协议版本不符=3 / 半帧超时=4 / 改不了的标志=6 |
+| **泄漏** | 1000 次 attach/detach 句柄数 **73 → 73（变化 0）** |
+
+**踩到的 5 个坑**（写进 `docs/attach-design.md`）：HPROF 魔数大端、Windows 必须用**具名共享内存**
+`hsperfdata_<user>_<pid>` 才能被真工具读、字符串条目 `vector_length` 必须 >0、
+`generation.0.space.0` 是 Eden、**Windows accept 出来的 socket 继承非阻塞**（表现为"加了日志就好了"的竞态）。
+
+**已知边界**：`jmap -dump` 的 `CLASS_DUMP` 常量池/静态字段段与 JDK 25 实际编码不完全一致
+（"真 MAT 能打开"本机无法证明，`jhat` 在 JDK 9 已删除）；`jstatd` 用同语义 TCP 而非 JRMP。

@@ -1,0 +1,20 @@
+[package]
+name = "vmless-attach"
+version = "0.1.0"
+edition = "2021"
+description = "attach protocol + perfdata counters for the VMless JVM (jps/jcmd/jinfo/jmap/jstack/jstat/jstatd)"
+license = "GPL-2.0-only"
+
+# 为什么没有依赖 classfile/rustjavac：
+# ① 骨架里写的 `classfile = { path = "../rustjavac" }` 编译不过 —— `../rustjavac` 的
+#    package 名是 `rustjavac`，不是 `classfile`（cargo build 直接 "no matching package named
+#    classfile found"）。
+# ② 本 crate 一个 class 文件都不需要读：perfdata 是二进制文件格式，attach 走自有协议。
+# ③ ../rustjavac 正在被另一个子代理改 vm/，把它当依赖会让本 crate 的构建跟着它一起红。
+# 所以这里保持 **零外部依赖**。
+
+[dependencies]
+
+[profile.release]
+opt-level = 3
+panic = "unwind"
