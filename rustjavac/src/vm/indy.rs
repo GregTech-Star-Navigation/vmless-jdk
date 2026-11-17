@@ -1554,6 +1554,18 @@ impl Vm {
             ))),
             (_, "in") | (_, "dropLookupMode") => Ok(args.first().copied().unwrap_or(Slot::I(0))),
             (_, "accessClass") => Ok(args.first().copied().unwrap_or(Slot::I(0))),
+            // `Lookup.ensureInitialized(Class)Class`：触发目标类的 `<clinit>` 并把类对象返回。
+            // 少了它，`SharedSecrets` 没装好时的兜底路径（`MethodHandles.lookup()
+            // .ensureInitialized(FileDescriptor.class)`）会在 `<clinit>` 里
+            // 抛 `BootstrapMethodError` —— 于是任何文件写入都跑不起来。
+            (_, "ensureInitialized") => {
+                let c = args.first().copied().unwrap_or(Slot::I(0));
+                let cname = self
+                    .class_obj_name(c.as_i32())
+                    .ok_or_else(|| self.bsm_error("Lookup.ensureInitialized 的参数不是 Class".to_string()))?;
+                self.ensure_init(&cname)?;
+                Ok(c)
+            }
             (_, "lookupClass") => {
                 // 返回 this 的查找类
                 Ok(Slot::I(0))

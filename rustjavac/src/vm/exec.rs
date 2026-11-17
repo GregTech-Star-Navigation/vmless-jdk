@@ -1242,12 +1242,26 @@ impl Vm {
                     self.last_caller = class;
                     match self.store.resolve_method(&info.class, &info.name, &info.desc) {
                         Some((ci, mi)) => {
+                            let op_pc = pc - 3;
                             self.depth += 1;
                             let r = self.execute(ci, mi, &info.desc, &all, true);
                             self.depth -= 1;
-                            // super.m() 有返回值（构造器没有）：要压回栈上
-                            if info.name != "<init>" && !info.desc.ends_with(")V") {
-                                frame.push(r?);
+                            // 构造器/父类方法抛的异常要先过**本方法**的异常表：
+                            // `new FileInputStream("不存在")` 里 `<init>` 抛 FileNotFoundException，
+                            // 调用方的 try/catch 必须接得住。（原来 `<init>` 那一支把 `r` 直接丢掉，
+                            // 异常静默消失，程序带着半初始化对象继续跑。）
+                            match call_or_handle!(r, op_pc) {
+                                CallOutcome::Value(v) => {
+                                    // super.m() / 普通方法有返回值：压回栈上
+                                    if info.name != "<init>" && !info.desc.ends_with(")V") {
+                                        frame.push(v);
+                                    }
+                                }
+                                CallOutcome::Handler(t, h) => {
+                                    pc = t;
+                                    frame.stack.clear();
+                                    frame.push(Slot::I(h));
+                                }
                             }
                         }
                         None if info.desc == "(Ljava/lang/String;)V" => {

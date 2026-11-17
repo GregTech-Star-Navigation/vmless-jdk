@@ -30,6 +30,15 @@ pub(crate) mod jni;
 #[path = "jni_lib.rs"]
 pub(crate) mod jni_lib;
 
+// native 实现的分组文件（按「java.base native 的领域」切）：
+// 每条并行工作线只碰自己那一份，`native_reg.rs` 只在 `register_all` 末尾各调一次。
+#[path = "nat_intrinsics.rs"]
+pub(crate) mod nat_intrinsics;
+#[path = "nat_os.rs"]
+pub(crate) mod nat_os;
+#[path = "nat_util.rs"]
+pub(crate) mod nat_util;
+
 /// native 方法的 Rust 实现。参数在 `frame.locals` 里按 JVM 槽位落位
 /// （实例方法 `this` 在槽 0），返回值由 `Result<Slot, VmError>` 给出（`void` 返回 `Slot::I(0)`）。
 pub(crate) type NativeFn = fn(&mut Vm, &mut Frame) -> Result<Slot, VmError>;
@@ -293,6 +302,11 @@ fn register_all(r: &mut NativeRegistry) {
 
     // ---- java.lang.Thread ----
     register_thread(r);
+
+    // ---- 分组注册（各文件独立，避免并行改同一处）----
+    nat_intrinsics::register(r);
+    nat_os::register(r);
+    nat_util::register(r);
 }
 
 /// `java.lang.Thread`：native 部分 + **VM 接管**的构造器 / `start()`。

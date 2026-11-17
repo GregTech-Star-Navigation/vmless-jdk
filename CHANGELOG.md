@@ -1134,3 +1134,35 @@ ours : v=42        ← 修前是 v=0
 
 **验证**：`verify.sh` 103/103（非压力与 `STRESS` 都过）、`cargo test` **92 passed**、
 `verify-sync.sh` 6/6（峰值 111–120MB < 200MB）、`run_jdk M2` 与 java 逐行一致。
+
+## 0.61.0 — 2026-11-18 · 修两个跨模块的真 bug + 搭 native 分组骨架
+
+### ① 构造器抛的异常被静默丢弃（严重）
+`exec.rs` 的 `invokespecial` 分支里，`<init>` 那一路把 `execute` 的返回值直接丢掉了：
+
+```rust
+if info.name != "<init>" && !info.desc.ends_with(")V") { frame.push(r?); }   // ← <init> 时 r 没人接
+```
+
+后果：`new FileInputStream("不存在")` 抛了 `FileNotFoundException`，**调用方 `catch` 一行都收不到**，
+程序带着一个半初始化的对象继续跑。实测：
+
+```
+java : caught: ctor-boom | after
+修前  : 未捕获异常: Exception in thread "main" java.lang.RuntimeException: ctor-boom   ← catch 没接住
+修后  : caught: ctor-boom | after
+```
+
+修法：走 `call_or_handle!`，让异常先过**本方法**的异常表（`super.m()` 的返回值照旧压栈）。
+
+### ② `MethodHandles.Lookup.ensureInitialized` 未实现
+后果：`SharedSecrets.getJavaIOFileDescriptorAccess()` 缺失时，兜底路径
+`MethodHandles.lookup().ensureInitialized(FileDescriptor.class)` 在 `FileOutputStream.<clinit>` 抛
+`BootstrapMethodError` —— **任何文件写入都跑不起来**。已按签名补上（触发 `<clinit>` 并返回类对象）。
+
+### ③ native 实现按领域分组（为并行铺路）
+`native_reg.rs` 末尾改为调用三个独立文件：
+`nat_intrinsics`（内存/反射核心）· `nat_os`（文件/进程/网络）· `nat_util`（VM/System/压缩/FFM）。
+每条工作线只改自己那份，`native_reg.rs` 不再成为冲突点。
+
+**验证**：`verify.sh` 103/103、`cargo test` 全绿。
