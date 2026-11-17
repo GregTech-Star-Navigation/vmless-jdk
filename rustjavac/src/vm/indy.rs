@@ -1709,7 +1709,7 @@ impl Vm {
         }
         // ---------------- MethodHandles$Lookup ----------------
         if class == "java/lang/invoke/MethodHandles$Lookup" {
-            return Ok(Some(self.lookup_op(kind, name, desc, args)?));
+            return Ok(Some(self.lookup_op(kind, name, desc, recv, args)?));
         }
         // ---------------- MethodHandle ----------------
         if class == "java/lang/invoke/MethodHandle" {
@@ -1783,6 +1783,7 @@ impl Vm {
         kind: u8,
         name: &str,
         desc: &str,
+        recv: i32,
         args: &[Slot],
     ) -> Result<Slot, VmError> {
         match (kind, name) {
@@ -1804,8 +1805,15 @@ impl Vm {
                 Ok(c)
             }
             (_, "lookupClass") => {
-                // 返回 this 的查找类
-                Ok(Slot::I(0))
+                // 返回 this 的查找类。**必须是真的类对象**：`MhUtil.findVarHandle(lookup, name, type)`
+                // 就是 `lookup.findVarHandle(lookup.lookupClass(), ...)`，返回 0 会让
+                // `findVarHandle` 报「第一个参数不是 Class」—— 实测卡死
+                // `ThreadBuilders$BaseThreadFactory.<clinit>`（进而 ProcessBuilder/ProcessHandle 全废）。
+                let name = self.indy().lookups.get(&recv).cloned();
+                match name {
+                    Some(c) => Ok(Slot::I(self.class_obj(&c))),
+                    None => Ok(Slot::I(0)),
+                }
             }
             (_, "findStatic") | (_, "findVirtual") | (_, "findSpecial") | (_, "findConstructor") => {
                 let c = self.class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())

@@ -32,6 +32,11 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
+// 共享的「假」native 内存 arena（全 VM 一份，nat_intrinsics / nat_os 共用）。
+// 在这里声明而不是 vm/mod.rs：那两处是几条并行工作线的公用文件，少改一行就少一次冲突。
+#[path = "nat_mem.rs"]
+pub(crate) mod nat_mem;
+
 use super::NativeRegistry;
 use super::super::frame::Frame;
 use super::super::shared::lk;
@@ -139,6 +144,18 @@ fn group_a_vm_system(r: &mut NativeRegistry) {
     // 因此 `Class.forName` 一类「按调用者取加载器」的语义与原来一致（都落到引导加载器），
     // 而 `isAssignableFrom` 检查能过。没有栈的 VM 只能这么近似，宁可比真实调用链更宽松。
     r.add("jdk/internal/reflect/Reflection", "getCallerClass", "()Ljava/lang/Class;", get_caller_class);
+    // ---- java.lang.NullPointerException ----
+    //
+    // 「有帮助的 NPE 消息」（JDK 14+）：JVM 分析字节码给出「哪个引用是 null」。
+    // 我们没有调试信息，返回 null = 「没有额外信息」，getMessage() 照旧返回原始消息。
+    // 不接住它，**任何** NPE 都会变成 UnsatisfiedLinkError，把真问题盖掉
+    //（实测：ProcessBuilder.start() 里的 NPE 就是这样被伪装成缺 native 的）。
+    r.add(
+        "java/lang/NullPointerException",
+        "getExtendedNPEMessage",
+        "()Ljava/lang/String;",
+        |_, _| Ok(Slot::I(0)),
+    );
     // ---- java.lang.ref.Reference ----
     //
     // 没有 GC 引用处理线程（ReferenceHandler）也没有 pending 列表：我们的引用是
@@ -308,9 +325,28 @@ fn natives_load(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 /// 都不会撞车。这是近似 —— 真正的调用者类只有解释器知道；
 /// 但 @CallerSensitive 的检查只需要「一个合法的 ClassLoader 子类」。
 fn get_caller_class(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
-    // 候选按**继承链从浅到深**排：第 i 个的父类是第 i-1 个（第 0 个的父类是 ClassLoader，
-    // 它一开始就在 ParallelLoaders 的集合里）。每次返回「父类已登记、自己还没登记」的第一个，
-    // 这样 ParallelLoaders.register 的 contains(c.getSuperclass()) 一定为真。
+    // 本 VM 没有调用栈，但有一个**等价信息**：`sh.initializing`（哪个线程正在初始化哪个类）。
+    // 真实调用点绝大多数都在 `@CallerSensitive` 方法的调用者 `<clinit>` 里：
+    //
+    // * `ClassLoader.registerAsParallelCapable()`：要求「调用者是 ClassLoader 的子类」，
+    //   拿错就是 IllegalCallerException / InternalError —— Cleaner、InnocuousThread 都过不去；
+    // * `MethodHandles.lookup()`：会把 caller 记进 `indy().lookups`，而
+    //   `MhUtil.findVarHandle(lookup, name, type)` 就是 `lookup.findVarHandle(lookup.lookupClass(), ...)`。
+    //   调用者记错 → lookupClass 错的 → findVarHandle 报「第一个参数不是 Class」，
+    //   实测卡死 ThreadBuilders$BaseThreadFactory / ProcessHandleImpl / ProcessBuilder。
+    //
+    // 所以：**当前线程正在初始化的类**就是最可能的调用者。恰好一个时直接用它；
+    // 多个或没有时退回轮转（保证 registerAsParallelCapable 至少拿到一个合法的 ClassLoader 子类）。
+    let me = super::super::thread::cur_tid();
+    let in_init: Vec<String> = lk(&vm.sh.initializing)
+        .iter()
+        .filter(|(_, tid)| **tid == me)
+        .map(|(name, _)| name.clone())
+        .collect();
+    if in_init.len() == 1 {
+        return Ok(Slot::I(vm.class_obj(&in_init[0])));
+    }
+    // 兜底：按继承链从浅到深挑一个「父类已登记」的 ClassLoader 子类
     const CANDIDATES: [&str; 5] = [
         "java/security/SecureClassLoader",
         "jdk/internal/loader/BuiltinClassLoader",
@@ -483,6 +519,11 @@ fn ensure_thread_fields(vm: &mut Vm, h: i32) {
     }
     let _guard = FillGuard;
     // 1) holder.group：getThreadGroup() 直接返回它，Cleaner / InnocuousThread 会拿它去 synchronized
+    // 根 ThreadGroup 可能是 thread.rs 先建的（那边没设 maxPriority）→ 这里兜底补一次
+    let g0 = root_group(vm);
+    if g0 > 0 && vm.get_named(g0, "java/lang/ThreadGroup", "maxPriority").as_i32() <= 0 {
+        vm.put_named(g0, "java/lang/ThreadGroup", "maxPriority", Slot::I(10));
+    }
     let holder = vm.get_named(h, "java/lang/Thread", "holder").as_i32();
     if holder > 0 {
         let grp = vm.get_named(holder, "java/lang/Thread$FieldHolder", "group").as_i32();
@@ -526,6 +567,10 @@ fn root_group(vm: &mut Vm) -> i32 {
     let nm = vm.str_new("main".to_string());
     let _ = vm.put_named(h, "java/lang/ThreadGroup", "name", Slot::I(nm));
     let _ = vm.put_named(h, "java/lang/ThreadGroup", "parent", Slot::I(h));
+    // maxPriority 必须是 10：Thread.priority(int) 会拿它做上限裁剪，
+    // 默认 0 会把 setPriority 的结果裁成 0（表现为 getPriority() 永远是 0）
+    let _ = vm.put_named(h, "java/lang/ThreadGroup", "maxPriority", Slot::I(10));
+    let _ = vm.put_named(h, "java/lang/ThreadGroup", "nthreads", Slot::I(1));
     lk(&vm.sh.statics).insert(key, Slot::I(h));
     h
 }

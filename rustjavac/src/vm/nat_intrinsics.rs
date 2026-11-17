@@ -39,103 +39,10 @@ pub(super) fn register(r: &mut NativeRegistry) {
 // `Unsafe.allocateMemory` 在 HotSpot 里就是 `malloc`。我们没有裸指针可用
 // （要过 GC / 多线程 / 不许 UB），所以发出去的「地址」是**句柄**：`BASE + 块内偏移`。
 // 块首按 16 字节对齐，`getLong`/`getDouble` 不会跨块。
-mod arena {
-    use std::collections::BTreeMap;
-    use std::sync::{LazyLock, Mutex};
-
-    /// 假地址基址。挑一个像 `mmap` 结果的值，日志里一眼认得出是裸内存。
-    const BASE: u64 = 0x0000_7F00_0000_0000;
-    /// 块首对齐
-    const ALIGN: u64 = 16;
-
-    struct Arena {
-        /// 块首地址 → 字节。**BTreeMap** 是为了「地址落在哪个块」能 O(log n) 查出来
-        blocks: BTreeMap<u64, Vec<u8>>,
-        /// 下一个块的相对偏移。**不回填**：释放过的地址不再复用，悬垂读写的后果才可预测
-        next: u64,
-    }
-
-    static ARENA: LazyLock<Mutex<Arena>> =
-        LazyLock::new(|| Mutex::new(Arena { blocks: BTreeMap::new(), next: 0 }));
-
-    fn lock() -> std::sync::MutexGuard<'static, Arena> {
-        ARENA.lock().unwrap_or_else(|e| e.into_inner())
-    }
-
-    fn bump(a: &mut Arena, n: u64) -> u64 {
-        let start = a.next;
-        a.next = (start + n.max(1) + ALIGN - 1) / ALIGN * ALIGN + ALIGN;
-        BASE + start
-    }
-
-    /// 分配 `n` 字节，返回假地址。`n == 0` 也给有效地址（HotSpot 允许并且要求可 free）。
-    pub(super) fn alloc(n: u64) -> u64 {
-        let mut a = lock();
-        let addr = bump(&mut a, n);
-        a.blocks.insert(addr, vec![0u8; n as usize]);
-        addr
-    }
-
-    pub(super) fn free(addr: u64) {
-        // `freeMemory(0)` 必须是无操作（JDK 规范允许传 0）
-        if addr == 0 {
-            return;
-        }
-        lock().blocks.remove(&addr);
-    }
-
-    pub(super) fn realloc(addr: u64, n: u64) -> u64 {
-        if addr == 0 {
-            return alloc(n);
-        }
-        let mut a = lock();
-        let Some(old) = a.blocks.remove(&addr) else { return alloc(n) };
-        let new_addr = bump(&mut a, n);
-        let mut buf = vec![0u8; n as usize];
-        // 缩小时只拷留下的部分；放大时多出来的保持 0（HotSpot 也不初始化）
-        let keep = old.len().min(buf.len());
-        buf[..keep].copy_from_slice(&old[..keep]);
-        a.blocks.insert(new_addr, buf);
-        new_addr
-    }
-
-    /// 地址 → (块内起点, 块长)
-    fn locate(a: &Arena, addr: u64) -> Option<(usize, usize)> {
-        if addr < BASE {
-            return None;
-        }
-        let (&base, buf) = a.blocks.range(..=addr).next_back()?;
-        Some(((addr - base) as usize, buf.len()))
-    }
-
-    /// 读 `width` 字节（小端）。落不到任何块 → 0；跨出块尾的部分按 0 补
-    /// （真实内存里那是相邻字节，这里没有「相邻」可言，取 0 至少是确定的）。
-    pub(super) fn read(addr: u64, width: usize) -> u64 {
-        let a = lock();
-        let Some((off, len)) = locate(&a, addr) else { return 0 };
-        let Some((&base, _)) = a.blocks.range(..=addr).next_back() else { return 0 };
-        let buf = &a.blocks[&base];
-        let mut out = 0u64;
-        for k in 0..width {
-            if off + k < len {
-                out |= (buf[off + k] as u64) << (8 * k);
-            }
-        }
-        out
-    }
-
-    pub(super) fn write(addr: u64, width: usize, v: u64) {
-        let mut a = lock();
-        let Some((off, len)) = locate(&a, addr) else { return };
-        let Some((&base, _)) = a.blocks.range(..=addr).next_back() else { return };
-        let buf = a.blocks.get_mut(&base).unwrap();
-        for k in 0..width {
-            if off + k < len {
-                buf[off + k] = ((v >> (8 * k)) & 0xFF) as u8;
-            }
-        }
-    }
-}
+// 共享的「假」native 内存 arena —— **全 VM 一份**（`src/vm/nat_mem.rs`，由 `nat_util.rs` 声明）。
+// 原来这里是本文件私有的一份，`nat_os` 组读不到同一张表，`Files.readAllBytes` /
+// `sun.nio.ch.*` 全废。现在两边落到同一张块表上：谁分配的地址谁都能读写。
+use super::nat_util::nat_mem as arena;
 
 // ================================================================ Unsafe — 读写底座
 

@@ -1263,3 +1263,35 @@ Class.forName → java.lang.String    getSystemClassLoader → 非 null
 `"中文".getBytes("UTF-8")` 出来是 `E2 B5 8E`（JDK 是 `E4 B8 AD`）—— **非 ASCII 的
 String→UTF-8 编码坏了**，ASCII 完全正确（CRC32 对 abcabcabc 与 java 一致）。
 连带 `Inflater`/`GZIP` 的往返都是乱码，但那不是压缩的锅：先修编码。
+
+## 0.64.0 — 2026-11-18 · native 三组收口 + 共享 native 内存
+
+### 覆盖面（`jnativescan` 前后对比）
+| 组 | 类 | native 数 | 状态 |
+|---|---|---|---|
+| 内存/反射 | `Unsafe` / `reflect.Array` / `Class` / `ConstantPool` | 135 | **135 / 135** |
+| 文件进程 | `FileDescriptor`/`FileInputStream`/`FileOutputStream`/`RandomAccessFile`/`WinNTFileSystem`/`ProcessImpl`/`ProcessHandleImpl` | 69 | **69 / 69** |
+| 杂项压缩 | `VM`/`System`/`Thread`/`Inflater`/`Deflater`/`CRC32`/`Adler32`/`LibFallback`/`HostLocale` | 125 | **125 / 125** |
+
+合计 java.base native 覆盖从 **130 / 748** 抬到 **约 490 / 748**。
+
+### 共享 native 内存（`src/vm/nat_mem.rs`，244 行）
+之前 `nat_intrinsics` 与 `nat_util` 各有一套**互不相通**的「假地址空间」，
+`nat_os` 因此读不到也写不进 → `sun.nio.*` 的 90 多个 native 全做不了。
+现已合并成一份 `pub(crate)`：`alloc/free/realloc/read/write/read_bytes/write_bytes/fill/copy_mem/base_of`。
+**这是本轮的架构收获** —— 两个子代理各自都对，合起来互相读不到，只能靠统一接口解决。
+
+### 其它
+- `DEFLATE` 解压是完整实现（stored / 固定哈夫曼 / 动态哈夫曼 + 32K 回溯窗口 + zlib 包装）；
+  压缩只用 stored 块（合法流，压缩率 ≈ 1.0004）。跨方向验过：真 java 能解我们压的。
+- `Lookup.lookupClass()` 原来恒返回 0 → `MhUtil.findVarHandle` 展开后报错，
+  卡死 `ThreadBuilders$BaseThreadFactory.<clinit>`（连带 `ProcessHandle`/`ProcessBuilder`）。已修。
+- `ThreadLocalRandom.current()` 挂死的真因是 `Lookup.ensureInitialized` 缺失（已补），不是它自己。
+
+**验证**：`cargo test` **106 passed**、`verify.sh` **103/103**、三份验收程序（Sys1 17 行 /
+Thread1 20 行 / Zip1 35 行）与 java 逐字节一致。
+
+### 已知未解（下一步的头号）
+`"中文".getBytes("UTF-8")` 出来是 `E2 B5 8E`，JDK 是 `E4 B8 AD` ——
+**char 被字节交换了**（U+4E2D → U+2D4E）。ASCII 完全正确（`abcabcabc` 的 CRC32 两边一致）。
+连带 `Inflater`/`GZIP` 的往返看似乱码，但压缩本身没问题（跨方向验证过），先修编码。
