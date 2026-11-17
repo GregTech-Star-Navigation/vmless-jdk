@@ -228,7 +228,13 @@ impl JImageSource {
     /// 条目路径（`java/lang/Object.class`，也可以带前导 `/` 和模块名）→ 字节
     pub fn find(&self, entry: &str) -> Result<Option<Vec<u8>>, String> {
         let key = entry.trim_start_matches('/').to_string();
-        let loc = self.with_entries(|m| m.get(&key).copied());
+        // 短名（`java/lang/Object.class`）和带模块的全名（`/java.base/java/lang/Object.class`）
+        // 在索引里是不同的键：两种都试。带模块的那种正是「按模块取类」用的。
+        let loc = self.with_entries(|m| {
+            m.get(&key)
+                .copied()
+                .or_else(|| m.get(&format!("/{key}")).copied())
+        });
         let Some(loc) = loc else { return Ok(None) };
         let comp = loc.attr[ATTR_COMPRESSED];
         let uncomp = loc.attr[ATTR_UNCOMPRESSED];

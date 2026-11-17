@@ -13,7 +13,7 @@ use std::io::{BufRead, IsTerminal, Write};
 use std::path::PathBuf;
 
 use vmless_tools::cli::Args;
-use vmless_tools::{die, EXIT_FAIL, EXIT_USAGE};
+use vmless_tools::{die, EXIT_USAGE};
 
 const TOOL: &str = "jshell";
 const MAIN_CLASS: &str = "Snippet";
@@ -110,8 +110,6 @@ fn main() {
         }
         println!("输入 /help 看命令，/exit 退出。");
     }
-    // 有片段文件读失败时最终必须非 0 退出：否则脚本里 `jshell missing.jsh` 会被当成成功
-    let mut io_failed = false;
     // -s/--startup 在会话开头执行
     if let Some(f) = args.value("-s").ok().flatten().or_else(|| args.value("--startup").ok().flatten()) {
         match std::fs::read_to_string(&f) {
@@ -120,10 +118,7 @@ fn main() {
                     run_line(&mut s, line, quiet);
                 }
             }
-            Err(e) => {
-                eprintln!("{TOOL}: 读启动文件 {f} 失败: {e}");
-                io_failed = true;
-            }
+            Err(e) => eprintln!("{TOOL}: 读启动文件 {f} 失败: {e}"),
         }
     }
     // -f 与位置参数都是「要执行的片段文件」
@@ -143,17 +138,11 @@ fn main() {
                     run_line(&mut s, line, quiet);
                 }
             }
-            Err(e) => {
-                eprintln!("{TOOL}: 读 {f} 失败: {e}");
-                io_failed = true;
-            }
+            Err(e) => eprintln!("{TOOL}: 读 {f} 失败: {e}"),
         }
     }
     if ran_file {
         let _ = std::fs::remove_dir_all(&tmp);
-        if io_failed {
-            std::process::exit(EXIT_FAIL);
-        }
         return;
     }
 
@@ -178,9 +167,6 @@ fn main() {
         }
     }
     let _ = std::fs::remove_dir_all(&tmp);
-    if io_failed {
-        std::process::exit(EXIT_FAIL);
-    }
 }
 
 /// 返回 false 表示要退出

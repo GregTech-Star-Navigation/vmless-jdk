@@ -1,0 +1,11 @@
+[
+ {
+  "id": "vml-jdk-empty",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/Empty",
+   "Empty"
+  ],
+  "timeoutMs": 120000
+ }
+]

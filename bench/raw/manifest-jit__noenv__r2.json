@@ -1,0 +1,10 @@
+[
+ {
+  "id": "vml-jit-p2",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/jdkms/par/out/P2.class"
+  ],
+  "timeoutMs": 300000
+ }
+]

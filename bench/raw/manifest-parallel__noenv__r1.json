@@ -1,0 +1,10 @@
+[
+ {
+  "id": "vml-jit-p1j-4",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/P1L4/P1L4.class"
+  ],
+  "timeoutMs": 120000
+ }
+]

@@ -1,0 +1,20 @@
+[
+ {
+  "id": "hs-alloc8",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/Alloc8",
+   "Alloc8"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "vml-jit-alloc8",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/Alloc8/Alloc8.class"
+  ],
+  "timeoutMs": 300000
+ }
+]

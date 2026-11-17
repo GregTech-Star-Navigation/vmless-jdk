@@ -1,0 +1,110 @@
+[
+ {
+  "id": "hs-obj-1m",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ObjSize",
+   "ObjSize1000000"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "hs-obj-2m",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ObjSize",
+   "ObjSize2000000"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "hs-obj-4m",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ObjSize",
+   "ObjSize4000000"
+  ],
+  "timeoutMs": 180000
+ },
+ {
+  "id": "vml-obj-1m",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/ObjSize/ObjSize1000000.class"
+  ],
+  "timeoutMs": 180000
+ },
+ {
+  "id": "vml-obj-2m",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/ObjSize/ObjSize2000000.class"
+  ],
+  "timeoutMs": 240000
+ },
+ {
+  "id": "vml-obj-4m",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/ObjSize/ObjSize4000000.class"
+  ],
+  "timeoutMs": 300000
+ },
+ {
+  "id": "hs-objE-1m",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ObjSizeE",
+   "ObjSizeE1000000"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "hs-objE-4m",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ObjSizeE",
+   "ObjSizeE4000000"
+  ],
+  "timeoutMs": 180000
+ },
+ {
+  "id": "hs-objE-8m",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ObjSizeE",
+   "ObjSizeE8000000"
+  ],
+  "timeoutMs": 240000
+ },
+ {
+  "id": "vml-objE-1m",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/ObjSizeE/ObjSizeE1000000.class"
+  ],
+  "timeoutMs": 180000
+ },
+ {
+  "id": "vml-objE-4m",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/ObjSizeE/ObjSizeE4000000.class"
+  ],
+  "timeoutMs": 240000
+ },
+ {
+  "id": "vml-objE-8m",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/ObjSizeE/ObjSizeE8000000.class"
+  ],
+  "timeoutMs": 300000
+ }
+]

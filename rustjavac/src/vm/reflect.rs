@@ -832,7 +832,26 @@ impl Vm {
         override_: bool,
         what: &str,
     ) -> Result<(), VmError> {
-        if override_ || flags & ACC_PUBLIC != 0 {
+        if override_ {
+            return Ok(());
+        }
+        // ---- 模块系统（JPMS）----
+        // 没有 `--add-opens` / `--add-exports` 时，跨模块反射访问必须拒绝：
+        // 非 public 成员要 opens，public 成员要 exports（`Access::check_reflective`）。
+        // 没进模块模式时 `current_access()` 是 None，这一段完全不生效（旧行为不变）。
+        if let Some(acc) = crate::load::current_access() {
+            let caller = self.store.name_of_index(self.last_caller).unwrap_or_default();
+            let caller_mod = acc
+                .graph
+                .module_of_class(&caller)
+                .unwrap_or(crate::load::modules::UNNAMED)
+                .to_string();
+            let is_public = flags & ACC_PUBLIC != 0;
+            if let Err(detail) = acc.check_reflective(&caller_mod, decl, is_public, what) {
+                return Err(self.throw_msg("java/lang/reflect/InaccessibleObjectException", detail));
+            }
+        }
+        if flags & ACC_PUBLIC != 0 {
             return Ok(());
         }
         let caller = self.store
@@ -1616,6 +1635,21 @@ pub(super) fn register(r: &mut super::native_reg::NativeRegistry) {
 
     // ---- AccessibleObject：访问检查与注解（Field/Method/Constructor 共用）----
     const AO: &str = "java/lang/reflect/AccessibleObject";
+    // `setAccessible` **必须由 VM 接管**：模块系统（`--add-opens`）的判定在这里做，
+    // 真 JDK 走的是 `checkCanSetAccessible` → `Module.canAccess`，本 VM 用同一套规则
+    // 直接判（见 `load::modules::Access::check_reflective`）。
+    //
+    // 注意：JDK 25 里 `Field` / `Method` / `Constructor` **各自重新声明**了
+    // `setAccessible(boolean)`（不是只继承 `AccessibleObject` 的那份），所以四个类都要挂 ——
+    // 只挂 `AccessibleObject` 的话调用点解析到的是 `Field.setAccessible`，接管根本不会命中。
+    for owner in [
+        AO,
+        "java/lang/reflect/Field",
+        "java/lang/reflect/Method",
+        "java/lang/reflect/Constructor",
+    ] {
+        r.add_override(owner, "setAccessible", "(Z)V", ao_set_accessible);
+    }
     const ANN: &str = "Ljava/lang/annotation/Annotation;";
     for owner in [AO, "java/lang/reflect/Executable", "java/lang/reflect/Field", "java/lang/reflect/Method", "java/lang/reflect/Constructor"] {
         let owner: &'static str = match owner {
@@ -1917,6 +1951,165 @@ fn member_attrs(vm: &Vm, decl: &str, idx: usize, is_method: bool) -> Vec<crate::
     list.get(idx).map(|m| m.attributes.clone()).unwrap_or_default()
 }
 
+
+/// `AccessibleObject.setAccessible(boolean)`：**模块系统在这里做判定**。
+///
+/// 真 JDK 走 `checkCanSetAccessible` → `Module.canAccess`；本 VM 用同一套规则直接判：
+/// 目标包没 `opens`（private 成员）或没 `exports`（public 成员）给调用者模块就抛
+/// `InaccessibleObjectException`，允许才把 `override` 置成 `flag`。
+/// 没进模块模式时（`current_access()` 为 None）行为与以前一致：只记 `override`。
+fn ao_set_accessible(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    let flag = f.arg_i(0) != 0;
+    let obj_class = vm.obj_class_name(this).unwrap_or_default();
+    let member = vm.refl_member_of(this, &obj_class);
+    if std::env::var_os("VMLESS_JPMS_DEBUG").is_some() {
+        eprintln!(
+            "[jpms] setAccessible(obj={obj_class} flag={flag} member={member:?} access={})",
+            crate::load::current_access().is_some()
+        );
+    }
+    if flag {
+        if let Some((decl, idx)) = member.clone() {
+            if let Some(acc) = crate::load::current_access() {
+                let caller = vm.store.name_of_index(vm.last_caller).unwrap_or_default();
+                let caller_mod = acc
+                    .graph
+                    .module_of_class(&caller)
+                    .unwrap_or(crate::load::modules::UNNAMED)
+                    .to_string();
+                let (is_public, what) = member_shape(vm, &decl, idx, &obj_class);
+                if let Err(detail) = acc.check_reflective(&caller_mod, &decl, is_public, &what) {
+                    return Err(
+                        vm.throw_msg("java/lang/reflect/InaccessibleObjectException", detail)
+                    );
+                }
+            }
+        }
+    }
+    if let Some(slot) = vm.store.field_index("java/lang/reflect/AccessibleObject", "override") {
+        vm.sh.heap.set(this, slot, Slot::I(i32::from(flag)));
+    }
+    Ok(Slot::I(0))
+}
+
+/// 反射对象 → (成员是否 public、`setAccessible` 报错里怎么称呼它)
+///
+/// 措辞对齐真 JDK：`AccessibleObject.throwInaccessibleObjectException` 打的是
+/// `"Unable to make " + ["field "] + <Field/Method/Constructor.toString()> + " accessible: …"`，
+/// 而 `Field.toString()` 是 `private final byte[] java.lang.String.value` 这个形状。
+fn member_shape(vm: &Vm, decl: &str, idx: usize, obj_class: &str) -> (bool, String) {
+    let Some(cf) = vm.cf_of(decl) else { return (false, "member".to_string()) };
+    let class_public = cf.access_flags & ACC_PUBLIC != 0;
+    let class_name = decl.replace('/', ".");
+    if obj_class.ends_with("Field") {
+        let f = &cf.fields[idx];
+        let ty = desc_type_name(&desc_of(&cf, f));
+        let mods = modifier_words(f.access_flags, true);
+        (
+            class_public && f.access_flags & ACC_PUBLIC != 0,
+            format!("field {mods}{ty} {class_name}.{}", name_of(&cf, f)),
+        )
+    } else if obj_class.ends_with("Constructor") {
+        let m = &cf.methods[idx];
+        let params = param_type_names(&desc_of(&cf, m)).join(",");
+        let mods = modifier_words(m.access_flags, false);
+        (class_public && m.access_flags & ACC_PUBLIC != 0, format!("{mods}{class_name}({params})"))
+    } else {
+        let m = &cf.methods[idx];
+        let d = desc_of(&cf, m);
+        let params = param_type_names(&d).join(",");
+        let ret = crate::ret_of(&d).map(|c| desc_type_name(&(c as char).to_string())).unwrap_or_default();
+        let mods = modifier_words(m.access_flags, false);
+        (
+            class_public && m.access_flags & ACC_PUBLIC != 0,
+            format!("{mods}{ret} {class_name}.{}({params})", name_of(&cf, m)),
+        )
+    }
+}
+
+/// 修饰符文本（JDK `Modifier.toString` 的顺序，末尾带一个空格）
+fn modifier_words(flags: u16, is_field: bool) -> String {
+    const BITS: &[(u16, &str)] = &[
+        (0x0001, "public"),
+        (0x0004, "protected"),
+        (0x0002, "private"),
+        (0x0400, "abstract"),
+        (0x0008, "static"),
+        (0x0010, "final"),
+        (0x0080, "transient"),
+        (0x0040, "volatile"),
+        (0x0020, "synchronized"),
+        (0x0100, "native"),
+    ];
+    let mut out = String::new();
+    for (bit, word) in BITS {
+        // abstract / transient / volatile / synchronized / native 按种类过滤，别串味
+        let ok = match *word {
+            "abstract" => !is_field,
+            "transient" | "volatile" => is_field,
+            "synchronized" | "native" => !is_field,
+            _ => true,
+        };
+        if ok && flags & bit != 0 {
+            out.push_str(word);
+            out.push(' ');
+        }
+    }
+    out
+}
+
+/// 字段/返回类型描述符 → Java 类型名（`[B` → `byte[]`）
+fn desc_type_name(desc: &str) -> String {
+    if let Some(rest) = desc.strip_prefix('[') {
+        return format!("{}[]", desc_type_name(rest));
+    }
+    match desc {
+        "B" => "byte".into(),
+        "C" => "char".into(),
+        "D" => "double".into(),
+        "F" => "float".into(),
+        "I" => "int".into(),
+        "J" => "long".into(),
+        "S" => "short".into(),
+        "Z" => "boolean".into(),
+        "V" => "void".into(),
+        _ => desc
+            .trim_start_matches('L')
+            .trim_end_matches(';')
+            .replace('/', "."),
+    }
+}
+
+/// 方法描述符 → 参数类型名列表
+fn param_type_names(desc: &str) -> Vec<String> {
+    let inner = match desc.strip_prefix('(').and_then(|d| d.split_once(')')) {
+        Some((p, _)) => p,
+        None => return Vec::new(),
+    };
+    let mut out = Vec::new();
+    let b = inner.as_bytes();
+    let mut i = 0;
+    while i < b.len() {
+        let start = i;
+        while i < b.len() && b[i] == b'[' {
+            i += 1;
+        }
+        if i >= b.len() {
+            break;
+        }
+        let c = b[i] as char;
+        i += 1;
+        if c == 'L' {
+            while i < b.len() && b[i] != b';' {
+                i += 1;
+            }
+            i += 1;
+        }
+        out.push(desc_type_name(&inner[start..i.min(inner.len())]));
+    }
+    out
+}
 
 fn ao_get_annotation(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let this = f.this();

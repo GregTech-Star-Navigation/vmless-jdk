@@ -1,0 +1,26 @@
+[
+ {
+  "id": "gc-vml-1",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/Gc/Gc.class"
+  ],
+  "timeoutMs": 300000
+ },
+ {
+  "id": "gc-vml-2",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/Gc/Gc.class"
+  ],
+  "timeoutMs": 300000
+ },
+ {
+  "id": "gc-vml-3",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/Gc/Gc.class"
+  ],
+  "timeoutMs": 300000
+ }
+]

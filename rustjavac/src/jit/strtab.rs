@@ -34,6 +34,24 @@ pub fn register_desc(s: &str) -> u32 {
     (t.len() - 1) as u32
 }
 
+/// 字符串常量编号 → 文本。
+///
+/// 读的是堆上的 String 对象（GC 搬过之后按根槽里**当前**的偏移读），
+/// 供 `rt::indy_concat` 拼字面量用。
+pub fn text(idx: u32) -> String {
+    let root = { TABLE.lock().unwrap().get(idx as usize).copied() };
+    let Some(r) = root else { return String::new() };
+    let off = rt::root_value(r) as i64;
+    if off == 0 {
+        return String::new();
+    }
+    unsafe {
+        let p = rt::base_ptr().wrapping_add(off as usize);
+        let len = std::ptr::read_unaligned(p.add(8) as *const u32) as usize;
+        String::from_utf8_lossy(std::slice::from_raw_parts(p.add(16), len)).into_owned()
+    }
+}
+
 /// 运行时辅助：字符串常量当前在堆里的偏移（0 = 没有这个序号）
 pub extern "C" fn str_const(idx: u32) -> i64 {
     let root = { TABLE.lock().unwrap().get(idx as usize).copied() };

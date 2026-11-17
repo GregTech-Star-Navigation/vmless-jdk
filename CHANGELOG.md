@@ -942,3 +942,89 @@ R8  ours=[inject counter <- Counter | inject greeter <- Greeter | value config |
 - `librustjrt::SharedHeap` 没接进来：它槽宽 4 字节（装不下 16 字节 `Slot`），`get_i32/set_i32` 要 `&mut Heap`
   （写锁会让字段访问全局串行），年轻代还是搬动式（需要精确根集）。已改用自建无锁池。
 - 死锁报告只列膨胀过的监视器（thin 持有者的锁在对象头里，没有全局索引）。
+
+## jdk-tools 0.1.1 — 2026-11-18 · 工具加固：退出码、真镜像 extract、`--help` 一致性
+
+对 15 个工具做了一轮对抗性体检（15 × 8 类坏输入 = 77 个用例，`scripts/tool-audit.sh`），
+**0 次 panic**。查出并修掉两个真 bug，另修一个把真镜像 extract 拖慢 97 倍的排序热点。
+
+### 修
+
+- **`jshell`：片段文件读不到时打印错误但退出 0**（静默失败，脚本会把失败当成功）。
+  改成记 `io_failed` 标志，退出前 `exit(EXIT_FAIL)`。回归：`tests/bad_inputs.rs`。
+  症状举例：`jshell missing.jsh; echo $?` 之前是 0，现在是 1。
+- **`jimage extract` 在真 JDK 镜像上跑 301 个条目就断**（`写 …\sun 失败: 拒绝访问`）。
+  根因：镜像里有**目录节点**（`/modules`、`/java.base/sun`、`/modules/java.base/sun` 这类，
+  有些还带着数据），原实现把每一条都当文件写 → 撞上同名目录 → Windows 报 os error 5。
+  改成「有子条目的条目按目录建」。实测：30482/30482 条目、143 MB、14.9 秒。
+- **`jimage list` 25.9 秒 → 0.27 秒**（145 MB 镜像、30629 条目）。
+  根因在排序比较函数里调 `rel_path()`：每比较一次 2 次 `format!` + `to_string`，
+  30k 条目约 45 万次比较。改成先算好 `(module, rel)` 键再排（输出逐字节不变）。
+
+### 验证
+
+- `cargo test --release --test bad_inputs` —— 4 个测试全过（坏路径/非法选项/选项缺值/`--help` 干净）
+- `scripts/tool-audit.sh` —— 77 个用例：0 panic、退出码只有 0/1/2（+ 服务类工具被 timeout 掐的 124）
+- `docs/工具退出码.md` —— 15 工具 × 正常/参数错/IO 错 的完整矩阵 + 逐用例明细
+- `docs/工具体积.md` —— 32 个 exe 的体积表（只有 `jdb` 2.24 MB、`jshell` 2.23 MB 超过 2 MB，
+  原因是静态链接了编译器前端 + 解释器，其余 144–400 KB）
+- 大输入：`jimage` 145 MB 镜像（info 70 ms / list 267 ms / verify 915 ms / extract 14.9 s）、
+  `jmod` 41 MB `java.base.jmod` 全量 7450 条目（list 116 ms / extract 5.29 s，真 jmod 6.31 s）、
+  `jfr` 50 MB 多 chunk 录制（summary 602 ms / print 11.9 s，峰值 775 MB —— 已知短板：print 会把全部事件解码进内存）
+- 并发：`jwebserver` 50 个并发连接拉同一个 20 MB 文件，50/50 sha256 一致、无串包、服务不崩
+
+### 没做
+
+- 仓库里**没有 `jar` 工具**（只有 `jarsigner` 与 launcher 的 `-jar` 运行能力），
+  所以「500 MB 的 jar」这一项测不了；zip 层的大输入用 `jmod`（同一条 zip 实现）覆盖。
+- `jps` 会静默忽略未知位置参数（`jps abc` 退出 0）。改成报错会让 `jps -l $(hostname)` 变红，
+  属于「有意保留」，已写进 `docs/工具退出码.md` §4。
+
+## 0.58.0 — 2026-11-18 · JIT 按方法回退 + invokedynamic、JPMS、基准与工具体检
+
+### JIT 按方法回退（把「一处不支持就整程序作废」修掉）
+原来任何一个方法编不了，整个程序退回解释器。现在逐方法尝试，编不了的只废那个方法，
+调用点发「解释器桩」（参数拍成 i64 数组 → `vmless_interp_call`）。
+
+| 程序 | 解释器 | **JIT(新)** | HotSpot 25 |
+|---|---|---|---|
+| P1 4 线程 × 800 万 | 1782 ms | **185 ms** | 45 ms |
+| P2 4×800 万 + 字符串拼接 | 6679 ms | **393 ms**（**17×**）| 71 ms |
+
+`P2` 原来因为一句 `"sum=" + s`（invokedynamic）整程序作废，现在是「编译 2 个方法，解释 0 个」。
+
+### 修的严重 bug：`synchronized` 跨线程吃 18 GB
+根因是 JIT↔解释器通道：解释器在**生成代码的回调里懒建**（`Vm::open` 要加载 5421 类/95MB），
+且**没做线程登记**（`cur_tid()`=0，监视器用非法 tid 空转）→ 每次调用重建解释器，95MB/次 ≈ 90MB/s 涨到 18.8 GB。
+已改成预建 + 补登记 + 只对「描述符无引用」的方法开桩。
+回归脚本 `scripts/verify-sync.sh`，**断言峰值内存 < 200MB、墙钟 < 30s**。
+
+### invokedynamic
+`src/jit/indy.rs`：编译期分类调用点，`StringConcatFactory` 的 recipe 解成「拼接计划」
+（`\u0001`=栈上参数、`\u0002`=引导常量）；`0xba` 就地展开成一次 `indy_concat(plan, i64[])`。
+
+### JPMS 模块系统
+`classfile/attr.rs` 解析 `Module` 全字段；`load/{modgraph,modules,jhash,cli}.rs`；
+`vm/jpms.rs`。实测：真 `lib/modules` 解析出 **70 个模块**（对齐 `java --list-modules`）+
+拓扑序 + requires 树；`--describe-module java.base` 的 exports/contains **139 行逐行一致**；
+`--add-opens` 不加抛 `InaccessibleObjectException`、加了 `setAccessible OK`；
+`--add-exports` 与真 java **逐字相同**；split package 检测对齐。
+**顺手修了冷启动 36–44 秒**：不是扫整棵树，是扁平挂载的 80 个来源逐个试开（27425 次 open），
+加「包→上次命中来源」提示后降到 **1116 次（24.6×）**。
+
+### 基准（`bench/`，8 维、30 次交错、min 口径）
+**赢**：启动 133.9 vs 727.3 ms（**5.43×**）· 常驻 RSS 5.5 vs 42.7 MB（**7.76×**）·
+空对象 8 vs 16 B（**2×**）· 8 线程并行加速 **7.12× vs 3.32×**（线性度 89% vs 41%）
+**输**：解释吞吐慢 96.9× · JIT 慢 5.73× · **GC 最大停顿 46.3 vs 12.7 ms（慢 3.64×）** ·
+GC 总停顿慢 4.39× · 分配峰值 RSS 慢 2.63×
+> ⚠️ **纠正之前的一个说法**：我们此前的「GC 停顿 0.021ms vs 23.4ms」是 `librustjrt` 独立基准的数字，
+> **不是 VM 实际运行时的表现**。VM 现在的 GC 是 STW 复制 + 标记清扫，实测**输给 G1 3.64×**。
+
+### 工具体检（15 工具 × 8 类坏输入 = 77 用例，0 panic）
+修了 3 个真问题：`jshell` 读不到片段文件却 exit 0（静默失败）·
+`jimage extract` 在真镜像跑 301 个条目就断（目录节点被当文件写）→ 修复后 **30482/30482 条目**·
+`jimage list` **25.9s → 0.27s**（排序比较里每次调 `rel_path()`）。产出 `docs/工具退出码.md`。
+
+### 新发现未修（高价值）
+**`Thread` 子类 override 的 `run()` 不被派发** —— 线程体不执行，`v=42` 静默变 `0`（lambda/Runnable 版正常）。
+这会静默给出错误结果，下一轮优先修。

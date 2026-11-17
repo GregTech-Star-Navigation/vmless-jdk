@@ -8,13 +8,29 @@
 //! jimage 的索引解码在 `jimage.rs` 里按 `jdk.internal.jimage.ImageLocation` 的
 //! 位压缩格式解（`kind << 3 | (len-1)`）。
 
+pub mod cli;
 pub mod dir;
 pub mod jar;
 pub mod jimage;
+pub mod jhash;
+pub mod modgraph;
+pub mod modules;
 
 use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
+
+/// 诊断：进程内累计的「文件探测」次数（`VMLESS_CP_STATS=1` 时在析构里打出来）
+static PROBES: AtomicU64 = AtomicU64::new(0);
+
+fn pkg_hint_enabled() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMLESS_NO_PKG_HINT").is_none())
+}
+
+use modules::{Access, ModuleStore};
 
 /// 一个类来源。三种格式各自独立，`find` 拿的是**条目路径**（`java/lang/Object.class`）。
 #[derive(Debug)]
@@ -79,6 +95,14 @@ pub struct ClassPath {
     entries: Vec<(PathBuf, ClassSource)>,
     /// 内部类名 → 字节（未命中记 `None`，避免同一个缺类反复查盘）
     cache: RefCell<HashMap<String, Option<Vec<u8>>>>,
+    /// 模块模式：模块 → 包 → 来源（`None` = 旧的扁平 classpath）
+    modules: Option<Box<ModuleStore>>,
+    /// 模块访问规则（与 `modules` 一起设置；反射层通过 `current_access` 拿它）
+    access: Option<Arc<Access>>,
+    /// 是不是 `push_module_tree` 挂进来的模块镜像（多来源、包不重叠）
+    module_tree: bool,
+    /// 包 → 上次命中的来源下标（只在 `module_tree` 下用，省掉冷启动的文件探测）
+    pkg_hint: RefCell<HashMap<String, usize>>,
 }
 
 /// 内部类名 → 条目路径：`java/lang/Object` / `java/lang/Object.class` → `java/lang/Object.class`
@@ -102,6 +126,7 @@ impl ClassPath {
         let src = ClassSource::open(p)?;
         self.entries.push((p.to_path_buf(), src));
         self.cache.borrow_mut().clear();
+        self.pkg_hint.borrow_mut().clear();
         Ok(())
     }
 
@@ -143,6 +168,8 @@ impl ClassPath {
         for m in mods {
             self.push(m)?;
         }
+        self.module_tree = true;
+        self.pkg_hint.borrow_mut().clear();
         Ok(())
     }
 
@@ -161,19 +188,103 @@ impl ClassPath {
         }
         let entry = to_entry(class);
         let mut got = None;
-        for (path, src) in &self.entries {
-            match src.find(&entry) {
-                Ok(Some(bytes)) => {
-                    got = Some(bytes);
-                    break;
+        // 模块模式：先问模块路径（模块里的类是「模块私有」的，不该被扁平层盖掉）
+        if let Some(store) = &self.modules {
+            got = store.find(class)?;
+        }
+        // 「包 → 上次命中的来源」提示：只对 `push_module_tree` 挂进来的模块镜像生效。
+        // 动机是冷启动的 syscall 数：一个 80 来源的镜像上，加载 N 个类要探 80×N 次文件，
+        // 冷缓存（Defender 逐个扫）时 5421 个类的闭包要 40 秒。同一个包的类几乎总在
+        // 同一个来源里，先试那一个能把探测数压到「包数×来源数」。
+        // 语义不变：模块镜像里一个包只属于一个模块，不存在「前面的来源也有一份」。
+        let pkg = match class.rsplit_once('/') {
+            Some((p, _)) => p,
+            None => "",
+        };
+        let hint = if self.module_tree && pkg_hint_enabled() {
+            self.pkg_hint.borrow().get(pkg).copied()
+        } else {
+            None
+        };
+        if got.is_none() {
+            if let Some(h) = hint {
+                if let Some((path, src)) = self.entries.get(h) {
+                    match src.find(&entry) {
+                        Ok(Some(bytes)) => got = Some(bytes),
+                        Ok(None) => {}
+                        Err(e) => return Err(format!("{} 里的 {entry}: {e}", path.display())),
+                    }
                 }
-                Ok(None) => {}
-                // 找到了但解不出来（例如 deflate）：直接报出来，不要静默跳过
-                Err(e) => return Err(format!("{} 里的 {entry}: {e}", path.display())),
+            }
+        }
+        if got.is_none() {
+            for (i, (path, src)) in self.entries.iter().enumerate() {
+                if Some(i) == hint {
+                    continue;
+                }
+                PROBES.fetch_add(1, Ordering::Relaxed);
+                match src.find(&entry) {
+                    Ok(Some(bytes)) => {
+                        got = Some(bytes);
+                        if self.module_tree && pkg_hint_enabled() {
+                            self.pkg_hint.borrow_mut().insert(pkg.to_string(), i);
+                        }
+                        break;
+                    }
+                    Ok(None) => {}
+                    // 找到了但解不出来（例如 deflate）：直接报出来，不要静默跳过
+                    Err(e) => return Err(format!("{} 里的 {entry}: {e}", path.display())),
+                }
             }
         }
         self.cache.borrow_mut().insert(class.to_string(), got.clone());
         Ok(got)
+    }
+
+    // ------------------------------------------------------ 模块模式（JPMS）
+
+    /// 挂上模块路径：从此类查找先走「模块 → 包」，并启用**访问检查**。
+    ///
+    /// 访问规则同时发布到进程级（`current_access`），反射层（`setAccessible`）
+    /// 与这里用的是同一份 —— 两处的判定必须一致，不能各说各话。
+    pub fn set_module_store(&mut self, store: ModuleStore) {
+        let access = Arc::new(store.access());
+        self.modules = Some(Box::new(store));
+        self.access = Some(access.clone());
+        self.cache.borrow_mut().clear();
+        set_current_access(Some(access));
+    }
+
+    pub fn modules(&self) -> Option<&ModuleStore> {
+        self.modules.as_deref()
+    }
+
+    pub fn access(&self) -> Option<&Arc<Access>> {
+        self.access.as_ref()
+    }
+
+    /// 内部类名 → 模块名（`None` = 未命名模块 = classpath 上的类）
+    pub fn module_of_class(&self, class: &str) -> Option<&str> {
+        self.modules.as_ref().and_then(|s| s.module_of_class(class))
+    }
+
+    /// 字节码引用的访问检查。没有模块模式时是 **no-op**（旧行为不变）。
+    ///
+    /// `requester`：引用者所在模块（`None` = 未命名模块）
+    /// `requester_class`：引用者的内部类名（只用来写错误消息）
+    /// `target`：被引用类的内部类名
+    pub fn check_reference(
+        &self,
+        requester: Option<&str>,
+        requester_class: &str,
+        target: &str,
+    ) -> Result<(), String> {
+        let Some(access) = &self.access else { return Ok(()) };
+        access.check_class_access(
+            requester.unwrap_or(modules::UNNAMED),
+            requester_class,
+            target,
+        )
     }
 
     /// 哪个来源提供的这个类（诊断用）
@@ -184,4 +295,32 @@ impl ClassPath {
             .find(|(_, s)| matches!(s.find(&entry), Ok(Some(_))))
             .map(|(p, _)| p.as_path())
     }
+}
+
+// ------------------------------------------------------- 进程级访问规则（反射层用）
+
+/// 反射层（`vm/reflect.rs` 的 `setAccessible` / 成员访问）要用的模块访问规则。
+///
+/// 放在进程级而不是穿参数传下去：反射路径在 `vm/` 深处，调用方拿不到 `ClassPath`；
+/// 而一个进程只跑一次模块解析，规则是启动时定死的。没进模块模式时是 `None`
+/// （= 旧行为：不做任何模块检查）。
+static CURRENT_ACCESS: Mutex<Option<Arc<Access>>> = Mutex::new(None);
+
+pub fn set_current_access(access: Option<Arc<Access>>) {
+    *CURRENT_ACCESS.lock().unwrap_or_else(|e| e.into_inner()) = access;
+}
+
+pub fn current_access() -> Option<Arc<Access>> {
+    CURRENT_ACCESS.lock().unwrap_or_else(|e| e.into_inner()).clone()
+}
+
+/// 模块模式是否开着（反射层用它决定要不要做检查）
+pub fn module_mode() -> bool {
+    current_access().is_some()
+}
+
+
+/// 进程内累计的「文件探测」次数（诊断用，见 `VMLESS_CP_STATS`）
+pub fn probe_count() -> u64 {
+    PROBES.load(Ordering::Relaxed)
 }

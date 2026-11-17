@@ -1,0 +1,47 @@
+[
+ {
+  "id": "gc-hs-1",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-Xmx256m",
+   "-Xlog:gc:file=D:/vmless/bench/logs/hs-gc-%p.log",
+   "-cp",
+   "D:/vmless/bench/out/Gc",
+   "Gc"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "gc-hs-2",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-Xmx256m",
+   "-Xlog:gc:file=D:/vmless/bench/logs/hs-gc-%p.log",
+   "-cp",
+   "D:/vmless/bench/out/Gc",
+   "Gc"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "gc-hs-3",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-Xmx256m",
+   "-Xlog:gc:file=D:/vmless/bench/logs/hs-gc-%p.log",
+   "-cp",
+   "D:/vmless/bench/out/Gc",
+   "Gc"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "gc-vml-interp",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/Gc",
+   "Gc"
+  ],
+  "timeoutMs": 300000
+ }
+]

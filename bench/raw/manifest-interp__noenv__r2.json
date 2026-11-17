@@ -1,0 +1,20 @@
+[
+ {
+  "id": "vml-interp-p2j",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/P2j",
+   "P2j"
+  ],
+  "timeoutMs": 300000
+ },
+ {
+  "id": "vml-interp-p2",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/jdkms/par/out",
+   "P2"
+  ],
+  "timeoutMs": 300000
+ }
+]

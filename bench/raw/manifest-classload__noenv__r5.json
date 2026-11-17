@@ -1,0 +1,13 @@
+[
+ {
+  "id": "hs-empty-xshareoff",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-Xshare:off",
+   "-cp",
+   "D:/vmless/bench/out/Empty",
+   "Empty"
+  ],
+  "timeoutMs": 60000
+ }
+]

@@ -1,0 +1,78 @@
+[
+ {
+  "id": "hs-p1j-1",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/P1L1",
+   "P1L1"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "hs-p1j-2",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/P1L2",
+   "P1L2"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "hs-p1j-4",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/P1L4",
+   "P1L4"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "hs-p1j-8",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/P1L8",
+   "P1L8"
+  ],
+  "timeoutMs": 120000
+ },
+ {
+  "id": "vml-interp-p1j-1",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/P1L1",
+   "P1L1"
+  ],
+  "timeoutMs": 300000
+ },
+ {
+  "id": "vml-interp-p1j-2",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/P1L2",
+   "P1L2"
+  ],
+  "timeoutMs": 300000
+ },
+ {
+  "id": "vml-interp-p1j-4",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/P1L4",
+   "P1L4"
+  ],
+  "timeoutMs": 300000
+ },
+ {
+  "id": "vml-interp-p1j-8",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/P1L8",
+   "P1L8"
+  ],
+  "timeoutMs": 300000
+ }
+]

@@ -1,0 +1,12 @@
+[
+ {
+  "id": "hs-p2",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/P2j",
+   "P2j"
+  ],
+  "timeoutMs": 120000
+ }
+]

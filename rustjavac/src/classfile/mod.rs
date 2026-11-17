@@ -113,6 +113,11 @@ impl ClassFile {
         }
     }
 
+    /// `module-info.class` 的模块描述符（不是模块描述符就返回 `None`）
+    pub fn module_info(&self) -> Result<Option<attr::ModuleInfo>> {
+        attr::module_info(self)
+    }
+
     pub fn this_class_name(&self) -> Option<String> {
         let idx = match self.constant_pool.get(self.this_class as usize) {
             Some(Some(CpEntry::Class(n))) => *n,

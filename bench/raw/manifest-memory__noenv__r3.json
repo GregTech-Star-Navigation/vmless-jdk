@@ -1,0 +1,20 @@
+[
+ {
+  "id": "hs-obj-8m",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ObjSize",
+   "ObjSize8000000"
+  ],
+  "timeoutMs": 240000
+ },
+ {
+  "id": "vml-obj-8m",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/ObjSize/ObjSize8000000.class"
+  ],
+  "timeoutMs": 300000
+ }
+]

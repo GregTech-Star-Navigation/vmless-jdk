@@ -26,6 +26,7 @@ use std::collections::HashMap;
 use std::sync::atomic::Ordering;
 use std::sync::{Arc, Mutex};
 
+mod bridge;
 mod call;
 mod class;
 mod exception;
@@ -35,6 +36,7 @@ mod gc;
 mod heap;
 mod indy;
 mod load;
+pub mod jpms;
 mod monitors;
 mod native_reg;
 mod natives;
@@ -44,6 +46,11 @@ mod shared;
 mod slot;
 mod thread;
 
+pub use bridge::{
+    call_interpreted_ptr, has_ref, install_jit, interp_ready, interp_targets, jit_table_len, open_interp,
+    register_interp,
+    JitEntry, JitTable,
+};
 pub use slot::Slot;
 pub(crate) use class::builtin_super;
 use load::ClassStore;

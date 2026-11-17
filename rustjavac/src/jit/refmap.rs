@@ -17,6 +17,7 @@ use std::collections::{HashMap, HashSet};
 use cranelift_codegen::ir::Block;
 
 use super::call::{argc_of, method_ref_of};
+use super::indy;
 use super::insn::insn_len_at;
 use super::layout::field_ref_of;
 use super::JitError;
@@ -235,18 +236,24 @@ fn effect(
         0xc1 => (1, vec![V]),                     // instanceof
         0xc5 => (body.get(pc + 3).copied().unwrap_or(0) as usize, vec![R]), // multianewarray
         0xc6 | 0xc7 => (1, vec![]),               // ifnull / ifnonnull
-        // invokedynamic：JIT 编不出调用点（机器码里要留可替换跳板，没做）。
-        // 这里直接给出带 "invokedynamic" 字样的明确错误 —— `run_jit` 按它整体退回解释器。
+        // invokedynamic：弹掉站点的参数、压回返回值（`StringConcatFactory` 压的是字符串引用）。
+        // 能不能编译不在这里判 —— 这里只管**操作数栈的形状**，接不了的那个调用点
+        // 由翻译器在 0xba 处报错（方法级回退）。
         0xba => {
             let idx = u2();
-            return Err(JitError(format!(
-                "JIT 不支持 invokedynamic（0xba@{pc}，{} 常量池 #{idx}）：\
-                 lambda / 字符串拼接只能由解释器执行（JIT 未接入调用点缓存）",
-                cf.this_class_name().unwrap_or_default()
-            )));
+            let (_, desc, _) = indy_site(cf, idx)?;
+            let argc = argc_of(&desc);
+            let ret = desc.split_once(')').map(|(_, r)| r).unwrap_or("V");
+            let pushes = if ret.starts_with('V') { vec![] } else { vec![desc_val(ret)] };
+            (argc as usize, pushes)
         }
         other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
     })
+}
+
+/// invokedynamic 调用点的 `(名字, 描述符, 引导方法索引)`（栈形状分析只要描述符）
+fn indy_site(cf: &ClassFile, idx: u16) -> Result<(String, String, u16), JitError> {
+    indy::site_of(cf, idx).map_err(JitError)
 }
 
 /// 描述符 → 栈上值类别

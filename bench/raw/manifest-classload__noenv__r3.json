@@ -1,0 +1,21 @@
+[
+ {
+  "id": "hs-classload",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/ClassLoad2",
+   "ClassLoad2"
+  ],
+  "timeoutMs": 180000
+ },
+ {
+  "id": "vml-jdk-load5421",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/Empty",
+   "Empty"
+  ],
+  "timeoutMs": 120000
+ }
+]

@@ -1052,3 +1052,97 @@ pub extern "C" fn sb_to_string(obj: i64) -> i64 {
     }
     hd
 }
+
+// ---------- invokedynamic：字符串拼接（`StringConcatFactory`）----------
+//
+// JIT 不跑引导方法：`"a" + b` 编译出来的 `invokedynamic` 在**编译期**就被解码成一条
+// 「拼接计划」（字面量 + 参数类型序列），运行时只走一次 `indy_concat`。
+// 这样调用点缓存、`CallSite`、`MethodHandle` 都不必进机器码，而结果与
+// `StringConcatFactory` 的语义一致（`\u0001` = 栈上的参数，`\u0002` = 静态常量）。
+
+/// 拼接计划里的一段
+#[derive(Clone, Copy)]
+pub enum CPiece {
+    /// 字面量：`strtab` 里的字符串编号
+    Lit(u32),
+    /// 栈上的动态参数（按 `K_*` 解码）
+    Arg(u8),
+}
+
+/// 参数类型：与描述符字符一一对应（`I`/`Z`/`C`/`J`/`F`/`D`/引用）
+pub const K_INT: u8 = 0;
+pub const K_BOOL: u8 = 1;
+pub const K_CHAR: u8 = 2;
+pub const K_LONG: u8 = 3;
+pub const K_FLOAT: u8 = 4;
+pub const K_DOUBLE: u8 = 5;
+pub const K_REF: u8 = 6;
+
+static CONCAT_PLANS: Mutex<Vec<Vec<CPiece>>> = Mutex::new(Vec::new());
+
+/// 编译期登记一条拼接计划，返回编号
+pub fn register_concat(plan: Vec<CPiece>) -> u32 {
+    let mut g = CONCAT_PLANS.lock().unwrap();
+    g.push(plan);
+    (g.len() - 1) as u32
+}
+
+/// 分配一个 String 对象（内容 = `bytes`）。**不登记永久根**：保活是调用方的事。
+pub fn new_string(bytes: &[u8]) -> i64 {
+    let cid = string_class_id();
+    let hd = new_array(cid, bytes.len() as u32);
+    if !bytes.is_empty() {
+        let p = base_ptr().wrapping_add(hd as u32 as usize + ARRAY_HEADER);
+        unsafe { std::ptr::copy_nonoverlapping(bytes.as_ptr(), p, bytes.len()) };
+    }
+    hd
+}
+
+/// 运行时桩：按计划拼出字符串。
+///
+/// `vals` 是「每个动态参数一格」的 i64 数组（float/double 走位模式，和生成代码一致）。
+/// 先把文本攒进 Rust 侧缓冲、最后一次性分配 —— 中途没有 GC 能移动源对象，
+/// 所以参数里的引用不必额外保活。
+pub extern "C" fn indy_concat(plan: u32, vals: *const i64) -> i64 {
+    let pieces = match CONCAT_PLANS.lock().unwrap().get(plan as usize) {
+        Some(p) => p.clone(),
+        None => return 0,
+    };
+    let mut buf: Vec<u8> = Vec::new();
+    let mut i = 0usize;
+    for p in pieces {
+        match p {
+            CPiece::Lit(id) => buf.extend_from_slice(super::strtab::text(id).as_bytes()),
+            CPiece::Arg(k) => {
+                let raw = unsafe { std::ptr::read_unaligned(vals.add(i)) };
+                i += 1;
+                match k {
+                    K_INT => buf.extend_from_slice((raw as i32).to_string().as_bytes()),
+                    K_BOOL => buf.extend_from_slice(if raw as i32 != 0 { b"true" } else { b"false" }),
+                    K_CHAR => {
+                        let mut tmp = [0u8; 4];
+                        let c = char::from_u32(raw as u32).unwrap_or('?');
+                        buf.extend_from_slice(c.encode_utf8(&mut tmp).as_bytes());
+                    }
+                    K_LONG => buf.extend_from_slice(raw.to_string().as_bytes()),
+                    K_FLOAT => buf.extend_from_slice(
+                        crate::java_float_to_string(f32::from_bits(raw as u32)).as_bytes(),
+                    ),
+                    K_DOUBLE => buf.extend_from_slice(
+                        crate::java_double_to_string(f64::from_bits(raw as u64)).as_bytes(),
+                    ),
+                    _ => buf.extend_from_slice(super::natives::obj_to_string(raw).as_bytes()),
+                }
+            }
+        }
+    }
+    new_string(&buf)
+}
+
+/// 运行时桩：JIT 调用一个**只能解释执行**的方法（方法级回退的入口）。
+///
+/// `vals` 是「每个实参一格」的 i64 数组，返回值也是 i64 位模式（与解释器桥同一套 ABI）。
+/// 实参个数由登记表里的描述符决定，桥自己按描述符读，所以这里不设上限。
+pub extern "C" fn interp_call(id: u32, vals: *const i64) -> i64 {
+    unsafe { super::super::vm::call_interpreted_ptr(id, vals) }
+}

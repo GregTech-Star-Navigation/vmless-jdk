@@ -1,0 +1,94 @@
+[
+ {
+  "id": "spawn-hostname",
+  "exe": "C:/Windows/System32/hostname.exe",
+  "args": [],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "hs-version",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-version"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "hs-empty",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/Empty",
+   "Empty"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "hs-hello",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/Hello",
+   "Hello"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "hs-big1000",
+  "exe": "C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/bin/java.exe",
+  "args": [
+   "-cp",
+   "D:/vmless/bench/out/Big1000",
+   "Big1000"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "vml-rustjava-empty",
+  "exe": "D:/vmless/bparv/rustjava.exe",
+  "args": [
+   "D:/vmless/bench/out/Empty/Empty.class"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "vml-rustjava-hello",
+  "exe": "D:/vmless/bparv/rustjava.exe",
+  "args": [
+   "D:/vmless/bench/out/Hello/Hello.class"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "vml-rustjava-big1000",
+  "exe": "D:/vmless/bparv/rustjava.exe",
+  "args": [
+   "D:/vmless/bench/out/Big1000/Big1000.class"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "vml-jit-empty",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/Empty/Empty.class"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "vml-jit-hello",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/Hello/Hello.class"
+  ],
+  "timeoutMs": 60000
+ },
+ {
+  "id": "vml-jit-big1000",
+  "exe": "D:/vmless/bparv/run_jit.exe",
+  "args": [
+   "D:/vmless/bench/out/Big1000/Big1000.class"
+  ],
+  "timeoutMs": 60000
+ }
+]

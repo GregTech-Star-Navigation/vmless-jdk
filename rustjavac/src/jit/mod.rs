@@ -16,7 +16,9 @@ use crate::{parse, ClassFile};
 mod call;
 mod classes;
 mod exc;
+mod indy;
 mod insn;
+mod pure;
 mod layout;
 mod natives;
 mod refmap;
@@ -25,6 +27,7 @@ pub mod strtab;
 mod translate;
 
 pub use call::CompiledMethod;
+pub(crate) use call::param_descs;
 pub(crate) use call::param_slots;
 use classes::ClassSet;
 
@@ -40,6 +43,10 @@ pub struct Jit {
     pending_clinit: Vec<(u32, cranelift_module::FuncId)>,
     /// 已经安排编译过 `<clinit>` 的类标签（防递归）
     clinit_started: std::collections::HashSet<u32>,
+    /// 编不了、只能**解释执行**的方法 → 原因（方法级回退的账本）
+    interpreted: std::collections::HashMap<(String, String, String), String>,
+    /// 成功编译的方法个数（= `compiled` 里真正 define 过的那些）
+    n_compiled: usize,
 }
 
 #[derive(Debug)]
@@ -98,6 +105,10 @@ impl Jit {
         builder.symbol("vmless_sb_append_obj", rt::sb_append_obj as *const u8);
         builder.symbol("vmless_sb_to_string", rt::sb_to_string as *const u8);
         builder.symbol("vmless_sb_append_char", rt::sb_append_char as *const u8);
+        // invokedynamic 的字符串拼接桩（编译期解码 recipe，运行期一次调用拼完）
+        builder.symbol("vmless_indy_concat", rt::indy_concat as *const u8);
+        // 方法级回退：编不了的方法改走解释器桩
+        builder.symbol("vmless_interp_call", rt::interp_call as *const u8);
         // 内建 JDK 类：包装类 / String / Object 协议 / System / Arrays
         builder.symbol("vmless_builtin_vcall", natives::builtin_vcall as *const u8);
         builder.symbol("vmless_builtin_static", natives::builtin_static as *const u8);
@@ -114,6 +125,8 @@ impl Jit {
             pending_v: Vec::new(),
             pending_clinit: Vec::new(),
             clinit_started: std::collections::HashSet::new(),
+            interpreted: std::collections::HashMap::new(),
+            n_compiled: 0,
         }
     }
 
@@ -154,23 +167,16 @@ impl Jit {
         for c in self.classes.names() {
             self.classes.build_layout(&c);
         }
-        let (func_id, max_locals, _) = self.compile_into(&cname, name, desc)?;
-        // 入口类的 <clinit> 要在 main 之前跑（JVM 的语义），所以先把它编出来
-        self.ensure_clinit(&cname)?;
-        self.module
-            .finalize_definitions()
-            .map_err(|e| JitError(e.to_string()))?;
-        // finalize 之后才知道函数地址：把攒下的虚方法实现登记进运行时表
-        let pending = std::mem::take(&mut self.pending_v);
-        for (tag, sig, fid, ret) in pending {
-            let p = self.module.get_finalized_function(fid) as usize;
-            rt::register_vmethod(tag, sig, p, ret);
+        // 入口方法编不了**不算致命**：它自己进「解释执行集合」，调用方仍然是 JIT 的
+        // （回退是方法级的）。所以这里先记下结果，finalize 照做 —— 地址不落地的话
+        // 已经编好的其它方法就没法被解释器回调。
+        let entry = self.compile_into(&cname, name, desc);
+        if entry.is_ok() {
+            // 入口类的 <clinit> 要在 main 之前跑（JVM 的语义），所以先把它编出来
+            self.ensure_clinit(&cname)?;
         }
-        let pending_clinit = std::mem::take(&mut self.pending_clinit);
-        for (tag, fid) in pending_clinit {
-            let p = self.module.get_finalized_function(fid) as usize;
-            rt::register_clinit(tag, p);
-        }
+        self.finalize()?;
+        let (func_id, max_locals, _) = entry?;
         // 入口类静态初始化：JVM 在调 main 之前就会做这件事
         rt::clinit(rt::class_tag(&cname));
         let ptr = self.module.get_finalized_function(func_id);
@@ -181,6 +187,117 @@ impl Jit {
             code,
             max_locals,
         })
+    }
+
+    /// 把定义落地：之后才知道函数地址（虚方法表、`<clinit>` 表、解释器回退表都要它）
+    fn finalize(&mut self) -> Result<(), JitError> {
+        self.module
+            .finalize_definitions()
+            .map_err(|e| JitError(e.to_string()))?;
+        let pending = std::mem::take(&mut self.pending_v);
+        for (tag, sig, fid, ret) in pending {
+            let p = self.module.get_finalized_function(fid) as usize;
+            rt::register_vmethod(tag, sig, p, ret);
+        }
+        let pending_clinit = std::mem::take(&mut self.pending_clinit);
+        for (tag, fid) in pending_clinit {
+            let p = self.module.get_finalized_function(fid) as usize;
+            rt::register_clinit(tag, p);
+        }
+        Ok(())
+    }
+
+    /// 成功编译的方法个数
+    pub fn compiled_count(&self) -> usize {
+        self.n_compiled
+    }
+
+    /// **逐方法**试一遍：把类表里每个有字节码的方法都编译一次。
+    ///
+    /// 这条路径只在入口方法本身编不了时走（见 `examples/run_jit.rs`）：入口要交给
+    /// 解释器，但程序里其它的方法不该跟着一起废掉 —— 编得了的都进表，让解释器能回调。
+    pub fn compile_all(&mut self) -> Result<(), JitError> {
+        let names = self.classes.names();
+        for c in names {
+            let Some(cf) = self.classes.get(&c) else { continue };
+            let cf = cf.clone();
+            for m in &cf.methods {
+                // native / abstract 没有字节码，跳过（不是「编不了」）
+                if m.access_flags & 0x0100 != 0 || m.access_flags & 0x0400 != 0 {
+                    continue;
+                }
+                let n = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
+                let d = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
+                let _ = self.compile_into(&c, &n, &d);
+            }
+        }
+        self.finalize()
+    }
+
+    /// 「解释执行集合」：`(类, 方法, 描述符) → 原因`
+    pub fn interpreted(&self) -> &std::collections::HashMap<(String, String, String), String> {
+        &self.interpreted
+    }
+
+    /// 一行统计（`run_jit` 打到 stderr）：编译 N 个、解释 M 个（按原因归并）
+    pub fn stats_line(&self) -> String {
+        let mut by_reason: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+        for why in self.interpreted.values() {
+            let key = reason_tag(why);
+            *by_reason.entry(key).or_insert(0) += 1;
+        }
+        let detail = if by_reason.is_empty() {
+            String::new()
+        } else {
+            let parts: Vec<String> = by_reason.iter().map(|(k, v)| format!("{k} ×{v}")).collect();
+            format!("（原因：{}）", parts.join("、"))
+        };
+        format!(
+            "JIT: 编译 {} 个方法，解释 {} 个{}",
+            self.n_compiled,
+            self.interpreted.len(),
+            detail
+        )
+    }
+
+    /// 逐个列出被解释的方法（`VMLESS_JIT_VERBOSE=1` 时打）
+    pub fn interpreted_lines(&self) -> Vec<String> {
+        let mut out: Vec<String> = self
+            .interpreted
+            .iter()
+            .map(|(k, why)| format!("  解释执行 {}.{}{}：{}", k.0, k.1, k.2, why))
+            .collect();
+        out.sort();
+        out
+    }
+
+    /// 解释器可以回调的 JIT 方法表（纯数值方法，见 `jit::pure`）
+    pub fn pure_table(&self) -> crate::vm::JitTable {
+        pure::pure_table(self)
+    }
+}
+
+/// 把一条失败原因归并成统计用的短标签
+fn reason_tag(why: &str) -> String {
+    let pick = |s: &str| why.starts_with(s);
+    if pick("JIT 不支持 invokedynamic") {
+        if why.contains("LambdaMetafactory") {
+            "invokedynamic/LambdaMetafactory".into()
+        } else if why.contains("StringConcatFactory") {
+            "invokedynamic/StringConcatFactory".into()
+        } else {
+            "invokedynamic".into()
+        }
+    } else if pick("JIT 不支持 synchronized") || why.contains("monitor") {
+        "synchronized/monitor".into()
+    } else if pick("JIT 不接管 java.lang.invoke") {
+        "java.lang.invoke".into()
+    } else if pick("JIT 暂不支持字节码") {
+        why.to_string()
+    } else if why.contains("不能跨 JIT/解释器边界") {
+        "引用跨边界".into()
+    } else {
+        "其它编译失败".into()
     }
 }
 

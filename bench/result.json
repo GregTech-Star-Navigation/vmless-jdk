@@ -1,0 +1,1396 @@
+{
+  "generated": "2026-11-17T17:29:56.541Z",
+  "spawnBaselineMs": 136.753,
+  "cases": {
+    "vml-classload": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 81731.769,
+        "med": 81731.769,
+        "p90": 81731.769,
+        "max": 81731.769
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 154816,
+        "med": 154816,
+        "p90": 154816,
+        "max": 154816
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "ok": 5000,
+        "miss": 0,
+        "inprog": 81146,
+        "failed": false,
+        "err": ""
+      }
+    },
+    "hs-classload": {
+      "n": 3,
+      "wall": {
+        "n": 3,
+        "min": 393.878,
+        "med": 394.322,
+        "p90": 394.322,
+        "max": 398.635
+      },
+      "peak_kb": {
+        "n": 3,
+        "min": 67080,
+        "med": 67192,
+        "p90": 67192,
+        "max": 67212
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "ok": 5000,
+        "miss": 0,
+        "inprog": 258
+      }
+    },
+    "vml-jdk-load5421": {
+      "n": 3,
+      "wall": {
+        "n": 3,
+        "min": 548.532,
+        "med": 549.711,
+        "p90": 549.711,
+        "max": 565.889
+      },
+      "peak_kb": {
+        "n": 3,
+        "min": 113784,
+        "med": 113796,
+        "p90": 113796,
+        "max": 113916
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "classes": 5421,
+        "inprog": null
+      }
+    },
+    "hs-empty-xshareoff": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 160.33,
+        "med": 166.385,
+        "p90": 177.336,
+        "max": 177.715
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 36808,
+        "med": 36896,
+        "p90": 36900,
+        "max": 36976
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "gc-hs-1": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 220.501,
+        "med": 220.501,
+        "p90": 220.501,
+        "max": 220.501
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 179200,
+        "med": 179200,
+        "p90": 179200,
+        "max": 179200
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 96
+      }
+    },
+    "gc-hs-2": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 212.278,
+        "med": 212.278,
+        "p90": 212.278,
+        "max": 212.278
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 179240,
+        "med": 179240,
+        "p90": 179240,
+        "max": 179240
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 93
+      }
+    },
+    "gc-hs-3": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 233.85,
+        "med": 233.85,
+        "p90": 233.85,
+        "max": 233.85
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 179300,
+        "med": 179300,
+        "p90": 179300,
+        "max": 179300
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 116
+      }
+    },
+    "gc-vml-interp": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 57668.987,
+        "med": 57668.987,
+        "p90": 57668.987,
+        "max": 57668.987
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 1199528,
+        "med": 1199528,
+        "p90": 1199528,
+        "max": 1199528
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 56978
+      }
+    },
+    "gc-vml-1": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 1915.898,
+        "med": 1915.898,
+        "p90": 1915.898,
+        "max": 1915.898
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 530572,
+        "med": 530572,
+        "p90": 530572,
+        "max": 530572
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "minor": 1,
+        "major": 1,
+        "totalPause": 79.28,
+        "maxPause": 46.28,
+        "inprog": 1873.24
+      }
+    },
+    "gc-vml-2": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 2029.024,
+        "med": 2029.024,
+        "p90": 2029.024,
+        "max": 2029.024
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 530576,
+        "med": 530576,
+        "p90": 530576,
+        "max": 530576
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "minor": 1,
+        "major": 1,
+        "totalPause": 81.17,
+        "maxPause": 44.25,
+        "inprog": 1987.9
+      }
+    },
+    "gc-vml-3": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 1964.537,
+        "med": 1964.537,
+        "p90": 1964.537,
+        "max": 1964.537
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 529992,
+        "med": 529992,
+        "p90": 529992,
+        "max": 529992
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "minor": 1,
+        "major": 1,
+        "totalPause": 78.2,
+        "maxPause": 46.32,
+        "inprog": 1924.27
+      }
+    },
+    "vml-interp-p2j": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 7538.656,
+        "med": 7538.656,
+        "p90": 7538.656,
+        "max": 7681.941
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 114196,
+        "med": 114196,
+        "p90": 114196,
+        "max": 114248
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 7076
+      }
+    },
+    "vml-interp-p2": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 8343.701,
+        "med": 8343.701,
+        "p90": 8343.701,
+        "max": 8402.558
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 114104,
+        "med": 114104,
+        "p90": 114104,
+        "max": 114304
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 7729
+      }
+    },
+    "hs-p2": {
+      "n": 3,
+      "wall": {
+        "n": 3,
+        "min": 193.476,
+        "med": 194.87,
+        "p90": 194.87,
+        "max": 196.927
+      },
+      "peak_kb": {
+        "n": 3,
+        "min": 45196,
+        "med": 45220,
+        "p90": 45220,
+        "max": 45248
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 73
+      }
+    },
+    "vml-jit-p2": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 6819.076,
+        "med": 6819.076,
+        "p90": 6819.076,
+        "max": 7010.774
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 5928,
+        "med": 5928,
+        "p90": 5928,
+        "max": 5932
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 6796,
+        "fellback": true,
+        "reason": "JIT 不支持 invokedynamic（0xba@53）：P2.main([Ljava/lang/String;)V 里的 lambda / 字符串拼接只能由解释器执行（JIT 未接入调用点缓存）"
+      }
+    },
+    "hs-p2j-jit": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 187.036,
+        "med": 190.41,
+        "p90": 193.239,
+        "max": 204.189
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 45228,
+        "med": 45232,
+        "p90": 45232,
+        "max": 45284
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 76
+      }
+    },
+    "vml-jit-p2j": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 414.967,
+        "med": 421.571,
+        "p90": 425.281,
+        "max": 443.068
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 5936,
+        "med": 5940,
+        "p90": 5948,
+        "max": 5952
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 418.41,
+        "jitc": 1.71,
+        "fellback": false
+      }
+    },
+    "hs-obj-8m": {
+      "n": 3,
+      "wall": {
+        "n": 3,
+        "min": 2109.352,
+        "med": 2165.928,
+        "p90": 2165.928,
+        "max": 2446.386
+      },
+      "peak_kb": {
+        "n": 3,
+        "min": 269072,
+        "med": 269352,
+        "p90": 269352,
+        "max": 269376
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-obj-8m": {
+      "n": 3,
+      "wall": {
+        "n": 3,
+        "min": 3740.57,
+        "med": 3851.379,
+        "p90": 3851.379,
+        "max": 3963.426
+      },
+      "peak_kb": {
+        "n": 3,
+        "min": 273488,
+        "med": 274340,
+        "p90": 274340,
+        "max": 274392
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-obj-1m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 1176.217,
+        "med": 1555.295,
+        "p90": 1758.574,
+        "max": 1776.401
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 72212,
+        "med": 72292,
+        "p90": 72308,
+        "max": 72328
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-obj-2m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 816.98,
+        "med": 1535.625,
+        "p90": 1721.362,
+        "max": 1772.448
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 151764,
+        "med": 152048,
+        "p90": 152188,
+        "max": 152424
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-obj-4m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 976.322,
+        "med": 1436.052,
+        "p90": 1777.398,
+        "max": 1885.211
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 161872,
+        "med": 162148,
+        "p90": 162232,
+        "max": 162288
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-obj-1m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 536.918,
+        "med": 761.576,
+        "p90": 909.553,
+        "max": 913.126
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 33300,
+        "med": 33340,
+        "p90": 33344,
+        "max": 33364
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-obj-2m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 772.037,
+        "med": 1071.527,
+        "p90": 1101.08,
+        "max": 1187.006
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 136704,
+        "med": 136776,
+        "p90": 137404,
+        "max": 137428
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-obj-4m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 1562.699,
+        "med": 1611.732,
+        "p90": 2042.31,
+        "max": 2219.474
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 138848,
+        "med": 138924,
+        "p90": 138936,
+        "max": 138948
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-objE-1m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 921.002,
+        "med": 1556.655,
+        "p90": 1567.882,
+        "max": 1708.031
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 64320,
+        "med": 64348,
+        "p90": 64356,
+        "max": 64432
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-objE-4m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 883.298,
+        "med": 1558.226,
+        "p90": 1676.468,
+        "max": 1823.3
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 161528,
+        "med": 161896,
+        "p90": 162040,
+        "max": 162044
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-objE-8m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 1258.065,
+        "med": 1829.043,
+        "p90": 1908.198,
+        "max": 1911.775
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 206276,
+        "med": 206888,
+        "p90": 206952,
+        "max": 207100
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-objE-1m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 611.801,
+        "med": 808.9,
+        "p90": 885.749,
+        "max": 896.193
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 17664,
+        "med": 17708,
+        "p90": 17712,
+        "max": 17712
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-objE-4m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 1063.384,
+        "med": 1487.762,
+        "p90": 1522.411,
+        "max": 1637.669
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 52820,
+        "med": 52824,
+        "p90": 52832,
+        "max": 52872
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-objE-8m": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 2110.675,
+        "med": 2607.912,
+        "p90": 2661.149,
+        "max": 2841.621
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 136692,
+        "med": 136740,
+        "p90": 136748,
+        "max": 136756
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-alloc8": {
+      "n": 7,
+      "wall": {
+        "n": 7,
+        "min": 884.272,
+        "med": 1583.662,
+        "p90": 1711.561,
+        "max": 1888.733
+      },
+      "peak_kb": {
+        "n": 7,
+        "min": 51964,
+        "med": 52880,
+        "p90": 54396,
+        "max": 54680
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-jit-alloc8": {
+      "n": 7,
+      "wall": {
+        "n": 7,
+        "min": 1991.359,
+        "med": 2182.52,
+        "p90": 2510.887,
+        "max": 2557.86
+      },
+      "peak_kb": {
+        "n": 7,
+        "min": 136716,
+        "med": 136768,
+        "p90": 136796,
+        "max": 136804
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-jit-p1j-4": {
+      "n": 1,
+      "wall": {
+        "n": 1,
+        "min": 25.549,
+        "med": 25.549,
+        "p90": 25.549,
+        "max": 25.549
+      },
+      "peak_kb": {
+        "n": 1,
+        "min": 5656,
+        "med": 5656,
+        "p90": 5656,
+        "max": 5656
+      },
+      "exits": [
+        1
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "failed": false,
+        "reason": "",
+        "inprog": null
+      }
+    },
+    "hs-p1j-1": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 151.767,
+        "med": 151.767,
+        "p90": 151.767,
+        "max": 153.416
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 45176,
+        "med": 45176,
+        "p90": 45176,
+        "max": 45212
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 32
+      }
+    },
+    "hs-p1j-2": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 159.294,
+        "med": 159.294,
+        "p90": 159.294,
+        "max": 175.935
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 45276,
+        "med": 45276,
+        "p90": 45276,
+        "max": 45408
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 42
+      }
+    },
+    "hs-p1j-4": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 159.264,
+        "med": 159.264,
+        "p90": 159.264,
+        "max": 189.317
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 45344,
+        "med": 45344,
+        "p90": 45344,
+        "max": 45400
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 61
+      }
+    },
+    "hs-p1j-8": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 183.255,
+        "med": 183.255,
+        "p90": 183.255,
+        "max": 221.552
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 45564,
+        "med": 45564,
+        "p90": 45564,
+        "max": 45616
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 77
+      }
+    },
+    "vml-interp-p1j-1": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 2221.373,
+        "med": 2221.373,
+        "p90": 2221.373,
+        "max": 2467.673
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 114376,
+        "med": 114376,
+        "p90": 114376,
+        "max": 114408
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 1860
+      }
+    },
+    "vml-interp-p1j-2": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 2273.261,
+        "med": 2273.261,
+        "p90": 2273.261,
+        "max": 2436.37
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 114424,
+        "med": 114424,
+        "p90": 114424,
+        "max": 114448
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 1861
+      }
+    },
+    "vml-interp-p1j-4": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 2335.968,
+        "med": 2335.968,
+        "p90": 2335.968,
+        "max": 2447.894
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 114224,
+        "med": 114224,
+        "p90": 114224,
+        "max": 114456
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 1872
+      }
+    },
+    "vml-interp-p1j-8": {
+      "n": 2,
+      "wall": {
+        "n": 2,
+        "min": 2506.823,
+        "med": 2506.823,
+        "p90": 2506.823,
+        "max": 2691.873
+      },
+      "peak_kb": {
+        "n": 2,
+        "min": 114268,
+        "med": 114268,
+        "p90": 114268,
+        "max": 114332
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": 2089
+      }
+    },
+    "spawn-hostname": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 136.753,
+        "med": 324.409,
+        "p90": 418.97,
+        "max": 1239.313
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 5188,
+        "med": 5208,
+        "p90": 5216,
+        "max": 5220
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-version": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 485.643,
+        "med": 1061.066,
+        "p90": 1351.581,
+        "max": 2866.547
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 43600,
+        "med": 43692,
+        "p90": 43772,
+        "max": 43816
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-empty": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 727.317,
+        "med": 1126.065,
+        "p90": 1585.228,
+        "max": 1855.262
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 43752,
+        "med": 43824,
+        "p90": 43888,
+        "max": 43936
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-hello": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 536.952,
+        "med": 1122.155,
+        "p90": 1431.804,
+        "max": 2351.093
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 18808,
+        "med": 43908,
+        "p90": 43960,
+        "max": 44000
+      },
+      "exits": [
+        0,
+        1
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "hs-big1000": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 498.579,
+        "med": 1141.593,
+        "p90": 1658.213,
+        "max": 3769.999
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 43976,
+        "med": 44016,
+        "p90": 44104,
+        "max": 44136
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-rustjava-empty": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 137.945,
+        "med": 259.204,
+        "p90": 337.073,
+        "max": 1397.017
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 4964,
+        "med": 4968,
+        "p90": 4972,
+        "max": 4976
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-rustjava-hello": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 110.935,
+        "med": 259.048,
+        "p90": 332,
+        "max": 868.871
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 5012,
+        "med": 5020,
+        "p90": 5024,
+        "max": 5028
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-rustjava-big1000": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 106.094,
+        "med": 272.316,
+        "p90": 347.104,
+        "max": 966.763
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 5144,
+        "med": 5148,
+        "p90": 5152,
+        "max": 5160
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-jit-empty": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 133.898,
+        "med": 299.485,
+        "p90": 379.579,
+        "max": 794.941
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 5640,
+        "med": 5656,
+        "p90": 5708,
+        "max": 5720
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-jit-hello": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 146.418,
+        "med": 310.125,
+        "p90": 386.649,
+        "max": 1091.189
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 5748,
+        "med": 5752,
+        "p90": 5760,
+        "max": 5764
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-jit-big1000": {
+      "n": 30,
+      "wall": {
+        "n": 30,
+        "min": 146.522,
+        "med": 313.895,
+        "p90": 399.754,
+        "max": 1368.259
+      },
+      "peak_kb": {
+        "n": 30,
+        "min": 5996,
+        "med": 6008,
+        "p90": 6036,
+        "max": 6056
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "inprog": null
+      }
+    },
+    "vml-jdk-empty": {
+      "n": 5,
+      "wall": {
+        "n": 5,
+        "min": 2405.107,
+        "med": 3828.576,
+        "p90": 3923.592,
+        "max": 3949.447
+      },
+      "peak_kb": {
+        "n": 5,
+        "min": 113956,
+        "med": 113980,
+        "p90": 114000,
+        "max": 114060
+      },
+      "exits": [
+        0
+      ],
+      "timeouts": 0,
+      "parsed": {
+        "classes": null,
+        "inprog": null
+      }
+    }
+  },
+  "gc": {
+    "hs": [
+      {
+        "count": 2,
+        "maxPause": 12.236,
+        "totalPause": 17.253,
+        "full": 0
+      },
+      {
+        "count": 2,
+        "maxPause": 12.511,
+        "totalPause": 17.383,
+        "full": 0
+      },
+      {
+        "count": 2,
+        "maxPause": 12.739,
+        "totalPause": 18.475,
+        "full": 0
+      }
+    ],
+    "vml": [
+      {
+        "minor": 1,
+        "major": 1,
+        "totalPause": 79.28,
+        "maxPause": 46.28,
+        "inprog": 1873.24
+      },
+      {
+        "minor": 1,
+        "major": 1,
+        "totalPause": 81.17,
+        "maxPause": 44.25,
+        "inprog": 1987.9
+      },
+      {
+        "minor": 1,
+        "major": 1,
+        "totalPause": 78.2,
+        "maxPause": 46.32,
+        "inprog": 1924.27
+      }
+    ],
+    "hsMaxPauseMs": 12.739,
+    "hsTotalPauseMs": 18.475,
+    "vmlMaxPauseMs": 46.32,
+    "vmlTotalPauseMs": 81.17
+  },
+  "objectBytes": {
+    "hotspotEmpty": 16,
+    "vmlessEmpty": 8,
+    "hotspotPair": 24,
+    "vmlessPair": 24,
+    "hotspotSlopeB": 30.603946666666666,
+    "vmlessSlopeB_unusable": 36.02705066666667
+  },
+  "verdicts": {
+    "startupGainVsHotspot": 5.4318735156611755,
+    "residentMemGain": 7.757446808510639,
+    "objectSizeGain": 2,
+    "interpSlowdown": 96.93150684931507,
+    "jitSlowdown": 5.731643835616438,
+    "jitSpeedupOverInterp": 16.911641691164167,
+    "parallel8Vmless": 0.8903781713738631,
+    "parallel8Hotspot": 0.4155844155844156
+  }
+}

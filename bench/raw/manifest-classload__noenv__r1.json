@@ -1,0 +1,11 @@
+[
+ {
+  "id": "vml-classload",
+  "exe": "D:/vmless/bparv/run_jdk.exe",
+  "args": [
+   "D:/vmless/bench/out/ClassLoad2",
+   "ClassLoad2"
+  ],
+  "timeoutMs": 300000
+ }
+]

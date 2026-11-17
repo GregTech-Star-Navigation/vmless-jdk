@@ -144,7 +144,7 @@ pub struct CompiledMethod {
 
 /// 描述符里每个参数所在的 JVM 槽位（long/double 占两槽；静态方法从 0 起）
 /// 方法描述符里的参数描述符（按顺序，不含 this）
-pub(super) fn param_descs(desc: &str) -> Vec<String> {
+pub(crate) fn param_descs(desc: &str) -> Vec<String> {
     let b = desc.as_bytes();
     let mut i = 1usize;
     let mut out = Vec::new();

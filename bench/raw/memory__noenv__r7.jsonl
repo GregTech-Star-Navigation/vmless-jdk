@@ -1,0 +1,14 @@
+{"id":"hs-alloc8","rep":0,"wall_ms":1888.733,"peak_kb":54396.0,"exit":0,"timedOut":false}
+{"id":"vml-jit-alloc8","rep":0,"wall_ms":2557.860,"peak_kb":136768.0,"exit":0,"timedOut":false}
+{"id":"hs-alloc8","rep":1,"wall_ms":1583.662,"peak_kb":52256.0,"exit":0,"timedOut":false}
+{"id":"vml-jit-alloc8","rep":1,"wall_ms":2081.573,"peak_kb":136804.0,"exit":0,"timedOut":false}
+{"id":"hs-alloc8","rep":2,"wall_ms":1711.561,"peak_kb":54680.0,"exit":0,"timedOut":false}
+{"id":"vml-jit-alloc8","rep":2,"wall_ms":2510.887,"peak_kb":136760.0,"exit":0,"timedOut":false}
+{"id":"hs-alloc8","rep":3,"wall_ms":1640.309,"peak_kb":51964.0,"exit":0,"timedOut":false}
+{"id":"vml-jit-alloc8","rep":3,"wall_ms":2401.866,"peak_kb":136796.0,"exit":0,"timedOut":false}
+{"id":"hs-alloc8","rep":4,"wall_ms":884.272,"peak_kb":54392.0,"exit":0,"timedOut":false}
+{"id":"vml-jit-alloc8","rep":4,"wall_ms":2182.520,"peak_kb":136768.0,"exit":0,"timedOut":false}
+{"id":"hs-alloc8","rep":5,"wall_ms":1560.414,"peak_kb":52704.0,"exit":0,"timedOut":false}
+{"id":"vml-jit-alloc8","rep":5,"wall_ms":1991.359,"peak_kb":136716.0,"exit":0,"timedOut":false}
+{"id":"hs-alloc8","rep":6,"wall_ms":923.992,"peak_kb":52880.0,"exit":0,"timedOut":false}
+{"id":"vml-jit-alloc8","rep":6,"wall_ms":2072.047,"peak_kb":136796.0,"exit":0,"timedOut":false}

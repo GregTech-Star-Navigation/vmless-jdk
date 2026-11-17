@@ -1,0 +1,117 @@
+[
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-startup__noenv__r30.json",
+  "out": "D:\\vmless\\bench\\raw\\startup__noenv__r30.jsonl",
+  "env": {},
+  "reps": 30,
+  "gk": "startup__noenv__r30"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-startup__noenv__r5.json",
+  "out": "D:\\vmless\\bench\\raw\\startup__noenv__r5.jsonl",
+  "env": {},
+  "reps": 5,
+  "gk": "startup__noenv__r5"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-memory__noenv__r7.json",
+  "out": "D:\\vmless\\bench\\raw\\memory__noenv__r7.jsonl",
+  "env": {},
+  "reps": 7,
+  "gk": "memory__noenv__r7"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-memory__noenv__r5.json",
+  "out": "D:\\vmless\\bench\\raw\\memory__noenv__r5.jsonl",
+  "env": {},
+  "reps": 5,
+  "gk": "memory__noenv__r5"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-memory__noenv__r3.json",
+  "out": "D:\\vmless\\bench\\raw\\memory__noenv__r3.jsonl",
+  "env": {},
+  "reps": 3,
+  "gk": "memory__noenv__r3"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-gc__noenv__r1.json",
+  "out": "D:\\vmless\\bench\\raw\\gc__noenv__r1.jsonl",
+  "env": {},
+  "reps": 1,
+  "gk": "gc__noenv__r1"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-gc__VMLESS_GC_STATS,VMLESS_HEAP_MB__r1.json",
+  "out": "D:\\vmless\\bench\\raw\\gc__VMLESS_GC_STATS,VMLESS_HEAP_MB__r1.jsonl",
+  "env": {
+   "VMLESS_GC_STATS": "1",
+   "VMLESS_HEAP_MB": "256"
+  },
+  "reps": 1,
+  "gk": "gc__VMLESS_GC_STATS,VMLESS_HEAP_MB__r1"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-classload__noenv__r3.json",
+  "out": "D:\\vmless\\bench\\raw\\classload__noenv__r3.jsonl",
+  "env": {},
+  "reps": 3,
+  "gk": "classload__noenv__r3"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-classload__noenv__r5.json",
+  "out": "D:\\vmless\\bench\\raw\\classload__noenv__r5.jsonl",
+  "env": {},
+  "reps": 5,
+  "gk": "classload__noenv__r5"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-classload__noenv__r1.json",
+  "out": "D:\\vmless\\bench\\raw\\classload__noenv__r1.jsonl",
+  "env": {},
+  "reps": 1,
+  "gk": "classload__noenv__r1"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-interp__noenv__r3.json",
+  "out": "D:\\vmless\\bench\\raw\\interp__noenv__r3.jsonl",
+  "env": {},
+  "reps": 3,
+  "gk": "interp__noenv__r3"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-interp__noenv__r2.json",
+  "out": "D:\\vmless\\bench\\raw\\interp__noenv__r2.jsonl",
+  "env": {},
+  "reps": 2,
+  "gk": "interp__noenv__r2"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-jit__noenv__r5.json",
+  "out": "D:\\vmless\\bench\\raw\\jit__noenv__r5.jsonl",
+  "env": {},
+  "reps": 5,
+  "gk": "jit__noenv__r5"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-jit__noenv__r2.json",
+  "out": "D:\\vmless\\bench\\raw\\jit__noenv__r2.jsonl",
+  "env": {},
+  "reps": 2,
+  "gk": "jit__noenv__r2"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-parallel__noenv__r2.json",
+  "out": "D:\\vmless\\bench\\raw\\parallel__noenv__r2.jsonl",
+  "env": {},
+  "reps": 2,
+  "gk": "parallel__noenv__r2"
+ },
+ {
+  "file": "D:\\vmless\\bench\\raw\\manifest-parallel__noenv__r1.json",
+  "out": "D:\\vmless\\bench\\raw\\parallel__noenv__r1.jsonl",
+  "env": {},
+  "reps": 1,
+  "gk": "parallel__noenv__r1"
+ }
+]

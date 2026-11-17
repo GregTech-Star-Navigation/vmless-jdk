@@ -101,6 +101,8 @@ impl ClassStore {
             };
             let cf = crate::parse(&bytes)
                 .map_err(|e| VmError { msg: format!("解析 {name} 失败: {e}"), exc: None })?;
+            // 这个类自己属于哪个模块（模块模式才有；否则是未命名模块 = classpath）
+            let cur_module = cp.module_of_class(&name).map(|s| s.to_string());
             // 引用到的类型都在 `Class` 常量池项里（含 super_class 与 interfaces 指过去的那两个）。
             // `<SELF>` 是我们编译器写常量池时用的占位符（字节码生成完会被改写成真实类名），
             // 它不是类，别拿它去 classpath 里找。
@@ -108,14 +110,29 @@ impl ClassStore {
                 if let Some(CpEntry::Class(ix)) = e {
                     if let Some(raw) = cf.utf8(*ix) {
                         let n = String::from_utf8_lossy(raw).into_owned();
-                        if !n.starts_with('[') && !n.contains('<') && !n.contains(';') && pull_jdk(jdk_present, &n)
-                        {
+                        if n.starts_with('[') || n.contains('<') || n.contains(';') {
+                            continue;
+                        }
+                        // **模块访问检查**：引用者模块 → 被引用类所在模块的包。
+                        // 没有模块模式时 `check_reference` 是 no-op（旧行为不变）；
+                        // 有模块模式时**默认拒绝**，不许静默放行。
+                        if let Err(msg) = cp.check_reference(cur_module.as_deref(), &name, &n) {
+                            return Err(VmError { msg, exc: None });
+                        }
+                        if pull_jdk(jdk_present, &n) {
                             queue.push(n);
                         }
                     }
                 }
             }
             files.push(cf);
+        }
+        if std::env::var_os("VMLESS_CP_STATS").is_some() {
+            eprintln!(
+                "[cp] 装载 {} 个类，文件探测 {} 次",
+                files.len(),
+                crate::load::probe_count()
+            );
         }
         if files.is_empty() {
             return err("没有可执行的 class");

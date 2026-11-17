@@ -77,6 +77,13 @@ impl Vm {
         args: &[Slot],
         receiver: bool,
     ) -> Result<Slot, VmError> {
+        // 方法级回退的**反向**通道：这个方法在 JIT 那边已经编好了（纯数值、非实例），
+        // 就直接调机器码。表是空的时侯这里只有一次借用 —— 全解释执行的路径不受影响。
+        if !receiver {
+            if let Some(r) = super::bridge::try_call_jit(&self.store.classes[class], method, desc, args, receiver) {
+                return r;
+            }
+        }
         let sync = {
             let cf = &self.store.classes[class];
             cf.methods[method].access_flags & ACC_SYNCHRONIZED != 0

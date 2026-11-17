@@ -31,6 +31,37 @@ impl Jit {
         name: &str,
         desc: &str,
     ) -> Result<(cranelift_module::FuncId, usize, i32), JitError> {
+        let key = (class.to_string(), name.to_string(), desc.to_string());
+        if let Some(v) = self.compiled.get(&key) {
+            return Ok(*v);
+        }
+        // 已经判定「只能解释执行」的方法：不再重试，直接回同一个原因
+        if let Some(why) = self.interpreted.get(&key) {
+            return Err(JitError(format!("{class}.{name}{desc} 只能解释执行：{why}")));
+        }
+        match self.compile_into_inner(class, name, desc) {
+            Ok(v) => {
+                self.n_compiled += 1;
+                Ok(v)
+            }
+            Err(e) => {
+                // 失败的方法不能留在缓存里：留着会让后续调用点拿到一个**从没定义过**的
+                // 函数 id（生成代码会跳到空洞）
+                self.compiled.remove(&key);
+                self.interpreted.insert(key, e.0.clone());
+                Err(e)
+            }
+        }
+    }
+
+    /// 真正编译一个方法。内层失败**不**记进解释执行集合（由外层 `compile_into` 记），
+    /// 也不负责把它从 `compiled` 里摘掉。
+    fn compile_into_inner(
+        &mut self,
+        class: &str,
+        name: &str,
+        desc: &str,
+    ) -> Result<(cranelift_module::FuncId, usize, i32), JitError> {
         if let Some(v) = self.compiled.get(&(class.to_string(), name.to_string(), desc.to_string())) {
             return Ok(*v);
         }
@@ -54,15 +85,9 @@ impl Jit {
             (ml, ms, body, table, is_static, is_sync)
         };
 
-        // `invokedynamic` 在**进任何分析之前**就挡住：这个方法整体交给解释器执行，
-        // 所以不能让同一方法里别的 JIT 限制（比如 switch 汇合点的栈模型）抢先报错 ——
-        // 那样 `run_jit` 会看到一个与 indy 无关的失败，降级判据就失效了。
-        if let Some(pc) = find_invokedynamic(&body) {
-            return Err(JitError(format!(
-                "JIT 不支持 invokedynamic（0xba@{pc}）：{class}.{name}{desc} 里的 lambda / \
-                 字符串拼接只能由解释器执行（JIT 未接入调用点缓存）"
-            )));
-        }
+        // `invokedynamic` 不再在这里整体挡住：能内联的（`StringConcatFactory`）在 0xba
+        // 那个点就地展开，接不了的（`LambdaMetafactory` 等）才报错 —— 报错只让**这个方法**
+        // 交给解释器执行，调用方会把它记进「解释执行集合」并改发解释器桩。
         // `synchronized` 是**绝不能静默放过**的一类：JIT 拿到监视器表的入口是解释器那条路，
         // 它自己既不会加锁也不会解锁。放过去 = 悄悄丢掉互斥语义（比拒绝更糟）。
         if is_sync {
@@ -280,6 +305,26 @@ impl Jit {
         let sb_to_str_id = self
             .module
             .declare_function("vmless_sb_to_string", Linkage::Import, &sig_sb_str)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        // invokedynamic 的字符串拼接桩：`indy_concat(计划编号, i64 值数组) -> 字符串引用`
+        let mut sig_concat = self.module.make_signature();
+        sig_concat.params.push(AbiParam::new(types::I32));
+        sig_concat.params.push(AbiParam::new(types::I64));
+        sig_concat.returns.push(AbiParam::new(types::I64));
+        let concat_id = self
+            .module
+            .declare_function("vmless_indy_concat", Linkage::Import, &sig_concat)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        // 方法级回退的解释器桩：`interp_call(解释器条目编号, i64 实参数组) -> 返回值`
+        let mut sig_interp = self.module.make_signature();
+        sig_interp.params.push(AbiParam::new(types::I32));
+        sig_interp.params.push(AbiParam::new(types::I64));
+        sig_interp.returns.push(AbiParam::new(types::I64));
+        let interp_call_id = self
+            .module
+            .declare_function("vmless_interp_call", Linkage::Import, &sig_interp)
             .map_err(|e| JitError(e.to_string()))?;
 
         // 内建 JDK 类：三个通用入口（参数一律 i64，double 由调用点 bitcast）
@@ -513,6 +558,9 @@ impl Jit {
         // 先把本方法里所有 invokestatic 目标编译好，得到 FuncId 映射
         let mut call_targets: std::collections::HashMap<u16, (cranelift_module::FuncId, usize, i32)> =
             std::collections::HashMap::new();
+        // 编不了的目标 → 解释器桩（调用点编号 → (解释器条目 id, 描述符)）
+        let mut interp_targets: std::collections::HashMap<u16, (u32, String)> =
+            std::collections::HashMap::new();
         {
             let mut q = 0usize;
             while q < body.len() {
@@ -523,9 +571,23 @@ impl Jit {
                     if let Ok(info) = method_ref_of(&cf, idx) {
                         // 从引用类沿继承链找**声明类**：父类里的方法也要能调到
                         if let Some((owner, _)) = self.classes.resolve_method(&info.0, &info.1, &info.2) {
-                            let (fid, ml, argc) = self.compile_into(&owner, &info.1, &info.2)?;
-                            let extra = if op == 0xb7 { 1 } else { 0 };
-                            call_targets.insert(idx, (fid, ml, argc + extra));
+                            match self.compile_into(&owner, &info.1, &info.2) {
+                                Ok((fid, ml, argc)) => {
+                                    let extra = if op == 0xb7 { 1 } else { 0 };
+                                    call_targets.insert(idx, (fid, ml, argc + extra));
+                                }
+                                // 方法级回退：目标本身编不了，但它**能跨边界**
+                                // （参数/返回值都是基本类型）→ 这个调用点改发解释器桩，
+                                // 方法其余部分照旧走 JIT。
+                                Err(_) if !crate::vm::has_ref(&info.2) => {
+                                    let id = crate::vm::register_interp(
+                                        &owner, &info.1, &info.2,
+                                    );
+                                    interp_targets.insert(idx, (id, info.2.clone()));
+                                }
+                                // 目标要收/发引用，或构造器：整个方法只能一起回退
+                                Err(e) => return Err(e),
+                            }
                         }
                         // 找不到（java.* 的方法 / 构造器）就当作外部调用，按空操作处理
                     }
@@ -1008,6 +1070,48 @@ impl Jit {
                         reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                         let ret = bdesc.rsplit(')').next().unwrap_or("V").to_string();
                         if ret != "V" {
+                            let v = abi_result(&mut fb, raw, &ret);
+                            stack.push(v);
+                        }
+                    } else if let Some((mid, mdesc)) = interp_targets.get(&idx) {
+                        // 方法级回退：被调方法编不了，改发解释器桩（参数与返回值都是
+                        // 基本类型，跨边界安全 —— 见 `vm::bridge`）。
+                        let mdesc = mdesc.clone();
+                        let params = param_descs(&mdesc);
+                        let mut args = Vec::new();
+                        for _ in 0..params.len() {
+                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                        }
+                        args.reverse();
+                        let slot = fb.create_sized_stack_slot(
+                            cranelift_codegen::ir::StackSlotData::new(
+                                cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                (args.len().max(1) * 8) as u32,
+                                3,
+                            ),
+                        );
+                        for (i, (v, p)) in args.iter().zip(params.iter()).enumerate() {
+                            let raw = abi_arg(&mut fb, *v, p);
+                            let addr = fb.ins().stack_addr(types::I64, slot, (i * 8) as i32);
+                            fb.ins().store(MemFlags::new(), raw, addr, 0);
+                        }
+                        let ptr = fb.ins().stack_addr(types::I64, slot, 0);
+                        let op_pc = pc - 3;
+                        let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                        spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                        if has_refs {
+                            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                        }
+                        let iid = fb.ins().iconst(types::I32, *mid as i64);
+                        let fref = self.module.declare_func_in_func(interp_call_id, fb.func);
+                        let c = fb.ins().call(fref, &[iid, ptr]);
+                        if has_refs {
+                            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                        }
+                        reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                        let ret = mdesc.rsplit(')').next().unwrap_or("V").to_string();
+                        if ret != "V" {
+                            let raw = fb.inst_results(c)[0];
                             let v = abi_result(&mut fb, raw, &ret);
                             stack.push(v);
                         }
@@ -2046,16 +2150,53 @@ impl Jit {
                     };
                     stack.push(v);
                 }
-                // invokedynamic：JIT 侧**明确不支持**，不假装支持。
-                // 这个 opcode 要跑引导方法、构造/缓存 CallSite，属于解释器那条路径
-                // （`vm::indy` 已完整实现：字符串拼接、lambda、方法引用、condy）。
-                // 真正接进 JIT 需要把调用点缓存做成机器码里的可替换跳板，是另一件事；
-                // 在那之前 `run_jit` 看到这个错误会整体退回解释器执行。
+                // invokedynamic：编译期解码（`StringConcatFactory` 内联成一条拼接计划 +
+                // 一次运行时调用）。接不了的引导方法在这里报错 → **只这个方法**回退解释器。
                 0xba => {
-                    return Err(JitError(format!(
-                        "JIT 不支持 invokedynamic（0xba@{pc}）：{class}.{name}{desc} 里的 \
-                         lambda/字符串拼接只能由解释器执行（JIT 未接入调用点缓存）"
-                    )))
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    let op_pc = pc - 1;
+                    pc += 4; // 2 字节索引 + 2 个保留字节（JVMS 规定必须为 0）
+                    let site = super::indy::classify(&cf, idx).map_err(|why| {
+                        JitError(format!(
+                            "JIT 不支持 invokedynamic（0xba@{op_pc}，{why}）：{class}.{name}{desc}"
+                        ))
+                    })?;
+                    match site {
+                        super::indy::Site::Concat { plan, params } => {
+                            let mut args = Vec::with_capacity(params.len());
+                            for _ in 0..params.len() {
+                                args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                            }
+                            args.reverse();
+                            // 参数一律拍成 i64（float/double 走位模式），运行时按计划解码
+                            let slot = fb.create_sized_stack_slot(
+                                cranelift_codegen::ir::StackSlotData::new(
+                                    cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
+                                    (args.len().max(1) * 8) as u32,
+                                    3,
+                                ),
+                            );
+                            for (i, (v, p)) in args.iter().zip(params.iter()).enumerate() {
+                                let raw = abi_arg(&mut fb, *v, p);
+                                let addr = fb.ins().stack_addr(types::I64, slot, (i * 8) as i32);
+                                fb.ins().store(MemFlags::new(), raw, addr, 0);
+                            }
+                            let ptr = fb.ins().stack_addr(types::I64, slot, 0);
+                            let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                            spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                            if has_refs {
+                                self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                            }
+                            let pi = fb.ins().iconst(types::I32, plan as i64);
+                            let fref = self.module.declare_func_in_func(concat_id, fb.func);
+                            let c = fb.ins().call(fref, &[pi, ptr]);
+                            if has_refs {
+                                self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                            }
+                            reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                            stack.push(fb.inst_results(c)[0]);
+                        }
+                    }
                 }
                 other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
             }
