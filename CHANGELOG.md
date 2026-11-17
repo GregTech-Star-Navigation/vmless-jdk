@@ -780,3 +780,31 @@ Math、Integer/Long 进制、Character、Arrays）；解释器与 JIT 侧的集�
 | corpus/napi | — | **7 一致 + 1 两路，失败 0** |
 | 真 java.base M2 | 一致 | 一致 |
 | `cargo test` | 50 | 50 |
+
+## 0.53.0 — 2026-11-17 · jconsole / jaccess* / jabswitch（Win32 原生 GUI，不依赖 java.desktop）
+
+我们没有实现 Swing/AWT，所以这四个工具用 **Win32 原生 GUI（Rust 手写 `extern "system"`）+ attach 协议**。
+这是刻意的取舍：功能等价、体积小、不必先造一套 GUI 工具包。
+
+新增 `jdk-gui/`（5729 行，依赖只有 `vmless-attach`）：
+`win.rs` Win32 FFI（含 `oleacc`/`advapi32`）· `ui.rs` 窗口类/消息循环/双缓冲自绘 ·
+`vm.rs` 采样线程 + 断线重连 · `msaa.rs` **手写 `IAccessible` vtable（28 槽）** · `pick.rs` 进程选择 · `reg.rs`
+
+**实测**
+| 项 | 结果 |
+|---|---|
+| `jconsole -p <pid>` | 窗口标题 `jconsole —— VMless 监控  pid 15072`；`EnumChildWindows` 数到 **18 个控件**（SysTabControl32 + 自绘页 + SysListView32 + SysHeader32）|
+| 数据实时 | `采样 #4 · 堆 25 KB / 104.0 MB · 线程 8 · 类 10` → 2s 后 `采样 #6 · 堆 30 KB …` |
+| 内存页 19 列 | 与真 `jstat -gc` 同一目标**逐列一致** |
+| `jaccesswalker` | `共 479 个窗口 / 65 个进程`，按进程分组打印类名/标题/可见性/尺寸 |
+| `jabswitch` | `-q`→禁用 → `-enable` → `-q`→启用 → `-disable` → `-q`→禁用；`reg query` 独立核对 `JavaAccessBridge REG_SZ 1/0` 同步 |
+| 错误路径 | 坏 pid → exit **2**；坏参数 → exit **1** |
+| 断线 | 杀掉目标后状态栏 `连接断开… 每 3 秒重试`，窗口不崩 |
+| 体积 | jconsole 298KB · jaccessinspector 166KB · jaccesswalker 171KB · jabswitch 126KB |
+
+**踩到的两个硬坑**（写进 `AGENTS.md`）：`wide("")` 的 `as_mut_ptr()` 是悬挂非空指针
+（comctl32 按 NUL 读 → 插列表项直接访问违例）；`SysTabControl32` 在 `TCM_INSERTITEM` 后会把自己提到 Z 序最前，
+页面窗口必须显式 `bring_to_top`，否则「WM_PAINT 跑了、BitBlt 返回 1、屏幕上却是标签控件的灰底」。
+
+**边界**：无障碍真用了 `oleacc` + 手写 `IAccessible`（不是退回 Win32），但老式窗口的 OLEACC 代理不给
+每个 child 的属性，所以子节点改成逐子窗口探 MSAA；无 comctl32 v6 manifest（v5 外观、不跟随深色模式）。

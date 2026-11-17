@@ -1,0 +1,18 @@
+[package]
+name = "vmless-gui"
+version = "0.1.0"
+edition = "2021"
+description = "VMless 的图形化监控工具（jconsole / jaccessinspector / jaccesswalker / jabswitch），Win32 原生，不依赖 java.desktop"
+
+[dependencies]
+vmless-attach = { path = "../jdk-attach" }
+
+# 四个 GUI/系统工具共用一份库。体积目标 ≤2MB/个：
+# 关掉 lto 之外的优化把首字节压小没有意义 —— opt-level="z" + lto + strip 之后
+# 一个 Win32 GUI 程序在 300~500KB，离上限很远，真正的上限是"别把 std 的 panic 路径带上"。
+[profile.release]
+opt-level = "z"
+lto = true
+codegen-units = 1
+panic = "abort"
+strip = true
