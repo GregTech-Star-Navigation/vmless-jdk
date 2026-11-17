@@ -212,7 +212,9 @@ pub fn string_to_key_aes(password: &[u8], salt: &[u8], enctype: u16, iterations:
         18 => 32,
         other => return Err(Error::new(format!("不支持的类型 {other}"))),
     };
-    Ok(pbkdf2(Alg::Sha1, password, salt, iterations, len))
+    // RFC 3962 §4：PBKDF2 之后再走一次 DK(tkey, "kerberos")
+    let tkey = pbkdf2(Alg::Sha1, password, salt, iterations, len);
+    vmless_crypto::cipher::krb_dk(&tkey, b"kerberos", len)
 }
 
 fn split_principal(s: &str) -> (Vec<String>, Option<String>) {

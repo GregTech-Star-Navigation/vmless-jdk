@@ -691,3 +691,31 @@ crypto(1) / kerberos(2) / attach+JFR(8) / GUI 无障碍(4) / 其它(2)。
 
 **已知边界**：`jmap -dump` 的 `CLASS_DUMP` 常量池/静态字段段与 JDK 25 实际编码不完全一致
 （"真 MAT 能打开"本机无法证明，`jhat` 在 JDK 9 已删除）；`jstatd` 用同语义 TCP 而非 JRMP。
+
+## 0.50.0 — 2026-11-17 · Kerberos v5（kinit / klist / kdc）+ 修 ktab 的 string2key
+
+新增 `jdk-krb/`（6463 行，41 单测）：
+
+- **ASN.1**：`[APPLICATION n]` + EXPLICIT TAGS；`Ticket`/`KdcReq`/`KdcRep`/`EncKdcRepPart`/`EncTicketPart`/`ApReq`/`Authenticator`/`KrbError`
+- **加密**：RFC 3961 `n-fold` / `DR`、RFC 3962 `aes256-cts-hmac-sha1-96`、string2key、
+  CTS(CS3)、confounder+HMAC、checksum（向量双源：RFC 3962 附录 B + JDK 25 实测）
+- **ccache**：MIT `FILE:` `0x0504` 格式，**JDK 的 `klist` 能读**
+- **KDC**：AS / TGS、UDP+TCP 同端口、keytab 自动识别 JDK 与 MIT 两种格式
+
+**互通验收 14/14**，硬判据全部达成（我亲自复现）：
+```
+我们的 ktab 写 keytab → 我们的 KDC 载入 → 标准口令客户端 kinit 拿到 TGT（19ms）
+同一 keytab → 真 JDK 25 的 kinit 登进我们的 KDC → JDK klist 显示
+  Default principal: testuser@VMKRB.LOCAL, 1 entry found.
+  [1] Service Principal: krbtgt/VMKRB.LOCAL@VMKRB.LOCAL
+```
+错误路径与真 JDK 同码：错口令 `Pre-authentication information was invalid (24)`、
+未知 principal `Client not found in Kerberos database (6)`、时钟偏移 `KRB_AP_ERR_SKEW(37)`
+
+**顺带修了 `jdk-crypto` 的一个真 bug**：`ktab` 的 `string_to_key_aes` 只做了 PBKDF2，
+缺 RFC 3962 §4 的 `DK(tkey, "kerberos")` 这一步 —— 于是同一口令派生的密钥与 JDK/MIT 不同，
+外人用标准口令登不进以该 keytab 建库的 KDC。已补 `cipher::krb_nfold` / `krb_dk` 并接上。
+
+**生产级**：600000 例 fuzz（kdc-req / as-rep / ccache）**0 panic**；AS 交换 19–26ms。
+
+**已知限制**：仅 aes128/aes256-cts；无 rc4/des3/AES-SHA2、无跨 realm referral、无 replay cache、无 PAC。

@@ -1,0 +1,7 @@
+[package]
+name = "vmless-krb"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vmless-crypto = { path = "../jdk-crypto" }

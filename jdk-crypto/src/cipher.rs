@@ -329,3 +329,89 @@ mod tests {
         assert_eq!(hex(&ct[..32]), "7649abac8119b246cee98e9b12e9197d5086cb9b507219ee95db113a917678b2");
     }
 }
+
+// ---------------------------------------------------------------- Kerberos n-fold / DK
+//
+// `ktab` 把口令转成 Kerberos 密钥时要按 RFC 3962 §4 走
+// `key = DK(PBKDF2(pass, salt, iter, len), "kerberos")`。
+// 缺了最后这一步，算出来的密钥和 JDK / MIT 从同一口令算出来的不同。
+
+/// RFC 3961 `n-fold`（AES 用 128 位块）
+pub fn krb_nfold(input: &[u8], out_bytes: usize) -> Vec<u8> {
+    let inbits = input.len();
+    let outbits = out_bytes;
+    if inbits == 0 || outbits == 0 {
+        return Vec::new();
+    }
+    let mut out = vec![0u8; outbits];
+    let (mut a, mut b) = (outbits, inbits);
+    while b != 0 {
+        let c = b;
+        b = a % b;
+        a = c;
+    }
+    let lcm = outbits * inbits / a;
+    let inbits8 = inbits * 8;
+    let mut carry: usize = 0;
+    for i in (0..lcm).rev() {
+        let msbit =
+            (inbits8 - 1 + (inbits8 + 13) * (i / inbits) + (inbits - (i % inbits)) * 8) % inbits8;
+        let hi = input[(inbits - 1 - msbit / 8) % inbits] as usize;
+        let lo = input[(inbits - msbit / 8) % inbits] as usize;
+        let byte = (((hi << 8) | lo) >> ((msbit & 7) + 1)) & 0xff;
+        carry += byte;
+        carry += out[i % outbits] as usize;
+        out[i % outbits] = (carry & 0xff) as u8;
+        carry >>= 8;
+    }
+    if carry != 0 {
+        for i in (0..outbits).rev() {
+            carry += out[i] as usize;
+            out[i] = (carry & 0xff) as u8;
+            carry >>= 8;
+        }
+    }
+    out
+}
+
+/// RFC 3961 `DK(Key, Constant)`：AES 的 random-to-key 是恒等，所以 DK 与 DR 同形。
+pub fn krb_dk(key: &[u8], constant: &[u8], out_len: usize) -> crate::Result<Vec<u8>> {
+    if key.is_empty() || out_len == 0 {
+        return Err(crate::Error::new("KRB DK: 空密钥或零长度输出"));
+    }
+    let aes = Aes::new(key)?;
+    let mut cur = krb_nfold(constant, 16);
+    if cur.len() != 16 {
+        return Err(crate::Error::new("KRB DK: n-fold 失败"));
+    }
+    let mut out = Vec::with_capacity(out_len + 16);
+    while out.len() < out_len {
+        let mut blk = [0u8; 16];
+        blk.copy_from_slice(&cur);
+        let enc = aes.encrypt_block(&blk);
+        out.extend_from_slice(&enc);
+        cur = enc.to_vec();
+    }
+    out.truncate(out_len);
+    Ok(out)
+}
+
+#[cfg(test)]
+mod krb_tests {
+    use super::*;
+
+    #[test]
+    fn nfold_is_deterministic_and_sized() {
+        let n = krb_nfold(b"kerberos", 16);
+        assert_eq!(n.len(), 16);
+        assert_eq!(n, krb_nfold(b"kerberos", 16));
+    }
+
+    #[test]
+    fn dk_differs_from_raw_key() {
+        let base = [0x11u8; 16];
+        let d = krb_dk(&base, b"kerberos", 16).unwrap();
+        assert_eq!(d.len(), 16);
+        assert_ne!(d, base.to_vec());
+    }
+}
