@@ -195,6 +195,18 @@ impl ObjHdr {
         }
     }
 
+    /// 有没有引用槽（没有的话标记时连值都不用碰 —— 少一次访存就是少一次 miss）
+    #[inline]
+    pub(crate) fn has_refs(&self) -> bool {
+        !matches!(&*self.refs, RefBits::None)
+    }
+
+    /// 槽位数组的首地址（GC 预取用：访问它才算把对象的"身体"拉进缓存）
+    #[inline]
+    pub(crate) fn cells_ptr(&self) -> *const Cell {
+        self.cells.as_ptr()
+    }
+
     /// 快照（冷路径用：反射/indy 要整块读）
     pub(crate) fn snapshot(&self) -> Vec<Slot> {
         self.cells.iter().map(|c| c.get()).collect()
@@ -653,12 +665,6 @@ impl Heap {
         self.obj(h).or_else(|| self.arr(h))
     }
 
-    /// 句柄指向的对象还存在吗？（页表里有条目 = 还在；被回收过就是 None）
-    #[inline]
-    pub(crate) fn is_live_handle(&self, h: i32) -> bool {
-        self.hdr(h).is_some()
-    }
-
     /// 标记：返回 true = 这一轮**第一次**标到它（调用方要把它的槽也扫一遍）
     #[inline]
     pub(crate) fn mark(&self, h: i32, epoch: u32) -> bool {
@@ -922,6 +928,9 @@ pub(crate) struct Shared {
     pub(crate) gc_lock: Mutex<()>,
     /// 上一次「停世界」失败的退避截止时间（毫秒，相对进程启动）
     pub(crate) gc_backoff: AtomicU64,
+    /// 算过的引用位图数 / 其中退化成保守的个数（覆盖率诊断）
+    pub(crate) refmap_total: AtomicU64,
+    pub(crate) refmap_cons: AtomicU64,
     /// 每帧引用位图缓存：`(ClassFile 地址, 方法下标) → 位图`
     pub(crate) refmaps: RwLock<HashMap<(usize, usize), (Arc<ClassFile>, Arc<super::gc::MethodRefs>)>>,
 }
@@ -968,6 +977,8 @@ impl Shared {
             sweeping: AtomicBool::new(false),
             gc_lock: Mutex::new(()),
             gc_backoff: AtomicU64::new(0),
+            refmap_total: AtomicU64::new(0),
+            refmap_cons: AtomicU64::new(0),
             refmaps: RwLock::new(HashMap::new()),
         }
     }

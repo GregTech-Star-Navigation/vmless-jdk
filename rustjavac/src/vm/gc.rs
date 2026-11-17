@@ -85,9 +85,6 @@ pub(crate) struct MethodRefs {
     /// `body.len()` 项；下标 = 字节码偏移，值 = `shapes` 下标（0 = 保守形状）
     at: Vec<u16>,
     shapes: Vec<Shape>,
-    /// 精确（非保守）pc 的比例，诊断用
-    pub(crate) precise: usize,
-    pub(crate) total: usize,
 }
 
 impl MethodRefs {
@@ -108,8 +105,6 @@ impl MethodRefs {
         MethodRefs {
             at: vec![0; n.max(1)],
             shapes: vec![Shape { lbits: Box::new([0; 4]), sbits: Box::new([0; 4]), depth: 0, all: true }],
-            precise: 0,
-            total: n,
         }
     }
 }
@@ -118,7 +113,7 @@ impl MethodRefs {
 type Val = u8;
 const V: Val = 0; // 基本类型，1 槽
 const R: Val = 1; // 引用，1 槽
-const W: Val = 3; // long/double，2 槽（bit0 = 0 非引用，bit1 = 1 宽）
+const W: Val = 2; // long/double，2 槽（bit0 = 0 非引用，bit1 = 1 宽）
 
 #[inline]
 fn is_ref_val(v: Val) -> bool {
@@ -423,7 +418,6 @@ pub(crate) fn analyze(
     }];
     let mut seen: HashMap<(Vec<u64>, Vec<u64>, u16), u16> = HashMap::new();
     let mut at = vec![0u16; n];
-    let mut precise = 0usize;
     for &pc in &starts {
         let Some(st) = states[pc].as_ref() else { continue };
         if st.stack.len() > u16::MAX as usize {
@@ -445,9 +439,8 @@ pub(crate) fn analyze(
             }
         };
         at[pc] = idx;
-        precise += 1;
     }
-    MethodRefs { at, shapes, precise, total: starts.len() }
+    MethodRefs { at, shapes }
 }
 
 fn to_bits(n: usize, f: impl Fn(usize) -> bool) -> Vec<u64> {
@@ -818,6 +811,8 @@ pub(crate) struct ThreadRoots {
     sp: AtomicUsize,
     /// 本线程 `Vm` 的地址（GC 要读它的 `held`：线程持有的监视器句柄）
     vm: std::cell::UnsafeCell<*const Vm>,
+    /// 本线程已经停靠到哪一轮（`>= 当前轮次` = 在停靠点里停着）
+    parked: AtomicUsize,
 }
 
 unsafe impl Send for ThreadRoots {}
@@ -831,6 +826,7 @@ impl ThreadRoots {
             stack_base,
             sp: AtomicUsize::new(0),
             vm: std::cell::UnsafeCell::new(std::ptr::null()),
+            parked: AtomicUsize::new(0),
         }
     }
 }
@@ -887,7 +883,7 @@ pub(crate) struct FrameGuard {
 
 impl FrameGuard {
     #[inline]
-    pub(crate) fn push(f: &Frame, vm: *const Vm) -> FrameGuard {
+    pub(super) fn push(f: &Frame, vm: *const Vm) -> FrameGuard {
         let p = MY_ROOTS.with(|r| r.get());
         if p.is_null() {
             return FrameGuard { roots: std::ptr::null(), depth: 0 };
@@ -975,7 +971,6 @@ pub(crate) fn cards_enable(on: bool) {
 
 pub(crate) struct Safepoint {
     epoch: AtomicUsize,
-    arrived: AtomicUsize,
     active: AtomicUsize,
     requested: AtomicBool,
     lock: Mutex<()>,
@@ -986,7 +981,6 @@ impl Safepoint {
     pub(crate) fn new() -> Safepoint {
         Safepoint {
             epoch: AtomicUsize::new(0),
-            arrived: AtomicUsize::new(0),
             active: AtomicUsize::new(0),
             requested: AtomicBool::new(false),
             lock: Mutex::new(()),
@@ -1033,12 +1027,32 @@ impl Safepoint {
                 unsafe { (*p).sp.store(&anchor as *const u8 as usize, Ordering::Release) };
             }
         });
-        let epoch = self.epoch.load(Ordering::Acquire);
-        self.arrived.fetch_add(1, Ordering::AcqRel);
-        let mut g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
-        while self.epoch.load(Ordering::Acquire) == epoch {
-            self.cv.notify_all(); // 叫醒发起方：我又到了一个
-            g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+        loop {
+            if !self.requested.load(Ordering::Acquire) {
+                return; // 这一轮已经结束了
+            }
+            let epoch = self.epoch.load(Ordering::Acquire);
+            // 先宣告「我停在第 epoch 轮」，再睡 —— 发起方按**每个线程各自的轮次**判定是否停全，
+            // 这样上一轮迟到的宣告不会被下一轮误当成「已到齐」。
+            MY_ROOTS.with(|r| {
+                let p = r.get();
+                if !p.is_null() {
+                    unsafe { (*p).parked.store(epoch, Ordering::Release) };
+                }
+            });
+            let mut g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            while self.epoch.load(Ordering::Acquire) == epoch {
+                if !self.requested.load(Ordering::Acquire) {
+                    break;
+                }
+                self.cv.notify_all(); // 叫醒发起方：我又到了一个
+                g = self.cv.wait(g).unwrap_or_else(|e| e.into_inner());
+            }
+            drop(g);
+            if !self.requested.load(Ordering::Acquire) {
+                return;
+            }
+            // 还在请求里（新一轮开始了）：继续停在下一个停靠点
         }
     }
 
@@ -1046,26 +1060,33 @@ impl Safepoint {
     ///
     /// 没到齐也不死等 —— 返回 false 让调用方放弃这一轮（**没停全就不回收**）。
     pub(crate) fn sync(&self, timeout_ms: u64) -> bool {
-        let want = self.active.load(Ordering::Acquire);
-        self.arrived.store(0, Ordering::Release);
+        let me = MY_ROOTS.with(|r| r.get()) as usize;
+        let round = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
         self.requested.store(true, Ordering::Release);
-        let epoch = self.epoch.fetch_add(1, Ordering::AcqRel) + 1;
 
         let deadline = std::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
-        let mut g = self.lock.lock().unwrap_or_else(|e| e.into_inner());
         let mut ok = false;
-        while std::time::Instant::now() < deadline {
-            if self.arrived.load(Ordering::Acquire) >= want.saturating_sub(1) {
+        loop {
+            // 每个登记线程各自宣告「我停在第几轮」：只要还有人的轮次 < 本轮，就还没停全
+            let pending = {
+                let g = ALL_ROOTS.0.lock().unwrap_or_else(|e| e.into_inner());
+                g.iter()
+                    .filter(|p| !p.is_null() && **p as usize != me)
+                    .filter(|p| unsafe { (***p).parked.load(Ordering::Acquire) } < round)
+                    .count()
+            };
+            if pending == 0 {
                 ok = true;
                 break;
             }
-            let left = deadline.saturating_duration_since(std::time::Instant::now());
-            let (ng, _) = self.cv.wait_timeout(g, left).unwrap_or_else(|e| e.into_inner());
-            g = ng;
+            if std::time::Instant::now() >= deadline {
+                break;
+            }
+            std::thread::sleep(std::time::Duration::from_micros(50));
         }
-        drop(g);
+        // 结束这一轮（再 +1 让所有等着的线程醒来）
         self.requested.store(false, Ordering::Release);
-        self.epoch.store(epoch + 1, Ordering::Release);
+        self.epoch.fetch_add(1, Ordering::AcqRel);
         self.cv.notify_all();
         ok
     }
@@ -1095,6 +1116,8 @@ struct Marker<'a> {
     work: Vec<i32>,
     /// 本轮标记到的句柄数（统计）
     marked: u64,
+    /// 只标记不扫槽（`VMLESS_GC_NOSCAN=1`，量时间构成用）
+    noscan: bool,
     /// 校验/统计：精确帧 / 保守帧 / 位图失配帧
     verify: bool,
     f_precise: u64,
@@ -1111,6 +1134,7 @@ impl<'a> Marker<'a> {
             work: Vec::with_capacity(4096),
             marked: 0,
             verify: std::env::var("VMLESS_GC_VERIFY").map(|v| v != "0").unwrap_or(false),
+            noscan: std::env::var("VMLESS_GC_NOSCAN").map(|v| v != "0").unwrap_or(false),
             f_precise: 0,
             f_conservative: 0,
             f_mismatch: 0,
@@ -1170,6 +1194,9 @@ impl<'a> Marker<'a> {
         }
         self.marked += 1;
         let o = unsafe { &*o };
+        if self.noscan {
+            return; // 只做「标记」不扫槽（量时间构成用，结果不完整）
+        }
         let n = o.len();
         for i in 0..n {
             if o.refs.is_ref(i) {
@@ -1250,7 +1277,7 @@ fn scan_frame(m: &mut Marker, fr: &Frame) {
     let shape = fr.refs.as_ref().and_then(|r| r.shape_at(fr.pc));
     if m.verify {
         match shape {
-            Some(sh) if !sh.is_all() && sh.depth() == fr.stack.len() => m.f_precise += 1,
+            Some(sh) if !sh.is_all() && sh.depth() >= fr.stack.len() => m.f_precise += 1,
             Some(sh) if !sh.is_all() => {
                 m.f_mismatch += 1;
                 if m.verify {
@@ -1268,7 +1295,10 @@ fn scan_frame(m: &mut Marker, fr: &Frame) {
     let stk = &fr.stack;
     match shape {
         // 位图与当前栈深对不上：说明我们算错了/状态不是指令边界 —— 保守扫这一帧
-        Some(sh) if sh.is_all() || sh.depth() != stk.len() => {
+        // 实际栈**比位图短**是合法的：停在调用点上时参数已经被弹掉了，剩下的正好是
+        // 位图栈的前缀 —— 前缀上每一位的含义没变，所以仍然可以精确扫。
+        // 反过来（实际比位图长）说明我们对不上这条指令的语义，只能保守。
+        Some(sh) if sh.is_all() || sh.depth() < stk.len() => {
             conservative_frame(m, fr);
         }
         Some(sh) => {
@@ -1491,6 +1521,18 @@ fn mark_worker(w: &Work, m: &mut Marker) {
             for k in 0..(end - i) {
                 ptrs[k] = m.resolve(batch[i + k]);
             }
+            // 对象头已经到手（resolve 顺带把第一行拉进缓存），再把"身体"（槽位数组）
+            // 预取进来 —— 标记每个对象都要多一次跳跃，不预取就是一次实打实的 miss。
+            for k in 0..(end - i) {
+                let o = ptrs[k];
+                if !o.is_null() && unsafe { (*o).has_refs() } {
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        use std::arch::x86_64::{_mm_prefetch, _MM_HINT_T0};
+                        _mm_prefetch((*o).cells_ptr() as *const i8, _MM_HINT_T0);
+                    }
+                }
+            }
             for k in 0..(end - i) {
                 m.mark_resolved(batch[i + k], ptrs[k]);
             }
@@ -1560,7 +1602,7 @@ impl Vm {
     /// **只在这里回收**：`pc` 是精确的指令边界、`frame` 的栈形状与位图一致。分配函数
     /// 本身只累加计数，绝不自己触发回收（那样 `pc` 会停在半条指令上，位图对不上）。
     #[inline]
-    pub(crate) fn gc_poll(&mut self, frame: &mut Frame, pc: usize) {
+    pub(super) fn gc_poll(&mut self, frame: &mut Frame, pc: usize) {
         // 压力模式下 gc_should_run 就是「这一小段有没有分配过」—— 没分配就不必回收
         if !self.sh.gc_should_run() {
             return;
@@ -1588,9 +1630,12 @@ impl Vm {
         let st = self.collect();
         if self.sh.gc_stats {
             eprintln!(
-                "[gc] pause={:.2}ms live={}{}",
+                "[gc] pause={:.2}ms live={} 位图:精确/总={}/{}{}",
                 st.pause_us as f64 / 1000.0,
                 st.live,
+                self.sh.refmap_total.load(Ordering::Relaxed)
+                    - self.sh.refmap_cons.load(Ordering::Relaxed),
+                self.sh.refmap_total.load(Ordering::Relaxed),
                 if st.all_parked { "" } else { " (未停全：跳过)" }
             );
         }
@@ -1752,7 +1797,7 @@ mod tests {
             0x37, 0x06, // 6  lstore 6    local6/7 = 非引用
             0xb1, // 8  return
         ];
-        let m = call(&body, "(Ljava/lang/Object;I)V", false, 8, &[]);
+        let m = call(&body, "(I)V", false, 8, &[]);
         assert!(!m.is_conservative(), "简单方法不该退化");
         let s0 = m.shape_at(0).unwrap();
         assert!(s0.local_is_ref(0), "this 必须是引用");

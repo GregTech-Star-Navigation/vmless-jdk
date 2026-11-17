@@ -59,6 +59,10 @@ impl Vm {
             }
         }
         let m = std::sync::Arc::new(super::gc::analyze(cf, body, desc, max_locals, is_static, exc));
+        self.sh.refmap_total.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        if m.is_conservative() {
+            self.sh.refmap_cons.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.sh
             .refmaps
             .write()
