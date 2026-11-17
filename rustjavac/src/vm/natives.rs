@@ -4,6 +4,7 @@
 //! 这些类没有 `.class` 在 classpath 上（`store.resolve_method` 找不到），
 //! 所以调用点在 `exec` 里先问这张表；表本身在 `crate::jdk`（与 JIT 共用）。
 
+use super::shared::lk;
 use crate::jdk;
 
 use super::heap::{java_class_name, RefKind, STR_BASE};
@@ -32,7 +33,7 @@ impl Vm {
     pub(super) fn wrapper_value(&self, h: i32) -> Option<Slot> {
         let RefKind::Obj(cls) = self.ref_kind(h) else { return None };
         crate::jdk::wrapper_prim(&cls)?;
-        self.objects.get(h as usize - 1).and_then(|f| f.first().copied())
+        self.sh.heap.snapshot(h).and_then(|f| f.first().copied())
     }
 
     fn wrapper_class(&self, h: i32) -> Option<String> {
@@ -107,14 +108,13 @@ impl Vm {
 
     /// 把已缓冲的输出刷到 stdout（`System.exit` 前必须调：缓冲在 Vm 里，进程退出会丢）
     pub(super) fn flush_output(&mut self) {
-        for line in self.output.drain(..) {
+        for line in self.output_drain() {
             println!("{line}");
         }
     }
 
     pub(super) fn str_new(&mut self, s: String) -> i32 {
-        self.strings.push(s);
-        STR_BASE + self.strings.len() as i32 - 1
+        self.sh.heap.new_string(s)
     }
 
     /// 字符串句柄的文本；不是字符串就当空串
@@ -140,7 +140,7 @@ impl Vm {
         if !matches!(self.ref_kind(h), RefKind::Obj(ref c) if c == "java/lang/reflect/Field") {
             return (None, None);
         }
-        let Some(slots) = self.objects.get(h as usize - 1) else { return (None, None) };
+        let Some(slots) = self.sh.heap.snapshot(h) else { return (None, None) };
         let get = |name: &str| -> Option<Slot> {
             let i = self.store.field_index("java/lang/reflect/Field", name)?;
             slots.get(i).copied()
@@ -155,9 +155,7 @@ impl Vm {
     pub(super) fn new_instance(&mut self, class: &str, ctor_desc: &str) -> Result<i32, VmError> {
         self.ensure_init(class)?;
         let n = self.store.field_count(class);
-        self.objects.push(vec![Slot::I(0); n.max(1)]);
-        self.object_class.push(class.to_string());
-        let h = self.objects.len() as i32;
+        let h = self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &class.to_string()).unwrap_or(0);
         if let Some((ci, mi)) = self.store.resolve_method(class, "<init>", ctor_desc) {
             self.depth += 1;
             let r = self.execute(ci, mi, ctor_desc, &[Slot::I(h)], true);
@@ -172,22 +170,22 @@ impl Vm {
         // Boolean 只有两个值：与 Java 一样返回单例（`Boolean.TRUE == Boolean.TRUE`）
         if cls == "java/lang/Boolean" {
             let key = format!("Boolean#{}", if v.as_i32() != 0 { 1 } else { 0 });
-            if let Some(h) = self.wrapper_cache.get(&key) {
-                return *h;
+            if let Some(h) = self.sh.heap.wrapper_get(&key) {
+                return h;
             }
             let h = self.alloc_wrapper(cls, Slot::I(if v.as_i32() != 0 { 1 } else { 0 }));
-            self.wrapper_cache.insert(key, h);
+            self.sh.heap.wrapper_put(key, h);
             return h;
         }
         if cls == "java/lang/Integer" {
             let n = v.as_i32();
             if (-INT_CACHE..INT_CACHE).contains(&n) {
                 let key = format!("Integer#{n}");
-                if let Some(h) = self.wrapper_cache.get(&key) {
-                    return *h;
+                if let Some(h) = self.sh.heap.wrapper_get(&key) {
+                    return h;
                 }
                 let h = self.alloc_wrapper(cls, v);
-                self.wrapper_cache.insert(key, h);
+                self.sh.heap.wrapper_put(key, h);
                 return h;
             }
         }
@@ -195,16 +193,12 @@ impl Vm {
     }
 
     fn alloc_wrapper(&mut self, cls: &str, v: Slot) -> i32 {
-        self.objects.push(vec![v]);
-        self.object_class.push(cls.to_string());
-        self.objects.len() as i32
+        self.sh.heap.new_object(vec![v], cls).unwrap_or(0)
     }
 
     /// 抛一个 Java 异常（新建异常对象，交给异常表处理）
     pub(super) fn throw(&mut self, class: &str) -> VmError {
-        self.objects.push(vec![Slot::I(0)]);
-        self.object_class.push(class.to_string());
-        let h = self.objects.len() as i32;
+        let h = self.sh.heap.new_object(vec![Slot::I(0)], class).unwrap_or(0);
         VmError { msg: format!("抛出 {class}"), exc: Some(h) }
     }
 
@@ -225,11 +219,7 @@ impl Vm {
                 Err(e) => return e,
             }
         }
-        let h = {
-            self.objects.push(vec![Slot::I(0)]);
-            self.object_class.push(class.to_string());
-            self.objects.len() as i32
-        };
+        let h = self.sh.heap.new_object(vec![Slot::I(0)], class).unwrap_or(0);
         VmError { msg: format!("抛出 {class}: {msg}"), exc: Some(h) }
     }
 
@@ -464,9 +454,7 @@ impl Vm {
                 for p in parts {
                     elems.push(Slot::I(self.str_new(p)));
                 }
-                self.arrays.push(elems);
-                self.array_class.push("[Ljava/lang/String;".to_string());
-                Slot::I(-(self.arrays.len() as i32))
+                Slot::I(self.sh.heap.new_array(elems, "[Ljava/lang/String;").unwrap_or(0))
             }
             "equals" => {
                 let same = match self.ref_kind(a.as_i32()) {
@@ -673,7 +661,7 @@ impl Vm {
         }
         match self.ref_kind(h) {
             RefKind::Arr(d) if d == "[I" => {
-                let arr = &self.arrays[(-h - 1) as usize];
+                let arr = self.sh.heap.snapshot(h).unwrap_or_default();
                 let parts: Vec<String> = arr.iter().map(|v| v.as_i32().to_string()).collect();
                 Ok(format!("[{}]", parts.join(", ")))
             }
@@ -687,12 +675,17 @@ impl Vm {
         }
         match self.ref_kind(h) {
             RefKind::Arr(d) if d == "[I" => {
-                if let Some(arr) = self.arrays.get_mut((-h - 1) as usize) {
-                    let mut vals: Vec<i32> = arr.iter().map(|v| v.as_i32()).collect();
-                    vals.sort_unstable();
-                    for (i, v) in vals.into_iter().enumerate() {
-                        arr[i] = Slot::I(v);
-                    }
+                let mut vals: Vec<i32> = self
+                    .sh
+                    .heap
+                    .snapshot(h)
+                    .unwrap_or_default()
+                    .iter()
+                    .map(|v| v.as_i32())
+                    .collect();
+                vals.sort_unstable();
+                for (i, v) in vals.into_iter().enumerate() {
+                    self.sh.heap.set(h, i, Slot::I(v));
                 }
                 Ok(())
             }
@@ -713,8 +706,7 @@ impl Vm {
             }
         };
         if n < 0 || sp < 0 || dp < 0 {
-            return Err(self
-                .throw_msg("java/lang/IndexOutOfBoundsException", format!("arraycopy: 偏移为负（{sp}/{dp}/n={n}）")));
+            return Err(self.throw_msg("java/lang/IndexOutOfBoundsException", format!("arraycopy: 偏移为负（{sp}/{dp}/n={n}）")));
         }
         // 类型兼容按 `System.arraycopy` 的规范：**不要求两边类型相同**，
         // 只要求「源的元素能存进目标」（`Object[] ← String[]` 合法）。
@@ -733,7 +725,7 @@ impl Vm {
         // 引用元素：搬句柄（句柄本身就是引用），逐个按目标元素类型验一遍
         let mut tmp = Vec::with_capacity(n as usize);
         {
-            let Some(a) = self.arrays.get((-src - 1) as usize) else {
+            let Some(a) = self.sh.heap.snapshot(src) else {
                 return Err(VmError { msg: "arraycopy: 源句柄无效".into(), exc: None });
             };
             for i in 0..n as usize {
@@ -750,7 +742,7 @@ impl Vm {
         }
         let d_elem_name = if both_ref { Some(internal_of_elem(d_elem)) } else { None };
         // 越界与元素类型先**验证完**再取可变借用（Rust 的借用检查逼出来的顺序，正好也更清楚）
-        let d_len = match self.arrays.get((-dst - 1) as usize) {
+        let d_len = match self.sh.heap.snapshot(dst) {
             Some(a) => a.len(),
             None => return Err(VmError { msg: "arraycopy: 目标句柄无效".into(), exc: None }),
         };
@@ -772,9 +764,9 @@ impl Vm {
                 }
             }
         }
-        let d = &mut self.arrays[(-dst - 1) as usize];
+        let d = dst;
         for (i, v) in tmp.into_iter().enumerate() {
-            d[dp as usize + i] = v;
+            self.sh.heap.set(d, dp as usize + i, v);
         }
         Ok(())
     }
@@ -783,7 +775,7 @@ impl Vm {
         if h >= 0 {
             return None;
         }
-        self.array_class.get((-h - 1) as usize).cloned()
+        self.sh.heap.class_of(h).map(|c| c.to_string())
     }
 }
 
@@ -858,7 +850,7 @@ impl Vm {
         if recv <= 0 {
             return None;
         }
-        let v = self.objects.get(recv as usize - 1)?.first()?.as_i32();
+        let v = self.sh.heap.snapshot(recv)?.first()?.as_i32();
         if v <= 0 {
             None
         } else {
@@ -873,12 +865,7 @@ impl Vm {
             v.len() - 1
         });
         if recv > 0 {
-            if let Some(f) = self.objects.get_mut(recv as usize - 1) {
-                if f.is_empty() {
-                    f.push(Slot::I(0));
-                }
-                f[0] = Slot::I(id as i32 + 1);
-            }
+            self.sh.heap.set(recv, 0, Slot::I(id as i32 + 1));
         }
         id
     }
@@ -896,9 +883,7 @@ impl Vm {
 
     /// 分配一个「只有状态槽」的内建对象（视图 / 迭代器 / Entry）
     fn new_plain(&mut self, cls: &str, n: usize) -> i32 {
-        self.objects.push(vec![Slot::I(0); n.max(1)]);
-        self.object_class.push(cls.to_string());
-        self.objects.len() as i32
+        self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &cls.to_string()).unwrap_or(0)
     }
 
     /// 两个引用是不是「Java equals」：String 比内容、包装类比数值、其余比句柄
@@ -934,7 +919,7 @@ impl Vm {
     fn coll_op(&mut self, cls: &str, name: &str, recv: i32, a: Slot, b: Slot) -> Result<Slot, VmError> {
         // ---- Map.Entry ----
         if cls == "java/util/Map$Entry" {
-            let f = self.objects.get(recv as usize - 1).cloned().unwrap_or_default();
+            let f = self.sh.heap.snapshot(recv).unwrap_or_default();
             let k = f.first().copied().unwrap_or(Slot::I(0)).as_i32();
             let v = f.get(1).copied().unwrap_or(Slot::I(0)).as_i32();
             return Ok(match name {
@@ -1047,9 +1032,7 @@ impl Vm {
                     }
                     "toArray" => {
                         let elems: Vec<Slot> = list.iter().map(|&h| Slot::I(h)).collect();
-                        self.arrays.push(elems);
-                        self.array_class.push("[Ljava/lang/Object;".to_string());
-                        Ok(Slot::I(-(self.arrays.len() as i32)))
+                        Ok(Slot::I(self.sh.heap.new_array(elems, "[Ljava/lang/Object;").unwrap_or(0)))
                     }
                     _ => {
                         // iterator：新对象 + 独立游标
@@ -1147,10 +1130,8 @@ impl Vm {
                         let mut entries = Vec::with_capacity(keys.len());
                         for i in 0..keys.len() {
                             let e = self.new_plain("java/util/Map$Entry", 2);
-                            if let Some(f) = self.objects.get_mut(e as usize - 1) {
-                                f[0] = Slot::I(keys[i]);
-                                f[1] = Slot::I(vals[i]);
-                            }
+                            self.sh.heap.set(e, 0, Slot::I(keys[i]));
+                            self.sh.heap.set(e, 1, Slot::I(vals[i]));
                             entries.push(e);
                         }
                         let view = self.new_plain("java/util/Set", 1);
@@ -1231,7 +1212,7 @@ impl Vm {
 
     /// `Throwable` 的 `getMessage` / `toString` / `printStackTrace`
     fn throwable_op(&mut self, name: &str, recv: i32) -> Result<Slot, VmError> {
-        let msg = self.exc_msgs.get(&recv).copied().unwrap_or(0);
+        let msg = lk(&self.sh.exc_msgs).get(&recv).copied().unwrap_or(0);
         let text = if msg != 0 { self.obj_to_string(msg) } else { String::new() };
         match name {
             "getMessage" => Ok(Slot::I(msg)),
@@ -1325,8 +1306,9 @@ impl Vm {
                 return String::new();
             }
             return self
-                .arrays
-                .get((-h - 1) as usize)
+                .sh
+                .heap
+                .snapshot(h)
                 .map(|a| a.iter().map(|x| char::from_u32(x.as_i32() as u32).unwrap_or('\0')).collect())
                 .unwrap_or_default();
         }
@@ -1461,7 +1443,7 @@ impl Vm {
         let RefKind::Arr(d) = self.ref_kind(h) else {
             return Ok("null".to_string());
         };
-        let arr = &self.arrays[(-h - 1) as usize];
+        let arr = self.sh.heap.snapshot(h).unwrap_or_default();
         let parts: Vec<String> = match d.as_str() {
             "[J" => arr.iter().map(|v| v.as_i64().to_string()).collect(),
             "[D" => arr.iter().map(|v| crate::java_double_to_string(v.as_f64())).collect(),
@@ -1498,7 +1480,7 @@ impl Vm {
                 let fmt = self.str_of(a.as_i32());
                 let hv = b.as_i32();
                 let argv: Vec<Slot> = if hv < 0 {
-                    self.arrays.get((-hv - 1) as usize).cloned().unwrap_or_default()
+                    self.sh.heap.snapshot(hv).unwrap_or_default()
                 } else {
                     Vec::new()
                 };
@@ -1624,8 +1606,8 @@ impl Vm {
                 } else if x == 0 || y == 0 {
                     false
                 } else {
-                    let ax = self.arrays.get((-x - 1) as usize).cloned().unwrap_or_default();
-                    let ay = self.arrays.get((-y - 1) as usize).cloned().unwrap_or_default();
+                    let ax = self.sh.heap.snapshot(x).unwrap_or_default();
+                    let ay = self.sh.heap.snapshot(y).unwrap_or_default();
                     ax == ay
                 };
                 Ok(Slot::I(if same { 1 } else { 0 }))
@@ -1634,10 +1616,9 @@ impl Vm {
                 let h = a.as_i32();
                 if h < 0 {
                     let v = b;
-                    if let Some(arr) = self.arrays.get_mut((-h - 1) as usize) {
-                        for e in arr.iter_mut() {
-                            *e = v;
-                        }
+                    let n = self.sh.heap.array_len(h).unwrap_or(0);
+                    for i in 0..n {
+                        self.sh.heap.set(h, i, v);
                     }
                 }
                 Ok(Slot::I(0))
@@ -1645,31 +1626,30 @@ impl Vm {
             ("java/util/Arrays", "sort") => {
                 let h = a.as_i32();
                 if h < 0 {
-                    let d = self.array_class.get((-h - 1) as usize).cloned().unwrap_or_default();
+                    let d = self.sh.heap.class_of(h).map(|c| c.to_string()).unwrap_or_default();
                     // 引用元素要先按 `&self` 比完序（排序闭包拿不到 self），再写回
                     if matches!(d.as_str(), "[J" | "[D" | "[I") {
-                        if let Some(arr) = self.arrays.get_mut((-h - 1) as usize) {
-                            match d.as_str() {
-                                "[J" => arr.sort_by_key(|v| v.as_i64()),
-                                "[D" => arr.sort_by(|x, y| {
-                                    x.as_f64().partial_cmp(&y.as_f64()).unwrap_or(std::cmp::Ordering::Equal)
-                                }),
-                                _ => arr.sort_by_key(|v| v.as_i32()),
-                            }
+                        let mut vals = self.sh.heap.snapshot(h).unwrap_or_default();
+                        match d.as_str() {
+                            "[J" => vals.sort_by_key(|v| v.as_i64()),
+                            "[D" => vals.sort_by(|x, y| {
+                                x.as_f64().partial_cmp(&y.as_f64()).unwrap_or(std::cmp::Ordering::Equal)
+                            }),
+                            _ => vals.sort_by_key(|v| v.as_i32()),
+                        }
+                        for (i, v) in vals.into_iter().enumerate() {
+                            self.sh.heap.set(h, i, v);
                         }
                     } else {
                         let mut refs: Vec<i32> = self
-                            .arrays
-                            .get((-h - 1) as usize)
+                            .sh
+                            .heap
+                            .snapshot(h)
                             .map(|a| a.iter().map(|v| v.as_i32()).collect())
                             .unwrap_or_default();
                         refs.sort_by(|&x, &y| self.refs_cmp(x, y));
-                        if let Some(arr) = self.arrays.get_mut((-h - 1) as usize) {
-                            for (i, r) in refs.into_iter().enumerate() {
-                                if i < arr.len() {
-                                    arr[i] = Slot::I(r);
-                                }
-                            }
+                        for (i, r) in refs.into_iter().enumerate() {
+                            self.sh.heap.set(h, i, Slot::I(r));
                         }
                     }
                 }

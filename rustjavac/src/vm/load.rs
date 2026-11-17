@@ -11,11 +11,12 @@
 use crate::load::ClassPath;
 use crate::{ClassFile, CpEntry};
 use std::collections::HashMap;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::class::builtin_super;
 use super::VmError;
 
+#[derive(Clone)]
 pub(crate) struct ClassMeta {
     /// 实例字段名 → 下标（含继承）
     pub(crate) fields: HashMap<String, usize>,
@@ -23,8 +24,9 @@ pub(crate) struct ClassMeta {
     pub(crate) field_count: usize,
 }
 
+#[derive(Clone)]
 pub(crate) struct ClassStore {
-    pub(super) classes: Vec<Rc<ClassFile>>,
+    pub(super) classes: Vec<Arc<ClassFile>>,
     /// 内部类名 → 类下标
     pub(super) by_name: HashMap<String, usize>,
     pub(super) metas: HashMap<String, ClassMeta>,
@@ -39,7 +41,7 @@ fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
 }
 
 /// 类的直接父类：已加载的类看 `super_class`，其余靠 java.* 写死的表
-fn super_of_of(classes: &[Rc<ClassFile>], by_name: &HashMap<String, usize>, class: &str) -> Option<String> {
+fn super_of_of(classes: &[Arc<ClassFile>], by_name: &HashMap<String, usize>, class: &str) -> Option<String> {
     if let Some(&i) = by_name.get(class) {
         let cf = &classes[i];
         return match cf.constant_pool.get(cf.super_class as usize).and_then(|e| e.as_ref()) {
@@ -127,11 +129,11 @@ impl ClassStore {
         let name = cf.this_class_name().unwrap_or_default();
         let idx = match self.by_name.get(&name) {
             Some(&i) => {
-                self.classes[i] = Rc::new(cf);
+                self.classes[i] = Arc::new(cf);
                 i
             }
             None => {
-                self.classes.push(Rc::new(cf));
+                self.classes.push(Arc::new(cf));
                 self.classes.len() - 1
             }
         };
@@ -154,7 +156,7 @@ impl ClassStore {
 
     /// 用一批已解析的类建表
     pub(super) fn new(files: Vec<ClassFile>, main_class: Option<&str>) -> Result<Self, VmError> {
-        let classes: Vec<Rc<ClassFile>> = files.into_iter().map(Rc::new).collect();
+        let classes: Vec<Arc<ClassFile>> = files.into_iter().map(Arc::new).collect();
         // 入口类必须排在最前面？不必 —— 按名字找即可
         let mut by_name = HashMap::new();
         for (i, cf) in classes.iter().enumerate() {
@@ -279,7 +281,7 @@ impl ClassStore {
     }
 
     /// 类内部名 → 已解析的 class 文件
-    pub(super) fn class_file(&self, name: &str) -> Option<Rc<ClassFile>> {
+    pub(super) fn class_file(&self, name: &str) -> Option<Arc<ClassFile>> {
         self.by_name.get(name).map(|&i| self.classes[i].clone())
     }
 

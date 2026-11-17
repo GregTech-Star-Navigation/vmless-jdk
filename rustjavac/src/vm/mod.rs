@@ -5,28 +5,49 @@
 //! 比较与跳转、goto、pop/pop2、对象与 int 数组、
 //! `System.out.println(int|long|double|String)`、invokestatic、各 xreturn。
 //!
+//! ## 线程模型（2026-11 去 GIL）
+//!
+//! `Vm` 不再是一个"整个 VM"的结构体，而是**一个 Java 线程的解释器上下文**：
+//!
+//! ```text
+//! Arc<Shared>  堆 / 监视器 / 类表快照 / 静态字段 / indy 状态（见 shared.rs）
+//! Vm           调用深度、safepoint 计数、当前调用者、本线程持有的监视器（无锁）
+//! Frame        局部变量与操作数栈（在 Rust 栈上，天然线程私有）
+//! ```
+//!
+//! 每个 OS 线程一个 `Vm`（`Vm::fork`），彼此只通过 `Shared` 通信，而 `Shared` 里
+//! 每一条路径都有明确的同步（原子 / 锁 / 快照）。所以「多线程并行执行字节码」是
+//! 真的并行：没有全局锁、没有 safepoint 交还、没有票据排队。
+//!
 //! 本文件只剩入口与 `Vm` 的定义 —— 具体实现按职责分散在同目录各模块里。
+use self::shared::lk;
 use crate::{parse, ClassFile};
 use std::collections::HashMap;
-use std::sync::Mutex;
+use std::sync::atomic::Ordering;
+use std::sync::{Arc, Mutex};
+
 mod call;
 mod class;
 mod exception;
 mod exec;
 mod frame;
+mod gc;
 mod heap;
 mod indy;
 mod load;
+mod monitors;
 mod native_reg;
 mod natives;
 mod reflect;
 mod rt;
+mod shared;
 mod slot;
 mod thread;
 
 pub use slot::Slot;
 pub(crate) use class::builtin_super;
 use load::ClassStore;
+use shared::Shared;
 
 #[derive(Debug)]
 pub struct VmError {
@@ -63,7 +84,7 @@ pub fn property(key: &str) -> Option<String> {
     PROPS.lock().ok()?.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
 }
 
-fn prop(key: &str) -> Option<String> {
+pub(crate) fn prop(key: &str) -> Option<String> {
     property(key)
 }
 
@@ -97,95 +118,27 @@ pub struct ExecResult {
     pub exception: Option<String>,
 }
 
+/// 一个 Java 线程的解释器上下文。
+///
+/// 字段只有两种：**线程私有的执行状态**（深度 / 计数 / 当前调用者 / 持有的锁），
+/// 和两个指向共享世界的 `Arc`。既没有 `&mut` 别名，也没有全局锁 ——
+/// 这就是"字节码真并行"的全部含义。
 pub struct Vm {
-    /// 所有已加载的类 + 继承/字段/方法元数据
-    store: ClassStore,
-    output: Vec<String>,
-    depth: usize,
-    /// 对象堆：每个对象是一组字段槽（Slot 自带宽度，long/double 不会被截断）；
-    /// 引用 = 下标 + 1（0 表示 null）
-    objects: Vec<Vec<Slot>>,
-    /// 对象堆的运行时类型名（instanceof / checkcast / 虚分派用）
-    object_class: Vec<String>,
-    /// 数组堆：每个数组是一组元素槽；句柄 = -(下标 + 1)
-    arrays: Vec<Vec<Slot>>,
-    /// 数组堆的类描述符，如 `[I` / `[Ljava/lang/String;`
-    array_class: Vec<String>,
-    /// 字符串常量堆；句柄 = STR_BASE + 下标
-    strings: Vec<String>,
-    /// `java/lang/StringBuilder` 的缓冲：对象句柄 → 已拼好的文本
-    /// （`toString()` 之后从表里移除）
-    sb_bufs: std::collections::HashMap<i32, String>,
-    /// (类下标, 常量池索引) → 字符串句柄（同一常量必须拿到同一句柄，否则引用相等会错）
-    string_handles: HashMap<(usize, u16), i32>,
-    /// 包装类的小整数缓存：`Integer#5` → 对象句柄（Java 的 valueOf 也缓存 -128..127）
-    wrapper_cache: HashMap<String, i32>,
-    /// 异常对象句柄 → 构造函数里那个 message 的字符串句柄。
-    /// `new RuntimeException("boom")` 的构造器在 java.* 里（我们没有它的字节码），
-    /// 所以构造时只把消息记下来，抛出来时再拼。
-    exc_msgs: HashMap<i32, i32>,
-    /// 静态字段：(声明类, 字段名) → 值（没有条目就是默认值 0/null）
-    statics: HashMap<(String, String), Slot>,
-    /// 已经跑完 `<clinit>` 的类（静态初始化只跑一次，且先跑父类）
-    initialized: std::collections::HashSet<String>,
-    /// 正在跑 `<clinit>` 的类 → 初始化它的线程 id（JVMS 5.5：一个类同时只许一个线程初始化）
-    initializing: HashMap<String, u64>,
-    /// 等某个类初始化完成的线程
-    init_waiters: HashMap<String, Vec<u64>>,
-    /// 类对象：句柄 → 它代表的类描述符（`X.class` / `getClass()` 的轻量句柄）
-    class_objs: HashMap<i32, String>,
-    /// 类描述符 → 类对象句柄（同一个类必须永远同一个句柄，`X.class == X.class` 靠它）
-    class_obj_cache: HashMap<String, i32>,
-    /// 字符串句柄的**字段视图**：`getfield value/coder/...` 落在字符串堆句柄上时用。
-    /// 真 java.base 的 `String.length()` 是 `value.length >> coder`，没有这层就一碰常量就断。
-    str_fields: HashMap<i32, Vec<Slot>>,
-    /// native 方法注册表：`(类, 方法名, 描述符) → Rust 实现`
-    natives: native_reg::NativeRegistry,
-    /// 真 JDK 的类是否真的加载进来了（`java/lang/Object` 在类表里 = 真字节码优先）
-    jdk_loaded: bool,
-    /// `VMLESS_PREFER_BUILTIN=1`：显式要求先走 `jdk.rs` 的内建实现
-    prefer_builtin: bool,
-    /// 缺 native 的累计清单（`UnsatisfiedLinkError` 时记一条，供 `docs/java-base-native-清单.md`）
-    missing_natives: std::collections::BTreeSet<String>,
-    /// `invokedynamic` / `java.lang.invoke` 的全部状态（句柄、调用点、lambda、VarHandle）
-    mhs: HashMap<i32, indy::MhInfo>,
-    mtypes: HashMap<i32, String>,
-    lookups: HashMap<i32, String>,
-    callsites: HashMap<i32, indy::CallSiteInfo>,
-    lambdas: HashMap<i32, indy::LambdaInfo>,
-    varhandles: HashMap<i32, indy::VarHandleInfo>,
-    /// 引导方法表缓存（按类名：`define_class` 换掉字节码时清空）
-    bsm_tables: HashMap<String, indy::BsmTable>,
-    /// 调用点 → 已解析的目标句柄：(类下标, 常量池索引)
-    indy_sites: HashMap<(usize, u16), i32>,
-    /// `ldc Constant_Dynamic` 的常量值
-    condy_values: HashMap<(usize, u16), indy::TypedSlot>,
-    /// 打印调用点解析统计（`-Dvmless.indy.stats` 或 `VMLESS_INDY_STATS=1`）
-    indy_stats: bool,
-    /// 解析过的调用点个数（同一调用点只解析一次 —— 这个数就是证据）
-    indy_resolved: usize,
-    /// `invokedynamic` 执行过的次数
-    indy_calls: usize,
-    /// 已生成的 lambda 类序号
-    lambda_seq: usize,
-    /// Java 线程表：tid → 记录（parker / 状态 / 对应的 `Thread` 对象）
-    threads: HashMap<u64, thread::ThreadRec>,
-    /// 对象监视器表：对象句柄 → 锁状态（owner / 重入计数 / entry 与 cond 两个队列）
-    monitors: HashMap<i32, thread::Monitor>,
-    /// 存活的 Java 线程数（1 = 单线程，safepoint 什么都不用做）
-    nthreads: u32,
-    /// 距上一次 safepoint 已经跑了多少条字节码
-    tick: u32,
-    /// 自动起名计数器（`Thread-N`）
-    thread_seq: u32,
-    /// 死锁 watchdog 的停滞计数（连续几次 tick 所有线程都不在 RUNNABLE）
-    stalled: u32,
-    /// 运行期类加载用的 classpath（`Class.forName` 靠它；`None` = 独立模式，只能找到已加载的类）
-    cp: Option<crate::load::ClassPath>,
-    /// 注解代理对象：句柄 → 注解实例（`java.lang.reflect.Proxy` 的替身，语义在 `reflect.rs`）
-    ann_objs: HashMap<i32, reflect::AnnInst>,
+    /// 共享世界（堆、监视器、类表快照、静态字段…）
+    pub(crate) sh: Arc<Shared>,
+    /// 类表**快照**：加类时 COW 换一份（读路径不拿锁，见 `sync_store`）
+    pub(crate) store: Arc<ClassStore>,
+    /// 本地快照对应的类表版本
+    store_ver: u64,
+    /// 调用深度（单线程上限，防递归爆栈）
+    pub(crate) depth: usize,
+    /// 距上一次 safepoint 查问跑了多少条字节码
+    pub(crate) tick: u32,
     /// 最近一次字节码调用点的类下标（反射的访问检查要「调用者是谁」；`usize::MAX` = 无）
-    last_caller: usize,
+    pub(crate) last_caller: usize,
+    /// 本线程当前持有的监视器句柄（`count` 从 0 → 1 时入栈）。
+    /// 线程异常终止时靠它把锁全放掉；空则说明没持有任何锁。
+    pub(crate) held: Vec<i32>,
 }
 
 impl Vm {
@@ -195,71 +148,103 @@ impl Vm {
     }
 
     pub(crate) fn from_store(store: ClassStore) -> Self {
-        let jdk_loaded = store.has_class("java/lang/Object");
+        let store = Arc::new(store);
+        let sh = Arc::new(Shared::new(Arc::clone(&store)));
+        thread::register_shared(&sh);
         Vm {
+            sh,
             store,
-            output: Vec::new(),
+            store_ver: 0,
             depth: 0,
-            objects: Vec::new(),
-            object_class: Vec::new(),
-            arrays: Vec::new(),
-            array_class: Vec::new(),
-            strings: Vec::new(),
-            sb_bufs: HashMap::new(),
-            string_handles: HashMap::new(),
-            wrapper_cache: HashMap::new(),
-            exc_msgs: HashMap::new(),
-            statics: HashMap::new(),
-            initialized: std::collections::HashSet::new(),
-            initializing: HashMap::new(),
-            init_waiters: HashMap::new(),
-            class_objs: HashMap::new(),
-            class_obj_cache: HashMap::new(),
-            str_fields: HashMap::new(),
-            natives: native_reg::NativeRegistry::new(),
-            jdk_loaded,
-            prefer_builtin: std::env::var("VMLESS_PREFER_BUILTIN").map(|v| v == "1").unwrap_or(false),
-            missing_natives: std::collections::BTreeSet::new(),
-            mhs: HashMap::new(),
-            mtypes: HashMap::new(),
-            lookups: HashMap::new(),
-            callsites: HashMap::new(),
-            lambdas: HashMap::new(),
-            varhandles: HashMap::new(),
-            bsm_tables: HashMap::new(),
-            indy_sites: HashMap::new(),
-            condy_values: HashMap::new(),
-            indy_stats: prop("vmless.indy.stats").map(|v| v != "0" && v != "false").unwrap_or_else(|| {
-                std::env::var("VMLESS_INDY_STATS").map(|v| v == "1").unwrap_or(false)
-            }),
-            indy_resolved: 0,
-            indy_calls: 0,
-            lambda_seq: 0,
-            threads: HashMap::new(),
-            monitors: HashMap::new(),
-            nthreads: 0,
             tick: 0,
-            thread_seq: 0,
-            stalled: 0,
-            cp: None,
-            ann_objs: HashMap::new(),
             last_caller: usize::MAX,
+            held: Vec::new(),
         }
     }
 
+    /// 从一个已有的共享世界造解释器上下文（死锁看门狗用：不跑字节码，只读状态）。
+    pub(crate) fn from_shared(sh: Arc<Shared>) -> Vm {
+        let store = sh.store_snapshot();
+        Vm { sh, store, store_ver: 0, depth: 0, tick: 0, last_caller: usize::MAX, held: Vec::new() }
+    }
+
+    /// 造一个**本线程专用**的解释器上下文：共享同一个 `Shared`，执行状态全新。
+    ///
+    /// `Thread.start` 与死锁看门狗都走它 —— 这是"每个线程有自己的 `Vm`"的唯一入口。
+    pub(crate) fn fork(&self) -> Vm {
+        Vm {
+            sh: Arc::clone(&self.sh),
+            store: Arc::clone(&self.store),
+            store_ver: self.store_ver,
+            depth: 0,
+            tick: 0,
+            last_caller: usize::MAX,
+            held: Vec::new(),
+        }
+    }
+
+    // ---------------------------------------------------------- 类表快照
+
+    /// 别的线程刚加载过类 → 换一份新快照（版本号没变就什么都不做）
+    pub(crate) fn sync_store(&mut self) {
+        let v = self.sh.store_ver.load(Ordering::Acquire);
+        if v != self.store_ver {
+            self.store = self.sh.store_snapshot();
+            self.store_ver = v;
+        }
+    }
+
+    /// 可变访问类表（COW）。改完必须 [`Vm::publish_store`]。
+    pub(crate) fn store_mut(&mut self) -> &mut ClassStore {
+        Arc::make_mut(&mut self.store)
+    }
+
+    /// 把本线程改过的类表发布出去（COW 换快照 + 推进版本号）
+    pub(crate) fn publish_store(&mut self) {
+        self.store_ver = self.sh.store_publish(Arc::clone(&self.store));
+    }
+
+    // ---------------------------------------------------------- 输出
+
+    /// 这一轮 VM 已经打印的行（不取走，含别的线程打印的）
+    pub(crate) fn output_snapshot(&self) -> Vec<String> {
+        lk(&self.sh.output).clone()
+    }
+
+    /// 刷出并清空已打印的行（VM 内部错误时用：先让用户看到前半段输出）
+    pub(crate) fn output_drain(&self) -> Vec<String> {
+        std::mem::take(&mut *lk(&self.sh.output))
+    }
+
+    pub(crate) fn output_take(&self) -> Vec<String> {
+        std::mem::take(&mut *lk(&self.sh.output))
+    }
+
+    pub(crate) fn println(&self, line: String) {
+        lk(&self.sh.output).push(line);
+    }
+
+    // ---------------------------------------------------------- 状态查询
+
     /// 真 JDK 的类是否真的进了类表（= 遇到 `java.*` 就该执行真字节码，而不是拿内建顶替）
     pub fn jdk_loaded(&self) -> bool {
-        self.jdk_loaded
+        self.sh.jdk_loaded
     }
 
     /// 这次运行里累计遇到的「缺 native」（`UnsatisfiedLinkError` 的清单）
     pub fn missing_natives(&self) -> Vec<String> {
-        self.missing_natives.iter().cloned().collect()
+        self.sh
+            .missing_natives
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .cloned()
+            .collect()
     }
 
     /// 已注册的 native 条目（`docs/java-base-native-清单.md` 与自检用）
     pub fn native_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
-        self.natives.entries()
+        self.sh.natives.entries()
     }
 
     /// 找一个 native 实现；找不到就记进缺清单并报 `UnsatisfiedLinkError`
@@ -269,11 +254,15 @@ impl Vm {
         name: &str,
         desc: &str,
     ) -> Result<native_reg::NativeFn, VmError> {
-        if let Some(f) = self.natives.lookup(class, name, desc) {
+        if let Some(f) = self.sh.natives.lookup(class, name, desc) {
             return Ok(f);
         }
         let key = format!("{class}.{name}{desc}");
-        self.missing_natives.insert(key.clone());
+        self.sh
+            .missing_natives
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key.clone());
         Err(VmError {
             msg: format!("UnsatisfiedLinkError: {key} not registered"),
             exc: None,
@@ -282,34 +271,31 @@ impl Vm {
 
     /// 跑 main([Ljava/lang/String;)V
     pub fn run_main(&mut self) -> Result<ExecResult, VmError> {
-        let mi = self
-            .store
+        let mi = self.store
             .main_method()
             .ok_or_else(|| VmError { msg: "找不到 main([Ljava/lang/String;)V".into(), exc: None })?;
         let main_class = self.store.main;
         // JVM 在调 main 之前会先初始化入口类
         let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
         self.ensure_init(&main_name)?;
-        thread::set_vm_ptr(self as *mut Vm);
         thread::set_main_tid();
-        thread::gil_lock();
+        self.sh.safepoint.register();
         self.thread_register(1, 0, "main", false);
         let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);
         // 主线程返回 ≠ 进程退出：非 daemon 线程要继续跑完（`System.exit` 已经在 native 里直接退）
         self.wait_non_daemon();
         self.thread_terminate_main();
         // `-Dvmless.indy.stats`：调用点解析次数（「同一调用点只解析一次」的证据）
-        if self.indy_stats {
+        if self.sh.indy_stats {
             for line in self.indy_stats_lines() {
                 eprintln!("{line}");
             }
         }
-        thread::clear_vm_ptr();
-        thread::gil_unlock();
+        self.sh.safepoint.unregister();
         match r {
             Ok(r) => Ok(ExecResult {
                 return_value: r.as_i32(),
-                output: std::mem::take(&mut self.output),
+                output: self.output_take(),
                 exception: None,
             }),
             // 未捕获的 Java 异常：输出照常给出，另附一行 "Exception in thread ..."
@@ -317,14 +303,14 @@ impl Vm {
                 let text = self.exc_text(e.exc.unwrap());
                 Ok(ExecResult {
                     return_value: 1,
-                    output: std::mem::take(&mut self.output),
+                    output: self.output_take(),
                     exception: Some(format!("Exception in thread \"main\" {text}")),
                 })
             }
             // VM 内部错误（不是 Java 异常）：已经打印的行**先刷出去**再报错 ——
             // 否则「前面跑得好好的、后面炸了」的诊断信息全被缓冲区吞掉，排查时活受罪
             Err(e) => {
-                for line in self.output.drain(..) {
+                for line in self.output_drain() {
                     println!("{line}");
                 }
                 Err(e)
@@ -347,11 +333,13 @@ impl Vm {
                 "defineClass 的名字 {name:?} 与 class 文件声明的 {actual} 不一致"
             ));
         }
-        self.store.add_class(cf);
+        self.store_mut().add_class(cf);
+        self.publish_store();
         // 类表被换过：调用点与常量缓存全部失效（常量池下标的含义可能已经变了）
-        self.indy_sites.clear();
-        self.condy_values.clear();
-        self.bsm_tables.clear();
+        let mut indy = self.sh.indy.lock().unwrap_or_else(|e| e.into_inner());
+        indy.indy_sites.clear();
+        indy.condy_values.clear();
+        indy.bsm_tables.clear();
         Ok(actual)
     }
 
@@ -370,7 +358,7 @@ impl Vm {
         let name = internal_name(main_class);
         let mut vm = Self::from_store(ClassStore::load_path(&cp, &name)?);
         // classpath 留着：`Class.forName` 要在运行期按需加载闭包（见 `reflect.rs`）
-        vm.cp = Some(cp);
+        *vm.sh.cp.lock().unwrap_or_else(|e| e.into_inner()) = Some(cp);
         Ok(vm)
     }
 }

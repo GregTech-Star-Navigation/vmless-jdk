@@ -33,9 +33,10 @@
 //! 规范里也没规定必须执行它们的 Java 代码）；**其它任何引导方法**（用户自己写的）
 //! 都走通用路径：真的用解释器执行那个 Java 方法，再取它返回的 `CallSite.getTarget()`。
 
+use super::shared::lk;
 use crate::jdk;
 use crate::CpEntry;
-use std::rc::Rc;
+use std::sync::Arc;
 
 use super::err;
 use super::heap::RefKind;
@@ -130,9 +131,9 @@ pub(super) enum MhKind {
     /// 只换了类型的句柄（`asType`）：执行时直接转发到 `target`
     Adapter { target: i32 },
     /// 字符串拼接调用点的目标
-    Concat { chunks: Rc<Vec<Chunk>>, consts: Rc<Vec<TypedSlot>> },
+    Concat { chunks: Arc<Vec<Chunk>>, consts: Arc<Vec<TypedSlot>> },
     /// 函数式接口实例的工厂（`LambdaMetafactory` 的结果）
-    LambdaCtor(Rc<LambdaTemplate>),
+    LambdaCtor(Arc<LambdaTemplate>),
 }
 
 #[derive(Clone)]
@@ -168,6 +169,7 @@ pub(super) struct LambdaTemplate {
     pub factory_type: String,
 }
 
+#[derive(Clone)]
 pub(super) struct LambdaInfo {
     pub target: i32,
     /// 捕获值（原始槽，类型见 `captured_desc`）
@@ -179,6 +181,7 @@ pub(super) struct LambdaInfo {
     pub class_name: String,
 }
 
+#[derive(Clone)]
 pub(super) struct CallSiteInfo {
     pub target: i32,
     pub mutable: bool,
@@ -201,11 +204,9 @@ impl Vm {
     pub(super) fn java_exception(&mut self, class: &str, msg: impl Into<String>) -> VmError {
         let msg = msg.into();
         let n = self.store.field_count(class).max(1);
-        self.objects.push(vec![Slot::I(0); n]);
-        self.object_class.push(class.to_string());
-        let h = self.objects.len() as i32;
+        let h = self.sh.heap.new_object(vec![Slot::I(0); n], &class.to_string()).unwrap_or(0);
         let m = self.str_new(msg.clone());
-        self.exc_msgs.insert(h, m);
+        lk(&self.sh.exc_msgs).insert(h, m);
         // `getMessage()` 读的是 `Throwable.detailMessage` 字段 —— 只记在 `exc_msgs` 里的话，
         // Java 代码 catch 到之后 `e.getMessage()` 会拿到 null（与 HotSpot 不一致）
         self.put_named(h, class, "detailMessage", Slot::I(m));
@@ -224,38 +225,36 @@ impl Vm {
     /// 新建一个 VM 自己管理的对象（`java.lang.invoke.*` 的实例都这么来）
     pub(super) fn alloc_vmobj(&mut self, class: &str) -> i32 {
         let n = self.store.field_count(class).max(1);
-        self.objects.push(vec![Slot::I(0); n]);
-        self.object_class.push(class.to_string());
-        self.objects.len() as i32
+        self.sh.heap.new_object(vec![Slot::I(0); n], &class.to_string()).unwrap_or(0)
     }
 
     // ---------- MethodType ----------
 
     pub(super) fn mtype_obj(&mut self, desc: &str) -> i32 {
         let h = self.alloc_vmobj("java/lang/invoke/MethodType");
-        self.mtypes.insert(h, desc.to_string());
+        self.indy().mtypes.insert(h, desc.to_string());
         h
     }
 
     pub(super) fn mtype_of(&self, h: i32) -> Option<String> {
-        self.mtypes.get(&h).cloned()
+        self.indy().mtypes.get(&h).cloned()
     }
 
     // ---------- MethodHandle ----------
 
     pub(super) fn mh_obj(&mut self, kind: MhKind, mtype: String) -> i32 {
         let h = self.alloc_vmobj("java/lang/invoke/MethodHandle");
-        self.mhs.insert(h, MhInfo { kind, mtype });
+        self.indy().mhs.insert(h, MhInfo { kind, mtype });
         h
     }
 
     fn mh_info(&self, h: i32) -> Option<MhInfo> {
-        self.mhs.get(&h).cloned()
+        self.indy().mhs.get(&h).cloned()
     }
 
     /// 某个句柄是不是我们管的对象（错误信息里区分「不是句柄」和「句柄没有方法」）
     fn is_mh(&self, h: i32) -> bool {
-        self.mhs.contains_key(&h)
+        self.indy().mhs.contains_key(&h)
     }
 
     // ---------- 常量重建 ----------
@@ -324,7 +323,7 @@ impl Vm {
     /// `CONSTANT_Dynamic`：跑一次引导方法拿值，然后缓存（同一个常量只算一次）
     fn condy_value(&mut self, class: usize, bsm: u16, nat: u16) -> Result<TypedSlot, VmError> {
         let key = (class, nat);
-        if let Some(v) = self.condy_values.get(&key) {
+        if let Some(v) = self.indy().condy_values.get(&key) {
             return Ok(v.clone());
         }
         let cf = self.store.classes[class].clone();
@@ -335,23 +334,23 @@ impl Vm {
         let got = ("Ljava/lang/Object;".to_string(), v);
         let v = self.coerce(got.1, &got.0, &want, "CONSTANT_Dynamic")?;
         let out = (want, v);
-        self.condy_values.insert(key, out.clone());
+        self.indy().condy_values.insert(key, out.clone());
         Ok(out)
     }
 
     // ---------- 引导方法表 ----------
 
-    fn bsm_table(&mut self, class: usize) -> Result<Rc<Vec<crate::classfile::attr::BootstrapMethod>>, VmError> {
+    fn bsm_table(&mut self, class: usize) -> Result<Arc<Vec<crate::classfile::attr::BootstrapMethod>>, VmError> {
         let cf = self.store.classes[class].clone();
         let name = cf.this_class_name().unwrap_or_default();
-        if let Some(t) = self.bsm_tables.get(&name) {
+        if let Some(t) = self.indy().bsm_tables.get(&name) {
             return Ok(t.clone());
         }
-        let table = Rc::new(crate::classfile::attr::bootstrap_methods(&cf).map_err(|e| VmError {
+        let table = Arc::new(crate::classfile::attr::bootstrap_methods(&cf).map_err(|e| VmError {
             msg: format!("{name} 的 BootstrapMethods 属性解析失败: {e}"),
             exc: None,
         })?);
-        self.bsm_tables.insert(name, table.clone());
+        self.indy().bsm_tables.insert(name, table.clone());
         Ok(table)
     }
 
@@ -402,14 +401,14 @@ impl Vm {
 
     /// `invokedynamic` 的调用点目标句柄：**每个调用点只解析一次**，之后直接复用
     pub(super) fn indy_site_target(&mut self, class: usize, index: u16) -> Result<i32, VmError> {
-        if let Some(t) = self.indy_sites.get(&(class, index)) {
+        if let Some(t) = self.indy().indy_sites.get(&(class, index)) {
             return Ok(*t);
         }
         let (name, desc, bsm) = self.site_info(class, index)?;
         let site = self.run_bootstrap(class, bsm, &name, &desc)?.as_i32();
         let target = self.callsite_target(site, &name, &desc)?;
-        self.indy_sites.insert((class, index), target);
-        self.indy_resolved += 1;
+        self.indy().indy_sites.insert((class, index), target);
+        self.indy().indy_resolved += 1;
         Ok(target)
     }
 
@@ -420,8 +419,8 @@ impl Vm {
 
     /// `CallSite.getTarget()`：我们的 side table 优先，其次真字节码构造的实例的 `target` 字段
     fn callsite_target(&mut self, site: i32, name: &str, desc: &str) -> Result<i32, VmError> {
-        if let Some(info) = self.callsites.get(&site) {
-            let t = info.target;
+        let site_target = self.indy().callsites.get(&site).map(|i| i.target);
+        if let Some(t) = site_target {
             if self.is_mh(t) {
                 return Ok(t);
             }
@@ -445,7 +444,7 @@ impl Vm {
             }
         };
         if let Some(i) = self.store.field_index(&cls, "target") {
-            if let Some(slots) = self.objects.get(site as usize - 1) {
+            if let Some(slots) = self.sh.heap.snapshot(site) {
                 let t = slots.get(i).map(|s| s.as_i32()).unwrap_or(0);
                 if self.is_mh(t) {
                     return Ok(t);
@@ -505,7 +504,7 @@ impl Vm {
         let params = param_descs(&bsm_desc);
         let mut call_args: Vec<Slot> = Vec::with_capacity(params.len());
         let lookup = self.alloc_vmobj("java/lang/invoke/MethodHandles$Lookup");
-        self.lookups.insert(lookup, caller_name.clone());
+        self.indy().lookups.insert(lookup, caller_name.clone());
         call_args.push(Slot::I(lookup));
         let n = self.str_new(site_name.to_string());
         call_args.push(Slot::I(n));
@@ -558,9 +557,7 @@ impl Vm {
 
     /// 新建一个引用类型数组（元素按 `elem_desc` 的类）
     fn new_ref_array(&mut self, elem_desc: &str, items: Vec<Slot>) -> i32 {
-        self.arrays.push(items);
-        self.array_class.push(elem_desc.to_string());
-        -(self.arrays.len() as i32)
+        self.sh.heap.new_array(items, elem_desc).unwrap_or(0)
     }
 
     // ---------- 方法句柄：类型适配 ----------
@@ -702,7 +699,7 @@ impl Vm {
             }
             MhKind::LambdaCtor(t) => {
                 let h = self.alloc_vmobj(&t.class_name);
-                self.lambdas.insert(
+                self.indy().lambdas.insert(
                     h,
                     LambdaInfo {
                         target: t.target,
@@ -770,7 +767,7 @@ impl Vm {
                 if name == "println" && class == "java/io/PrintStream" {
                     let v = rest.first().copied().unwrap_or(Slot::I(0));
                     let text = self.println_text(desc, v);
-                    self.output.push(text);
+                    self.println(text);
                     return Ok(Slot::I(0));
                 }
                 let actual = match self.ref_kind(recv) {
@@ -811,7 +808,7 @@ impl Vm {
                 let obj = args.first().copied().unwrap_or(Slot::I(0)).as_i32();
                 let f = self.field_offset(obj, class, name)?;
                 Ok(if obj > 0 {
-                    *self.objects[obj as usize - 1].get(f).unwrap_or(&Slot::I(0))
+                    self.sh.heap.get(obj, f).unwrap_or(Slot::I(0))
                 } else {
                     Slot::I(0)
                 })
@@ -822,8 +819,7 @@ impl Vm {
                     return Ok(v);
                 }
                 self.ensure_init(class)?;
-                Ok(self
-                    .statics
+                Ok(lk(&self.sh.statics)
                     .get(&(class.to_string(), name.to_string()))
                     .copied()
                     .unwrap_or(Slot::I(0)))
@@ -834,11 +830,7 @@ impl Vm {
                 let v = args.get(1).copied().unwrap_or(Slot::I(0));
                 let f = self.field_offset(obj, class, name)?;
                 if obj > 0 {
-                    if let Some(slots) = self.objects.get_mut(obj as usize - 1) {
-                        if f < slots.len() {
-                            slots[f] = v;
-                        }
-                    }
+                    self.sh.heap.set(obj, f, v);
                 }
                 Ok(Slot::I(0))
             }
@@ -846,7 +838,7 @@ impl Vm {
                 // putStatic
                 let v = args.first().copied().unwrap_or(Slot::I(0));
                 self.ensure_init(class)?;
-                self.statics.insert((class.to_string(), name.to_string()), v);
+                lk(&self.sh.statics).insert((class.to_string(), name.to_string()), v);
                 Ok(Slot::I(0))
             }
             other => err(format!("未知的方法句柄引用种类 {other}")),
@@ -890,14 +882,14 @@ impl Vm {
     /// 它们的 `toString()` 在 java.base 里会去读对象字段 —— 而状态在 side table 里，
     /// 真跑那段字节码只会得到垃圾，所以这里直接给答案（与 HotSpot 的输出一致）。
     fn vm_object_text(&self, h: i32) -> Option<String> {
-        if let Some(d) = self.mtypes.get(&h) {
+        if let Some(d) = self.indy().mtypes.get(&h) {
             let ps: Vec<String> = param_descs(d).iter().map(|p| java_type_name(p)).collect();
             return Some(format!("({}){}", ps.join(","), java_type_name(&ret_desc(d))));
         }
-        if let Some(i) = self.mhs.get(&h) {
+        if let Some(i) = self.indy().mhs.get(&h) {
             return Some(format!("MethodHandle{}", i.mtype));
         }
-        if let Some(l) = self.lambdas.get(&h) {
+        if let Some(l) = self.indy().lambdas.get(&h) {
             return Some(format!("{}$$Lambda/0x00000000", l.class_name));
         }
         None
@@ -917,7 +909,7 @@ impl Vm {
                 if jdk::wrapper_prim(c).is_some() {
                     return Ok(self.obj_to_string(h));
                 }
-                if let Some(name) = self.lambdas.get(&h).map(|l| l.class_name.clone()) {
+                if let Some(name) = self.indy().lambdas.get(&h).map(|l| l.class_name.clone()) {
                     return Ok(format!("{}$$Lambda", name));
                 }
                 // 真的覆写了 toString 就执行它
@@ -988,7 +980,7 @@ impl Vm {
                 .collect()
         };
         let mh = self.mh_obj(
-            MhKind::Concat { chunks: Rc::new(chunks), consts: Rc::new(consts) },
+            MhKind::Concat { chunks: Arc::new(chunks), consts: Arc::new(consts) },
             site_desc.to_string(),
         );
         Ok(Slot::I(self.new_callsite(mh, "java/lang/invoke/ConstantCallSite", false)))
@@ -996,14 +988,10 @@ impl Vm {
 
     fn new_callsite(&mut self, target: i32, class: &str, mutable: bool) -> i32 {
         let h = self.alloc_vmobj(class);
-        self.callsites.insert(h, CallSiteInfo { target, mutable });
+        self.indy().callsites.insert(h, CallSiteInfo { target, mutable });
         // 真字节码路径也要能看到目标（用户可能调用 getTarget() 的字节码版本）
         if let Some(i) = self.store.field_index(class, "target") {
-            if let Some(slots) = self.objects.get_mut(h as usize - 1) {
-                if i < slots.len() {
-                    slots[i] = Slot::I(target);
-                }
-            }
+            self.sh.heap.set(h, i, Slot::I(target));
         }
         h
     }
@@ -1123,8 +1111,8 @@ impl Vm {
                 }
             }
         }
-        let seq = self.lambda_seq;
-        self.lambda_seq += 1;
+        let seq = self.indy().lambda_seq;
+        self.indy().lambda_seq += 1;
         let class_name = format!("{}$$Lambda${seq}", caller.replace('/', "_"));
         let tpl = LambdaTemplate {
             target: implmh,
@@ -1133,7 +1121,7 @@ impl Vm {
             sams,
             factory_type: invoked_type,
         };
-        let mh = self.mh_obj(MhKind::LambdaCtor(Rc::new(tpl)), factory_type.to_string());
+        let mh = self.mh_obj(MhKind::LambdaCtor(Arc::new(tpl)), factory_type.to_string());
         Ok(Slot::I(self.new_callsite(mh, "java/lang/invoke/ConstantCallSite", false)))
     }
 
@@ -1161,7 +1149,7 @@ impl Vm {
         desc: &str,
         args: &[Slot],
     ) -> Option<Result<Slot, VmError>> {
-        let info = self.lambdas.get(&recv)?;
+        let info = self.indy().lambdas.get(&recv).cloned()?;
         let target = info.target;
         let captured = info.captured.clone();
         let captured_desc = info.captured_desc.clone();
@@ -1234,8 +1222,7 @@ impl Vm {
                 let Some(mh) = typed.first().map(|t| t.1.as_i32()) else {
                     return Err(self.bsm_error("ConstantBootstraps.invoke 缺少 MethodHandle 参数"));
                 };
-                let mtype = self
-                    .mh_info(mh)
+                let mtype = self.mh_info(mh)
                     .map(|i| i.mtype)
                     .ok_or_else(|| self.bsm_error("ConstantBootstraps.invoke 的第 1 个参数不是方法句柄"))?;
                 let rest: Vec<Slot> = typed[1..].iter().map(|t| t.1).collect();
@@ -1260,7 +1247,7 @@ impl Vm {
                     .and_then(|t| self.class_desc_of(t.1.as_i32()))
                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
                 let h = self.alloc_vmobj("java/lang/invoke/VarHandle");
-                self.varhandles.insert(
+                self.indy().varhandles.insert(
                     h,
                     VarHandleInfo {
                         class: decl,
@@ -1279,7 +1266,7 @@ impl Vm {
                 };
                 self.ensure_init(&decl)?;
                 let key = (decl.clone(), site_name.to_string());
-                if let Some(v) = self.statics.get(&key).copied() {
+                if let Some(v) = lk(&self.sh.statics).get(&key).copied() {
                     return Ok(v);
                 }
                 Ok(Slot::I(0))
@@ -1310,11 +1297,10 @@ impl Vm {
         desc: &str,
         args: &[Slot],
     ) -> Result<Option<Slot>, VmError> {
-        let Some(info) = self.varhandles.get(&vh) else {
+        let Some(info) = self.indy().varhandles.get(&vh).map(|i| (i.class.clone(), i.name.clone(), i.desc.clone(), i.is_static)) else {
             return Ok(None);
         };
-        let (class, fname, fdesc, is_static) =
-            (info.class.clone(), info.name.clone(), info.desc.clone(), info.is_static);
+        let (class, fname, fdesc, is_static) = info;
         // 坐标参数：静态字段 0 个，实例字段 1 个（holder）
         let coord = usize::from(!is_static);
         let _ = desc;
@@ -1322,8 +1308,7 @@ impl Vm {
         let read = |vm: &mut Vm| -> Result<Slot, VmError> {
             if is_static {
                 vm.ensure_init(&class)?;
-                Ok(vm
-                    .statics
+                Ok(lk(&vm.sh.statics)
                     .get(&(class.clone(), fname.clone()))
                     .copied()
                     .unwrap_or(Slot::I(0)))
@@ -1335,13 +1320,13 @@ impl Vm {
                     ));
                 }
                 let f = vm.field_offset(holder, &class, &fname)?;
-                Ok(*vm.objects[holder as usize - 1].get(f).unwrap_or(&Slot::I(0)))
+                Ok(vm.sh.heap.get(holder, f).unwrap_or(Slot::I(0)))
             }
         };
         let write = |vm: &mut Vm, v: Slot| -> Result<(), VmError> {
             if is_static {
                 vm.ensure_init(&class)?;
-                vm.statics.insert((class.clone(), fname.clone()), v);
+                lk(&vm.sh.statics).insert((class.clone(), fname.clone()), v);
             } else {
                 if holder == 0 {
                     return Err(vm.java_exception(
@@ -1350,11 +1335,7 @@ impl Vm {
                     ));
                 }
                 let f = vm.field_offset(holder, &class, &fname)?;
-                if let Some(slots) = vm.objects.get_mut(holder as usize - 1) {
-                    if f < slots.len() {
-                        slots[f] = v;
-                    }
-                }
+                vm.sh.heap.set(holder, f, v);
             }
             Ok(())
         };
@@ -1445,14 +1426,13 @@ impl Vm {
         if class == "java/lang/invoke/MethodHandles" {
             return Ok(Some(match name {
                 "lookup" | "publicLookup" => {
-                    let caller = self
-                        .store
+                    let caller = self.store
                         .classes
                         .get(0)
                         .and_then(|c| c.this_class_name())
                         .unwrap_or_default();
                     let h = self.alloc_vmobj("java/lang/invoke/MethodHandles$Lookup");
-                    self.lookups.insert(h, caller);
+                    self.indy().lookups.insert(h, caller);
                     Slot::I(h)
                 }
                 "privateLookupIn" => {
@@ -1533,7 +1513,7 @@ impl Vm {
                 .collect();
             let caller = args
                 .first()
-                .and_then(|s| self.lookups.get(&s.as_i32()).cloned())
+                .and_then(|s| self.indy().lookups.get(&s.as_i32()).cloned())
                 .unwrap_or_else(|| {
                     self.store
                         .classes
@@ -1550,7 +1530,7 @@ impl Vm {
 
     fn array_slots(&self, h: i32) -> Vec<Slot> {
         if h < 0 {
-            self.arrays.get((-h - 1) as usize).cloned().unwrap_or_default()
+            self.sh.heap.snapshot(h).unwrap_or_default()
         } else {
             Vec::new()
         }
@@ -1579,12 +1559,10 @@ impl Vm {
                 Ok(Slot::I(0))
             }
             (_, "findStatic") | (_, "findVirtual") | (_, "findSpecial") | (_, "findConstructor") => {
-                let c = self
-                    .class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                let c = self.class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
                     .ok_or_else(|| self.bsm_error(format!("Lookup.{name} 的第一个参数不是 Class")))?;
                 let n = self.value_text(args.get(1).copied().unwrap_or(Slot::I(0)).as_i32())?;
-                let mt = self
-                    .mtype_of(args.get(2).copied().unwrap_or(Slot::I(0)).as_i32())
+                let mt = self.mtype_of(args.get(2).copied().unwrap_or(Slot::I(0)).as_i32())
                     .ok_or_else(|| {
                         self.bsm_error(format!("Lookup.{name} 的第 3 个参数不是 MethodType"))
                     })?;
@@ -1626,12 +1604,10 @@ impl Vm {
                 Ok(Slot::I(h))
             }
             (_, "findGetter") | (_, "findSetter") | (_, "findStaticGetter") | (_, "findStaticSetter") => {
-                let c = self
-                    .class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                let c = self.class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
                     .ok_or_else(|| self.bsm_error(format!("Lookup.{name} 的第一个参数不是 Class")))?;
                 let f = self.value_text(args.get(1).copied().unwrap_or(Slot::I(0)).as_i32())?;
-                let fdesc = self
-                    .class_desc_of(args.get(2).copied().unwrap_or(Slot::I(0)).as_i32())
+                let fdesc = self.class_desc_of(args.get(2).copied().unwrap_or(Slot::I(0)).as_i32())
                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
                 let (ref_kind, mtype) = match name {
                     "findGetter" => (1, format!("(L{c};){fdesc}")),
@@ -1646,15 +1622,13 @@ impl Vm {
                 Ok(Slot::I(h))
             }
             (_, "findVarHandle") | (_, "findStaticVarHandle") => {
-                let c = self
-                    .class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                let c = self.class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
                     .ok_or_else(|| self.bsm_error(format!("Lookup.{name} 的第一个参数不是 Class")))?;
                 let f = self.value_text(args.get(1).copied().unwrap_or(Slot::I(0)).as_i32())?;
-                let fdesc = self
-                    .class_desc_of(args.get(2).copied().unwrap_or(Slot::I(0)).as_i32())
+                let fdesc = self.class_desc_of(args.get(2).copied().unwrap_or(Slot::I(0)).as_i32())
                     .unwrap_or_else(|| "Ljava/lang/Object;".into());
                 let h = self.alloc_vmobj("java/lang/invoke/VarHandle");
-                self.varhandles.insert(
+                self.indy().varhandles.insert(
                     h,
                     VarHandleInfo {
                         class: c,
@@ -1715,18 +1689,15 @@ impl Vm {
                 self.invoke_mh_as(recv, &want, &vals, "MethodHandle.invokeWithArguments")
             }
             "type" => {
-                let t = self
-                    .mh_info(recv)
+                let t = self.mh_info(recv)
                     .map(|i| i.mtype)
                     .ok_or_else(|| self.wrong_type("MethodHandle.type(): 接收者不是方法句柄"))?;
                 Ok(Slot::I(self.mtype_obj(&t)))
             }
             "asType" => {
-                let want = self
-                    .mtype_of(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                let want = self.mtype_of(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
                     .ok_or_else(|| self.bsm_error("MethodHandle.asType: 参数不是 MethodType"))?;
-                let have = self
-                    .mh_info(recv)
+                let have = self.mh_info(recv)
                     .map(|i| i.mtype)
                     .ok_or_else(|| self.wrong_type("MethodHandle.asType: 接收者不是方法句柄"))?;
                 // 规范要求：asType **只允许** 宽化 / 装箱 / 拆箱 / 引用转换。
@@ -1762,8 +1733,7 @@ impl Vm {
                 Ok(Slot::I(h))
             }
             "toString" => {
-                let ty = self
-                    .mh_info(recv)
+                let ty = self.mh_info(recv)
                     .map(|i| i.mtype)
                     .unwrap_or_else(|| "?".into());
                 let s = self.str_new(format!("MethodHandle{ty}"));
@@ -1789,8 +1759,7 @@ impl Vm {
                 // (Class,Class,Class[]) / (Class,List)。**按签名走**，不要按「第 2 个参数
                 // 长得像什么」猜 —— `methodType(int.class, int.class)` 走的是单参数重载。
                 let params = param_descs(desc);
-                let r = self
-                    .class_desc_of(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                let r = self.class_desc_of(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
                     .unwrap_or_else(|| "V".into());
                 let mut ps = String::new();
                 for (i, p) in params.iter().enumerate().skip(1) {
@@ -1800,16 +1769,14 @@ impl Vm {
                             // 末尾的 varargs 数组（可能是 null）
                             for s in self.array_slots(v) {
                                 ps.push_str(
-                                    &self
-                                        .class_desc_of(s.as_i32())
+                                    &self.class_desc_of(s.as_i32())
                                         .unwrap_or_else(|| "Ljava/lang/Object;".into()),
                                 );
                             }
                         }
                         "Ljava/lang/Class;" => {
                             ps.push_str(
-                                &self
-                                    .class_desc_of(v)
+                                &self.class_desc_of(v)
                                     .unwrap_or_else(|| "Ljava/lang/Object;".into()),
                             );
                         }
@@ -1837,22 +1804,19 @@ impl Vm {
                 Ok(Slot::I(self.mtype_obj(&s)))
             }
             "parameterCount" => {
-                let d = self
-                    .mtype_of(recv)
+                let d = self.mtype_of(recv)
                     .ok_or_else(|| self.bsm_error("MethodType.parameterCount: 接收者不是 MethodType"))?;
                 Ok(Slot::I(param_descs(&d).len() as i32))
             }
             "parameterType" => {
-                let d = self
-                    .mtype_of(recv)
+                let d = self.mtype_of(recv)
                     .ok_or_else(|| self.bsm_error("MethodType.parameterType: 接收者不是 MethodType"))?;
                 let i = args.first().copied().unwrap_or(Slot::I(0)).as_i32().max(0) as usize;
                 let p = param_descs(&d).get(i).cloned().unwrap_or_else(|| "V".into());
                 Ok(Slot::I(self.class_obj(&p)))
             }
             "parameterArray" => {
-                let d = self
-                    .mtype_of(recv)
+                let d = self.mtype_of(recv)
                     .ok_or_else(|| self.bsm_error("MethodType.parameterArray: 接收者不是 MethodType"))?;
                 let mut items = Vec::new();
                 for p in param_descs(&d) {
@@ -1863,21 +1827,18 @@ impl Vm {
                 Ok(Slot::I(arr))
             }
             "returnType" => {
-                let d = self
-                    .mtype_of(recv)
+                let d = self.mtype_of(recv)
                     .ok_or_else(|| self.bsm_error("MethodType.returnType: 接收者不是 MethodType"))?;
                 let r = ret_desc(&d);
                 Ok(Slot::I(self.class_obj(&r)))
             }
             "descriptorString" | "toMethodDescriptorString" => {
-                let d = self
-                    .mtype_of(recv)
+                let d = self.mtype_of(recv)
                     .ok_or_else(|| self.bsm_error(format!("MethodType.{name}: 接收者不是 MethodType")))?;
                 Ok(Slot::I(self.str_new(d)))
             }
             "toString" => {
-                let d = self
-                    .mtype_of(recv)
+                let d = self.mtype_of(recv)
                     .ok_or_else(|| self.bsm_error("MethodType.toString: 接收者不是 MethodType"))?;
                 // Java 的形态是 `(int,long)void`（类型名，不是描述符）
                 let ps: Vec<String> = param_descs(&d).iter().map(|p| java_type_name(p)).collect();
@@ -1917,18 +1878,14 @@ impl Vm {
             let target = args.first().copied().unwrap_or(Slot::I(0)).as_i32();
             let mutable = class.contains("Mutable");
             if self.is_mh(target) {
-                self.callsites.insert(recv, CallSiteInfo { target, mutable });
+                self.indy().callsites.insert(recv, CallSiteInfo { target, mutable });
                 if let Some(i) = self.store.field_index(class, "target") {
-                    if let Some(slots) = self.objects.get_mut(recv as usize - 1) {
-                        if i < slots.len() {
-                            slots[i] = Slot::I(target);
-                        }
-                    }
+                    self.sh.heap.set(recv, i, Slot::I(target));
                 }
             } else if let Some(mt) = self.mtype_of(target) {
                 // MutableCallSite(MethodType)：先放一个「恒等」目标，等 setTarget 覆盖
                 let mh = self.mh_obj(MhKind::Identity, mt.clone());
-                self.callsites.insert(recv, CallSiteInfo { target: mh, mutable: true });
+                self.indy().callsites.insert(recv, CallSiteInfo { target: mh, mutable: true });
             } else {
                 return Err(self.bsm_error(format!(
                     "{}.<init>({desc}) 的参数既不是方法句柄也不是 MethodType",
@@ -1938,23 +1895,29 @@ impl Vm {
             return Ok(Slot::I(0));
         }
         match name {
-            "getTarget" | "dynamicInvoker" => match self.callsites.get(&recv) {
-                Some(i) => Ok(Slot::I(i.target)),
-                None => Err(self.bsm_error(format!(
-                    "CallSite.getTarget(): 句柄 {recv} 不是本 VM 的调用点"
-                ))),
-            },
+            "getTarget" | "dynamicInvoker" => {
+                let t = self.indy().callsites.get(&recv).map(|i| i.target);
+                match t {
+                    Some(t) => Ok(Slot::I(t)),
+                    None => Err(self.bsm_error(format!(
+                        "CallSite.getTarget(): 句柄 {recv} 不是本 VM 的调用点"
+                    ))),
+                }
+            }
             "setTarget" => {
                 let target = args.first().copied().unwrap_or(Slot::I(0)).as_i32();
                 if !self.is_mh(target) {
                     return Err(self.wrong_type("CallSite.setTarget: 参数不是方法句柄"));
                 }
-                match self.callsites.get_mut(&recv) {
-                    Some(i) if i.mutable => {
-                        i.target = target;
+                let mutable = self.indy().callsites.get(&recv).map(|i| i.mutable);
+                match mutable {
+                    Some(true) => {
+                        if let Some(i) = self.indy().callsites.get_mut(&recv) {
+                            i.target = target;
+                        }
                         Ok(Slot::I(0))
                     }
-                    Some(_) => Err(self.java_exception(
+                    Some(false) => Err(self.java_exception(
                         "java/lang/UnsupportedOperationException",
                         "ConstantCallSite.setTarget()".to_string(),
                     )),
@@ -1964,7 +1927,7 @@ impl Vm {
                 }
             }
             "type" => {
-                let mh = self.callsites.get(&recv).map(|i| i.target);
+                let mh = self.indy().callsites.get(&recv).map(|i| i.target);
                 match mh.and_then(|m| self.mh_info(m)).map(|i| i.mtype) {
                     Some(t) => Ok(Slot::I(self.mtype_obj(&t))),
                     None => Err(self.bsm_error("CallSite.type(): 拿不到目标句柄")),
@@ -1985,10 +1948,10 @@ impl Vm {
         vec![
             format!(
                 "[indy] 调用点解析 {} 次，执行 {} 次，lambda 实例 {} 个，缓存命中 {} 次",
-                self.indy_resolved,
-                self.indy_calls,
-                self.lambda_seq,
-                self.indy_calls.saturating_sub(self.indy_resolved)
+                self.indy().indy_resolved,
+                self.indy().indy_calls,
+                self.indy().lambda_seq,
+                self.indy().indy_calls.saturating_sub(self.indy().indy_resolved)
             ),
         ]
     }
@@ -2219,7 +2182,7 @@ fn prim_convert(v: Slot, from: &str, to: &str) -> Slot {
 /// 为什么不塞进对象字段：句柄/调用点的语义是 VM 的，不是 Java 对象的；side table
 /// 让 `getClass()`/`instanceof` 还能照常看到 `java.lang.invoke.MethodHandle` 这个类。
 /// 这里只放文档与类型别名，真正的字段在 `Vm` 上（与其它堆表保持同一处）。
-pub(super) type BsmTable = Rc<Vec<crate::classfile::attr::BootstrapMethod>>;
+pub(super) type BsmTable = Arc<Vec<crate::classfile::attr::BootstrapMethod>>;
 
 #[cfg(test)]
 mod tests {

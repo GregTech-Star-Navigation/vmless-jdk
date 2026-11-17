@@ -8,7 +8,8 @@ SRC="D:/vmless/src"
 
 # 本机有个带外文件监视器会长期持有「被执行过的 exe」句柄（之后 rm/cp/执行全报
 # "Device or resource busy"）。对策：每轮把三件套复制进带 PID+时间的新目录再跑。
-RUNBIN="/d/vmless/.runbin-$$-$(date +%H%M%S)"
+RUNBIN="/d/vmless/.runbin-$$"
+trap 'rm -rf "$RUNBIN" "$OUT" 2>/dev/null' EXIT
 mkdir -p "$RUNBIN"
 for e in rustjava compile_src run_jit; do
     cp "$BIN/$e.exe" "$RUNBIN/" 2>/dev/null || cp "$BIN/examples/$e.exe" "$RUNBIN/" 2>/dev/null

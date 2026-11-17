@@ -15,6 +15,7 @@
 //! 判据一句话：**这个方法在 OpenJDK 源码里带 `native` 关键字吗**？带 → 进本表；
 //! 不带 → 它有字节码，就该由解释器执行，不许在这里写一份。
 
+use super::shared::lk;
 use super::frame::Frame;
 use super::heap::RefKind;
 use super::slot::Slot;
@@ -517,7 +518,7 @@ fn thread_start_override(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 /// `Integer.IntegerCache.<clinit>` 就挂在里面。
 fn vm_initialize(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     let map = vm.new_instance("java/util/HashMap", "()V")?;
-    vm.statics.insert(("jdk/internal/misc/VM".to_string(), "savedProps".to_string()), Slot::I(map));
+    lk(&vm.sh.statics).insert(("jdk/internal/misc/VM".to_string(), "savedProps".to_string()), Slot::I(map));
     void()
 }
 
@@ -539,18 +540,14 @@ fn obj_clone(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         RefKind::Null => Err(vm.throw("java/lang/NullPointerException")),
         RefKind::Str => Ok(Slot::I(this)),
         RefKind::Obj(_) => {
-            let slots = vm.objects.get(this as usize - 1).cloned().unwrap_or_default();
-            let cls = vm.object_class.get(this as usize - 1).cloned().unwrap_or_default();
-            vm.objects.push(slots);
-            vm.object_class.push(cls);
-            Ok(Slot::I(vm.objects.len() as i32))
+            let slots = vm.sh.heap.snapshot(this).unwrap_or_default();
+            let cls = vm.sh.heap.class_of(this).unwrap_or_else(|| "java/lang/Object".into());
+            Ok(Slot::I(vm.sh.heap.new_object(slots, &cls).unwrap_or(0)))
         }
         RefKind::Arr(_) => {
-            let slots = vm.arrays.get((-this - 1) as usize).cloned().unwrap_or_default();
-            let cls = vm.array_class.get((-this - 1) as usize).cloned().unwrap_or_default();
-            vm.arrays.push(slots);
-            vm.array_class.push(cls);
-            Ok(Slot::I(-(vm.arrays.len() as i32)))
+            let slots = vm.sh.heap.snapshot(this).unwrap_or_default();
+            let cls = vm.sh.heap.class_of(this).unwrap_or_else(|| "[Ljava/lang/Object;".into());
+            Ok(Slot::I(vm.sh.heap.new_array(slots, &cls).unwrap_or(0)))
         }
     }
 }
@@ -671,7 +668,7 @@ fn read_mem(vm: &Vm, obj: i32, i: usize, width: usize) -> u64 {
     let is_bytes = matches!(vm.ref_kind(obj), RefKind::Arr(ref d) if d == "[B");
     if is_bytes && width > 1 {
         let mut out = 0u64;
-        if let Some(a) = vm.arrays.get((-obj - 1) as usize) {
+        if let Some(a) = vm.sh.heap.snapshot(obj) {
             for k in 0..width {
                 out |= ((a.get(i + k).map(|s| s.as_i32() as u8).unwrap_or(0) as u64) & 0xFF) << (8 * k);
             }
@@ -690,11 +687,9 @@ fn read_mem(vm: &Vm, obj: i32, i: usize, width: usize) -> u64 {
 fn write_mem(vm: &mut Vm, obj: i32, i: usize, width: usize, v: u64) {
     let is_bytes = matches!(vm.ref_kind(obj), RefKind::Arr(ref d) if d == "[B");
     if is_bytes && width > 1 {
-        if let Some(a) = vm.arrays.get_mut((-obj - 1) as usize) {
+        if vm.sh.heap.array_len(obj).is_some() {
             for k in 0..width {
-                if i + k < a.len() {
-                    a[i + k] = Slot::I(((v >> (8 * k)) & 0xFF) as i32);
-                }
+                vm.sh.heap.set(obj, i + k, Slot::I(((v >> (8 * k)) & 0xFF) as i32));
             }
         }
         return;
@@ -710,10 +705,10 @@ fn write_mem(vm: &mut Vm, obj: i32, i: usize, width: usize, v: u64) {
 fn unsafe_slot(vm: &Vm, obj: i32, off: i64) -> Option<Slot> {
     let i = slot_index(vm, obj, off)?;
     match vm.ref_kind(obj) {
-        RefKind::Arr(_) => vm.arrays.get((-obj - 1) as usize)?.get(i).copied(),
+        RefKind::Arr(_) => vm.sh.heap.get(obj, i),
         // 字符串常量的字段视图（材料化过才有；没材料化就当成 0，调用方自己会重新取）
-        RefKind::Str => vm.str_fields.get(&obj)?.get(i).copied(),
-        RefKind::Obj(_) => vm.objects.get(obj as usize - 1)?.get(i).copied(),
+        RefKind::Str => vm.sh.heap.str_field_get(obj, i),
+        RefKind::Obj(_) => vm.sh.heap.get(obj, i),
         _ => None,
     }
 }
@@ -721,26 +716,9 @@ fn unsafe_slot(vm: &Vm, obj: i32, off: i64) -> Option<Slot> {
 fn unsafe_put_impl(vm: &mut Vm, obj: i32, off: i64, v: Slot) {
     let Some(i) = slot_index(vm, obj, off) else { return };
     match vm.ref_kind(obj) {
-        RefKind::Arr(_) => {
-            if let Some(a) = vm.arrays.get_mut((-obj - 1) as usize) {
-                if i < a.len() {
-                    a[i] = v;
-                }
-            }
-        }
-        RefKind::Str => {
-            let slots = vm.str_field_slots(obj);
-            if i < slots.len() {
-                slots[i] = v;
-            }
-        }
-        RefKind::Obj(_) => {
-            if let Some(slots) = vm.objects.get_mut(obj as usize - 1) {
-                if i < slots.len() {
-                    slots[i] = v;
-                }
-            }
-        }
+        RefKind::Arr(_) => vm.sh.heap.set(obj, i, v),
+        RefKind::Str => vm.str_field_write(obj, i, v),
+        RefKind::Obj(_) => vm.sh.heap.set(obj, i, v),
         _ => {}
     }
 }
@@ -968,9 +946,7 @@ fn unsafe_throw(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 fn unsafe_allocate(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let cls = vm.class_obj_name(f.arg_i(0)).unwrap_or_default();
     let n = vm.store.field_count(&cls);
-    vm.objects.push(vec![Slot::I(0); n.max(1)]);
-    vm.object_class.push(cls);
-    Ok(Slot::I(vm.objects.len() as i32))
+    Ok(Slot::I(vm.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &cls).unwrap_or(0)))
 }
 
 fn now_millis() -> i64 {

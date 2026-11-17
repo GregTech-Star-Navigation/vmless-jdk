@@ -1,5 +1,6 @@
 //! 对象 / 数组 / 字符串 / 类对象 四套堆与引用句柄编码。
 
+use super::shared::lk;
 use crate::CpEntry;
 
 use super::slot::Slot;
@@ -39,18 +40,11 @@ pub(super) fn java_class_name(desc: &str) -> String {
 impl Vm {
     /// 字符串常量 → 句柄（同一常量池项复用同一句柄；不同类要分开记，索引会撞）
     pub(super) fn string_handle(&mut self, class: usize, cp_index: u16) -> i32 {
-        if let Some(h) = self.string_handles.get(&(class, cp_index)) {
-            return *h;
-        }
-        let text = self.string_at(class, cp_index).unwrap_or_default();
-        self.strings.push(text);
-        let h = STR_BASE + self.strings.len() as i32 - 1;
-        self.string_handles.insert((class, cp_index), h);
-        h
+        self.sh.heap.string_handle(class, cp_index, || self.string_at(class, cp_index))
     }
 
     pub(super) fn string_text(&self, handle: i32) -> String {
-        self.strings.get((handle - STR_BASE) as usize).cloned().unwrap_or_default()
+        self.sh.heap.string_text(handle)
     }
 
     pub(super) fn ref_kind(&self, handle: i32) -> RefKind {
@@ -58,10 +52,13 @@ impl Vm {
             RefKind::Null
         } else if handle >= STR_BASE {
             RefKind::Str
-        } else if handle > 0 {
-            RefKind::Obj(self.object_class.get(handle as usize - 1).cloned().unwrap_or_default())
         } else {
-            RefKind::Arr(self.array_class.get((-handle - 1) as usize).cloned().unwrap_or_default())
+            match self.sh.heap.class_of(handle) {
+                Some(c) if handle > 0 => RefKind::Obj(c.to_string()),
+                Some(d) => RefKind::Arr(d.to_string()),
+                // 句柄指向一个已经不存在的对象：报 null 而不是瞎猜一个类名
+                None => RefKind::Null,
+            }
         }
     }
 
@@ -90,7 +87,7 @@ impl Vm {
         } else {
             desc
         };
-        if let Some(h) = self.class_obj_cache.get(desc) {
+        if let Some(h) = lk(&self.sh.class_obj_cache).get(desc) {
             return *h;
         }
         let n = self.store.field_count("java/lang/Class").max(1);
@@ -127,11 +124,9 @@ impl Vm {
                 }
             }
         }
-        self.objects.push(slots);
-        self.object_class.push("java/lang/Class".to_string());
-        let h = self.objects.len() as i32;
-        self.class_obj_cache.insert(desc.to_string(), h);
-        self.class_objs.insert(h, desc.to_string());
+        let h = self.sh.heap.new_object(slots, "java/lang/Class").unwrap_or(0);
+        lk(&self.sh.class_obj_cache).insert(desc.to_string(), h);
+        lk(&self.sh.class_objs).insert(h, desc.to_string());
         h
     }
 
@@ -167,7 +162,7 @@ impl Vm {
 
     /// 类对象句柄 → 它代表的类描述符（数组是 `[I` / `[Ljava/lang/String;` 这种）
     pub(crate) fn class_obj_name(&self, h: i32) -> Option<String> {
-        self.class_objs.get(&h).cloned()
+        lk(&self.sh.class_objs).get(&h).cloned()
     }
 
     /// 任意引用 → 它的运行时类描述符（`getClass()` 的语义；null 没有类）
@@ -188,8 +183,8 @@ impl Vm {
     /// 为什么要它：真 java.base 的 `String.length()` 是 `value.length >> coder`，
     /// 走的是 `getfield`。而 `ldc "abc"` 给的是字符串堆句柄（没有字段槽）。
     /// 两边必须能互相看见，否则「真字节码」一碰字符串常量就断。
-    pub(super) fn str_field_slots(&mut self, h: i32) -> &mut Vec<Slot> {
-        if !self.str_fields.contains_key(&h) {
+    pub(super) fn str_field_slots(&mut self, h: i32) -> Vec<Slot> {
+        if self.sh.heap.str_field_snapshot(h).is_none() {
             let text = self.string_text(h);
             let latin1 = text.chars().all(|c| (c as u32) <= 0xFF);
             let mut bytes: Vec<Slot> = Vec::with_capacity(text.len());
@@ -203,9 +198,7 @@ impl Vm {
                     bytes.push(Slot::I((u & 0xFF) as i32));
                 }
             }
-            self.arrays.push(bytes);
-            self.array_class.push("[B".to_string());
-            let arr = -(self.arrays.len() as i32);
+            let arr = self.sh.heap.new_array(bytes, "[B").unwrap_or(0);
             let coder = if latin1 { 0 } else { 1 };
             let mut slots = vec![Slot::I(0); self.str_field_count()];
             for (name, v) in [("value", Slot::I(arr)), ("coder", Slot::I(coder))] {
@@ -213,9 +206,17 @@ impl Vm {
                     slots[i] = v;
                 }
             }
-            self.str_fields.insert(h, slots);
+            // **必须**把算好的 value/coder 装进去；只 ensure 一个全零向量会让
+            // 字符串常量的 value=null、coder=0，"hello".hashCode() 变成 0、
+            // String.equals 与真 String 对象永远不等（踩过）
+            self.sh.heap.str_fields_install(h, slots);
         }
-        self.str_fields.get_mut(&h).expect("刚插入")
+        self.sh.heap.str_field_snapshot(h).unwrap_or_default()
+    }
+
+    /// 字符串句柄的字段写（`putfield` 落在字符串上时用）
+    pub(super) fn str_field_write(&mut self, h: i32, i: usize, v: Slot) {
+        self.sh.heap.str_field_set(h, i, v);
     }
 
     /// `java.lang.String` 的实例字段数（没加载这个类时按 4：value/coder/hash/hashIsZero）
@@ -253,13 +254,13 @@ impl Vm {
         if !matches!(self.ref_kind(h), RefKind::Obj(ref c) if c == "java/lang/String") {
             return None;
         }
-        let f = self.objects.get(h as usize - 1)?;
+        let f = self.sh.heap.snapshot(h)?;
         let arr = f.get(self.str_field_index("value")?)?.as_i32();
         let coder = f.get(self.str_field_index("coder")?)?.as_i32();
         if arr >= 0 {
             return None; // value 还没被 <init> 赋上
         }
-        let bytes = self.arrays.get((-arr - 1) as usize)?;
+        let bytes = self.sh.heap.snapshot(arr)?;
         let mut out = String::new();
         if coder == 0 {
             for s in bytes {

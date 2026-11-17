@@ -26,15 +26,12 @@ impl Vm {
             d if d.starts_with("(L") => self.obj_to_string(arg.as_i32()),
             _ => arg.as_i32().to_string(),
         };
-        let buf = self.sb_bufs.entry(handle).or_default();
-        buf.push_str(&text);
+        self.sh.heap.sb_bufs_append(handle, &text);
         Ok(Slot::I(handle))
     }
 
     /// `StringBuilder.toString()`：缓冲 → 字符串堆里的一个新句柄
     pub(super) fn sb_finish(&mut self, handle: i32) -> i32 {
-        let text = self.sb_bufs.remove(&handle).unwrap_or_default();
-        self.strings.push(text);
-        super::heap::STR_BASE + self.strings.len() as i32 - 1
+        self.sh.heap.new_string(self.sh.heap.sb_bufs_take(handle))
     }
 }

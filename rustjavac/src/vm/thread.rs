@@ -1,58 +1,47 @@
-//! Java 线程、对象监视器、全局 VM 锁（GIL）。
+//! Java 线程、对象监视器、停靠点。
 //!
-//! ## 为什么是「一把大锁」
+//! ## 线程模型（2026-11 去 GIL）
 //!
-//! 解释器（`Vm`）从头到尾是 `&mut self`：对象堆、静态字段、类表、字符串池都在里面。
-//! 把堆拆成 `Arc<Mutex<Heap>>` 意味着把 `execute` 里几千处 `self.objects[…]`
-//! 全改成「先 lock 再访问」，而且阻塞点上 `&mut self` 还得能交还 guard —— 借用检查不允许。
+//! 每个 Java 线程 = 一个 OS 线程（`std::thread`），**各自持有一个 `Vm`**
+//! （`Vm::fork` 造出来的解释器上下文），各自有 Rust 栈上的帧栈。
+//! 线程之间不再串行：需要共享的东西都在 `Shared` 里，且每一条路径都有明确的同步。
 //!
-//! 这里用等价但可行的做法：**整个 `Vm` 只有一把锁（GIL）**，谁持有谁独占访问；
-//! 阻塞点显式 `gil_unlock()` / `gil_lock()`。于是「堆要不要加锁」这个问题根本不存在 ——
-//! 加锁粒度 = 整个 VM（CPython 的 GIL 就是这个结构）。代价是 Java 线程之间**不并行**
-//! 执行字节码，收益是没有任何数据竞争，也不需要 TLAB / 对象搬动时的锁。
+//! 旧实现是「一把大锁 + `AtomicPtr<Vm>`」：谁持锁谁独占整个 VM，每 512 条字节码
+//! 交还一次。那是 CPython 式 GIL —— 实测 4 线程比串行慢 2.2 倍（票据锁的 condvar
+//! 乒乓比干活还贵）。现在**没有全局锁**：
 //!
-//! ## 线程模型
+//! | 共享物 | 同步方式 |
+//! | --- | --- |
+//! | 对象字段 / 数组元素 | `Cell` 上的原子（无锁） |
+//! | 对象分配 | 页表 + 原子序号（无锁） |
+//! | 类表 | `Arc<ClassStore>` 快照（读不加锁） |
+//! | 对象监视器 | 对象头 thin lock（CAS）+ 竞争时膨胀的等待集 |
+//! | 静态字段 / 类对象 / indy 状态 | 分组 `Mutex`（都不在字节码热路径上） |
+//! | 停靠点 | 全局轮次 + 每线程 park（`gc.rs`） |
 //!
-//! 每个 Java 线程 = 一个 OS 线程（`std::thread`），各自持有自己的 Rust 栈，
-//! 解释器的 `Frame` 就在那个栈上 —— 「每个线程有自己的帧栈」是白拿的。
-//! 线程之间靠 GIL 串行，但**真的会互相切换**：阻塞点（sleep / wait / join /
-//! monitorenter 竞争）交还 GIL，另外每 [`SAFEPOINT_EVERY`] 条字节码也强制交还一次，
-//! 所以死循环线程不会把别的线程饿死（抢占式调度的粗糙版）。
+//! 阻塞点（sleep / wait / join / monitorenter 竞争）就是普通的 park —— 不再需要
+//! 「交还 / 重新获取」锁这一步，因为根本没有锁可交还。
 //!
-//! GIL 是**票据锁**（ticket lock）：严格 FIFO。这不是洁癖 —— 释放后立刻重抢时，
-//! 非公平锁会让同一个线程一直赢，别的线程永远跑不上来。
+//! ## 监视器语义（JVMS）
 //!
-//! ## 监视器
-//!
-//! `monitors: 对象句柄 → Monitor{owner, count, entry, cond}`。因为只有 GIL 持有者
-//! 在跑，监视器表是普通 `HashMap`，不需要原子操作。语义按 JVMS：
 //! - `monitorenter` 可重入（同一线程 count+1），被别人持有就阻塞（FIFO 队首）；
 //! - `monitorexit` count-1，归零时**移交**给 entry 队首（hand-off，防插队）；
 //! - `wait` 必须在持锁时调用，否则 `IllegalMonitorStateException`；它会**完全释放**
 //!   监视器（含重入计数）、进条件队列、被 `notify` 搬进 entry 队列后再重新获取，
 //!   最后把重入计数恢复成 `wait` 前的值。
+//!
+//! 状态机与「状态存在哪」（对象头 thin 字 / 膨胀后的等待集）见 [`super::monitors`]。
 
+use super::shared::lk;
 use std::cell::Cell;
-use std::collections::{HashMap, VecDeque};
-use std::sync::atomic::{AtomicPtr, AtomicU64, Ordering};
+use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
+use super::monitors::{thin_count, thin_owner, thin_word, WaitSet, COUNT_MAX, INFLATED};
 use super::slot::Slot;
 use super::{Vm, VmError};
-
-// ---------------------------------------------------------------- 全局 VM 锁（GIL）
-
-struct Gil {
-    next: u64,
-    serving: u64,
-}
-
-static GIL: Mutex<Gil> = Mutex::new(Gil { next: 0, serving: 0 });
-static GIL_CV: Condvar = Condvar::new();
-
-/// 当前正在跑的 `Vm` 的地址。**只在持有 GIL 时解引用**（见 [`vm_ref`]）。
-static VM_PTR: AtomicPtr<Vm> = AtomicPtr::new(std::ptr::null_mut());
 
 /// 下一个 Java 线程 id（1 留给 main）
 static NEXT_TID: AtomicU64 = AtomicU64::new(2);
@@ -60,8 +49,6 @@ static NEXT_TID: AtomicU64 = AtomicU64::new(2);
 thread_local! {
     /// 本 OS 线程代表哪个 Java 线程
     static TID: Cell<u64> = const { Cell::new(0) };
-    /// 本线程此刻是否持有 GIL
-    static GIL_HELD: Cell<bool> = const { Cell::new(false) };
 }
 
 /// 当前线程的 Java 线程 id（0 = 还没进 VM）
@@ -76,63 +63,6 @@ fn set_tid(t: u64) {
 /// 主线程登记为 tid = 1（`run_main` 进 VM 时调）
 pub(super) fn set_main_tid() {
     set_tid(1);
-}
-
-fn holds_gil() -> bool {
-    GIL_HELD.with(|h| h.get())
-}
-
-fn set_holding(v: bool) {
-    GIL_HELD.with(|h| h.set(v));
-}
-
-/// 取 GIL（FIFO 票据锁；同一线程重入不算重新取）
-pub(super) fn gil_lock() {
-    if holds_gil() {
-        return;
-    }
-    let mut g = GIL.lock().unwrap_or_else(|e| e.into_inner());
-    let ticket = g.next;
-    g.next += 1;
-    while g.serving != ticket {
-        g = GIL_CV.wait(g).unwrap_or_else(|e| e.into_inner());
-    }
-    drop(g);
-    set_holding(true);
-}
-
-/// 交还 GIL（没持有就是空操作）
-pub(super) fn gil_unlock() {
-    if !holds_gil() {
-        return;
-    }
-    set_holding(false);
-    {
-        let mut g = GIL.lock().unwrap_or_else(|e| e.into_inner());
-        g.serving += 1;
-    }
-    GIL_CV.notify_all();
-}
-
-/// 把 `Vm` 的地址挂上来（`run_main` 进来时），线程要 `gil_lock()` 之后才能用它
-pub(super) fn set_vm_ptr(vm: *mut Vm) {
-    VM_PTR.store(vm, Ordering::SeqCst);
-}
-
-pub(super) fn clear_vm_ptr() {
-    VM_PTR.store(std::ptr::null_mut(), Ordering::SeqCst);
-}
-
-/// 当前线程可用的 `&mut Vm`。
-///
-/// # Safety
-///
-/// 调用者必须**持有 GIL**。整份代码里「同一时刻只有一个线程拿得到 `&mut Vm`」
-/// 这个不变式只由 GIL 保证 —— 这是本模块唯一的 unsafe 约定，其余地方都是安全代码。
-pub(super) unsafe fn vm_ref<'a>() -> &'a mut Vm {
-    let p = VM_PTR.load(Ordering::SeqCst);
-    debug_assert!(!p.is_null(), "VM 指针没设置：线程必须在 run_main 里启动");
-    &mut *p
 }
 
 // ---------------------------------------------------------------- 线程停靠点
@@ -200,6 +130,7 @@ pub(super) const ST_TIMED_WAITING: i32 = 0x0001 | 0x0080 | 0x0020; // ALIVE | WA
 /// 已终止
 pub(super) const ST_TERMINATED: i32 = 0x0002;
 
+#[derive(Clone)]
 pub(super) struct ThreadRec {
     pub tid: u64,
     /// 对应的 `java.lang.Thread` 对象句柄（0 = 还没建 / 没有 java.base）
@@ -216,19 +147,7 @@ pub(super) struct ThreadRec {
     pub waiting_on: i32,
 }
 
-// ---------------------------------------------------------------- 监视器
-
-#[derive(Default)]
-pub(super) struct Monitor {
-    /// 拥有者线程 id（0 = 空闲）
-    owner: u64,
-    /// 重入计数
-    count: u32,
-    /// 等锁队列（monitorenter 竞争 / 被 notify 唤醒后等重新获取）
-    entry: VecDeque<u64>,
-    /// 条件队列（Object.wait）
-    cond: VecDeque<u64>,
-}
+// ---------------------------------------------------------------- 停靠频率
 
 /// 每次 `safepoint` 之间的字节码条数。太小伤性能，太大饿死别的线程。
 pub(super) const SAFEPOINT_EVERY: u32 = 512;
@@ -236,8 +155,8 @@ pub(super) const SAFEPOINT_EVERY: u32 = 512;
 impl Vm {
     // ------------------------------------------------------------ 线程表
 
-    fn rec(&self, tid: u64) -> Option<&ThreadRec> {
-        self.threads.get(&tid)
+    fn rec(&self, tid: u64) -> Option<ThreadRec> {
+        lk(&self.sh.threads).get(&tid).cloned()
     }
 
     /// 进 VM 的线程登记（main 与 `Thread.start` 都走它）
@@ -253,8 +172,8 @@ impl Vm {
             interrupted: false,
             waiting_on: 0,
         };
-        self.threads.insert(tid, rec);
-        self.nthreads += 1;
+        lk(&self.sh.threads).insert(tid, rec);
+        self.sh.nthreads.fetch_add(1, Ordering::AcqRel);
         self.set_state(tid, ST_RUNNABLE);
     }
 
@@ -264,7 +183,7 @@ impl Vm {
 
     /// 改线程状态（同时镜像到 `Thread.holder.threadStatus`，`getState()` 读的就是它）
     pub(super) fn set_state(&mut self, tid: u64, st: i32) {
-        let obj = match self.threads.get_mut(&tid) {
+        let obj = match lk(&self.sh.threads).get_mut(&tid) {
             Some(r) => {
                 r.state = st;
                 r.java
@@ -280,7 +199,7 @@ impl Vm {
     }
 
     fn set_waiting_on(&mut self, tid: u64, handle: i32) {
-        if let Some(r) = self.threads.get_mut(&tid) {
+        if let Some(r) = lk(&self.sh.threads).get_mut(&tid) {
             r.waiting_on = handle;
         }
     }
@@ -288,7 +207,7 @@ impl Vm {
     /// 当前线程的 `java.lang.Thread` 对象（懒建；没有 java.base 时返回 0）
     pub(super) fn current_thread_obj(&mut self) -> i32 {
         let tid = cur_tid();
-        if let Some(r) = self.threads.get(&tid) {
+        if let Some(r) = lk(&self.sh.threads).get(&tid) {
             if r.java > 0 {
                 return r.java;
             }
@@ -300,7 +219,7 @@ impl Vm {
         let daemon = self.rec(tid).map(|r| r.daemon).unwrap_or(false);
         match self.thread_obj_new(&name, 0, daemon) {
             Ok(h) => {
-                if let Some(r) = self.threads.get_mut(&tid) {
+                if let Some(r) = lk(&self.sh.threads).get_mut(&tid) {
                     r.java = h;
                 }
                 let st = self.rec(tid).map(|r| r.state).unwrap_or(ST_RUNNABLE);
@@ -313,65 +232,134 @@ impl Vm {
 
     // ------------------------------------------------------------ Park / 唤醒
 
-    /// 交还 GIL 后 park 一次（超时返回 false）。**不处理 interrupt** —— 由调用方决定。
+    /// park 一次（超时返回 false）。**不处理 interrupt** —— 由调用方决定。
+    ///
+    /// 没有锁要交还了（GIL 已经不存在），所以这里就是纯粹的 park。
     pub(super) fn park_block(&mut self, timeout: Option<Duration>) -> bool {
         let tid = cur_tid();
-        let parker = match self.threads.get(&tid) {
+        let parker = match lk(&self.sh.threads).get(&tid) {
             Some(r) => r.parker.clone(),
             None => return false,
         };
-        gil_unlock();
-        let woke = match timeout {
+        match timeout {
             Some(d) => parker.park_timeout(d),
             None => {
                 parker.park();
                 true
             }
-        };
-        gil_lock();
-        woke
+        }
     }
 
     pub(super) fn wake(&self, tid: u64) {
-        if let Some(r) = self.threads.get(&tid) {
+        if let Some(r) = lk(&self.sh.threads).get(&tid) {
             r.parker.unpark();
         }
     }
 
-    /// 抢占点：交还一次 GIL，让别的 Java 线程有机会跑。
+    /// 停靠点检查：GC 要停世界时线程在这里 park。
     ///
-    /// 单线程时是纯比较（不付任何代价）；多线程时每 [`SAFEPOINT_EVERY`] 条字节码换一次线程。
+    /// 稳态成本是一条 relaxed 原子读。旧实现在这里交还 / 重抢 GIL，
+    /// 那是 4 线程比串行还慢 2.2 倍的直接原因。
     pub(super) fn safepoint(&mut self) {
-        if self.nthreads <= 1 {
-            return;
-        }
-        gil_unlock();
-        gil_lock();
+        self.sh.safepoint.poll();
     }
 
-    // ------------------------------------------------------------ 监视器表
+    // ------------------------------------------------------------ 监视器
 
-    fn mon(&mut self, handle: i32) -> &mut Monitor {
-        self.monitors.entry(handle).or_default()
+    /// 本线程持有的监视器（`count` 0 → 1 时记一笔，线程终止时靠它兜底释放）
+    fn held_push(&mut self, handle: i32) {
+        if !self.held.contains(&handle) {
+            self.held.push(handle);
+        }
+    }
+
+    fn held_pop(&mut self, handle: i32) {
+        if let Some(p) = self.held.iter().position(|h| *h == handle) {
+            self.held.remove(p);
+        }
+    }
+
+    /// 释放本线程还持有的所有锁（线程终止时兜底）
+    fn release_held(&mut self) {
+        let held: Vec<i32> = self.held.drain(..).collect();
+        for h in held {
+            let ws = self.inflate(h);
+            {
+                let mut st = ws.lock();
+                st.count = 0;
+                st.owner = 0;
+            }
+            self.mon_grant(&ws);
+        }
+    }
+
+    /// 把 thin 锁（或空闲状态）**原子地**搬进等待集，返回它。
+    ///
+    /// 关键在「原子」：`0/(tid,count) → INFLATED` 必须是一次 CAS —— 否则持有者
+    /// 正好在这一刻 `monitorexit`（它把字 CAS 回 0），而我们把「0」当成「别人拿着」，
+    /// 就会凭空造出一个永不被释放的锁。
+    fn inflate(&mut self, handle: i32) -> Arc<WaitSet> {
+        let mut g = self.sh.monitors.sets_lock();
+        if let Some(ws) = g.get(&handle).cloned() {
+            return ws;
+        }
+        let Some(w) = self.sh.heap.lock_word(handle) else {
+            // 字符串句柄（没有对象头）→ 只能直接给个等待集
+            let ws = Arc::new(WaitSet::new(0, 0));
+            g.insert(handle, ws.clone());
+            return ws;
+        };
+        let (owner, count) = loop {
+            let cur = w.load(Ordering::Acquire);
+            if cur == INFLATED {
+                break (0, 0);
+            }
+            if w.compare_exchange(cur, INFLATED, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                break if cur == 0 { (0, 0) } else { (thin_owner(cur), thin_count(cur)) };
+            }
+        };
+        let ws = Arc::new(WaitSet::new(owner, count));
+        g.insert(handle, ws.clone());
+        ws
     }
 
     /// 锁空闲时把所有权**移交**给 entry 队首（不留插队窗口）
-    fn grant_next(&mut self, handle: i32) {
-        let next = {
-            let m = self.mon(handle);
-            if m.owner != 0 {
-                return;
+    /// 谁持有这个句柄的锁（0 = 没人持有）—— 死锁报告用
+    fn monitor_owner(&self, handle: i32) -> Option<u64> {
+        if let Some(w) = self.sh.heap.lock_word(handle) {
+            let cur = w.load(Ordering::Acquire);
+            if cur != INFLATED && cur != 0 {
+                return Some(thin_owner(cur));
             }
-            match m.entry.pop_front() {
-                Some(t) => {
-                    m.owner = t;
-                    m.count = 1;
-                    t
-                }
-                None => return,
+        }
+        self.sh.monitors.lookup(handle).map(|ws| ws.lock().owner).filter(|o| *o != 0)
+    }
+
+    fn mon_grant(&mut self, ws: &Arc<WaitSet>) {
+        let mut st = ws.lock();
+        if st.owner != 0 {
+            return;
+        }
+        if let Some(t) = st.entry.pop_front() {
+            st.owner = t;
+            st.count = 1;
+            drop(st);
+            self.wake(t);
+        }
+    }
+
+    /// 本线程此刻是否持有这个句柄的锁
+    fn holds_word(&self, handle: i32, me: u64) -> bool {
+        if handle == 0 {
+            return false;
+        }
+        if let Some(w) = self.sh.heap.lock_word(handle) {
+            let cur = w.load(Ordering::Acquire);
+            if cur != INFLATED && cur != 0 {
+                return thin_owner(cur) == me;
             }
-        };
-        self.wake(next);
+        }
+        self.sh.monitors.lookup(handle).map(|ws| ws.lock().owner == me).unwrap_or(false)
     }
 
     /// `monitorenter`
@@ -383,25 +371,55 @@ impl Vm {
             ));
         }
         let me = cur_tid();
+        // 1) thin 快路径：一次 CAS（未竞争）/ 一次自增（重入）
+        if let Some(w) = self.sh.heap.lock_word(handle) {
+            loop {
+                let cur = w.load(Ordering::Acquire);
+                if cur == 0 {
+                    if w.compare_exchange(0, thin_word(me, 1), Ordering::AcqRel, Ordering::Acquire)
+                        .is_ok()
+                    {
+                        self.held_push(handle);
+                        return Ok(());
+                    }
+                    continue;
+                }
+                if cur != INFLATED && thin_count(cur) < COUNT_MAX && thin_owner(cur) == me {
+                    if w.compare_exchange(cur, cur + 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        return Ok(());
+                    }
+                    continue;
+                }
+                break;
+            }
+        }
+        // 2) 慢路径：膨胀成等待集，排队等移交
+        let ws = self.inflate(handle);
         loop {
             {
-                let m = self.mon(handle);
-                if m.owner == 0 {
-                    m.owner = me;
-                    m.count = 1;
+                let mut st = ws.lock();
+                if st.owner == 0 {
+                    st.owner = me;
+                    st.count = 1;
+                    drop(st);
+                    self.held_push(handle);
                     return Ok(());
                 }
-                if m.owner == me {
-                    m.count += 1;
+                if st.owner == me {
+                    if self.held.contains(&handle) {
+                        st.count += 1; // 真重入
+                    } else {
+                        self.held_push(handle); // 移交所得：count 已经是 1
+                    }
                     return Ok(());
                 }
-                if !m.entry.contains(&me) && !m.cond.contains(&me) {
-                    m.entry.push_back(me);
+                if !st.entry.contains(&me) && !st.cond.contains(&me) {
+                    st.entry.push_back(me);
                 }
             }
             self.set_state(me, ST_BLOCKED);
             self.set_waiting_on(me, handle);
-            // monitorenter 不响应 interrupt（JVMS：synchronized 阻塞不可中断）——醒了再看一眼就继续等
+            // monitorenter 不响应 interrupt（JVMS：synchronized 阻塞不可中断）
             self.park_block(None);
             self.set_state(me, ST_RUNNABLE);
             self.set_waiting_on(me, 0);
@@ -417,61 +435,82 @@ impl Vm {
             ));
         }
         let me = cur_tid();
-        let mut bad = true;
-        match self.monitors.get_mut(&handle) {
-            Some(m) if m.owner == me && m.count > 0 => {
-                m.count -= 1;
-                if m.count == 0 {
-                    m.owner = 0;
+        if let Some(w) = self.sh.heap.lock_word(handle) {
+            loop {
+                let cur = w.load(Ordering::Acquire);
+                if cur == 0 || cur == INFLATED {
+                    break;
                 }
-                bad = false;
+                if thin_owner(cur) != me {
+                    return Err(self.java_exception(
+                        "java/lang/IllegalMonitorStateException",
+                        "current thread is not owner",
+                    ));
+                }
+                if thin_count(cur) <= 1 {
+                    if w.compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                        self.held_pop(handle);
+                        return Ok(());
+                    }
+                    continue;
+                }
+                if w.compare_exchange(cur, cur - 1, Ordering::AcqRel, Ordering::Acquire).is_ok() {
+                    return Ok(());
+                }
             }
-            _ => {}
         }
-        if bad {
+        let ws = self.inflate(handle);
+        let mut st = ws.lock();
+        if st.owner != me || st.count == 0 {
             return Err(self.java_exception(
                 "java/lang/IllegalMonitorStateException",
                 "current thread is not owner",
             ));
         }
-        if self.monitors.get(&handle).map(|m| m.owner == 0).unwrap_or(false) {
-            self.grant_next(handle);
+        st.count -= 1;
+        if st.count > 0 {
+            return Ok(());
         }
+        st.owner = 0;
+        drop(st);
+        self.held_pop(handle);
+        self.mon_grant(&ws);
         Ok(())
     }
 
     /// 当前线程是否持有这把锁（`Thread.holdsLock`）
     pub(super) fn monitor_holds(&self, handle: i32) -> bool {
-        if handle == 0 {
-            return false;
-        }
-        let me = cur_tid();
-        self.monitors
-            .get(&handle)
-            .map(|m| m.owner == me && m.count > 0)
-            .unwrap_or(false)
+        self.holds_word(handle, cur_tid())
     }
 
     /// `Object.wait` 的 VM 实现（`wait0(J)V` 落到这里）
-    pub(super) fn monitor_wait(&mut self, handle: i32, timeout: Option<Duration>) -> Result<(), VmError> {
+    pub(super) fn monitor_wait(
+        &mut self,
+        handle: i32,
+        timeout: Option<Duration>,
+    ) -> Result<(), VmError> {
         let me = cur_tid();
-        let saved = match self.monitors.get(&handle) {
-            Some(m) if m.owner == me && m.count > 0 => m.count,
-            _ => {
+        // wait 必须膨胀（条件队列只在等待集里）
+        let ws = self.inflate(handle);
+        let saved = {
+            let st = ws.lock();
+            if st.owner != me || st.count == 0 {
                 return Err(self.java_exception(
                     "java/lang/IllegalMonitorStateException",
                     "current thread is not owner",
                 ));
             }
+            st.count
         };
         // 1) 完全释放监视器（重入计数会记下来，醒来后恢复），并移交出去
         {
-            let m = self.mon(handle);
-            m.owner = 0;
-            m.count = 0;
-            m.cond.push_back(me);
+            let mut st = ws.lock();
+            st.owner = 0;
+            st.count = 0;
+            st.cond.push_back(me);
         }
-        self.grant_next(handle);
+        self.held_pop(handle);
+        self.mon_grant(&ws);
         self.set_state(me, if timeout.is_some() { ST_TIMED_WAITING } else { ST_WAITING });
         self.set_waiting_on(me, handle);
 
@@ -491,16 +530,14 @@ impl Vm {
                     timed_out = true;
                 }
             }
-            let owns = self.monitors.get(&handle).map(|m| m.owner == me).unwrap_or(false);
+            let (owns, in_cond) = {
+                let st = ws.lock();
+                (st.owner == me, st.cond.contains(&me))
+            };
             if owns {
                 break;
             }
-            let in_cond = self
-                .monitors
-                .get(&handle)
-                .map(|m| m.cond.contains(&me))
-                .unwrap_or(false);
-            let intr = self.threads.get(&me).map(|r| r.interrupted).unwrap_or(false);
+            let intr = lk(&self.sh.threads).get(&me).map(|r| r.interrupted).unwrap_or(false);
             if interrupted {
                 // 已经在收尾：只等拿到锁
                 self.park_block(None);
@@ -511,14 +548,15 @@ impl Vm {
             }
             if interrupted || timed_out {
                 // 退出条件队列 → 排到 entry 队尾等锁（拿不到锁不能返回）
-                if in_cond {
-                    if let Some(m) = self.monitors.get_mut(&handle) {
-                        m.cond.retain(|t| *t != me);
+                {
+                    let mut st = ws.lock();
+                    if in_cond {
+                        st.cond.retain(|t| *t != me);
+                        st.entry.push_back(me);
                     }
-                    self.mon(handle).entry.push_back(me);
                 }
                 self.set_state(me, ST_BLOCKED);
-                self.grant_next(handle);
+                self.mon_grant(&ws);
                 self.park_block(None);
                 continue;
             }
@@ -526,9 +564,11 @@ impl Vm {
             self.set_state(me, if timeout.is_some() { ST_TIMED_WAITING } else { ST_WAITING });
         }
         // 2) 重新拿到监视器：把重入计数恢复成 wait 之前的值
-        if let Some(m) = self.monitors.get_mut(&handle) {
-            m.count = saved;
+        {
+            let mut st = ws.lock();
+            st.count = saved;
         }
+        self.held_push(handle);
         self.set_state(me, ST_RUNNABLE);
         self.set_waiting_on(me, 0);
         if interrupted {
@@ -541,14 +581,11 @@ impl Vm {
     /// `Object.notify` / `notifyAll`（**要求持锁**，Java 侧语义）
     pub(super) fn monitor_notify(&mut self, handle: i32, all: bool) -> Result<(), VmError> {
         let me = cur_tid();
-        match self.monitors.get(&handle) {
-            Some(m) if m.owner == me && m.count > 0 => {}
-            _ => {
-                return Err(self.java_exception(
-                    "java/lang/IllegalMonitorStateException",
-                    "current thread is not owner",
-                ))
-            }
+        if !self.holds_word(handle, me) {
+            return Err(self.java_exception(
+                "java/lang/IllegalMonitorStateException",
+                "current thread is not owner",
+            ));
         }
         self.notify_unchecked(handle, all);
         Ok(())
@@ -556,29 +593,32 @@ impl Vm {
 
     /// 唤醒条件队列（**不检查持锁**）：线程终止时 join 的 notifyAll 走这条
     fn notify_unchecked(&mut self, handle: i32, all: bool) {
+        let ws = self.inflate(handle);
         let mut moved: Vec<u64> = Vec::new();
         {
-            let m = self.mon(handle);
+            let mut st = ws.lock();
             if all {
-                moved.extend(m.cond.drain(..));
-            } else if let Some(t) = m.cond.pop_front() {
+                moved.extend(st.cond.drain(..));
+            } else if let Some(t) = st.cond.pop_front() {
                 moved.push(t);
             }
             for t in &moved {
-                m.entry.push_back(*t);
+                st.entry.push_back(*t);
             }
         }
         if moved.is_empty() {
             return;
         }
-        self.grant_next(handle);
+        self.mon_grant(&ws);
+        let owner = ws.lock().owner;
         for t in moved {
             // 被唤醒的线程要醒过来去「等锁」那一步（否则它还在 wait 里 park 着）
-            if self.monitors.get(&handle).map(|m| m.owner != t).unwrap_or(true) {
+            if owner != t {
                 self.wake(t);
             }
         }
     }
+
 
     // ------------------------------------------------------------ 线程生命周期
 
@@ -610,17 +650,17 @@ impl Vm {
         self.set_state(tid, ST_RUNNABLE);
 
         ensure_deadlock_watchdog();
-        // 子线程入口：拿 GIL → 跑 run() → 收尾
-        std::thread::spawn(move || unsafe {
+        // 子线程入口：**自己的解释器上下文**（共享 `Shared`，执行状态全新）
+        let mut child = self.fork();
+        std::thread::spawn(move || {
             set_tid(tid);
-            gil_lock();
-            let vm = vm_ref();
-            let r = vm.invoke_thread_run(thread_obj);
-            let exc = vm.thread_finish(tid, r);
+            child.sh.safepoint.register();
+            let r = child.invoke_thread_run(thread_obj);
+            let exc = child.thread_finish(tid, r);
+            child.sh.safepoint.unregister();
             if let Some(text) = exc {
                 eprintln!("{text}");
             }
-            gil_unlock();
         });
         Ok(())
     }
@@ -656,30 +696,18 @@ impl Vm {
             },
         };
         // 1) 把还挂在这个线程名下的锁全部释放（Java 代码不该这样，但锁不能永久泄漏）
-        let held: Vec<i32> = self
-            .monitors
-            .iter()
-            .filter(|(_, m)| m.owner == tid)
-            .map(|(h, _)| *h)
-            .collect();
-        for h in held {
-            if let Some(m) = self.monitors.get_mut(&h) {
-                m.count = 0;
-                m.owner = 0;
-            }
-            self.grant_next(h);
-        }
+        self.release_held();
         // 2) 置终止 + eetop=0（isAlive 立刻变 false）
         let obj = self.rec(tid).map(|t| t.java).unwrap_or(0);
         self.set_state(tid, ST_TERMINATED);
         if obj > 0 {
             self.put_named(obj, "java/lang/Thread", "eetop", Slot::L(0));
         }
-        if let Some(t) = self.threads.get_mut(&tid) {
+        if let Some(t) = lk(&self.sh.threads).get_mut(&tid) {
             t.alive = false;
             t.waiting_on = 0;
         }
-        self.nthreads = self.nthreads.saturating_sub(1);
+        self.sh.nthreads.fetch_sub(1, Ordering::AcqRel);
         // 3) 叫醒所有 join 在这个 Thread 对象上的线程（HotSpot 在 ensure_join 里 do_notify_all）
         if obj > 0 {
             self.notify_unchecked(obj, true);
@@ -689,31 +717,18 @@ impl Vm {
 
     /// 主线程收尾（它的未捕获异常由 `run_main` 自己格式化）
     pub(super) fn thread_terminate_main(&mut self) {
-        let held: Vec<i32> = self
-            .monitors
-            .iter()
-            .filter(|(_, m)| m.owner == 1)
-            .map(|(h, _)| *h)
-            .collect();
-        for h in held {
-            if let Some(m) = self.monitors.get_mut(&h) {
-                m.count = 0;
-                m.owner = 0;
-            }
-            self.grant_next(h);
-        }
+        self.release_held();
         self.set_state(1, ST_TERMINATED);
-        if let Some(t) = self.threads.get_mut(&1) {
+        if let Some(t) = lk(&self.sh.threads).get_mut(&1) {
             t.alive = false;
         }
-        self.nthreads = self.nthreads.saturating_sub(1);
+        self.sh.nthreads.fetch_sub(1, Ordering::AcqRel);
     }
 
     /// 主线程返回后：等所有**非 daemon** 线程跑完（JVM 语义），再让进程退出
     pub(super) fn wait_non_daemon(&mut self) {
         loop {
-            let pending: Vec<u64> = self
-                .threads
+            let pending: Vec<u64> = lk(&self.sh.threads)
                 .values()
                 .filter(|t| t.alive && !t.daemon && t.tid != cur_tid())
                 .map(|t| t.tid)
@@ -721,17 +736,15 @@ impl Vm {
             if pending.is_empty() {
                 return;
             }
-            gil_unlock();
             std::thread::sleep(Duration::from_millis(1));
-            gil_lock();
         }
     }
 
     /// `Thread.interrupt()`
     pub(super) fn thread_interrupt(&mut self, target: i32) {
-        let tid = self.threads.values().find(|t| t.java == target).map(|t| t.tid);
+        let tid = lk(&self.sh.threads).values().find(|t| t.java == target).map(|t| t.tid);
         if let Some(tid) = tid {
-            if let Some(r) = self.threads.get_mut(&tid) {
+            if let Some(r) = lk(&self.sh.threads).get_mut(&tid) {
                 r.interrupted = true;
             }
             if target > 0 {
@@ -748,7 +761,7 @@ impl Vm {
     /// 清掉中断标志：Rust 侧镜像与 Java 侧 `Thread.interrupted` 字段**必须一起清**
     /// （`Thread.isInterrupted()` 读的是字段；异常投递时 HotSpot 也清字段）
     fn clear_interrupt(&mut self, tid: u64) {
-        if let Some(r) = self.threads.get_mut(&tid) {
+        if let Some(r) = lk(&self.sh.threads).get_mut(&tid) {
             r.interrupted = false;
         }
         let obj = self.rec(tid).map(|r| r.java).unwrap_or(0);
@@ -766,7 +779,7 @@ impl Vm {
         const CAP: Duration = Duration::from_millis(100);
         let deadline = timeout.map(|d| Instant::now() + d);
         loop {
-            if self.threads.get(&me).map(|r| r.interrupted).unwrap_or(false) {
+            if lk(&self.sh.threads).get(&me).map(|r| r.interrupted).unwrap_or(false) {
                 return Ok(()); // 中断：LockSupport 的语义是「返回」，标志留给调用方看
             }
             let slice = match deadline {
@@ -791,7 +804,7 @@ impl Vm {
             self.wake(cur_tid());
             return;
         }
-        if let Some(tid) = self.threads.values().find(|t| t.java == target).map(|t| t.tid) {
+        if let Some(tid) = lk(&self.sh.threads).values().find(|t| t.java == target).map(|t| t.tid) {
             self.wake(tid);
         }
     }
@@ -801,7 +814,7 @@ impl Vm {
         let me = cur_tid();
         let mut slept = Duration::ZERO;
         loop {
-            let intr = self.threads.get(&me).map(|r| r.interrupted).unwrap_or(false);
+            let intr = lk(&self.sh.threads).get(&me).map(|r| r.interrupted).unwrap_or(false);
             if intr {
                 self.clear_interrupt(me);
                 return Err(self.java_exception("java/lang/InterruptedException", "sleep interrupted"));
@@ -822,7 +835,7 @@ impl Vm {
     /// `Thread.join` 的 VM 兜底（真字节码 join 走 wait/notify，用不上它）
     pub(super) fn thread_join(&mut self, target: i32, timeout: Option<Duration>) -> Result<(), VmError> {
         let me = cur_tid();
-        let tid = self.threads.values().find(|t| t.java == target).map(|t| t.tid);
+        let tid = lk(&self.sh.threads).values().find(|t| t.java == target).map(|t| t.tid);
         let t0 = Instant::now();
         loop {
             let alive = match tid {
@@ -832,7 +845,7 @@ impl Vm {
             if !alive {
                 return Ok(());
             }
-            let intr = self.threads.get(&me).map(|r| r.interrupted).unwrap_or(false);
+            let intr = lk(&self.sh.threads).get(&me).map(|r| r.interrupted).unwrap_or(false);
             if intr {
                 self.clear_interrupt(me);
                 return Err(self.java_exception("java/lang/InterruptedException", ""));
@@ -868,10 +881,7 @@ impl Vm {
             return Slot::I(0);
         }
         let Some(i) = self.store.field_index(class, name) else { return Slot::I(0) };
-        match self.objects.get(obj as usize - 1).and_then(|s| s.get(i)) {
-            Some(v) => *v,
-            None => Slot::I(0),
-        }
+        self.sh.heap.get(obj, i).unwrap_or(Slot::I(0))
     }
 
     pub(super) fn put_named(&mut self, obj: i32, class: &str, name: &str, v: Slot) {
@@ -879,11 +889,7 @@ impl Vm {
             return;
         }
         let Some(i) = self.store.field_index(class, name) else { return };
-        if let Some(slots) = self.objects.get_mut(obj as usize - 1) {
-            if i < slots.len() {
-                slots[i] = v;
-            }
-        }
+        self.sh.heap.set(obj, i, v);
     }
 
     /// 造一个 `java.lang.Thread`（`Thread.<init>` 由 VM 接管：真构造器要拖进
@@ -896,8 +902,8 @@ impl Vm {
 
     /// 自动起名：`Thread-0`、`Thread-1`……
     pub(super) fn next_thread_name(&mut self) -> String {
-        let n = self.thread_seq;
-        self.thread_seq += 1;
+        let n = self.sh.thread_seq.load(Ordering::Acquire);
+        self.sh.thread_seq.fetch_add(1, Ordering::AcqRel);
         format!("Thread-{n}")
     }
 
@@ -931,15 +937,16 @@ impl Vm {
 
     /// 线程清单（名字/状态/持有的锁/在等谁）—— `jstack` 那套的输出源。
     pub fn debug_threads(&self) -> Vec<(u64, String, i32, bool, Vec<i32>, i32)> {
-        let mut v: Vec<_> = self
-            .threads
+        // 持有的锁清单只包含**膨胀过**的监视器（thin 持有的锁在对象头里，没有全局索引）。
+        // 死锁判定不靠这张表：它按「等待的句柄 → 那个句柄的持有者」现算（见 debug_deadlocks）。
+        let inflated = self.sh.monitors.snapshot();
+        let mut v: Vec<_> = lk(&self.sh.threads)
             .values()
             .map(|t| {
-                let mut locks: Vec<i32> = self
-                    .monitors
+                let mut locks: Vec<i32> = inflated
                     .iter()
-                    .filter(|(_, m)| m.owner == t.tid && m.count > 0)
-                    .map(|(h, _)| *h)
+                    .filter(|(_, owner, count, _, _)| *owner == t.tid && *count > 0)
+                    .map(|(h, _, _, _, _)| *h)
                     .collect();
                 locks.sort_unstable();
                 (t.tid, t.name.clone(), t.state, t.daemon, locks, t.waiting_on)
@@ -956,6 +963,14 @@ impl Vm {
         for (tid, _, _, _, locks, _) in &threads {
             for h in locks {
                 owner_of.insert(*h, *tid);
+            }
+        }
+        // thin 持有的锁不在快照里：对每个「有人正在等」的句柄，直接从对象头/等待集读持有者
+        for (_, _, _, _, _, waiting) in &threads {
+            if *waiting != 0 && !owner_of.contains_key(waiting) {
+                if let Some(o) = self.monitor_owner(*waiting) {
+                    owner_of.insert(*waiting, o);
+                }
             }
         }
         // waiter 图：tid → 它在等谁
@@ -999,14 +1014,25 @@ impl Vm {
     /// 死锁自检（watchdog 每 tick 调一次）：连续若干次「所有存活线程都不在 RUNNABLE」
     /// **并且**等待图里有环，才认定是死锁 —— 单纯卡住（比如全在 sleep）不报。
     pub(super) fn deadlock_watchdog_tick(&mut self) -> Option<String> {
-        let alive: Vec<&ThreadRec> = self.threads.values().filter(|t| t.alive).collect();
-        let stalled = !alive.is_empty() && alive.iter().all(|t| t.state != ST_RUNNABLE);
+        let (n_alive, all_blocked) = {
+            let g = lk(&self.sh.threads);
+            let mut n = 0usize;
+            let mut blocked = true;
+            for t in g.values().filter(|t| t.alive) {
+                n += 1;
+                if t.state == ST_RUNNABLE {
+                    blocked = false;
+                }
+            }
+            (n, blocked)
+        };
+        let stalled = n_alive > 0 && all_blocked;
         if stalled {
-            self.stalled += 1;
+            self.sh.stalled.fetch_add(1, Ordering::AcqRel);
         } else {
-            self.stalled = 0;
+            self.sh.stalled.store(0, Ordering::Release);
         }
-        if self.stalled < 4 {
+        if self.sh.stalled.load(Ordering::Acquire) < 4 {
             return None;
         }
         let cycles = self.debug_deadlocks();
@@ -1052,6 +1078,22 @@ impl Vm {
     }
 }
 
+/// 进程里唯一的共享世界（看门狗线程要拿它造自己的 `Vm`）。
+///
+/// 只存一份：一个进程只有一个 VM（`run_main` 也只有一个）。
+static SHARED_REG: Mutex<Option<Arc<super::shared::Shared>>> = Mutex::new(None);
+
+/// VM 建好时登记（`Vm::from_store` 里调）
+pub(super) fn register_shared(sh: &Arc<super::shared::Shared>) {
+    if let Ok(mut g) = SHARED_REG.lock() {
+        *g = Some(Arc::clone(sh));
+    }
+}
+
+fn shared_reg() -> Option<Arc<super::shared::Shared>> {
+    SHARED_REG.lock().ok().and_then(|g| g.clone())
+}
+
 /// 死锁 watchdog：所有线程都阻塞且等待图有环时，打一份 jstack 风格的报告并退出。
 ///
 /// 只在 `Thread.start` 第一次发生时启动；`VMLESS_NO_DEADLOCK_REPORT=1` 可关掉
@@ -1066,17 +1108,13 @@ fn spawn_deadlock_watchdog() {
     }
     std::thread::spawn(|| loop {
         std::thread::sleep(Duration::from_millis(250));
-        gil_lock();
-        if VM_PTR.load(Ordering::SeqCst).is_null() {
-            gil_unlock();
-            return;
-        }
-        let report = unsafe { vm_ref() }.deadlock_watchdog_tick();
+        // 看门狗是一个独立线程：给它自己的解释器上下文（只需要 `Shared`，不跑字节码）
+        let Some(sh) = shared_reg() else { return };
+        let mut vm = Vm::from_shared(sh);
+        let report = vm.deadlock_watchdog_tick();
         if std::env::var_os("VMLESS_THREAD_DUMP_MS").is_some() {
-            let vm = unsafe { vm_ref() };
             eprintln!("[dump] threads={:?} cycles={:?}", vm.debug_threads(), vm.debug_deadlocks());
         }
-        gil_unlock();
         if let Some(text) = report {
             eprint!("{text}");
             std::process::exit(1);

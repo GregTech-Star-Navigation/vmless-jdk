@@ -1,5 +1,6 @@
 //! 异常：抛出、异常表查找、未捕获异常的文本。
 
+use super::shared::lk;
 use super::Vm;
 use super::VmError;
 
@@ -12,7 +13,7 @@ impl Vm {
     /// 异常对象 → 打印用的 `类名: message`
     pub(super) fn exc_text(&self, handle: i32) -> String {
         let class = self.type_name(handle);
-        match self.exc_msgs.get(&handle) {
+        match lk(&self.sh.exc_msgs).get(&handle) {
             Some(m) => format!("{class}: {}", self.string_text(*m)),
             // 真字节码构造出来的异常：`Throwable.detailMessage` 字段里有消息
             None => match self.throwable_message(handle) {
@@ -29,7 +30,7 @@ impl Vm {
         {
             return None;
         }
-        let slots = self.objects.get(handle as usize - 1)?;
+        let slots = self.sh.heap.snapshot(handle)?;
         let i = self.store.field_index("java/lang/Throwable", "detailMessage")?;
         let s = slots.get(i)?.as_i32();
         if s == 0 {

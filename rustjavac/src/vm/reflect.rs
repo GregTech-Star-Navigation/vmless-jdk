@@ -25,7 +25,8 @@
 //! 成员值放在 `Vm::ann_objs` 里」的对象，成员方法的调用在 `ann_dispatch` 里按名字查表
 //! 返回 —— 与 lambda 对象用的是同一类手法（见 `indy.rs::LambdaInfo`）。
 
-use std::rc::Rc;
+use super::shared::lk;
+use std::sync::Arc;
 
 use crate::classfile::annot::{self, Ann, AnnVal};
 use crate::{ClassFile, CpEntry, Member};
@@ -243,7 +244,7 @@ impl Vm {
             AnnVal::Enum(ty, name) => {
                 let cls = internal_of_desc(ty);
                 self.ensure_init(&cls)?;
-                self.statics
+                lk(&self.sh.statics)
                     .get(&(cls.clone(), name.clone()))
                     .copied()
                     .unwrap_or(Slot::I(0))
@@ -268,9 +269,7 @@ impl Vm {
 
     /// 新建一个数组（元素已经是槽）
     pub(super) fn new_array(&mut self, array_desc: &str, items: Vec<Slot>) -> i32 {
-        self.arrays.push(items);
-        self.array_class.push(array_desc.to_string());
-        -(self.arrays.len() as i32)
+        self.sh.heap.new_array(items, array_desc).unwrap_or(0)
     }
 
     /// 注解实例对象（分配 + 登记到 `ann_objs`，值表按「默认值在前」合并）
@@ -300,16 +299,14 @@ impl Vm {
             }
         }
         let n = self.store.field_count(&ty);
-        self.objects.push(vec![Slot::I(0); n.max(1)]);
-        self.object_class.push(ty.clone());
-        let h = self.objects.len() as i32;
-        self.ann_objs.insert(h, AnnInst { ty, vals });
+        let h = self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &ty.clone()).unwrap_or(0);
+        lk(&self.sh.ann_objs).insert(h, AnnInst { ty, vals });
         Ok(h)
     }
 
     /// 注解成员的取值（**没有**就 None，由调用点报 `IncompleteAnnotationException` 级别的问题）
     fn ann_member(&self, recv: i32, name: &str) -> Option<AnnVal> {
-        self.ann_objs.get(&recv)?.vals.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
+        lk(&self.sh.ann_objs).get(&recv)?.vals.iter().find(|(n, _)| n == name).map(|(_, v)| v.clone())
     }
 
     /// 注解对象的成员方法分派（`Annotation` 的语义在 VM 里，没有真正的 Proxy）
@@ -319,7 +316,7 @@ impl Vm {
         name: &str,
         desc: &str,
     ) -> Option<Result<Slot, VmError>> {
-        let inst = self.ann_objs.get(&recv)?.clone();
+        let inst = lk(&self.sh.ann_objs).get(&recv)?.clone();
         let ty = inst.ty.clone();
         match (name, desc) {
             ("annotationType", "()Ljava/lang/Class;") => {
@@ -332,7 +329,7 @@ impl Vm {
             ("hashCode", "()I") => Some(Ok(Slot::I(self.ann_hash(&inst)))),
             ("equals", "(Ljava/lang/Object;)Z") => {
                 // 与 JDK 一致：类型相同且每个成员值相等才算相等（本 VM 只比字面值）
-                let other = self.ann_objs.get(&recv).map(|i| i.vals.clone());
+                let other = lk(&self.sh.ann_objs).get(&recv).map(|i| i.vals.clone());
                 Some(Ok(Slot::I(i32::from(other == Some(inst.vals.clone())))))
             }
             _ => {
@@ -425,7 +422,7 @@ impl Vm {
     }
 
     /// 类描述符 → 已解析的 class 文件（数组与基本类型没有）
-    fn cf_of(&self, desc: &str) -> Option<Rc<ClassFile>> {
+    fn cf_of(&self, desc: &str) -> Option<Arc<ClassFile>> {
         if desc.starts_with('[') || desc.len() == 1 {
             return None;
         }
@@ -574,7 +571,7 @@ impl Vm {
     }
 
     /// 类描述符 → 已解析的 class 文件（数组与基本类型没有）—— 给同目录的注册函数用
-    pub(super) fn cf_pub(&self, desc: &str) -> Option<Rc<ClassFile>> {
+    pub(super) fn cf_pub(&self, desc: &str) -> Option<Arc<ClassFile>> {
         self.cf_of(desc)
     }
 
@@ -781,9 +778,7 @@ impl Vm {
         self.ensure_init(class)?;
 
         let n = self.store.field_count(class);
-        self.objects.push(vec![Slot::I(0); n.max(1)]);
-        self.object_class.push(class.to_string());
-        let h = self.objects.len() as i32;
+        let h = self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &class.to_string()).unwrap_or(0);
         if let Some((ci, mi)) = self.store.method_in_class(class, "<init>", desc) {
             let mut all = vec![Slot::I(h)];
             all.extend_from_slice(args);
@@ -802,7 +797,7 @@ impl Vm {
         if !matches!(self.ref_kind(h), RefKind::Obj(ref c) if self.is_subclass(c, obj_class)) {
             return None;
         }
-        let slots = self.objects.get(h as usize - 1)?;
+        let slots = self.sh.heap.snapshot(h)?;
         let get = |name: &str| -> Option<Slot> {
             let i = self.store.field_index(obj_class, name)?;
             slots.get(i).copied()
@@ -815,7 +810,7 @@ impl Vm {
 
     /// 反射对象上的 `boolean` 字段（`override`：`setAccessible(true)` 的结果）
     fn refl_flag(&self, h: i32, obj_class: &str, field: &str) -> bool {
-        let slots = match self.objects.get(h as usize - 1) {
+        let slots = match self.sh.heap.snapshot(h) {
             Some(s) => s,
             None => return false,
         };
@@ -840,8 +835,7 @@ impl Vm {
         if override_ || flags & ACC_PUBLIC != 0 {
             return Ok(());
         }
-        let caller = self
-            .store
+        let caller = self.store
             .name_of_index(self.last_caller)
             .unwrap_or_default();
         if !caller.is_empty() && nest_prefix(&caller) == nest_prefix(decl) {
@@ -874,11 +868,11 @@ impl Vm {
         let f = &cf.fields[idx];
         let name = name_of(&cf, f);
         if f.access_flags & ACC_STATIC != 0 {
-            return self.statics.get(&(decl.to_string(), name)).copied().unwrap_or(Slot::I(0));
+            return lk(&self.sh.statics).get(&(decl.to_string(), name)).copied().unwrap_or(Slot::I(0));
         }
         if target > 0 {
             if let Some(slot) = field_slot_index(self, decl, idx) {
-                if let Some(slots) = self.objects.get(target as usize - 1) {
+                if let Some(slots) = self.sh.heap.snapshot(target) {
                     return slots.get(slot).copied().unwrap_or(Slot::I(0));
                 }
             }
@@ -891,27 +885,22 @@ impl Vm {
         let f = &cf.fields[idx];
         let name = name_of(&cf, f);
         if f.access_flags & ACC_STATIC != 0 {
-            self.statics.insert((decl.to_string(), name), v);
+            lk(&self.sh.statics).insert((decl.to_string(), name), v);
             return;
         }
         if target > 0 {
             if let Some(slot) = field_slot_index(self, decl, idx) {
-                if let Some(slots) = self.objects.get_mut(target as usize - 1) {
-                    if slot < slots.len() {
-                        slots[slot] = v;
-                    }
-                }
+                self.sh.heap.set(target, slot, v);
             }
         }
     }
 
     /// `Field.get(Object)` 一族的公共实现：按字段类型装箱
     pub(super) fn field_get(&mut self, field: i32, target: i32, want: Option<char>) -> Result<Slot, VmError> {
-        let (decl, idx) = self
-            .refl_member_of(field, "java/lang/reflect/Field")
+        let (decl, idx) = self.refl_member_of(field, "java/lang/reflect/Field")
             .ok_or_else(|| VmError { msg: "不是 Field 对象".into(), exc: None })?;
         let cf = self.cf_of(&decl).ok_or_else(|| VmError { msg: format!("{decl} 没有字节码"), exc: None })?;
-        let f = match cf.fields.get(idx) { Some(x) => x, None => return err("Field 的 slot 越界") };
+        let f = &cf.fields[idx];
         let flags = f.access_flags;
         let ty = desc_of(&cf, f);
         let override_ = self.refl_flag(field, "java/lang/reflect/Field", "override");
@@ -960,11 +949,10 @@ impl Vm {
         value: Slot,
         prim_arg: Option<char>,
     ) -> Result<Slot, VmError> {
-        let (decl, idx) = self
-            .refl_member_of(field, "java/lang/reflect/Field")
+        let (decl, idx) = self.refl_member_of(field, "java/lang/reflect/Field")
             .ok_or_else(|| VmError { msg: "不是 Field 对象".into(), exc: None })?;
         let cf = self.cf_of(&decl).ok_or_else(|| VmError { msg: format!("{decl} 没有字节码"), exc: None })?;
-        let f = match cf.fields.get(idx) { Some(x) => x, None => return err("Field 的 slot 越界") };
+        let f = &cf.fields[idx];
         let flags = f.access_flags;
         let is_static = flags & ACC_STATIC != 0;
         let ty = desc_of(&cf, f);
@@ -1056,11 +1044,10 @@ impl Vm {
 
     /// `Method.invoke(Object, Object...)`
     pub(super) fn method_invoke(&mut self, method: i32, target: i32, args_h: i32) -> Result<Slot, VmError> {
-        let (decl, idx) = self
-            .refl_member_of(method, "java/lang/reflect/Method")
+        let (decl, idx) = self.refl_member_of(method, "java/lang/reflect/Method")
             .ok_or_else(|| VmError { msg: "不是 Method 对象".into(), exc: None })?;
         let cf = self.cf_of(&decl).ok_or_else(|| VmError { msg: format!("{decl} 没有字节码"), exc: None })?;
-        let m = match cf.methods.get(idx) { Some(x) => x, None => return err("Method 的 slot 越界") };
+        let m = &cf.methods[idx];
         let flags = m.access_flags;
         let name = name_of(&cf, m);
         let desc = desc_of(&cf, m);
@@ -1132,7 +1119,7 @@ impl Vm {
         let got = if args_h == 0 {
             0
         } else {
-            self.arrays.get((-args_h - 1) as usize).map(|a| a.len()).unwrap_or(0)
+            self.sh.heap.array_len(args_h).unwrap_or(0)
         };
         if got != want {
             return Err(self.throw_msg(
@@ -1143,7 +1130,7 @@ impl Vm {
         if args_h == 0 {
             return Ok(Vec::new());
         }
-        Ok(self.arrays.get((-args_h - 1) as usize).cloned().unwrap_or_default())
+        Ok(self.sh.heap.snapshot(args_h).unwrap_or_default())
     }
 
     /// 反射调用的实参转换：拆箱 → 宽化基本类型；引用类型要能赋给形参
@@ -1228,11 +1215,10 @@ impl Vm {
 
     /// `Constructor.newInstance(Object...)`
     pub(super) fn ctor_new_instance(&mut self, ctor: i32, args_h: i32) -> Result<Slot, VmError> {
-        let (decl, idx) = self
-            .refl_member_of(ctor, "java/lang/reflect/Constructor")
+        let (decl, idx) = self.refl_member_of(ctor, "java/lang/reflect/Constructor")
             .ok_or_else(|| VmError { msg: "不是 Constructor 对象".into(), exc: None })?;
         let cf = self.cf_of(&decl).ok_or_else(|| VmError { msg: format!("{decl} 没有字节码"), exc: None })?;
-        let m = match cf.methods.get(idx) { Some(x) => x, None => return err("Constructor 的 slot 越界") };
+        let m = &cf.methods[idx];
         let flags = m.access_flags;
         let desc = desc_of(&cf, m);
         let override_ = self.refl_flag(ctor, "java/lang/reflect/Constructor", "override");
@@ -1253,9 +1239,7 @@ impl Vm {
             values.push(self.coerce_arg(args[i], p, i)?);
         }
         let n = self.store.field_count(&decl);
-        self.objects.push(vec![Slot::I(0); n.max(1)]);
-        self.object_class.push(decl.clone());
-        let h = self.objects.len() as i32;
+        let h = self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &decl.clone()).unwrap_or(0);
         let mut all = vec![Slot::I(h)];
         all.extend(values);
         let target = match self.store.method_in_class(&decl, "<init>", &desc) {
@@ -1313,7 +1297,7 @@ impl Vm {
             Some(c) => c,
             None => return err(format!("{decl} 没有字节码")),
         };
-        let m = match cf.methods.get(idx) { Some(x) => x, None => return err("Executable 的 slot 越界") };
+        let m = &cf.methods[idx];
         let (params, _) = split_desc(&desc_of(&cf, m));
         let per = annot::visible_parameter_annotations(&cf, m.attributes.as_slice());
         // Java 的规则：只有 `RuntimeVisibleParameterAnnotations` 覆盖到的参数才有注解对象；
@@ -1345,11 +1329,16 @@ impl Vm {
         }
         let internal = name.replace('.', "/");
         if !self.store.has_class(&internal) {
-            let Some(cp) = self.cp.take() else {
+            let cp = {
+                let mut g = lk(&self.sh.cp);
+                g.take()
+            };
+            let Some(cp) = cp else {
                 return Err(self.throw_msg("java/lang/ClassNotFoundException", name.to_string()));
             };
-            let r = self.store.load_closure(&cp, &internal);
-            self.cp = Some(cp);
+            let r = self.store_mut().load_closure(&cp, &internal);
+            *lk(&self.sh.cp) = Some(cp);
+            self.publish_store();
             match r {
                 Ok(added) => {
                     // 新类可能带来新的字段布局：类对象缓存里已有的不受影响，
@@ -1800,7 +1789,7 @@ pub(super) fn class_arg_list(vm: &mut Vm, h: i32) -> Vec<String> {
     if h == 0 {
         return Vec::new();
     }
-    let items = vm.arrays.get((-h - 1) as usize).cloned().unwrap_or_default();
+    let items = vm.sh.heap.snapshot(h).unwrap_or_default();
     items
         .iter()
         .filter_map(|s| vm.class_obj_name(s.as_i32()))
@@ -2069,7 +2058,7 @@ fn ctor_new_instance_op(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 impl Vm {
     fn sj_field(&self, h: i32, name: &str) -> Slot {
         let Some(i) = self.store.field_index("java/util/StringJoiner", name) else { return Slot::I(0) };
-        self.objects.get(h as usize - 1).and_then(|s| s.get(i).copied()).unwrap_or(Slot::I(0))
+        self.sh.heap.snapshot(h).and_then(|s| s.get(i).copied()).unwrap_or(Slot::I(0))
     }
 
     /// `StringJoiner.toString()`
@@ -2088,8 +2077,10 @@ impl Vm {
         let items: Vec<i32> = if elts == 0 {
             Vec::new()
         } else {
-            self.arrays
-                .get((-elts - 1) as usize)
+            self
+                .sh
+                .heap
+                .snapshot(elts)
                 .map(|a| a.iter().map(|s| s.as_i32()).collect())
                 .unwrap_or_default()
         };
@@ -2290,9 +2281,13 @@ impl Vm {
         if name.starts_with('[') || name.len() == 1 {
             return false;
         }
-        let Some(cp) = self.cp.take() else { return false };
-        let r = self.store.load_closure(&cp, name);
-        self.cp = Some(cp);
+        let cp = {
+            let mut g = lk(&self.sh.cp);
+            match g.take() { Some(c) => c, None => return false }
+        };
+        let r = self.store_mut().load_closure(&cp, name);
+        *lk(&self.sh.cp) = Some(cp);
+        self.publish_store();
         matches!(r, Ok(_))
     }
 }

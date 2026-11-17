@@ -903,3 +903,42 @@ R8  ours=[inject counter <- Counter | inject greeter <- Greeter | value config |
 `getAnnotationsByType`、`AnnotatedType`、`Proxy` + 运行期字节码生成、`Method.getParameters()`。
 
 **顺手发现、没修**：数组读写越界**不抛异常**、静默返回 0（修它会改到 JIT 与三路一致行为，另开一件）。
+
+## 0.57.0 — 2026-11-22 · 拆掉 GIL：字节码真并行
+
+原来是一把大锁（CPython 式：`AtomicPtr` 持锁时造 `&mut Vm`）。实测**线程越多越慢**：
+
+| | 串行 | 4 线程 | |
+|---|---|---|---|
+| 旧（GIL）| 7024 ms | 15583 ms | **0.45×（劣化）** |
+| **新** | 6704 ms | **1732 ms** | **3.81×** |
+| HotSpot 25 | 71 ms | 44 ms | 1.61× |
+
+8 线程（各 4M，总工作量相同）：串行 7051 / 8 线程 **1055 = 6.68×**。
+
+### 改动
+新增三个文件，`Vm` 拆成三层：
+
+- **`src/vm/shared.rs`** —— `Arc<Shared>` 跨线程根 + 无锁堆：
+  对象 = `ObjHdr{class: Arc<str>, len, lock: AtomicU32, cells: Box<[Cell]>}`；
+  句柄仍是 `u32`，但下标查到的是**永不搬动的指针**（页表只追加）；
+  槽位 = `AtomicU64` + `AtomicU8` tag → **字段/元素读写无锁**；分配 = 页表 + 原子序号
+- **`src/vm/monitors.rs`** —— thin lock：`0` / `tid<<8|count` / `1`=INFLATED；
+  未竞争只付一次 CAS，真竞争**单向膨胀**成 `WaitSet`（先进先出 + hand-off 移交）
+- **`src/vm/gc.rs`** —— 停靠点（轮次 + 到达计数 + park/unpark）+ 卡表写屏障接线
+- `mod.rs` `Vm` = `Arc<Shared>` + 每线程 `Vm`（depth/tick/held）+ 栈上 Frame；`Vm::fork()`
+- `thread.rs` 删掉全部 GIL（`gil_lock/gil_unlock/vm_ref/VM_PTR`）
+- `load.rs` `Arc<ClassStore>` 快照（COW）
+- `heap.rs/exec.rs/natives.rs/reflect.rs/indy.rs/native_reg.rs` 84 处直接下标改走堆访问器
+
+### 验收
+`verify.sh` **103/103** · `cargo test` **56 passed** · corpus **40/45**（与基线同）·
+`thread/` 16 个用例全过（T1 = 400000、T3 无丢失、T4 死锁检出）· `run_jdk M2` 与 java 一致 ·
+2M 对象并行分配峰值 355MB、结果正确
+
+### 没做到的（诚实）
+- **没有 GC**：`Frame.locals` 是 `Vec<Slot>`，引用与 int 无类型标签 → 追溯扫描分不清句柄和整数。
+  停靠点协议可用，缺的是**每帧引用位图**。所以堆只增不减（线性于分配总量，不是失控）。
+- `librustjrt::SharedHeap` 没接进来：它槽宽 4 字节（装不下 16 字节 `Slot`），`get_i32/set_i32` 要 `&mut Heap`
+  （写锁会让字段访问全局串行），年轻代还是搬动式（需要精确根集）。已改用自建无锁池。
+- 死锁报告只列膨胀过的监视器（thin 持有者的锁在对象头里，没有全局索引）。

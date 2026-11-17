@@ -1,5 +1,6 @@
 //! 指令分派主循环：`Vm::execute`（含进入方法时的参数落位）。
 
+use super::shared::lk;
 use crate::CpEntry;
 
 use super::call::count_args;
@@ -18,6 +19,11 @@ pub(super) const ACC_NATIVE: u16 = 0x0100;
 
 /// 方法访问标志：`synchronized`（进入/退出时自动加解对象监视器）
 pub(super) const ACC_SYNCHRONIZED: u16 = 0x0020;
+
+/// 字段描述符是不是引用类型（写引用字段要过卡表写屏障）
+fn is_ref_desc(d: &str) -> bool {
+    d.starts_with('L') || d.starts_with('[')
+}
 
 /// 这个句柄是不是字符串堆里的（而不是对象堆 / 数组堆 / 类对象）
 fn is_str_handle(h: i32) -> bool {
@@ -119,11 +125,11 @@ impl Vm {
         //
         // 代价必须压住：`execute_body` 是解释器最热的函数，所以先用**不分配**的类名
         // 比较挡一道，只有命中接管清单里的类才去做真正的查表。
-        if self.natives.has_overrides() && is_override_owner(&cf) {
+        if self.sh.natives.has_overrides() && is_override_owner(&cf) {
             let owner = cf.this_class_name().unwrap_or_default();
             let name = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
             let odesc = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
-            if let Some(f) = self.natives.lookup_override(&owner, &name, &odesc) {
+            if let Some(f) = self.sh.natives.lookup_override(&owner, &name, &odesc) {
                 let mut frame =
                     Frame::new(crate::jit::param_slots(&odesc).last().map(|s| s + 2).unwrap_or(1));
                 native_reg::place_args(&mut frame, &odesc, args, receiver);
@@ -670,8 +676,7 @@ impl Vm {
                     let idx = frame.pop_i()?;
                     let arr = frame.pop_i()?;
                     let v = if arr < 0 {
-                        let a = &self.arrays[(-arr - 1) as usize];
-                        *a.get(idx as usize).unwrap_or(&Slot::I(0))
+                        self.sh.heap.get(arr, idx as usize).unwrap_or(Slot::I(0))
                     } else {
                         Slot::I(0)
                     };
@@ -688,21 +693,24 @@ impl Vm {
                     let idx = frame.pop_i()?;
                     let arr = frame.pop_i()?;
                     if arr < 0 && idx >= 0 {
-                        let a = &mut self.arrays[(-arr - 1) as usize];
-                        if (idx as usize) < a.len() {
-                            a[idx as usize] = match op {
-                                0x50 => Slot::L(v.as_i64()),  // lastore
-                                0x52 => Slot::F(v.as_f64()),  // dastore
-                                0x51 => Slot::Fl(v.as_f32()), // fastore
-                                _ => Slot::I(v.as_i32()),     // iastore / aastore
-                            };
+                        let v = match op {
+                            0x50 => Slot::L(v.as_i64()),  // lastore
+                            0x52 => Slot::F(v.as_f64()),  // dastore
+                            0x51 => Slot::Fl(v.as_f32()), // fastore
+                            _ => Slot::I(v.as_i32()),     // iastore / aastore
+                        };
+                        // 引用元素写卡表（GC 用），基本类型直接写
+                        if op == 0x53 {
+                            self.sh.heap.set_ref(arr, idx as usize, v);
+                        } else {
+                            self.sh.heap.set(arr, idx as usize, v);
                         }
                     }
                 }
                 // arraylength
                 0xbe => {
                     let arr = frame.pop_i()?;
-                    let n = if arr < 0 { self.arrays[(-arr - 1) as usize].len() as i32 } else { 0 };
+                    let n = self.sh.heap.array_len(arr).unwrap_or(0) as i32;
                     frame.push(Slot::I(n));
                 }
                 // newarray：操作数是元素类型码（10 = int / 11 = long / 7 = double ...）
@@ -723,10 +731,10 @@ impl Vm {
                         9 => ("[S", Slot::I(0)),
                         _ => ("[I", Slot::I(0)),
                     };
-                    self.arrays.push(vec![zero; n as usize]);
-                    self.array_class.push(desc.to_string());
-                    let handle = -((self.arrays.len() as i32));
-                    frame.push(Slot::I(handle));
+                    match self.sh.heap.alloc_array(n as usize, desc, zero) {
+                        Some(h) => frame.push(Slot::I(h)),
+                        None => return err("OutOfMemoryError: 数组堆用尽"),
+                    }
                 }
                 // anewarray：操作数是**元素类**的常量池索引
                 0xbd => {
@@ -742,10 +750,10 @@ impl Vm {
                     if n < 0 {
                         return err("数组长度为负");
                     }
-                    self.arrays.push(vec![Slot::I(0); n as usize]); // 引用元素默认 null
-                    self.array_class.push(desc);
-                    let handle = -((self.arrays.len() as i32));
-                    frame.push(Slot::I(handle));
+                    match self.sh.heap.alloc_array(n as usize, &desc, Slot::I(0)) {
+                        Some(h) => frame.push(Slot::I(h)),
+                        None => return err("OutOfMemoryError: 数组堆用尽"),
+                    }
                 }
                 // new：字段个数按**被创建的那个类**的布局（含父类字段）算
                 0xbb => {
@@ -755,10 +763,10 @@ impl Vm {
                     // 首次 new 这个类时先跑它的 <clinit>
                     self.ensure_init(&cls)?;
                     let n = self.store.field_count(&cls);
-                    self.objects.push(vec![Slot::I(0); n.max(1)]);
-                    self.object_class.push(cls);
-                    let handle = self.objects.len() as i32;
-                    frame.push(Slot::I(handle));
+                    match self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &cls) {
+                        Some(h) => frame.push(Slot::I(h)),
+                        None => return err("OutOfMemoryError: 对象堆用尽"),
+                    }
                 }
                 // getfield：字段槽自带宽度，直接按槽取
                 0xb4 => {
@@ -774,11 +782,7 @@ impl Vm {
                     } else {
                         // 偏移沿引用类的继承链解析；布局是「父类在前」，子类偏移与父类一致
                         let f = self.field_offset(obj, &info.class, &info.name)?;
-                        if obj > 0 {
-                            *self.objects[obj as usize - 1].get(f).unwrap_or(&Slot::I(0))
-                        } else {
-                            Slot::I(0)
-                        }
+                        self.sh.heap.get(obj, f).unwrap_or(Slot::I(0))
                     };
                     frame.push(v);
                 }
@@ -792,17 +796,13 @@ impl Vm {
                     if is_str_handle(obj) {
                         // 只有缓存字段（hash/hashIsZero）会被真字节码写；写 value/coder 不影响文本
                         let f = self.str_field_slot(&info.name)?;
-                        let slots = self.str_field_slots(obj);
-                        if f < slots.len() {
-                            slots[f] = value;
-                        }
+                        self.str_field_write(obj, f, value);
                     } else {
                         let f = self.field_offset(obj, &info.class, &info.name)?;
-                        if obj > 0 {
-                            let slots = &mut self.objects[obj as usize - 1];
-                            if f < slots.len() {
-                                slots[f] = value;
-                            }
+                        if is_ref_desc(&info.desc) {
+                            self.sh.heap.set_ref(obj, f, value);
+                        } else {
+                            self.sh.heap.set(obj, f, value);
                         }
                     }
                 }
@@ -917,8 +917,7 @@ impl Vm {
                     } else {
                         // 首次访问这个类时先跑它的 <clinit>
                         self.ensure_init(&info.class)?;
-                        let v = self
-                            .statics
+                        let v = lk(&self.sh.statics)
                             .get(&(info.class.clone(), info.name.clone()))
                             .copied()
                             .unwrap_or(Slot::I(0));
@@ -932,7 +931,7 @@ impl Vm {
                     let info = self.method_ref(&cf, idx)?;
                     let value = frame.pop()?;
                     self.ensure_init(&info.class)?;
-                    self.statics.insert((info.class, info.name), value);
+                    lk(&self.sh.statics).insert((info.class, info.name), value);
                 }
                 // invokevirtual / invokeinterface：println 走内建；
                 // 其余按**接收者的运行时类**虚分派（接口与类走同一条路，只是指令编码多两字节）
@@ -991,9 +990,9 @@ impl Vm {
                             }
                             _ => self.println_text(&info.desc, arg),
                         };
-                        self.output.push(text);
+                        self.println(text);
                     } else if info.class == "java/lang/StringBuilder"
-                        && (!self.store.has_class("java/lang/StringBuilder") || self.prefer_builtin)
+                        && (!self.store.has_class("java/lang/StringBuilder") || self.sh.prefer_builtin)
                     {
                         // 内置：字符串拼接。**只在 StringBuilder 没有字节码时**才走这里 ——
                         // 一旦 java.base 在 classpath 上，就该执行它自己的 append/toString。
@@ -1024,7 +1023,7 @@ impl Vm {
                         all.extend(args);
                         // 注解代理对象：运行时类 = 注解接口、成员值在 `Vm::ann_objs` 里。
                         // 接口方法都是抽象的，所以必须在方法解析之前分流（与 lambda 同一层）。
-                        if !self.ann_objs.is_empty() {
+                        if !lk(&self.sh.ann_objs).is_empty() {
                             if let Some(r) = self.ann_dispatch(recv.as_i32(), &info.name, &info.desc) {
                                 match call_or_handle!(r, op_pc) {
                                     CallOutcome::Value(v) => {
@@ -1077,7 +1076,7 @@ impl Vm {
                             .as_deref()
                             .and_then(|c| self.store.resolve_method(c, &info.name, &info.desc))
                             .or_else(|| self.store.resolve_method(&info.class, &info.name, &info.desc));
-                        if self.prefer_builtin {
+                        if self.sh.prefer_builtin {
                             // 只有内建实现**真给出值**才用它；给不出（或者这种接收者内建压根不支持）
                             // 就落到真字节码 —— 这个开关是「优先」不是「覆盖」，绝不能把路走死。
                             if let Some(Ok(v)) =
@@ -1092,8 +1091,7 @@ impl Vm {
                             None => {
                                 // 兜底：这个类**没有字节码**（独立模式下的 java.* 替身），查内建表。
                                 // 类字节码在的时候不会走到这里 —— resolve_method 会先命中。
-                                let builtin = self
-                                    .builtin_virtual(&info.class, &info.name, &info.desc, recv.as_i32(), &all[1..]);
+                                let builtin = self.builtin_virtual(&info.class, &info.name, &info.desc, recv.as_i32(), &all[1..]);
                                 match builtin {
                                     Some(v) => {
                                         frame.push(v?);
@@ -1192,7 +1190,7 @@ impl Vm {
                             // java.* 的构造器（`new RuntimeException("boom")`）我们没有字节码：
                             // 只把消息记在异常对象上，打印未捕获异常时才用得到。
                             if let Some(msg) = all.get(1) {
-                                self.exc_msgs.insert(all[0].as_i32(), msg.as_i32());
+                                lk(&self.sh.exc_msgs).insert(all[0].as_i32(), msg.as_i32());
                             }
                         }
                         None if info.name == "<init>" => {}
@@ -1254,7 +1252,7 @@ impl Vm {
                     let op_pc = pc - 3;
                     // 真字节码优先；`VMLESS_PREFER_BUILTIN=1` 只是「先问内建表」，
                     // 内建表没有的照样走字节码（不是硬覆盖）
-                    if self.prefer_builtin {
+                    if self.sh.prefer_builtin {
                         if let Some(Ok(v)) = self.builtin_static(&info.class, &info.name, &info.desc, &args) {
                             if !info.desc.ends_with(")V") {
                                 frame.push(v);
@@ -1345,7 +1343,7 @@ impl Vm {
                             continue;
                         }
                     };
-                    self.indy_calls += 1;
+                    self.indy().indy_calls += 1;
                     let r = call_or_handle!(
                         self.invoke_mh_as(target, &desc, &args, "invokedynamic"),
                         op_pc
@@ -1378,14 +1376,15 @@ impl Vm {
         if n < 0 {
             return err("数组长度为负");
         }
-        self.arrays.push(vec![Slot::I(0); n as usize]);
-        self.array_class.push(desc.to_string());
-        let handle = -(self.arrays.len() as i32);
+        let handle = match self.sh.heap.alloc_array(n as usize, desc, Slot::I(0)) {
+            Some(h) => h,
+            None => return err("OutOfMemoryError: 数组堆用尽"),
+        };
         if counts.len() > 1 {
             let elem_desc = &desc[1..];
             for i in 0..n as usize {
                 let sub = self.new_multi(elem_desc, &counts[1..])?;
-                self.arrays[(handle.abs() - 1) as usize][i] = Slot::I(sub);
+                self.sh.heap.set(handle, i, Slot::I(sub));
             }
         }
         Ok(handle)
@@ -1402,8 +1401,8 @@ impl Vm {
         if obj <= 0 {
             return None;
         }
-        let c = self.object_class.get(obj as usize - 1)?;
-        self.store.field_index(c, name)
+        let c = self.sh.heap.class_of(obj)?;
+        self.store.field_index(&c, name)
     }
 
     /// 主循环里的同步异常处理：本方法的异常表接得住就返回 handler 偏移 + 异常句柄，

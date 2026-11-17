@@ -1,5 +1,6 @@
 //! 类元数据、继承链与类型判定。
 
+use super::shared::lk;
 use crate::{ClassFile, CpEntry};
 
 use super::err;
@@ -85,13 +86,14 @@ impl Vm {
         // 另一个线程 getstatic 会读到默认值 0 —— `TimeUnit.MILLISECONDS` 变成 null、
         // `Thread.sleep(ms)` 的 `toNanos` 在 null 上取字段，最后是操作数栈下溢。
         loop {
-            if self.initialized.contains(class) {
+            if lk(&self.sh.initialized).contains(class) {
                 return Ok(());
             }
-            match self.initializing.get(class).copied() {
+            let init_owner = lk(&self.sh.initializing).get(class).copied();
+            match init_owner {
                 // 别的线程正在初始化 → 挂进等待队列，被唤醒后重新判定
                 Some(owner) if owner != me => {
-                    self.init_waiters.entry(class.to_string()).or_default().push(me);
+                    lk(&self.sh.init_waiters).entry(class.to_string()).or_default().push(me);
                     self.set_state(me, super::thread::ST_BLOCKED);
                     self.park_block(None);
                     self.set_state(me, super::thread::ST_RUNNABLE);
@@ -102,7 +104,7 @@ impl Vm {
                 None => break, // 没人做 → 我来
             }
         }
-        self.initializing.insert(class.to_string(), me);
+        lk(&self.sh.initializing).insert(class.to_string(), me);
         let r = (|| -> Result<(), VmError> {
             if let Some(s) = self.store.super_of(class) {
                 self.ensure_init(&s)?;
@@ -115,15 +117,14 @@ impl Vm {
             }
             Ok(())
         })();
-        self.initializing.remove(class);
+        lk(&self.sh.initializing).remove(class);
         if r.is_ok() {
             // **完成之后**才记进 initialized：先记会让别的线程看到「已完成」却读到默认值
-            self.initialized.insert(class.to_string());
+            lk(&self.sh.initialized).insert(class.to_string());
         }
-        if let Some(waiters) = self.init_waiters.remove(class) {
-            for w in waiters {
-                self.wake(w);
-            }
+        let waiters: Vec<u64> = lk(&self.sh.init_waiters).remove(class).unwrap_or_default();
+        for w in waiters {
+            self.wake(w);
         }
         r
     }
@@ -193,7 +194,7 @@ impl Vm {
             RefKind::Obj(c) => {
                 // lambda 对象：它实现的是若干个接口，而这个合成类**不在类表里** ——
                 // 只能按登记过的接口集合判（`instanceof Runnable` / checkcast 都靠这里）
-                if let Some(l) = self.lambdas.get(&handle) {
+                if let Some(l) = self.indy().lambdas.get(&handle) {
                     return l.ifaces.iter().any(|i| self.is_subclass(i, target));
                 }
                 self.is_subclass(&c, target)
