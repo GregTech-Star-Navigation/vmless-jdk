@@ -1,0 +1,16 @@
+[package]
+name = "vmless-crypto"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+# 运行时（rustjavac）只作为**可选**依赖：密码学栈不引用它的任何类型，
+# JarFile 集成通过 `jar_sign::verify_jar(bytes) -> VerifyReport` 这一层完成。
+# 设为 optional 是为了让本栈在运行时自身编译失败时仍可独立构建/验证。
+rustjavac = { path = "../rustjavac", optional = true }
+
+[features]
+classfile = ["dep:rustjavac"]
+
+[profile.release]
+opt-level = 3

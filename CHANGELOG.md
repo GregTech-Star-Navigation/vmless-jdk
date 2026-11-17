@@ -604,3 +604,32 @@ java: 5 h o hello true 99162322 99162322 false el
 
 **已知缺口**：`invokedynamic`(0xba) 解释器未实现（lambda 与字符串拼接死在第一处）、
 非 ASCII 字符串（`JavaLangAccess` 由 JDK 启动流程注册，我们缺那段）。
+
+## 0.47.0 — 2026-11-17 · 密码学栈 + jarsigner / keytool / ktab（生产级）
+
+新增 `jdk-crypto/`（24 个文件 / 7959 行，**零外部依赖**）：
+
+`SHA-1/256/512` + `MD5` + `HMAC` · 自写 `BigUint`（加/乘/幂模/求逆）· `RSA 2048/3072` +
+PKCS#1 v1.5 · `ASN.1 DER` · `X.509`（解析 + 自签生成）· `PKCS#7 SignedData` ·
+`PKCS#12`（PBES2/PBKDF2 + AES-CBC）· ZIP 读写 · JAR 签名/验签
+
+**硬判据是与真 JDK 双向互通**（实测）：
+| 项 | 结果 |
+|---|---|
+| 我们签的 jar → 真 `jarsigner -verify` | `jar verified.` exit 0 |
+| 真 `jarsigner` 签的 jar → 我们验 | exit 0（SHA-384/256/1 三种都过）|
+| 我们生成的证书 → 真 `keytool -printcert` | Owner/Serial/有效期/SHA384withRSA/2048-bit/v3 全对 |
+| PKCS#12 ↔ 真 keytool | 双向：真 jarsigner 能直接用我们的 `.p12` 签名 |
+| keytab ↔ 真 `klist -k -e` | 2 entries，KVNO 3/1，type 18/17 |
+
+**生产级指标**
+- **fuzz 50 万例（DER/X.509/PKCS#12 各 10 万 + 结构化变异 20 万），0 panic**
+- 常数时间比较用于 HMAC / PKCS#7 摘要 / PKCS#12 MAC / JAR 条目摘要；
+  PKCS#1 v1.5 验签严格按 RFC 8017 §8.2.2 检查 `00 01 FF..FF 00`（不是只比尾部哈希）
+- KAT 来自 FIPS 180-4 / RFC 1321 / 2202 / 4231 / 6070 / 7914 / FIPS-197 / SP800-38A / 7292
+- 性能：SHA-256 **144 MB/s**、RSA-2048 签名 15.2ms / 验签 3.6ms、PKCS#12 加载 75.6ms
+
+**已知限制**：无 TSA 时间戳、仅 RSA 签名块、单签名者、`.p12` 仅 PBES2/AES、不支持 ZIP64。
+
+**踩到两个硬坑**：ZIP 的 data-descriptor 位（bit 3）不清会让 JDK `ZipFile` 报
+`invalid entry size`；JDK 的 keytab 格式带 4 字节条目长度前缀，按 MIT 文档写会被 JDK `klist` 拒绝。
