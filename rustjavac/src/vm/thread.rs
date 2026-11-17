@@ -669,7 +669,18 @@ impl Vm {
     fn invoke_thread_run(&mut self, thread_obj: i32) -> Result<Slot, VmError> {
         let desc = "()V";
         self.ensure_init("java/lang/Thread")?;
-        if let Some((ci, mi)) = self.store.resolve_method("java/lang/Thread", "run", desc) {
+        // 虚分派：必须从**接收者的运行时类**开始沿继承链找 `run`，
+        // 而不是写死 `java/lang/Thread`。否则 `class MyT extends Thread { void run(){…} }`
+        // 会落到 `Thread.run()` 的默认实现（里面 target 为 null，什么都不做）——
+        // 线程体静默不执行，且不报错。
+        let start = self
+            .obj_class_name(thread_obj)
+            .unwrap_or_else(|| "java/lang/Thread".to_string());
+        let target = self
+            .store
+            .resolve_method(&start, "run", desc)
+            .or_else(|| self.store.resolve_method("java/lang/Thread", "run", desc));
+        if let Some((ci, mi)) = target {
             self.depth += 1;
             let r = self.execute(ci, mi, desc, &[Slot::I(thread_obj)], true);
             self.depth -= 1;

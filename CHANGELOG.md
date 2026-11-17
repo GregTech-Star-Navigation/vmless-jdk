@@ -1028,3 +1028,19 @@ GC 总停顿慢 4.39× · 分配峰值 RSS 慢 2.63×
 ### 新发现未修（高价值）
 **`Thread` 子类 override 的 `run()` 不被派发** —— 线程体不执行，`v=42` 静默变 `0`（lambda/Runnable 版正常）。
 这会静默给出错误结果，下一轮优先修。
+
+## 0.58.1 — 2026-11-18 · 修 `Thread` 子类覆写的 `run()` 不被派发
+
+`src/vm/thread.rs::invoke_thread_run` 写死了 `resolve_method("java/lang/Thread", "run", "()V")`，
+于是 `class MyT extends Thread { public void run(){ v = 42; } }` 会落到 `Thread.run()` 的默认实现
+（里面 `target` 为 null，什么都不做）—— **线程体静默不执行，`v` 保持 0，且不报错**。
+
+改成从**接收者的运行时类**开始沿继承链解析（`obj_class_name(thread_obj)` → `resolve_method` → 兜底 `java/lang/Thread`）。
+
+实测（javac 编的真字节码）：
+```
+java : v=42
+ours : v=42        ← 修前是 v=0
+```
+
+回归：`verify.sh` 103/103、`cargo test` 73 passed。
