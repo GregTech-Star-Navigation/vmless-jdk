@@ -633,3 +633,35 @@ PKCS#1 v1.5 · `ASN.1 DER` · `X.509`（解析 + 自签生成）· `PKCS#7 Signe
 
 **踩到两个硬坑**：ZIP 的 data-descriptor 位（bit 3）不清会让 JDK `ZipFile` 报
 `invalid entry size`；JDK 的 keytab 格式带 4 字节条目长度前缀，按 MIT 文档写会被 JDK `klist` 拒绝。
+
+## 0.48.0 — 2026-11-17 · JDK 工具集 15 个真实现（+17 个能力缺口桩）
+
+新增 `jdk-tools/`，**32 个 exe 全部实测可跑**：
+
+| 工具 | 做了什么 | 实测 |
+|---|---|---|
+| **jimage** | list / info / extract / verify | 全量 **30482 条**；extract 与真 jimage **逐字节相同**；`verify` 0 问题；145MB 索引 4.27s、峰值 RSS 16.1MB |
+| **jmod** | create / extract / list / describe / hash | `--compress zip-0/zip-6` → 30.9MB / 16.6MB；真 JDK 能 list/describe/extract 我们的 jmod |
+| **serialver** | 按 `ObjectStreamClass` 规范算 | 20 个 `java.*` 类与真 serialver **全一致**（`String` = `-6849794470754667710L`）|
+| **jnativescan** | 扫 `ACC_NATIVE` | `java.base` = **748**（与独立分析吻合）|
+| **jdeprscan** | 内置表 + 输入自身 `@Deprecated` | 报出 `Thread::stop()V (forRemoval=true)` |
+| **javaw** | GUI 子系统 exe，写 jps 登记 | 跑通 jar/class，jps 可见 |
+| **jwebserver** | HTTP/1.1、Range、304、keep-alive | curl 逐项验过 |
+| **jlink** | `module-info` 的 `requires` **传递闭包** + strip-debug | 镜像里跑出真类 |
+| **jshell** | 编译 + VM，变量保留/命令 | `1+2`→`3`；`var x="hi"; x.length()`→`2` |
+| **javadoc** | 类/方法/字段三张表 + 索引 + 交叉链接 | 4 个 HTML，`@author`/`-private` 生效 |
+| **jpackage** | `--type app-image` 真做 | launcher 跑出 `packaged hi` |
+| **jrunscript** | 自写极简 JS（变量/if/while/for/函数） | `2` / `5050` |
+| **rmiregistry** | TCP 注册表（bind/lookup/list） | 8 条命令全对 |
+| **jps** | 自建进程登记 + 存活剔除 | 列出运行中的 javaw |
+| **jdb** | 记录-回放式调试器 | 断点停在第 6 行，`print`/`next`/`cont` 值随循环变化 |
+
+**生产级**：20 组畸形输入全过（不 panic、非 0 退出码）；修了 EPIPE（`jmod list | head` 之前 panic）；
+`jimage --help` 与真 JDK 逐行相同；`serialver`/`jimage list`/`jmod describe` 输出与真 JDK 逐行一致。
+
+**17 个桩**（按能力归属分组，每个都打印「缺什么 + 归属 + 现有替代」并 exit 1）：
+crypto(1) / kerberos(2) / attach+JFR(8) / GUI 无障碍(4) / 其它(2)。
+其中 `jarsigner`/`keytool`/`ktab` 已由 `jdk-crypto` 提供真实现。
+
+**已知边界**：`jlink` 写的是目录形式的 `lib/modules`（不写 jimage 容器，`--compress` 无效）；
+`jdb` 是记录-回放（`Vm` 未暴露暂停原语）；`javadoc` 无 doclet 体系；`rmiregistry` 是行协议不是 JRMP。
