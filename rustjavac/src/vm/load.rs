@@ -50,14 +50,16 @@ fn super_of_of(classes: &[Rc<ClassFile>], by_name: &HashMap<String, usize>, clas
     builtin_super(class).map(|s| s.to_string())
 }
 
-/// `java.*` 的语义目前由 `natives` 写死（String / Object / 包装类 / 异常 / System …）。
-/// 真实 JDK 的字节码一旦进了类表就会**盖掉** natives（`resolve_method` 先查类表），
-/// 紧接着撞上解释器还不认识的那部分字节码 —— 所以闭包里不拉 `java.*`。
+/// **闭包里要不要拉 `java.*`**：以前一律排除（那时 java.* 全靠 `natives` 写死）。
 ///
-/// 想读这些类的结构请直接走 `load::ClassPath`（`examples/run_jimage.rs`）；
-/// 等哪天要真执行 JDK 字节码，去掉这一层限制，同时处理 natives 与真实实现的去重。
-fn is_jdk_runtime(name: &str) -> bool {
-    name.starts_with("java/")
+/// 现在反过来 —— 只要 classpath 里真有 `java/lang/Object`（也就是把 jimage / 解包目录
+/// 放进了 classpath，见 `VMLESS_JDK`），就**整条 `java.*` 都拉进来**，让真字节码优先执行。
+/// 否则（只给了一个 .class 的独立模式）仍然只拉用户自己的类，`java.*` 继续由内建兜。
+///
+/// 判据只能是「java.base 到底在不在」，不能是「这个类长得像不像 JDK 的」：前者是事实，
+/// 后者是猜。猜错的后果就是「真字节码被静默跳过」——那等于什么都没做。
+fn pull_jdk(jdk_present: bool, name: &str) -> bool {
+    jdk_present || !name.starts_with("java/")
 }
 
 impl ClassStore {
@@ -70,6 +72,8 @@ impl ClassStore {
         let mut files: Vec<ClassFile> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut queue: Vec<String> = vec![main_class.to_string()];
+        // java.base 在不在 classpath 上 —— 一次探测，决定整条闭包要不要拉 `java.*`
+        let jdk_present = cp.find("java/lang/Object").ok().flatten().is_some();
         while let Some(name) = queue.pop() {
             if name.is_empty() || name.starts_with('[') || !seen.insert(name.clone()) {
                 continue;
@@ -90,7 +94,7 @@ impl ClassStore {
                 if let Some(CpEntry::Class(ix)) = e {
                     if let Some(raw) = cf.utf8(*ix) {
                         let n = String::from_utf8_lossy(raw).into_owned();
-                        if !n.starts_with('[') && !n.contains('<') && !n.contains(';') && !is_jdk_runtime(&n)
+                        if !n.starts_with('[') && !n.contains('<') && !n.contains(';') && pull_jdk(jdk_present, &n)
                         {
                             queue.push(n);
                         }
@@ -255,6 +259,11 @@ impl ClassStore {
         let mut v: Vec<String> = self.by_name.keys().cloned().collect();
         v.sort();
         v
+    }
+
+    /// 这个类的字节码在不在类表里？在就必须执行它，不许拿内建实现顶替
+    pub(super) fn has_class(&self, name: &str) -> bool {
+        self.by_name.contains_key(name)
     }
 
     /// 从 `from` 开始沿继承链解析方法；类链上找不到再找接口的 **default 实现**

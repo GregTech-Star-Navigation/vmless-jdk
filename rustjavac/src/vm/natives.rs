@@ -51,6 +51,12 @@ impl Vm {
             RefKind::Null => "null".to_string(),
             RefKind::Str => self.string_text(h),
             RefKind::Obj(cls) => {
+                // 真字节码 `new` 出来的 String 对象：文本在它的 value/coder 字段里
+                if cls == "java/lang/String" {
+                    if let Some(text) = self.real_string_text(h) {
+                        return text;
+                    }
+                }
                 if let Some(v) = self.wrapper_value(h) {
                     return match v {
                         Slot::F(d) => crate::java_double_to_string(d),
@@ -77,9 +83,14 @@ impl Vm {
     pub(super) fn identity_hash(&self, h: i32) -> i32 {
         // 字符串按内容算（Java 的 `String.hashCode` 就是这么算的）：
         // `"abc".hashCode()` 与 HotSpot 的数值也一致
-        if let RefKind::Str = self.ref_kind(h) {
+        let text = match self.ref_kind(h) {
+            RefKind::Str => Some(self.string_text(h)),
+            RefKind::Obj(ref c) if c == "java/lang/String" => self.real_string_text(h),
+            _ => None,
+        };
+        if let Some(text) = text {
             let mut hash = 0i32;
-            for c in self.string_text(h).encode_utf16() {
+            for c in text.encode_utf16() {
                 hash = hash.wrapping_mul(31).wrapping_add(c as i32);
             }
             return hash;
@@ -105,6 +116,31 @@ impl Vm {
             RefKind::Str => self.string_text(h),
             _ => String::new(),
         }
+    }
+
+    /// 任意引用 → 文本：字符串堆句柄**和**真字节码 `new` 出来的 String 对象都能取
+    pub(super) fn text_of(&self, h: i32) -> String {
+        match self.ref_kind(h) {
+            RefKind::Str => self.string_text(h),
+            RefKind::Obj(ref c) if c == "java/lang/String" => self.real_string_text(h).unwrap_or_default(),
+            _ => String::new(),
+        }
+    }
+
+    /// `java.lang.reflect.Field` 对象 → (声明类名, 字段名)。
+    /// 我们的 VM 里 Field 的唯一用途是 `Unsafe.objectFieldOffset`。
+    pub(super) fn reflect_field_parts(&self, h: i32) -> (Option<String>, Option<String>) {
+        if !matches!(self.ref_kind(h), RefKind::Obj(ref c) if c == "java/lang/reflect/Field") {
+            return (None, None);
+        }
+        let Some(slots) = self.objects.get(h as usize - 1) else { return (None, None) };
+        let get = |name: &str| -> Option<Slot> {
+            let i = self.store.field_index("java/lang/reflect/Field", name)?;
+            slots.get(i).copied()
+        };
+        let cls = get("clazz").and_then(|s| self.class_obj_name(s.as_i32()));
+        let name = get("name").map(|s| self.text_of(s.as_i32()));
+        (cls, name)
     }
 
     /// 新建一个包装类对象（字段 0 = 值），含小整数缓存与布尔单例
@@ -146,6 +182,23 @@ impl Vm {
         self.object_class.push(class.to_string());
         let h = self.objects.len() as i32;
         VmError { msg: format!("抛出 {class}"), exc: Some(h) }
+    }
+
+    /// `new X(...)` 的 Rust 侧入口：分配对象并**真的执行**构造器字节码。
+    /// native 实现里要造 Java 对象时用（`VM.initialize()` 要一个空 HashMap）。
+    pub(super) fn new_instance(&mut self, class: &str, ctor_desc: &str) -> Result<i32, VmError> {
+        self.ensure_init(class)?;
+        let n = self.store.field_count(class);
+        self.objects.push(vec![Slot::I(0); n.max(1)]);
+        self.object_class.push(class.to_string());
+        let h = self.objects.len() as i32;
+        if let Some((ci, mi)) = self.store.resolve_method(class, "<init>", ctor_desc) {
+            self.depth += 1;
+            let r = self.execute(ci, mi, ctor_desc, &[Slot::I(h)], true);
+            self.depth -= 1;
+            r?;
+        }
+        Ok(h)
     }
 
     // ---------- 调用分派 ----------
@@ -551,7 +604,7 @@ impl Vm {
         }
     }
 
-    fn array_copy(&mut self, src: i32, sp: i32, dst: i32, dp: i32, n: i32) -> Result<(), VmError> {
+    pub(super) fn array_copy(&mut self, src: i32, sp: i32, dst: i32, dp: i32, n: i32) -> Result<(), VmError> {
         let sd = self.array_desc(src);
         let dd = self.array_desc(dst);
         if sd.is_none() || sd != dd || n < 0 || sp < 0 || dp < 0 {

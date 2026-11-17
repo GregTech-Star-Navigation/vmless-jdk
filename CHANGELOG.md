@@ -572,3 +572,35 @@ zip64/加密不支持；`-jar` 暂不支持给 main 传参；**`java.*` 故意�
 `jsr ret wide goto_w jsr_w`（本编译器不产）、`invokedynamic`、`monitorenter/monitorexit`。
 
 **验证**：`verify.sh` **103/103 三路一致**；`cargo test` 44 passed。
+
+## 0.46.0 — 2026-11-17 · native 方法机制 + **真的执行 OpenJDK 的 java.base 字节码**
+
+这是从「玩具 VM」到「真 VM」的分水岭。
+
+- **native 机制**：`ACC_NATIVE` 方法查注册表（`(类,名,描述符) → fn(&mut Vm,&mut Frame)`），
+  未命中报 `UnsatisfiedLinkError: <类>.<名><描述符> not registered` 并累积缺项清单；
+  已注册 **102 条**（Object 协议 / Class / System / Unsafe 64 条 / String.intern / Throwable / 浮点位转换 / VM / CDS）
+- **真字节码执行**：`VMLESS_JDK=<lib/modules|解包目录>` 把 java.base 挂到 classpath 末尾；
+  分派顺序改为 `VMLESS_PREFER_BUILTIN` → **真字节码** → 内建替身（仅当类无字节码）→ 报错
+- **`ldc Class`**：类对象是真对象（运行时类 `java/lang/Class`，`getName`/`isInstance` 可用），同类同句柄
+
+### 里程碑（javac 25 编，输出与 HotSpot 逐字节一致）
+| | 内容 | 结果 | 新增 native |
+|---|---|---|---|
+| **M1** | `new java.lang.Object()` | 7/7 | ~11 |
+| **M2** | `String.<init>(char[])`、`length`、`charAt`、`hashCode`、`equals`、`substring` | **9/9** | ~20 |
+| **M3** | `ArrayList add/get/size/remove` | 10/10 | **0** |
+| **M4** | `HashMap put/get/size` | 8/8 | **0** |
+| **M5** | `ldc Class` | 12/12 | 0 |
+
+实测 M2：
+```
+ours: 5 h o hello true 99162322 99162322 false el   缺 native: 0
+java: 5 h o hello true 99162322 99162322 false el
+```
+
+新增 `docs/java-base-native-清单.md`（231 行，按里程碑分组的 native 清单）。
+**验证**：`verify.sh` 103/103；`cargo test` 44 passed。
+
+**已知缺口**：`invokedynamic`(0xba) 解释器未实现（lambda 与字符串拼接死在第一处）、
+非 ASCII 字符串（`JavaLangAccess` 由 JDK 启动流程注册，我们缺那段）。

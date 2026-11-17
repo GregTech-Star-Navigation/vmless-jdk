@@ -1,26 +1,39 @@
 //! 指令分派主循环：`Vm::execute`（含进入方法时的参数落位）。
 
-use crate::jit::param_slots;
 use crate::CpEntry;
 
 use super::call::count_args;
 use super::class::class_name_of;
 use super::err;
-use super::heap::RefKind;
+use super::heap::{RefKind, STR_BASE};
 use super::exception::thrown;
 use super::frame::Frame;
+use super::native_reg;
 use super::slot::Slot;
 use super::Vm;
 use super::VmError;
 
+/// 方法访问标志：`native`（没有 Code 属性，实现由 VM 提供）
+pub(super) const ACC_NATIVE: u16 = 0x0100;
+
+/// 这个句柄是不是字符串堆里的（而不是对象堆 / 数组堆 / 类对象）
+fn is_str_handle(h: i32) -> bool {
+    h >= STR_BASE
+}
+
 impl Vm {
-    /// `ldc` / `ldc_w`：int / float / String 常量（都只占一个槽）
+    /// `ldc` / `ldc_w`：int / float / String / **Class** 常量（都只占一个槽）
     pub(super) fn ldc(&mut self, class: usize, index: u16) -> Result<Slot, VmError> {
         let cf = self.store.classes[class].clone();
         match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
             Some(CpEntry::Integer(v)) => Ok(Slot::I(*v as i32)),
             Some(CpEntry::Float(bits)) => Ok(Slot::Fl(f32::from_bits(*bits))),
             Some(CpEntry::String(_)) => Ok(Slot::I(self.string_handle(class, index))), // 句柄进字符串堆
+            // `X.class`：压一个**类对象**（同一个类永远同一个句柄，`X.class == X.class` 靠它）
+            Some(CpEntry::Class(ix)) => {
+                let name = String::from_utf8_lossy(cf.utf8(*ix).unwrap_or_default()).into_owned();
+                Ok(Slot::I(self.class_obj(&name)))
+            }
             other => err(format!("ldc 不支持的类型: {other:?}")),
         }
     }
@@ -51,20 +64,29 @@ impl Vm {
         // 每次调用先把「当前类」钉住：常量池、Code 属性都按它取（继承后方法来自不同类）
         let cf = self.store.classes[class].clone();
         let m = &cf.methods[method];
-        let (max_locals, body, exc_table) = code_of(&cf, m)?;
+        // native 方法没有 Code 属性：先查注册表，命中就交出去；没命中报 UnsatisfiedLinkError
+        if m.access_flags & ACC_NATIVE != 0 {
+            let owner = cf.this_class_name().unwrap_or_default();
+            let name = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
+            let desc = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
+            let f = self.require_native(&owner, &name, &desc)?;
+            let mut frame = Frame::new(crate::jit::param_slots(&desc).last().map(|s| s + 2).unwrap_or(1));
+            native_reg::place_args(&mut frame, &desc, args, receiver);
+            return f(self, &mut frame);
+        }
+        let (max_locals, body, exc_table) = code_of(&cf, m).map_err(|e| VmError {
+            msg: format!(
+                "{}.{}{}: {}",
+                cf.this_class_name().unwrap_or_default(),
+                String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()),
+                String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()),
+                e.msg
+            ),
+            exc: None,
+        })?;
 
         let mut frame = Frame::new(max_locals);
-        // 参数按 JVM 槽位落位：this 在 0，long/double 占两槽，后面的参数要跳过一槽
-        let arg_slots = param_slots(desc);
-        let offset = usize::from(receiver);
-        for (i, a) in args.iter().enumerate() {
-            let slot = if i < offset {
-                0
-            } else {
-                arg_slots.get(i - offset).copied().unwrap_or(i - offset) + offset
-            };
-            frame.store(slot, *a);
-        }
+        native_reg::place_args(&mut frame, desc, args, receiver);
 
         // 调用点上的异常：被调方抛出来的 Java 异常不能直接往上冒 ——
         // 先看本方法的异常表接不接得住（接住就按 handler 入口继续跑）。
@@ -670,12 +692,19 @@ impl Vm {
                     pc += 2;
                     let info = self.method_ref(&cf, idx)?;
                     let obj = frame.pop_i()?;
-                    // 偏移沿引用类的继承链解析；布局是「父类在前」，子类偏移与父类一致
-                    let f = self.field_offset(obj, &info.class, &info.name)?;
-                    let v = if obj > 0 {
-                        *self.objects[obj as usize - 1].get(f).unwrap_or(&Slot::I(0))
+                    let v = if is_str_handle(obj) {
+                        // 字符串堆句柄的字段视图（`ldc "abc"` 的 `value`/`coder`/`hash`）
+                        let f = self.str_field_slot(&info.name)?;
+                        let slots = self.str_field_slots(obj);
+                        slots.get(f).copied().unwrap_or(Slot::I(0))
                     } else {
-                        Slot::I(0)
+                        // 偏移沿引用类的继承链解析；布局是「父类在前」，子类偏移与父类一致
+                        let f = self.field_offset(obj, &info.class, &info.name)?;
+                        if obj > 0 {
+                            *self.objects[obj as usize - 1].get(f).unwrap_or(&Slot::I(0))
+                        } else {
+                            Slot::I(0)
+                        }
                     };
                     frame.push(v);
                 }
@@ -686,11 +715,20 @@ impl Vm {
                     let info = self.method_ref(&cf, idx)?;
                     let value = frame.pop()?;
                     let obj = frame.pop_i()?;
-                    let f = self.field_offset(obj, &info.class, &info.name)?;
-                    if obj > 0 {
-                        let slots = &mut self.objects[obj as usize - 1];
+                    if is_str_handle(obj) {
+                        // 只有缓存字段（hash/hashIsZero）会被真字节码写；写 value/coder 不影响文本
+                        let f = self.str_field_slot(&info.name)?;
+                        let slots = self.str_field_slots(obj);
                         if f < slots.len() {
                             slots[f] = value;
+                        }
+                    } else {
+                        let f = self.field_offset(obj, &info.class, &info.name)?;
+                        if obj > 0 {
+                            let slots = &mut self.objects[obj as usize - 1];
+                            if f < slots.len() {
+                                slots[f] = value;
+                            }
                         }
                     }
                 }
@@ -815,8 +853,11 @@ impl Vm {
                         let _recv = frame.pop()?;
                         let text = self.println_text(&info.desc, arg);
                         self.output.push(text);
-                    } else if info.class == "java/lang/StringBuilder" {
-                        // 内置：字符串拼接（`StringBuilder` 没有 .class，走不到 resolve_method）
+                    } else if info.class == "java/lang/StringBuilder"
+                        && (!self.store.has_class("java/lang/StringBuilder") || self.prefer_builtin)
+                    {
+                        // 内置：字符串拼接。**只在 StringBuilder 没有字节码时**才走这里 ——
+                        // 一旦 java.base 在 classpath 上，就该执行它自己的 append/toString。
                         if info.name == "append" {
                             let arg = frame.pop()?;
                             let recv = frame.pop()?.as_i32();
@@ -843,7 +884,8 @@ impl Vm {
                         let mut all = vec![recv];
                         all.extend(args);
                         // 从对象的**实际类**开始解析（这就是覆写的分派点）；
-                        // 拿不到运行时类才退回引用类，再不行再问内建表。
+                        // 拿不到运行时类才退回引用类。**真字节码优先**：
+                        // `VMLESS_PREFER_BUILTIN=1` 只是「先问内建表」，内建表没有的还能走字节码。
                         let actual = match self.ref_kind(recv.as_i32()) {
                             RefKind::Obj(c) => Some(c),
                             _ => None,
@@ -852,10 +894,21 @@ impl Vm {
                             .as_deref()
                             .and_then(|c| self.store.resolve_method(c, &info.name, &info.desc))
                             .or_else(|| self.store.resolve_method(&info.class, &info.name, &info.desc));
+                        if self.prefer_builtin {
+                            // 只有内建实现**真给出值**才用它；给不出（或者这种接收者内建压根不支持）
+                            // 就落到真字节码 —— 这个开关是「优先」不是「覆盖」，绝不能把路走死。
+                            if let Some(Ok(v)) =
+                                self.builtin_virtual(&info.class, &info.name, &info.desc, recv.as_i32(), &all[1..])
+                            {
+                                frame.push(v);
+                                continue;
+                            }
+                        }
                         let target = match target {
                             Some(t) => t,
                             None => {
-                                // 内建（String / 包装类 / Object 协议）：没有 .class，查表实现
+                                // 兜底：这个类**没有字节码**（独立模式下的 java.* 替身），查内建表。
+                                // 类字节码在的时候不会走到这里 —— resolve_method 会先命中。
                                 let builtin = self
                                     .builtin_virtual(&info.class, &info.name, &info.desc, recv.as_i32(), &all[1..]);
                                 match builtin {
@@ -947,9 +1000,19 @@ impl Vm {
                     }
                     args.reverse();
                     let op_pc = pc - 3;
+                    // 真字节码优先；`VMLESS_PREFER_BUILTIN=1` 只是「先问内建表」，
+                    // 内建表没有的照样走字节码（不是硬覆盖）
+                    if self.prefer_builtin {
+                        if let Some(Ok(v)) = self.builtin_static(&info.class, &info.name, &info.desc, &args) {
+                            if !info.desc.ends_with(")V") {
+                                frame.push(v);
+                            }
+                            continue;
+                        }
+                    }
                     let target = self.store.resolve_method(&info.class, &info.name, &info.desc);
                     let Some(target) = target else {
-                        // 内建静态方法（`Integer.parseInt` / `System.arraycopy` …）
+                        // 兜底：这个类**没有字节码**时的内建替身（`Integer.parseInt` / `System.arraycopy` …）
                         let Some(v) = self.builtin_static(&info.class, &info.name, &info.desc, &args) else {
                             return Err(VmError {
                                 msg: format!("找不到方法 {}{}", info.name, info.desc),

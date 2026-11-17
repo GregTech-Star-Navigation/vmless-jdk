@@ -14,7 +14,28 @@ impl Vm {
         let class = self.type_name(handle);
         match self.exc_msgs.get(&handle) {
             Some(m) => format!("{class}: {}", self.string_text(*m)),
-            None => class,
+            // 真字节码构造出来的异常：`Throwable.detailMessage` 字段里有消息
+            None => match self.throwable_message(handle) {
+                Some(m) => format!("{class}: {m}"),
+                None => class,
+            },
+        }
+    }
+
+    /// 真 `java.lang.Throwable` 实例的 `detailMessage`（没有就说 None）
+    fn throwable_message(&self, handle: i32) -> Option<String> {
+        if !matches!(self.ref_kind(handle), crate::vm::heap::RefKind::Obj(ref c)
+            if self.is_subclass(c, "java/lang/Throwable"))
+        {
+            return None;
+        }
+        let slots = self.objects.get(handle as usize - 1)?;
+        let i = self.store.field_index("java/lang/Throwable", "detailMessage")?;
+        let s = slots.get(i)?.as_i32();
+        if s == 0 {
+            None
+        } else {
+            Some(self.obj_to_string(s))
         }
     }
 

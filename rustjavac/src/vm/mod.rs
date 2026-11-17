@@ -15,6 +15,7 @@ mod exec;
 mod frame;
 mod heap;
 mod load;
+mod native_reg;
 mod natives;
 mod rt;
 mod slot;
@@ -75,6 +76,21 @@ pub struct Vm {
     statics: HashMap<(String, String), Slot>,
     /// 已经跑过 `<clinit>` 的类（静态初始化只跑一次，且先跑父类）
     initialized: std::collections::HashSet<String>,
+    /// 类对象：句柄 → 它代表的类描述符（`X.class` / `getClass()` 的轻量句柄）
+    class_objs: HashMap<i32, String>,
+    /// 类描述符 → 类对象句柄（同一个类必须永远同一个句柄，`X.class == X.class` 靠它）
+    class_obj_cache: HashMap<String, i32>,
+    /// 字符串句柄的**字段视图**：`getfield value/coder/...` 落在字符串堆句柄上时用。
+    /// 真 java.base 的 `String.length()` 是 `value.length >> coder`，没有这层就一碰常量就断。
+    str_fields: HashMap<i32, Vec<Slot>>,
+    /// native 方法注册表：`(类, 方法名, 描述符) → Rust 实现`
+    natives: native_reg::NativeRegistry,
+    /// 真 JDK 的类是否真的加载进来了（`java/lang/Object` 在类表里 = 真字节码优先）
+    jdk_loaded: bool,
+    /// `VMLESS_PREFER_BUILTIN=1`：显式要求先走 `jdk.rs` 的内建实现
+    prefer_builtin: bool,
+    /// 缺 native 的累计清单（`UnsatisfiedLinkError` 时记一条，供 `docs/java-base-native-清单.md`）
+    missing_natives: std::collections::BTreeSet<String>,
 }
 
 impl Vm {
@@ -84,6 +100,7 @@ impl Vm {
     }
 
     pub(crate) fn from_store(store: ClassStore) -> Self {
+        let jdk_loaded = store.has_class("java/lang/Object");
         Vm {
             store,
             output: Vec::new(),
@@ -99,7 +116,47 @@ impl Vm {
             exc_msgs: HashMap::new(),
             statics: HashMap::new(),
             initialized: std::collections::HashSet::new(),
+            class_objs: HashMap::new(),
+            class_obj_cache: HashMap::new(),
+            str_fields: HashMap::new(),
+            natives: native_reg::NativeRegistry::new(),
+            jdk_loaded,
+            prefer_builtin: std::env::var("VMLESS_PREFER_BUILTIN").map(|v| v == "1").unwrap_or(false),
+            missing_natives: std::collections::BTreeSet::new(),
         }
+    }
+
+    /// 真 JDK 的类是否真的进了类表（= 遇到 `java.*` 就该执行真字节码，而不是拿内建顶替）
+    pub fn jdk_loaded(&self) -> bool {
+        self.jdk_loaded
+    }
+
+    /// 这次运行里累计遇到的「缺 native」（`UnsatisfiedLinkError` 的清单）
+    pub fn missing_natives(&self) -> Vec<String> {
+        self.missing_natives.iter().cloned().collect()
+    }
+
+    /// 已注册的 native 条目（`docs/java-base-native-清单.md` 与自检用）
+    pub fn native_entries(&self) -> Vec<(&'static str, &'static str, &'static str)> {
+        self.natives.entries()
+    }
+
+    /// 找一个 native 实现；找不到就记进缺清单并报 `UnsatisfiedLinkError`
+    pub(super) fn require_native(
+        &mut self,
+        class: &str,
+        name: &str,
+        desc: &str,
+    ) -> Result<native_reg::NativeFn, VmError> {
+        if let Some(f) = self.natives.lookup(class, name, desc) {
+            return Ok(f);
+        }
+        let key = format!("{class}.{name}{desc}");
+        self.missing_natives.insert(key.clone());
+        Err(VmError {
+            msg: format!("UnsatisfiedLinkError: {key} not registered"),
+            exc: None,
+        })
     }
 
     /// 跑 main([Ljava/lang/String;)V
@@ -154,6 +211,35 @@ impl Vm {
     pub fn loaded_classes(&self) -> Vec<String> {
         self.store.class_names()
     }
+
+    /// 按 classpath 建 VM（**公开入口**，`examples/run_jdk.rs` 与 `rustjava -cp` 共用）。
+    ///
+    /// `VMLESS_JDK` 设了就把它挂到 classpath **末尾**（用户自己的类优先）：
+    /// 从此 `java.*` 不再是 `natives` 里的替身，而是 **OpenJDK 的真字节码**。
+    pub fn open(spec: &str, main_class: &str) -> Result<Self, VmError> {
+        let mut cp = crate::load::ClassPath::from_spec(spec).map_err(|e| VmError { msg: e, exc: None })?;
+        push_jdk(&mut cp);
+        let name = internal_name(main_class);
+        Ok(Self::from_store(ClassStore::load_path(&cp, &name)?))
+    }
+}
+
+/// `VMLESS_JDK`：真 JDK 的 `lib/modules`（jimage）**或**解包出来的模块目录树。
+///
+/// 不设它 = 独立模式（只有用户自己的类，`java.*` 由 `natives` 的替身实现）。
+/// 设了它 = **真字节码模式**：`java.*` 全部真执行，缺 native 就报 `UnsatisfiedLinkError`，
+/// 绝不静默回退（要回退得显式 `VMLESS_PREFER_BUILTIN=1`）。
+fn push_jdk(cp: &mut crate::load::ClassPath) {
+    let Ok(spec) = std::env::var("VMLESS_JDK") else { return };
+    let spec = spec.trim().to_string();
+    if spec.is_empty() {
+        return;
+    }
+    let p = std::path::Path::new(&spec);
+    let r = if p.is_dir() { cp.push_module_tree(p) } else { cp.push(p) };
+    if let Err(e) = r {
+        eprintln!("VMLESS_JDK 挂载失败（{spec}）: {e}");
+    }
 }
 
 /// 从字节加载并执行 main（只有这一个类，父类找不到就是运行时错误）
@@ -175,8 +261,9 @@ pub fn run_class_file(path: &str) -> Result<ExecResult, VmError> {
         .ok_or_else(|| VmError { msg: "class 没有 this_class".into(), exc: None })?;
     let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ".".into());
     let root = package_root(&dir, &name);
-    let cp = crate::load::ClassPath::from_spec(&root.to_string_lossy())
+    let mut cp = crate::load::ClassPath::from_spec(&root.to_string_lossy())
         .map_err(|e| VmError { msg: e, exc: None })?;
+    push_jdk(&mut cp);
     let mut vm = Vm::from_store(ClassStore::load_path(&cp, &name)?);
     vm.run_main()
 }
@@ -194,10 +281,7 @@ fn internal_name(n: &str) -> String {
 
 /// 按 classpath（`a.jar:b.jar:dir`）加载并执行主类
 pub fn run_classpath(spec: &str, main_class: &str) -> Result<ExecResult, VmError> {
-    let cp = crate::load::ClassPath::from_spec(spec).map_err(|e| VmError { msg: e, exc: None })?;
-    let name = internal_name(main_class);
-    let store = ClassStore::load_path(&cp, &name)?;
-    Vm::from_store(store).run_main()
+    Vm::open(spec, main_class)?.run_main()
 }
 
 /// 从 jar 执行 main；`main` 为 None 时读 `META-INF/MANIFEST.MF` 的 `Main-Class`
@@ -214,7 +298,8 @@ pub fn run_jar(path: &str, main: Option<&str>) -> Result<ExecResult, VmError> {
             internal_name(&m)
         }
     };
-    let cp = crate::load::ClassPath::from_spec(path).map_err(|e| VmError { msg: e, exc: None })?;
+    let mut cp = crate::load::ClassPath::from_spec(path).map_err(|e| VmError { msg: e, exc: None })?;
+    push_jdk(&mut cp);
     let store = ClassStore::load_path(&cp, &name)?;
     Vm::from_store(store).run_main()
 }
