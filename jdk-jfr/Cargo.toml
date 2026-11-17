@@ -1,0 +1,15 @@
+[package]
+name = "vmless-jfr"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+vmless-attach = { path = "../jdk-attach" }
+
+# 三个产物：
+#   jfr      summary / print / metadata / record / inspect
+#   jhsdb    jmap/jstack/jinfo 的等价物（走 vmless-attach）
+#   jfrfuzz  解析入口的 fuzz 驱动
+[profile.release]
+opt-level = 3
+panic = "unwind"   # fuzz 驱动要靠 catch_unwind 统计 panic，不能 abort

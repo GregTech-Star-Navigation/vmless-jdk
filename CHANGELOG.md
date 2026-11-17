@@ -808,3 +808,30 @@ Math、Integer/Long 进制、Character、Arrays）；解释器与 JIT 侧的集�
 
 **边界**：无障碍真用了 `oleacc` + 手写 `IAccessible`（不是退回 Win32），但老式窗口的 OLEACC 代理不给
 每个 child 的属性，所以子节点改成逐子窗口探 MSAA；无 comctl32 v6 manifest（v5 外观、不跟随深色模式）。
+
+## 0.54.0 — 2026-11-17 · JFR（`.jfr` 格式读写）+ jhsdb
+
+新增 `jdk-jfr/`（7123 行，依赖只有 `vmless-attach`）：
+`format/{chunk,metadata,cp,event}` 二进制格式 · `reader` · `writer` · `recorder` · `model`
+· `bin/{jfr,jfrfuzz,jhsdb}`
+
+**双向都通（这是硬判据）**
+| 项 | 结果 |
+|---|---|
+| 我们的 `jfr summary` vs 真 `jfr summary`（同一个真 JDK 录的文件）| **204 行 `cmp` 逐字节相同** |
+| 我们的 `jfr print --events jdk.ExecutionSample` | **778 行 `cmp` 无差异** |
+| **我们的 `jfr record` 写出的文件 → 真 `jfr summary`** | 读了：`jdk.ExecutionSample 34 / GCPhasePause 3 / JavaMonitorEnter 2 / ThreadEnd 1` |
+| **同一文件 → 真 `jfr print`** | `sampledThread = "worker-0" (javaThreadId = 42)`，栈 `demo.Busy.work(long, String) line: 42` |
+| `jfr record --pid <pid>` | 真采我们的 VM（`Thread.print`→ExecutionSample，perfdata→GCPhasePause）|
+| 54.3MB / 5 chunk / 302 万事件 | `summary` 0.211s、峰值 RSS 59.6MB |
+| fuzz 5 万例 | **0 panic**，11.65s |
+
+**踩过的格式坑**（写进 `README`「格式要点」）：常量池链是**倒着**链的（delta 为负）·
+`byte` 是裸字节不是 varint · `int` 要按 32 位截断 · **key 0 可能是真值** ·
+`@Timespan` 有 5 种单位 · `@ContentType` 缺时间戳会打成 ISO-8601 ·
+**`StackTrace.frames` 不能进常量池**（否则真 jfr 抛 ClassCastException）· `chunkSize` 必须等于文件长度 ·
+真 jfr 的 summary 表头与表格行**行分隔符不同**
+
+`jhsdb` 只服务 VMless VM（Windows 无 ptrace），提供 `jmap --histo` / `--heap` / `jstack` / `jinfo` 等价能力。
+
+**边界**：全量 `print` 3.3M 事件占 2.6GB（未逐 chunk flush）；`--xml` 未实现；多 chunk 按结束时间统一出队。
