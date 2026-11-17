@@ -553,3 +553,22 @@ zip64/加密不支持；`-jar` 暂不支持给 main 传参；**`java.*` 故意�
 - **FFM 替代 JNI 已证伪**：`GL11C` 仍是 62 个 `native`，opengl 模块 2,278 个 native、`java/lang/foreign` 引用 0 处
 - P0 四块（反射 / `java.lang.invoke` / JNI / 线程 + 类加载模块）合计 **2.0–2.8 万行 / 32–48 人周**
 - 推荐路线：补 9 条指令 → **先跑服务端**（7,762 类、零 LWJGL）→ 客户端再上 JNI+GL
+
+## 0.45.0 — 2026-11-17 · float 全链路、switch 表、数组初始化、栈指令
+
+- **float 全链路**：`K_FLOAT`/`ITEM_Float`、`fconst_*`、`fadd/fsub/fmul/fdiv/frem/fneg`、
+  `fcmpl/fcmpg`、`i2f/l2f/f2i/f2l/f2d/d2f`、`freturn`、`println(F)`、StringBuilder `append(F)`；
+  解释器新增 `Slot::Fl(f32)`（float 与 double **必须分开**：槽宽不同，混用会让 `pop2`/局部变量落错槽）；
+  JIT 用 Cranelift `F32`，字段/数组 4 字节（原来 `[F` 分配 4 字节按 8 字节访存）
+- **float/double 打印**：算法从「Rust `{:e}`」改成「最小位数 + 正确舍入 + subnormal 多留一位」，
+  与 JDK 25 **逐字符比对 160 万个位型，0 处不同**（旧实现在 60 万位型里差 1184 个）；
+  顺手修 `Float/Double.MIN_VALUE` 取成最小正规数的老 bug
+- **switch 表**：`≥6` 分支且空槽 ≤ 一半 → `tableswitch`，否则 `lookupswitch`，小 switch 仍用比较链
+- **数组初始化**：`int[] a = {1,2,3}` 与 `new int[]{…}`（声明处与表达式两种来源）
+- **栈指令**：`dup2/swap/dup_x1/dup_x2/dup2_x1/dup2_x2`、`i2b/i2c/i2s`、解释器 `iinc`
+  —— 抓出一个真 bug：`dup2_x2` 形式 3（栈顶宽值）三处都判错
+
+**opcode 覆盖：解释器 194/202、JIT 194/202**（基线 177/157）。剩 8 条：
+`jsr ret wide goto_w jsr_w`（本编译器不产）、`invokedynamic`、`monitorenter/monitorexit`。
+
+**验证**：`verify.sh` **103/103 三路一致**；`cargo test` 44 passed。

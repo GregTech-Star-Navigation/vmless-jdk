@@ -87,9 +87,107 @@ pub(crate) fn needs_scratch(e: &Expr) -> bool {
     }
 }
 
+/// 长度已压在栈上时，发 newarray / anewarray（弹长度、压数组引用）。
+///
+/// 调用方负责长度在栈上：本函数只发创建指令，不碰栈深账。
+fn emit_new_array(elem: &Type, em: &mut Emit, cp: &mut CpBuilder) -> Result<(), CompileError> {
+    let atype = match elem {
+        Type::Prim("int") => Some(10u8),    // T_INT
+        Type::Prim("long") => Some(11),     // T_LONG
+        Type::Prim("double") => Some(7),    // T_DOUBLE
+        Type::Prim("boolean") => Some(4),   // T_BOOLEAN
+        Type::Prim("char") => Some(5),      // T_CHAR
+        Type::Prim("float") => Some(6),     // T_FLOAT
+        Type::Prim("byte") => Some(8),      // T_BYTE
+        Type::Prim("short") => Some(9),     // T_SHORT
+        _ => None,
+    };
+    match atype {
+        Some(a) => {
+            em.op(0xBC); // newarray
+            em.bytes.push(a);
+        }
+        None => {
+            if kind_of(elem) != K_REF {
+                return err(format!("不支持的数组元素类型: {elem:?}"));
+            }
+            let cls = ver_type(cp, elem);
+            em.op_u2(0xBD, cls); // anewarray
+        }
+    }
+    Ok(())
+}
+
+/// 数组初始化表达式 `{a, b, c}`：建数组 + 逐项赋值，栈上留数组引用。
+///
+/// 与 javac 同一套形态：`newarray` 之后每项 `dup / iconst_i / <值> / <x>astore`。
+fn compile_array_init(
+    items: &[Expr],
+    elem: &Type,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let elem_kind = kind_of(elem);
+    let (_load, store) = (0u8, array_store_op_of(elem));
+    em.const_int(items.len() as i32);
+    emit_new_array(elem, em, cp)?;
+    for (i, it) in items.iter().enumerate() {
+        em.op(0x59); // dup（数组引用）
+        em.push(1);
+        em.const_int(i as i32);
+        compile_expr(it, em, ctx, cp)?;
+        // 元素类型转换：`double[] d = {1, 2.5}` 里的 1 要 i2d
+        let k = expr_kind(it, ctx);
+        if elem_kind != K_REF && k != K_REF {
+            coerce(k, elem_kind, em)?;
+        }
+        em.op(store);
+        // 弹掉 dup 出来的引用、下标、值（宽值占两槽）
+        em.pop(if kind_wide(elem_kind) { 4 } else { 3 });
+    }
+    Ok(())
+}
+
+/// 数组元素类型 → 写入指令（iastore/lastore/fastore/dastore/aastore/bastore/castore/sastore）
+fn array_store_op_of(elem: &Type) -> u8 {
+    match elem {
+        Type::Prim("long") => 0x50,
+        Type::Prim("float") => 0x51,
+        Type::Prim("double") => 0x52,
+        Type::Prim("boolean") | Type::Prim("byte") => 0x54,
+        Type::Prim("char") => 0x55,
+        Type::Prim("short") => 0x56,
+        _ if kind_of(elem) == K_REF => 0x53,
+        _ => 0x4F,
+    }
+}
+
+/// 裸 `{…}` 的元素类型推断：取所有元素里「最宽」的那个种类
+/// （声明处或 `new T[]{…}` 都会把类型带进来，这里是兜底）
+fn infer_array_elem(items: &[Expr], ctx: &Ctx) -> Type {
+    let mut k = K_INT;
+    for it in items {
+        let ik = num_kind(it, ctx);
+        if ik == K_REF {
+            return match expr_type(it, ctx) {
+                Some(t @ Type::Named { .. }) => t,
+                _ => Type::Named { path: vec!["Object".into()], args: vec![] },
+            };
+        }
+        k = promote(k, ik);
+    }
+    match k {
+        K_LONG => Type::Prim("long"),
+        K_FLOAT => Type::Prim("float"),
+        K_DOUBLE => Type::Prim("double"),
+        K_BOOL => Type::Prim("boolean"),
+        _ => Type::Prim("int"),
+    }
+}
+
 /// 一个「先算进脏槽、稍后再取回来」的值
-pub(crate) struct Spilled {
-    slot: u8,
+pub(crate) struct Spilled {    slot: u8,
     kind: u8,
     /// 借之前该槽的验证类型，还的时候恢复回去
     saved: u16,
@@ -406,33 +504,16 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 return Ok(());
             }
             // newarray 的操作数是元素类型码，引用元素走 anewarray（操作数是元素类）
-            let atype = match elem {
-                Type::Prim("int") => Some(10u8),    // T_INT
-                Type::Prim("long") => Some(11),     // T_LONG
-                Type::Prim("double") => Some(7),    // T_DOUBLE
-                Type::Prim("boolean") => Some(4),   // T_BOOLEAN
-                Type::Prim("char") => Some(5),      // T_CHAR
-                Type::Prim("float") => Some(6),     // T_FLOAT
-                Type::Prim("byte") => Some(8),      // T_BYTE
-                Type::Prim("short") => Some(9),     // T_SHORT
-                _ => None,
-            };
-            match atype {
-                Some(a) => {
-                    em.op(0xBC); // newarray
-                    em.bytes.push(a);
-                }
-                None => {
-                    if kind_of(elem) != K_REF {
-                        return err(format!("不支持的数组元素类型: {elem:?}"));
-                    }
-                    let cls = ver_type(cp, elem);
-                    em.op_u2(0xBD, cls); // anewarray
-                }
-            }
+            emit_new_array(elem, em, cp)?;
             em.pop(1);
             em.push(1);
             Ok(())
+        }
+        // 数组初始化表达式 `{1,2,3}`：元素类型从上下文来（声明处或 `new T[]{…}` 的 Cast），
+        // 没有类型信息时按元素推断
+        Expr::ArrayInit(items) => {
+            let elem = infer_array_elem(items, ctx);
+            compile_array_init(items, &elem, em, ctx, cp)
         }
         Expr::ArrayAccess { array, index } => {
             let k = elem_kind(array, ctx);
@@ -465,6 +546,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             Ok(())
         }
         Expr::Cast { ty, expr } => {
+            // `new T[]{…}`：Cast 只是把元素类型带进来（parser 的包装），不是数值转换
+            if let (Type::Array(elem), Expr::ArrayInit(items)) = (ty, &**expr) {
+                return compile_array_init(items, elem, em, ctx, cp);
+            }
             let from = expr_kind(expr, ctx);
             let to = kind_of(ty);
             compile_expr(expr, em, ctx, cp)?;

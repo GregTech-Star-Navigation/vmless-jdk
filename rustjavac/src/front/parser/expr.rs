@@ -456,7 +456,13 @@ impl Parser {
                     }
                     if matches!(self.cur(), Tok::LBrace) {
                         let init = self.parse_array_or_expr()?;
-                        return Ok(init);
+                        // `new T[]{…}` / `new T[][]{…}`：元素类型由 T 与 `[]` 个数给出。
+                        // 包一层 Cast 把类型带给 codegen（裸 `{…}` 没有类型信息）
+                        let mut arr_ty = ty.clone();
+                        for _ in 0..extra.max(1) {
+                            arr_ty = Type::Array(Box::new(arr_ty));
+                        }
+                        return Ok(Expr::Cast { ty: arr_ty, expr: Box::new(init) });
                     }
                     // `new int[3][]` 的元素类型是 `int[]`：把没给长度的维度包进 elem，
                     // 这样 `dims.len()` 就是 multianewarray 的维数，elem 是最后一维的元素

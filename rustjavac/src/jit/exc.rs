@@ -7,7 +7,7 @@ use cranelift_module::Module;
 use crate::ClassFile;
 
 use super::call::{code_of, zero_of};
-use super::insn::insn_len;
+use super::insn::insn_len_at;
 use super::layout::class_const_tag;
 use super::{Jit, JitError};
 
@@ -100,7 +100,7 @@ impl Jit {
             if body[q] == 0xbf {
                 return true;
             }
-            q += insn_len(body[q]);
+            q += insn_len_at(&body, q);
         }
     }
     false

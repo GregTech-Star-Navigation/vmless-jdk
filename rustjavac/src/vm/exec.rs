@@ -253,26 +253,29 @@ impl Vm {
                         }
                     }
                 }
-                // dup2_x2：四个形式，按「栈顶两项的槽宽」区分
+                // dup2_x2：四个形式，按「栈顶两项的槽宽」区分：
+                //   形式 1 = 四个 cat-1；形式 2 = 第三项是宽值；
+                //   形式 3 = **栈顶**是宽值、下面两个 cat-1；形式 4 = 栈顶与第二项都是宽值
                 0x5e => {
                     let n = frame.stack.len();
                     if n >= 2 {
                         let top = frame.stack[n - 1];
-                        if frame.stack[n - 2].is_wide() {
-                            // 形式 2 / 4：… v2(宽), v1 → … v1, v2, v1
+                        if top.is_wide() && frame.stack[n - 2].is_wide() {
+                            // 形式 4：… v2(宽), v1(宽) → … v1, v2, v1
                             frame.stack.insert(n - 2, top);
+                        } else if top.is_wide() && n >= 3 {
+                            // 形式 3：… v3, v2, v1(宽) → … v1, v3, v2, v1
+                            frame.stack.insert(n - 3, top);
                         } else if n >= 3 {
                             let below = frame.stack[n - 2];
-                            let at = if frame.stack[n - 3].is_wide() {
-                                Some(n - 3) // 形式 3：… v3(宽), v2, v1
+                            if frame.stack[n - 3].is_wide() {
+                                // 形式 2：… v3(宽), v2, v1 → … v2, v1, v3, v2, v1
+                                frame.stack.insert(n - 3, below);
+                                frame.stack.insert(n - 2, top);
                             } else if n >= 4 {
-                                Some(n - 4) // 形式 1：… v4, v3, v2, v1
-                            } else {
-                                None
-                            };
-                            if let Some(at) = at {
-                                frame.stack.insert(at, below);
-                                frame.stack.insert(at + 1, top);
+                                // 形式 1：四个 cat-1 → … v2, v1, v4, v3, v2, v1
+                                frame.stack.insert(n - 4, below);
+                                frame.stack.insert(n - 3, top);
                             }
                         }
                     }
@@ -498,6 +501,52 @@ impl Vm {
                     let op_pc = pc - 1;
                     let off = i16::from_be_bytes([body[pc], body[pc + 1]]) as isize;
                     pc = (op_pc as isize + off) as usize;
+                }
+                // tableswitch：default / low / high / 每个值一个 4 字节偏移
+                // padding 让 default 字段落在「相对 Code 起点」的 4 字节边界上
+                0xaa => {
+                    let op_pc = pc - 1;
+                    while pc % 4 != 0 {
+                        pc += 1;
+                    }
+                    let rd = |at: usize| i32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+                    let default = rd(pc);
+                    let low = rd(pc + 4);
+                    let high = rd(pc + 8);
+                    let key = frame.pop_i()?;
+                    let off = if key >= low && key <= high {
+                        rd(pc + 12 + (key - low) as usize * 4)
+                    } else {
+                        default
+                    };
+                    pc = (op_pc as isize + off as isize) as usize;
+                }
+                // lookupswitch：default / npairs / (key, offset)* —— 按 key 升序，二分查找
+                0xab => {
+                    let op_pc = pc - 1;
+                    while pc % 4 != 0 {
+                        pc += 1;
+                    }
+                    let rd = |at: usize| i32::from_be_bytes([body[at], body[at + 1], body[at + 2], body[at + 3]]);
+                    let default = rd(pc);
+                    let n = rd(pc + 4).max(0) as usize;
+                    let key = frame.pop_i()?;
+                    let mut off = default;
+                    let (mut lo, mut hi) = (0usize, n);
+                    while lo < hi {
+                        let mid = (lo + hi) / 2;
+                        let at = pc + 8 + mid * 8;
+                        let k = rd(at);
+                        if k == key {
+                            off = rd(at + 4);
+                            break;
+                        } else if k < key {
+                            lo = mid + 1;
+                        } else {
+                            hi = mid;
+                        }
+                    }
+                    pc = (op_pc as isize + off as isize) as usize;
                 }
                 0xac => return Ok(Slot::I(frame.pop_i()?)),
                 0xad => return Ok(Slot::L(frame.pop()?.as_i64())),

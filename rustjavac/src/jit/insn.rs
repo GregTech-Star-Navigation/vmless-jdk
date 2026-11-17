@@ -18,3 +18,44 @@
         _ => 1,
     }
 }
+
+/// 指令长度（变长指令要按操作数算：`tableswitch` / `lookupswitch`）。
+///
+/// `pc` 指向操作码。线性扫描（跳转目标收集、引用分析、异常扫描）必须用这个版本，
+/// 否则 switch 后面的字节会被当成指令解析，扫出来的「目标」全是垃圾。
+    pub(super) fn insn_len_at(body: &[u8], pc: usize) -> usize {
+    let op = body[pc];
+    match op {
+        0xaa => {
+            // tableswitch：opcode + padding + default + low + high + 表项
+            let mut q = pc + 1;
+            while q % 4 != 0 {
+                q += 1;
+            }
+            let rd = |i: usize| -> i64 {
+                let b = |k: usize| body.get(k).copied().unwrap_or(0) as i64;
+                (b(i) << 24) | (b(i + 1) << 16) | (b(i + 2) << 8) | b(i + 3)
+            };
+            let low = rd(q + 4) as i32;
+            let high = rd(q + 8) as i32;
+            let n = (high as i64 - low as i64 + 1).max(0) as usize;
+            (q + 12 + n * 4) - pc
+        }
+        0xab => {
+            // lookupswitch：opcode + padding + default + npairs + npairs*(4+4)
+            let mut q = pc + 1;
+            while q % 4 != 0 {
+                q += 1;
+            }
+            let npairs = i32::from_be_bytes([
+                body.get(q + 4).copied().unwrap_or(0),
+                body.get(q + 5).copied().unwrap_or(0),
+                body.get(q + 6).copied().unwrap_or(0),
+                body.get(q + 7).copied().unwrap_or(0),
+            ])
+            .max(0) as usize;
+            (q + 8 + npairs * 8) - pc
+        }
+        _ => insn_len(op),
+    }
+}

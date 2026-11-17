@@ -15,6 +15,8 @@ pub(crate) struct Emit {
     pub(crate) labels: Vec<Option<usize>>,
     /// (操作数位置, 标签 id)，收尾时回填
     pub(crate) patches: Vec<(usize, usize)>,
+    /// tableswitch / lookupswitch 的 4 字节位移：(字段位置, 标签 id, 基准地址=操作码位置)
+    pub(crate) patches4: Vec<(usize, usize, usize)>,
     /// 需要 StackMapTable 帧的位置、局部变量快照、以及**操作数栈**里那一个引用类型
     /// （`u16::MAX` = 空栈；否则是常量池 Class 索引 —— 只有异常 handler 入口才会非空）
     pub(crate) frames: Vec<(usize, Vec<u16>, u16)>,
@@ -39,6 +41,7 @@ impl Emit {
             max_locals,
             labels: Vec::new(),
             patches: Vec::new(),
+            patches4: Vec::new(),
             frames: Vec::new(),
             exc_table: Vec::new(),
             stack_map_name: 0,
@@ -332,6 +335,48 @@ impl Emit {
         self.branch(0xA7, label);
     }
 
+    /// 发一条 `tableswitch`（0xAA）。`low..=high` 的每个下标对应一个目标标签。
+    ///
+    /// 对齐规则（JVMS §6.5）：`default` 那 4 个字节的起始地址必须是**相对 Code 数组
+    /// 起点**的 4 的倍数 —— 也就是 (操作码偏移 + 1 + padding) % 4 == 0。
+    pub(crate) fn tableswitch(&mut self, low: i32, high: i32, targets: &[usize], default: usize) {
+        let base = self.bytes.len();
+        self.op(0xAA);
+        while (self.bytes.len()) % 4 != 0 {
+            self.bytes.push(0);
+        }
+        self.jump4(default, base);
+        self.bytes.extend_from_slice(&low.to_be_bytes());
+        self.bytes.extend_from_slice(&high.to_be_bytes());
+        for t in targets {
+            self.jump4(*t, base);
+        }
+        self.pop(1); // 弹出选择子
+    }
+
+    /// 发一条 `lookupswitch`（0xAB）。`pairs` 必须按 key 升序（JVM 要求）。
+    pub(crate) fn lookupswitch(&mut self, pairs: &[(i32, usize)], default: usize) {
+        let base = self.bytes.len();
+        self.op(0xAB);
+        while (self.bytes.len()) % 4 != 0 {
+            self.bytes.push(0);
+        }
+        self.jump4(default, base);
+        self.bytes.extend_from_slice(&(pairs.len() as i32).to_be_bytes());
+        for (k, t) in pairs {
+            self.bytes.extend_from_slice(&k.to_be_bytes());
+            self.jump4(*t, base);
+        }
+        self.pop(1);
+    }
+
+    /// 写一个 4 字节位移占位并登记回填（位移相对 `base`，即操作码地址）
+    fn jump4(&mut self, label: usize, base: usize) {
+        let pos = self.bytes.len();
+        self.bytes.extend_from_slice(&[0, 0, 0, 0]);
+        self.patches4.push((pos, label, base));
+    }
+
     /// 把栈顶已经算好的比较结果用 `jump_false`（条件为假时跳）收尾成 0/1 压回栈上。
     ///
     /// 跳到 l_false 的是「假」分支（写 0），落空的是「真」分支（写 1）；
@@ -372,6 +417,19 @@ impl Emit {
             let off = target as i32 - pos as i32;
             let off = i16::try_from(off).map_err(|_| CompileError { msg: "跳转距离超出 16 位".into() })?;
             self.bytes[pos + 1..pos + 3].copy_from_slice(&off.to_be_bytes());
+        }
+        // switch 的 4 字节位移：相对操作码地址
+        let patches4 = std::mem::take(&mut self.patches4);
+        for (pos, label, base) in patches4 {
+            let target = self
+                .labels
+                .get(label)
+                .and_then(|o| *o)
+                .ok_or_else(|| CompileError { msg: format!("switch 标签 {label} 未绑定") })?;
+            let off = target as i64 - base as i64;
+            let off = i32::try_from(off)
+                .map_err(|_| CompileError { msg: "switch 跳转距离超出 32 位".into() })?;
+            self.bytes[pos..pos + 4].copy_from_slice(&off.to_be_bytes());
         }
         self.frames.sort_unstable_by_key(|(o, _, _)| *o);
         self.frames.dedup_by_key(|(o, _, _)| *o);

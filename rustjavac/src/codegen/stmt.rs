@@ -10,6 +10,104 @@ use super::expr::*;
 use super::method::*;
 use super::types::*;
 
+/// `switch` 的发射形态：比较链 / 跳转表 / 查表
+enum SwitchKind {
+    Table { low: i32, high: i32 },
+    Lookup { values: Vec<i32> },
+}
+
+/// 分支数达到这个量才值得用跳转表（小 switch 用比较链更省字节、也不用对齐 padding）
+const SWITCH_TABLE_MIN_CASES: usize = 6;
+
+/// 取出 `case N:` 里的 int 字面量（其它形态的标签 —— 常量名、枚举 ordinal —— 返回 None）
+fn case_lit(e: &Expr) -> Option<i32> {
+    match e {
+        Expr::IntLit(s) => {
+            let t = s.trim_end_matches(['l', 'L']);
+            t.parse::<i32>().ok()
+        }
+        Expr::Unary { op: UnOp::Neg, expr } => match &**expr {
+            Expr::IntLit(s) => s.trim_end_matches(['l', 'L']).parse::<i32>().ok().map(|v| -v),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 所有标签都是 int 字面量、且分支数够时，选跳转表还是查表。
+///
+/// 判据：case 值越密集越适合 tableswitch（表大小 = high-low+1）；
+/// 稀疏到「表里一半以上是空槽」就换 lookupswitch（按 key 二分）。
+fn pick_switch_kind(cases: &[SwitchCase]) -> Option<SwitchKind> {
+    let mut values: Vec<i32> = Vec::new();
+    for c in cases {
+        for l in &c.labels {
+            let Some(e) = l else { continue }; // default 不参与
+            values.push(case_lit(e)?); // 有任何一个标签不是字面量 → 退回比较链
+        }
+    }
+    values.sort_unstable();
+    values.dedup();
+    if values.len() < SWITCH_TABLE_MIN_CASES {
+        return None;
+    }
+    let low = *values.first()?;
+    let high = *values.last()?;
+    let span = high as i64 - low as i64 + 1;
+    // 空槽不超过一半就用表（表项 4 字节，查表是 O(1)）
+    if span <= (values.len() as i64) * 2 {
+        Some(SwitchKind::Table { low, high })
+    } else {
+        Some(SwitchKind::Lookup { values })
+    }
+}
+
+/// 某个 case 值属于哪个 case 体（`case 1: case 2:` 共用体时取同一个）
+fn case_of_value(cases: &[SwitchCase], v: i32) -> Option<usize> {
+    cases.iter().position(|c| {
+        c.labels.iter().any(|l| match l {
+            Some(e) => case_lit(e) == Some(v),
+            None => false,
+        })
+    })
+}
+
+/// 发射各 case 体 + end 标签（跳转表与比较链共用的收尾）
+fn finish_switch(
+    cases: &[SwitchCase],
+    body_labels: &[usize],
+    end_label: usize,
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<bool, CompileError> {
+    // 依次发射各 case 体（自然贯穿）
+    let scope = em.local_types.clone();
+    let lbl = ctx.pending_label.take();
+    ctx.break_labels.push(JumpTarget { label: lbl, target: end_label });
+    for (i, c) in cases.iter().enumerate() {
+        em.local_types = scope.clone();
+        em.bind(body_labels[i]);
+        let mut term = false;
+        for s in &c.body {
+            if term {
+                break; // 终结语句之后的代码不可达，编进去反而打乱栈图
+            }
+            term = compile_stmt(s, em, ctx, cp)?;
+        }
+        // 箭头语法（`case "a" -> ...`）**不贯穿**：体末尾自动 break
+        if c.arrow && !term {
+            em.goto(end_label);
+        }
+    }
+    // end_label 是 break 的落点（也可能没有任何 break 跳到它，照样要绑定）
+    em.local_types = scope.clone();
+    em.bind(end_label);
+    ctx.break_labels.pop();
+    // 不声明「已终结」：switch 之后可能还有语句（case 里 break 出来后要接着执行）
+    Ok(false)
+}
+
 
 pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
     match s {
@@ -64,7 +162,15 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             ctx.locals.insert(name.clone(), slot);
             ctx.local_kind.insert(name.clone(), kind);
             ctx.local_ty.insert(name.clone(), ty.clone());
-            if let Some(e) = init {
+            // `T[] a = {…}`：元素类型来自声明（裸 `{…}` 自己没有类型信息）
+            let init = match (ty, init) {
+                (Type::Array(_), Some(Expr::ArrayInit(items))) => Some(Expr::Cast {
+                    ty: ty.clone(),
+                    expr: Box::new(Expr::ArrayInit(items.clone())),
+                }),
+                _ => init.clone(),
+            };
+            if let Some(e) = &init {
                 compile_expr(e, em, ctx, cp)?;
                 // 泛型擦除后 `String s = box.get();` 的右值是 Object：补 checkcast
                 coerce_to(ty, e, ctx, em, cp)?;
@@ -243,6 +349,32 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 .map(|i| body_labels[i])
                 .unwrap_or(end_label);
 
+            // 分支多且标签都是 int 字面量时发 tableswitch / lookupswitch：
+            // 比较链是 O(case 数)，跳转表是一次查表。小 switch 仍然走比较链
+            // （表本身的字节数 + 对齐 padding 反而是浪费）。
+            if let Some(kind) = pick_switch_kind(cases) {
+                em.iload(sel_slot)?;
+                match kind {
+                    SwitchKind::Table { low, high } => {
+                        let mut targets = Vec::new();
+                        for v in low..=high {
+                            let idx = case_of_value(cases, v).map(|i| body_labels[i]).unwrap_or(default_target);
+                            targets.push(idx);
+                        }
+                        em.tableswitch(low, high, &targets, default_target);
+                    }
+                    SwitchKind::Lookup { values } => {
+                        let mut pairs = Vec::new();
+                        for v in values {
+                            let t = case_of_value(cases, v).map(|i| body_labels[i]).unwrap_or(default_target);
+                            pairs.push((v, t));
+                        }
+                        em.lookupswitch(&pairs, default_target);
+                    }
+                }
+                return finish_switch(cases, &body_labels, end_label, &mut *em, ctx, cp);
+            }
+
             for (i, c) in cases.iter().enumerate() {
                 for label in &c.labels {
                     match label {
@@ -263,32 +395,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 }
             }
             em.goto(default_target);
-
-            // 依次发射各 case 体（自然贯穿）
-            let scope = em.local_types.clone();
-            let lbl = ctx.pending_label.take();
-            ctx.break_labels.push(JumpTarget { label: lbl, target: end_label });
-            for (i, c) in cases.iter().enumerate() {
-                em.local_types = scope.clone();
-                em.bind(body_labels[i]);
-                let mut term = false;
-                for s in &c.body {
-                    if term {
-                        break; // 终结语句之后的代码不可达，编进去反而打乱栈图
-                    }
-                    term = compile_stmt(s, em, ctx, cp)?;
-                }
-                // 箭头语法（`case "a" -> ...`）**不贯穿**：体末尾自动 break
-                if c.arrow && !term {
-                    em.goto(end_label);
-                }
-            }
-            // end_label 是 break 的落点（也可能没有任何 break 跳到它，照样要绑定）
-            em.local_types = scope.clone();
-            em.bind(end_label);
-            ctx.break_labels.pop();
-            // 不声明「已终结」：switch 之后可能还有语句（case 里 break 出来后要接着执行）
-            Ok(false)
+            finish_switch(cases, &body_labels, end_label, em, ctx, cp)
         }
         Stmt::Break(None) => {
             let Some(t) = ctx.break_labels.last() else {

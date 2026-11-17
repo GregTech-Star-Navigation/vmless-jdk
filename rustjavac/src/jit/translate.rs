@@ -11,7 +11,7 @@ use super::call::{
     argc_of, code_of, convert_to, method_ref_of, param_descs, param_slots, ret_type, zero_of,
 };
 use super::exc::{class_uses_exceptions, ExcHelpers};
-use super::insn::insn_len;
+use super::insn::{insn_len, insn_len_at};
 use super::layout::{
     class_const_tag, elem_addr, emit_ref_addr, field_off, field_ref_of, field_slot_idx,
     field_slot_type, is_ref_desc, push_new_array,
@@ -387,6 +387,17 @@ impl Jit {
                     targets.push(pc + 3);
                     pc += 3;
                 }
+                // tableswitch / lookupswitch：每个 case + default 都是块首，
+                // 另外指令之后的地址单独建一个块（switch 不落空，那段是死代码，
+                // 给它一个无人跳入的块，才不会继续往已终结的块里塞指令）
+                0xaa | 0xab => {
+                    let len = insn_len_at(&body, pc);
+                    for t in switch_targets(&body, pc, len)? {
+                        targets.push((pc as isize + t as isize) as usize);
+                    }
+                    targets.push(pc + len);
+                    pc += len;
+                }
                 _ => pc += insn_len(op),
             }
         }
@@ -689,17 +700,20 @@ impl Jit {
                     }
                 }
                 0x5e => {
-                    // dup2_x2
+                    // dup2_x2：形式 4 = 栈顶两项都宽；形式 3 = 只有栈顶宽；
+                    // 形式 2 = 第三项宽；形式 1 = 四个都是 1 槽
                     let n = stack.len();
                     if n >= 2 {
                         let v1 = stack[n - 1];
-                        let w2 = is_wide_ty(fb.func.dfg.value_type(stack[n - 2]));
-                        if w2 {
-                            stack.insert(n - 2, v1); // 形式 2 / 4
+                        let top_wide = is_wide_ty(fb.func.dfg.value_type(v1));
+                        if top_wide && is_wide_ty(fb.func.dfg.value_type(stack[n - 2])) {
+                            stack.insert(n - 2, v1); // 形式 4
+                        } else if top_wide && n >= 3 {
+                            stack.insert(n - 3, v1); // 形式 3
                         } else if n >= 3 {
                             let v2 = stack[n - 2];
                             if is_wide_ty(fb.func.dfg.value_type(stack[n - 3])) {
-                                stack.insert(n - 3, v2); // 形式 3
+                                stack.insert(n - 3, v2); // 形式 2
                                 stack.insert(n - 2, v1);
                             } else if n >= 4 {
                                 stack.insert(n - 4, v2); // 形式 1
@@ -821,6 +835,41 @@ impl Jit {
                     open.push(fall);
                     terminated = false;
                     cur_start = pc;
+                }
+                // tableswitch / lookupswitch：发一串「查表值 == key」的条件跳转，
+                // 落空链的最后跳到 default。每个目标块都要求栈空，所以先弹掉 key。
+                0xaa | 0xab => {
+                    let len = insn_len_at(&body, pc - 1);
+                    let start = pc - 1;
+                    let (pairs, default_off) = parse_switch(&body, start, len)?;
+                    let key = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let key = convert_to(&mut fb, key, types::I32);
+                    let blk = |off: i32| -> Result<cranelift_codegen::ir::Block, JitError> {
+                        let target = (start as isize + off as isize) as usize;
+                        blocks
+                            .get(&target)
+                            .copied()
+                            .ok_or_else(|| JitError(format!("switch 目标 {target} 没有块")))
+                    };
+                    let default_block = blk(default_off)?;
+                    for (v, off) in &pairs {
+                        let target = blk(*off)?;
+                        let next = fb.create_block();
+                        let cv = fb.ins().iconst(types::I32, *v as i64);
+                        let eq = fb.ins().icmp(IntCC::Equal, key, cv);
+                        fb.ins().brif(eq, target, &[], next, &[]);
+                        fb.switch_to_block(next);
+                    }
+                    fb.ins().jump(default_block, &[]);
+                    pc = start + len;
+                    // switch 不落空：指令之后那段代码单独一个（无人跳入的）块
+                    let fall = *blocks.get(&pc).ok_or_else(|| JitError("缺少 switch 落空块".into()))?;
+                    open.pop();
+                    open.push(fall);
+                    fb.switch_to_block(fall);
+                    terminated = false;
+                    cur_start = pc;
+                    cur_block = fall;
                 }
                 // ireturn / lreturn / freturn / dreturn / areturn：统一按方法签名声明的返回类型收口
                 0xac | 0xad | 0xae | 0xaf | 0xb0 => {
@@ -2134,6 +2183,58 @@ fn abi_result(fb: &mut FunctionBuilder, raw: Value, ret: &str) -> Value {
 /// 这个机器类型是不是 JVM 意义上的 cat-2（long/double 占两个栈槽；F32 不算）
 fn is_wide_ty(ty: cranelift_codegen::ir::Type) -> bool {
     ty == types::I64 || ty == types::F64
+}
+
+/// 解析 `tableswitch` / `lookupswitch`：返回 `(case 值, 相对操作码的偏移)` 列表 + default 偏移。
+///
+/// `pc` 指向操作码，`len` 是整条指令的字节数（含 padding）。
+fn parse_switch(body: &[u8], pc: usize, len: usize) -> Result<(Vec<(i32, i32)>, i32), JitError> {
+    let mut q = pc + 1;
+    while q % 4 != 0 {
+        q += 1;
+    }
+    let rd = |at: usize| -> i32 {
+        let b = |k: usize| body.get(k).copied().unwrap_or(0) as i32;
+        (b(at) << 24) | (b(at + 1) << 16) | (b(at + 2) << 8) | b(at + 3)
+    };
+    if q + 8 > pc + len {
+        return Err(JitError("switch 指令被截断".into()));
+    }
+    let default = rd(q);
+    let mut pairs = Vec::new();
+    if body[pc] == 0xaa {
+        let low = rd(q + 4);
+        let high = rd(q + 8);
+        for v in low..=high {
+            let at = q + 12 + ((v - low) as usize) * 4;
+            if at + 4 > pc + len {
+                break;
+            }
+            pairs.push((v, rd(at)));
+        }
+    } else {
+        let n = rd(q + 4).max(0) as usize;
+        for i in 0..n {
+            let at = q + 8 + i * 8;
+            if at + 8 > pc + len {
+                break;
+            }
+            pairs.push((rd(at), rd(at + 4)));
+        }
+    }
+    Ok((pairs, default))
+}
+
+/// switch 的全部跳转目标（相对操作码的偏移，已去重）
+fn switch_targets(body: &[u8], pc: usize, len: usize) -> Result<Vec<i32>, JitError> {
+    let (pairs, default) = parse_switch(body, pc, len)?;
+    let mut out = vec![default];
+    for (_, off) in pairs {
+        if !out.contains(&off) {
+            out.push(off);
+        }
+    }
+    Ok(out)
 }
 
 fn bin(

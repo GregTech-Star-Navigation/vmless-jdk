@@ -17,7 +17,7 @@ use std::collections::{HashMap, HashSet};
 use cranelift_codegen::ir::Block;
 
 use super::call::{argc_of, method_ref_of};
-use super::insn::insn_len;
+use super::insn::insn_len_at;
 use super::layout::field_ref_of;
 use super::JitError;
 use crate::{ClassFile, CpEntry};
@@ -72,7 +72,7 @@ pub(super) fn analyze(
         if matches!(op, 0xac..=0xb1 | 0xbf | 0xa7) {
             stack.clear();
         }
-        pc += insn_len(op);
+        pc += insn_len_at(body, pc);
     }
     Ok(Refs { at: out, uses_ref })
 }
@@ -162,13 +162,16 @@ fn effect(
             }
         }
         0x5e => {
-            // dup2_x2：四个形式，按栈顶两项的槽宽区分
-            if nth(2).1 {
-                (2, vec![nth(1), nth(2), nth(1)])
+            // dup2_x2：形式 4 = 栈顶两项都宽；形式 3 = 只有栈顶宽；
+            // 形式 2 = 第三项宽；形式 1 = 四个都是 1 槽
+            if nth(1).1 && nth(2).1 {
+                (2, vec![nth(1), nth(2), nth(1)]) // 形式 4
+            } else if nth(1).1 {
+                (3, vec![nth(1), nth(3), nth(2), nth(1)]) // 形式 3
             } else if nth(3).1 {
-                (3, vec![nth(2), nth(1), nth(3), nth(2), nth(1)])
+                (3, vec![nth(2), nth(1), nth(3), nth(2), nth(1)]) // 形式 2
             } else {
-                (4, vec![nth(2), nth(1), nth(4), nth(3), nth(2), nth(1)])
+                (4, vec![nth(2), nth(1), nth(4), nth(3), nth(2), nth(1)]) // 形式 1
             }
         }
         0x5f => (2, vec![nth(1), nth(2)]),         // swap
@@ -198,6 +201,7 @@ fn effect(
         0x99..=0x9e => (1, vec![]),               // if<cond>
         0x9f..=0xa6 => (2, vec![]),               // if_icmp<cond> / if_acmp<cond>
         0xa7 => (0, vec![]),                      // goto
+        0xaa | 0xab => (1, vec![]),               // tableswitch / lookupswitch：弹出选择子
         0xac => (1, vec![]),                      // ireturn
         0xad | 0xaf => (1, vec![]),               // lreturn / dreturn
         0xae => (1, vec![]),                      // freturn
