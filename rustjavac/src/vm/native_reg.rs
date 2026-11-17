@@ -139,6 +139,11 @@ fn register_all(r: &mut NativeRegistry) {
     );
     r.add("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I", sys_identity_hash);
 
+    // ---- java.lang.Runtime ----
+    // `ArrayList.sort` → `Arrays.sort` 一族的路径上会问到 CPU 数（并行排序的门槛判断）。
+    // 这条不补，任何 `list.sort(...)` 都会在这里断。
+    r.add("java/lang/Runtime", "availableProcessors", "()I", runtime_available_processors);
+
     // ---- java.lang.String ----
     r.add("java/lang/String", "intern", "()Ljava/lang/String;", |_, f| Ok(Slot::I(f.this())));
 
@@ -374,6 +379,13 @@ fn sys_millis(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
 
 fn sys_nanos(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::L(now_nanos()))
+}
+
+/// `Runtime.availableProcessors()`：并行排序的门槛判断会问它。
+/// 报一个真实值（`std::thread::available_parallelism`），不编造。
+fn runtime_available_processors(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    let n = std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1);
+    Ok(Slot::I(n as i32))
 }
 
 fn sys_arraycopy(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {

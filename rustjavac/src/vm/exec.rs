@@ -22,7 +22,8 @@ fn is_str_handle(h: i32) -> bool {
 }
 
 impl Vm {
-    /// `ldc` / `ldc_w`：int / float / String / **Class** 常量（都只占一个槽）
+    /// `ldc` / `ldc_w`：int / float / String / **Class** / **MethodHandle** / **MethodType** /
+    /// **CONSTANT_Dynamic** 常量（都只占一个槽）
     pub(super) fn ldc(&mut self, class: usize, index: u16) -> Result<Slot, VmError> {
         let cf = self.store.classes[class].clone();
         match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
@@ -34,6 +35,11 @@ impl Vm {
                 let name = String::from_utf8_lossy(cf.utf8(*ix).unwrap_or_default()).into_owned();
                 Ok(Slot::I(self.class_obj(&name)))
             }
+            // Java 7 起常量池还能直接放方法句柄 / 方法类型 / 动态常量（后者要跑引导方法，
+            // 走 `reify_const` 的那条统一路径，包含 `CONSTANT_Dynamic` 的缓存）
+            Some(CpEntry::MethodHandle(..))
+            | Some(CpEntry::MethodType(..))
+            | Some(CpEntry::Dynamic(..)) => Ok(self.reify_const(class, index)?.1),
             other => err(format!("ldc 不支持的类型: {other:?}")),
         }
     }
@@ -848,10 +854,53 @@ impl Vm {
                         pc += 2; // count + 保留字节
                     }
                     let info = self.method_ref(&cf, idx)?;
+                    if Self::is_invoke_api_class(&info.class) {
+                        // `java.lang.invoke.*` 的方法在 OpenJDK 里靠 VM 内部原语实现
+                        // （`invokeBasic` / `linkToVirtual` / 隐藏类……），执行它们的
+                        // 字节码不可能跑通 —— 一律由 VM 接管（`vm::indy`）。
+                        let argc = count_args(&info.desc)?;
+                        let mut args = Vec::with_capacity(argc);
+                        for _ in 0..argc {
+                            args.push(frame.pop()?);
+                        }
+                        args.reverse();
+                        let recv = frame.pop()?.as_i32();
+                        let r = self.invoke_api(0, &info.class, &info.name, &info.desc, recv, &args);
+                        let r = match r {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => Err(self.java_exception(
+                                "java/lang/BootstrapMethodError",
+                                format!("VM 没有接管 {}.{}{}", info.class, info.name, info.desc),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        match call_or_handle!(r, op_pc) {
+                            CallOutcome::Value(v) => {
+                                if !info.desc.ends_with(")V") {
+                                    frame.push(v);
+                                }
+                            }
+                            CallOutcome::Handler(t, h) => {
+                                pc = t;
+                                frame.stack.clear();
+                                frame.push(Slot::I(h));
+                            }
+                        }
+                        continue;
+                    }
                     if info.name == "println" {
                         let arg = frame.pop()?;
                         let _recv = frame.pop()?;
-                        let text = self.println_text(&info.desc, arg);
+                        // `println(Object)` / `println(String)` 要按 java 的语义取文本：
+                        // `String.valueOf(x)` → 有覆写的 `toString()` 就**执行它**
+                        // （真跑 PrintStream 的字节码会把整条 java.base 拖进来，所以这里
+                        //  直接按同样的语义算，`value_text` 就是 `String.valueOf`）
+                        let text = match info.desc.as_str() {
+                            "(Ljava/lang/Object;)V" | "(Ljava/lang/String;)V" => {
+                                self.value_text(arg.as_i32())?
+                            }
+                            _ => self.println_text(&info.desc, arg),
+                        };
                         self.output.push(text);
                     } else if info.class == "java/lang/StringBuilder"
                         && (!self.store.has_class("java/lang/StringBuilder") || self.prefer_builtin)
@@ -883,12 +932,37 @@ impl Vm {
                         args.reverse();
                         let mut all = vec![recv];
                         all.extend(args);
+                        // lambda 对象：它的类是 VM 生成的合成类，**不在类表里** ——
+                        // 必须在方法解析之前分流（接口方法是抽象的，解析到了也执行不了）。
+                        if let Some(r) = self.lambda_dispatch(recv.as_i32(), &info.name, &info.desc, &all[1..]) {
+                            match call_or_handle!(r, op_pc) {
+                                CallOutcome::Value(v) => {
+                                    if !info.desc.ends_with(")V") {
+                                        frame.push(v);
+                                    }
+                                }
+                                CallOutcome::Handler(t, h) => {
+                                    pc = t;
+                                    frame.stack.clear();
+                                    frame.push(Slot::I(h));
+                                }
+                            }
+                            continue;
+                        }
                         // 从对象的**实际类**开始解析（这就是覆写的分派点）；
                         // 拿不到运行时类才退回引用类。**真字节码优先**：
                         // `VMLESS_PREFER_BUILTIN=1` 只是「先问内建表」，内建表没有的还能走字节码。
                         let actual = match self.ref_kind(recv.as_i32()) {
                             RefKind::Obj(c) => Some(c),
-                            _ => None,
+                            // 字符串句柄（`ldc "abc"` 给的那一坨）的运行时类**就是**
+                            // `java/lang/String`。少了这一条，`CharSequence.toString()`
+                            // 这种按接口声明的调用会解析到 `Object.toString` 上 ——
+                            // `String.contains` 的字节码正是 `indexOf(s.toString())`，
+                            // 于是它静默给出 false。
+                            RefKind::Str => Some("java/lang/String".to_string()),
+                            // 数组没有自己的方法，全部继承自 Object
+                            RefKind::Arr(_) => Some("java/lang/Object".to_string()),
+                            RefKind::Null => None,
                         };
                         let target = actual
                             .as_deref()
@@ -960,6 +1034,33 @@ impl Vm {
                     args.reverse();
                     let mut all = vec![obj];
                     all.extend(args);
+                    if Self::is_invoke_api_class(&info.class) {
+                        // `new ConstantCallSite(mh)` / `MutableCallSite.setTarget` 之类：
+                        // 由 VM 接管（构造出来的对象要登记进调用点表）
+                        let op_pc = pc - 3;
+                        let r = self.invoke_api(2, &info.class, &info.name, &info.desc, all[0].as_i32(), &all[1..]);
+                        let r = match r {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => Err(self.java_exception(
+                                "java/lang/BootstrapMethodError",
+                                format!("VM 没有接管 {}.{}{}", info.class, info.name, info.desc),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        match call_or_handle!(r, op_pc) {
+                            CallOutcome::Value(v) => {
+                                if !info.desc.ends_with(")V") {
+                                    frame.push(v);
+                                }
+                            }
+                            CallOutcome::Handler(t, h) => {
+                                pc = t;
+                                frame.stack.clear();
+                                frame.push(Slot::I(h));
+                            }
+                        }
+                        continue;
+                    }
                     match self.store.resolve_method(&info.class, &info.name, &info.desc) {
                         Some((ci, mi)) => {
                             self.depth += 1;
@@ -991,6 +1092,40 @@ impl Vm {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let info = self.method_ref(&cf, idx)?;
+                    // `java.lang.invoke` 的静态工厂由 VM 接管 —— **必须在 `<clinit>` 之前**：
+                    // 那些类的静态初始化本身就是 VM 内部原语的组合（`MethodType.<clinit>`
+                    // 会去碰 `MemberName`），执行它等于把整条 java.lang.invoke 拖进来。
+                    if Self::is_invoke_api_class(&info.class) {
+                        let argc = count_args(&info.desc)?;
+                        let mut args = Vec::with_capacity(argc);
+                        for _ in 0..argc {
+                            args.push(frame.pop()?);
+                        }
+                        args.reverse();
+                        let op_pc = pc - 3;
+                        let r = self.invoke_api(1, &info.class, &info.name, &info.desc, 0, &args);
+                        let r = match r {
+                            Ok(Some(v)) => Ok(v),
+                            Ok(None) => Err(self.java_exception(
+                                "java/lang/BootstrapMethodError",
+                                format!("VM 没有接管 {}.{}{}", info.class, info.name, info.desc),
+                            )),
+                            Err(e) => Err(e),
+                        };
+                        match call_or_handle!(r, op_pc) {
+                            CallOutcome::Value(v) => {
+                                if !info.desc.ends_with(")V") {
+                                    frame.push(v);
+                                }
+                            }
+                            CallOutcome::Handler(t, h) => {
+                                pc = t;
+                                frame.stack.clear();
+                                frame.push(Slot::I(h));
+                            }
+                        }
+                        continue;
+                    }
                     // 首次调用这个类的静态方法时先跑它的 <clinit>
                     self.ensure_init(&info.class)?;
                     let argc = count_args(&info.desc)?;
@@ -1066,6 +1201,50 @@ impl Vm {
                     let h = self.new_multi(&desc, &counts)?;
                     frame.push(Slot::I(h));
                 }
+                // invokedynamic（0xba）：操作数 = 常量池索引(u2) + 两个保留字节。
+                //
+                // 首次执行时跑引导方法、从 `CallSite.getTarget()` 拿到目标句柄并缓存；
+                // 之后**同一个调用点**直接用缓存（`Vm::indy_site_target`）。
+                // 参数弹出个数按调用点自己的描述符，不看引导方法。
+                0xba => {
+                    let op_pc = pc - 1;
+                    let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
+                    pc += 4;
+                    let desc = self.indy_desc(class, idx)?;
+                    let argc = count_args(&desc)?;
+                    let mut args = Vec::with_capacity(argc);
+                    for _ in 0..argc {
+                        args.push(frame.pop()?);
+                    }
+                    args.reverse();
+                    let target = call_or_handle!(self.indy_site_target(class, idx).map(Slot::I), op_pc);
+                    let target = match target {
+                        CallOutcome::Value(v) => v.as_i32(),
+                        CallOutcome::Handler(t, h) => {
+                            pc = t;
+                            frame.stack.clear();
+                            frame.push(Slot::I(h));
+                            continue;
+                        }
+                    };
+                    self.indy_calls += 1;
+                    let r = call_or_handle!(
+                        self.invoke_mh_as(target, &desc, &args, "invokedynamic"),
+                        op_pc
+                    );
+                    match r {
+                        CallOutcome::Value(v) => {
+                            if !desc.ends_with(")V") {
+                                frame.push(v);
+                            }
+                        }
+                        CallOutcome::Handler(t, h) => {
+                            pc = t;
+                            frame.stack.clear();
+                            frame.push(Slot::I(h));
+                        }
+                    }
+                }
                 other => {
                     return err(format!("未实现的字节码 0x{other:02x} @pc={}", pc - 1));
                 }
@@ -1095,7 +1274,7 @@ impl Vm {
     }
 
     /// 字段偏移：先按引用类的继承链找，找不到再按对象的**运行时类**找
-    fn field_offset(&self, obj: i32, owner: &str, name: &str) -> Result<usize, VmError> {
+    pub(super) fn field_offset(&self, obj: i32, owner: &str, name: &str) -> Result<usize, VmError> {
         self.field_index_of_object(obj, name)
             .or_else(|| self.store.field_index(owner, name))
             .ok_or_else(|| VmError { msg: format!("未知字段 {owner}.{name}"), exc: None })

@@ -8,12 +8,14 @@
 //! 本文件只剩入口与 `Vm` 的定义 —— 具体实现按职责分散在同目录各模块里。
 use crate::{parse, ClassFile};
 use std::collections::HashMap;
+use std::sync::Mutex;
 mod call;
 mod class;
 mod exception;
 mod exec;
 mod frame;
 mod heap;
+mod indy;
 mod load;
 mod native_reg;
 mod natives;
@@ -34,6 +36,54 @@ pub struct VmError {
 
 fn err<T>(msg: impl Into<String>) -> Result<T, VmError> {
     Err(VmError { msg: msg.into(), exc: None })
+}
+
+// ------------------------------------------------------- 系统属性（`-Dkey=value`）
+
+/// 启动时由 `rustjava` / `run_jdk` 从 `-D` 参数填进来的一小组系统属性。
+///
+/// 这不是 Java 的 `System.getProperties()`（这个 VM 的 `System` 还没有那套），
+/// 只为让 `-Dvmless.indy.stats` 这类开关能像真 JVM 一样写。环境变量是等价入口。
+static PROPS: Mutex<Vec<(String, String)>> = Mutex::new(Vec::new());
+
+/// 设置一个系统属性
+pub fn set_property(key: &str, value: &str) {
+    if let Ok(mut p) = PROPS.lock() {
+        match p.iter_mut().find(|(k, _)| k == key) {
+            Some(e) => e.1 = value.to_string(),
+            None => p.push((key.to_string(), value.to_string())),
+        }
+    }
+}
+
+/// 读一个系统属性
+pub fn property(key: &str) -> Option<String> {
+    PROPS.lock().ok()?.iter().find(|(k, _)| k == key).map(|(_, v)| v.clone())
+}
+
+fn prop(key: &str) -> Option<String> {
+    property(key)
+}
+
+/// 把 `-Dkey=value` 形式的参数从命令行里摘出来（返回剩下的参数）。
+///
+/// 两个 bin 共用：`rustjava -Dvmless.indy.stats -cp … Main` 与
+/// `run_jdk -Dvmless.indy.stats <目录> <主类>` 都支持。
+pub fn take_property_args(args: &[String]) -> Vec<String> {
+    let mut rest = Vec::with_capacity(args.len());
+    for a in args {
+        match a.strip_prefix("-D") {
+            Some(kv) => {
+                let (k, v) = match kv.split_once('=') {
+                    Some((k, v)) => (k, v),
+                    None => (kv, ""),
+                };
+                set_property(k, v);
+            }
+            None => rest.push(a.clone()),
+        }
+    }
+    rest
 }
 
 /// 执行结果
@@ -91,6 +141,27 @@ pub struct Vm {
     prefer_builtin: bool,
     /// 缺 native 的累计清单（`UnsatisfiedLinkError` 时记一条，供 `docs/java-base-native-清单.md`）
     missing_natives: std::collections::BTreeSet<String>,
+    /// `invokedynamic` / `java.lang.invoke` 的全部状态（句柄、调用点、lambda、VarHandle）
+    mhs: HashMap<i32, indy::MhInfo>,
+    mtypes: HashMap<i32, String>,
+    lookups: HashMap<i32, String>,
+    callsites: HashMap<i32, indy::CallSiteInfo>,
+    lambdas: HashMap<i32, indy::LambdaInfo>,
+    varhandles: HashMap<i32, indy::VarHandleInfo>,
+    /// 引导方法表缓存（按类名：`define_class` 换掉字节码时清空）
+    bsm_tables: HashMap<String, indy::BsmTable>,
+    /// 调用点 → 已解析的目标句柄：(类下标, 常量池索引)
+    indy_sites: HashMap<(usize, u16), i32>,
+    /// `ldc Constant_Dynamic` 的常量值
+    condy_values: HashMap<(usize, u16), indy::TypedSlot>,
+    /// 打印调用点解析统计（`-Dvmless.indy.stats` 或 `VMLESS_INDY_STATS=1`）
+    indy_stats: bool,
+    /// 解析过的调用点个数（同一调用点只解析一次 —— 这个数就是证据）
+    indy_resolved: usize,
+    /// `invokedynamic` 执行过的次数
+    indy_calls: usize,
+    /// 已生成的 lambda 类序号
+    lambda_seq: usize,
 }
 
 impl Vm {
@@ -123,6 +194,21 @@ impl Vm {
             jdk_loaded,
             prefer_builtin: std::env::var("VMLESS_PREFER_BUILTIN").map(|v| v == "1").unwrap_or(false),
             missing_natives: std::collections::BTreeSet::new(),
+            mhs: HashMap::new(),
+            mtypes: HashMap::new(),
+            lookups: HashMap::new(),
+            callsites: HashMap::new(),
+            lambdas: HashMap::new(),
+            varhandles: HashMap::new(),
+            bsm_tables: HashMap::new(),
+            indy_sites: HashMap::new(),
+            condy_values: HashMap::new(),
+            indy_stats: prop("vmless.indy.stats").map(|v| v != "0" && v != "false").unwrap_or_else(|| {
+                std::env::var("VMLESS_INDY_STATS").map(|v| v == "1").unwrap_or(false)
+            }),
+            indy_resolved: 0,
+            indy_calls: 0,
+            lambda_seq: 0,
         }
     }
 
@@ -169,7 +255,14 @@ impl Vm {
         // JVM 在调 main 之前会先初始化入口类
         let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
         self.ensure_init(&main_name)?;
-        match self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false) {
+        let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);
+        // `-Dvmless.indy.stats`：调用点解析次数（「同一调用点只解析一次」的证据）
+        if self.indy_stats {
+            for line in self.indy_stats_lines() {
+                eprintln!("{line}");
+            }
+        }
+        match r {
             Ok(r) => Ok(ExecResult {
                 return_value: r.as_i32(),
                 output: std::mem::take(&mut self.output),
@@ -204,6 +297,10 @@ impl Vm {
             ));
         }
         self.store.add_class(cf);
+        // 类表被换过：调用点与常量缓存全部失效（常量池下标的含义可能已经变了）
+        self.indy_sites.clear();
+        self.condy_values.clear();
+        self.bsm_tables.clear();
         Ok(actual)
     }
 
@@ -259,7 +356,13 @@ pub fn run_class_file(path: &str) -> Result<ExecResult, VmError> {
     let name = cf
         .this_class_name()
         .ok_or_else(|| VmError { msg: "class 没有 this_class".into(), exc: None })?;
-    let dir = std::path::Path::new(path).parent().map(|p| p.to_path_buf()).unwrap_or_else(|| ".".into());
+    let dir = std::path::Path::new(path)
+        .parent()
+        // `I1.class`（没有目录部分）的 `parent()` 是空串 —— 那就是当前目录，
+        // 不能当成「classpath 为空」报错
+        .filter(|p| !p.as_os_str().is_empty())
+        .map(|p| p.to_path_buf())
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
     let root = package_root(&dir, &name);
     let mut cp = crate::load::ClassPath::from_spec(&root.to_string_lossy())
         .map_err(|e| VmError { msg: e, exc: None })?;

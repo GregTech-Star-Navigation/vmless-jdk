@@ -14,9 +14,11 @@
 //! 另外会累积并打印本次运行遇到的**全部**缺 native（`docs/java-base-native-清单.md`
 //! 的那份清单就是它产出的）。
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> =
+        classfile::vm::take_property_args(&std::env::args().skip(1).collect::<Vec<_>>());
     if args.len() < 2 {
-        eprintln!("用法: run_jdk <类目录> <主类名>");
+        eprintln!("用法: run_jdk [-D<键>=<值>] <类目录> <主类名>");
+        eprintln!("      例: run_jdk -Dvmless.indy.stats=1 D:/out Main");
         eprintln!("      VMLESS_JDK=<lib/modules 或解包目录>  指定 java.base（默认本机 JDK）");
         std::process::exit(2);
     }

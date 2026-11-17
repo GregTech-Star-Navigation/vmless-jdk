@@ -125,6 +125,12 @@ pub const VIRTUALS: &[B] = &[
     b("java/lang/Object", "hashCode", "()I"),
     b("java/lang/Object", "equals", "(Ljava/lang/Object;)Z"),
     b("java/lang/Object", "toString", "()Ljava/lang/String;"),
+    // 真字节码模式下 `getClass` 是 native（native_reg 里有）；独立模式下 `java.*`
+    // 没有字节码，只能靠这条内建兜住 —— lambda 的 `getClass()` 就落在这里
+    b("java/lang/Object", "getClass", "()Ljava/lang/Class;"),
+    // `Class.getName()`：独立模式下 `java.lang.Class` 没有字节码，而它是 lambda
+    // 自省（`obj.getClass().getName()`）的必经一步
+    b("java/lang/Class", "getName", "()Ljava/lang/String;"),
 ];
 
 /// 静态方法表（下标 = op 号）
@@ -149,6 +155,17 @@ pub const STATICS: &[B] = &[
     b("java/util/Arrays", "toString", "([I)Ljava/lang/String;"),
     b("java/util/Arrays", "sort", "([I)V"),
     b("java/lang/System", "nanoTime", "()J"),
+    // `String.valueOf`：**独立模式下 javac 的字符串拼接也依赖它** ——
+    // JDK 21+ 对「拼接里的 Object 实参」会先在调用点外求 `String.valueOf(o)`，
+    // 再把这个 String 传给 `makeConcatWithConstants`（见 I1：`"a"+o` 的字节码）。
+    // 没有它，任何 `"" + someObject` 在独立模式下都会报「找不到方法 valueOf」。
+    b("java/lang/String", "valueOf", "(Ljava/lang/Object;)Ljava/lang/String;"),
+    b("java/lang/String", "valueOf", "(I)Ljava/lang/String;"),
+    b("java/lang/String", "valueOf", "(J)Ljava/lang/String;"),
+    b("java/lang/String", "valueOf", "(Z)Ljava/lang/String;"),
+    b("java/lang/String", "valueOf", "(C)Ljava/lang/String;"),
+    b("java/lang/String", "valueOf", "(D)Ljava/lang/String;"),
+    b("java/lang/String", "valueOf", "(F)Ljava/lang/String;"),
 ];
 
 /// 静态字段：(类, 字段名, 描述符)
@@ -168,6 +185,17 @@ pub const FIELDS: &[(&str, &str, &str)] = &[
     ("java/lang/Float", "MAX_VALUE", "F"),
     ("java/lang/Float", "MIN_VALUE", "F"),
     ("java/lang/Float", "NaN", "F"),
+    // 基本类型的 `Class` 对象：`MethodType.methodType(int.class, …)` 在字节码里是
+    // `getstatic Integer.TYPE`，没有这几条独立模式拿到的就是 null
+    ("java/lang/Integer", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Long", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Float", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Double", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Boolean", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Character", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Byte", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Short", "TYPE", "Ljava/lang/Class;"),
+    ("java/lang/Void", "TYPE", "Ljava/lang/Class;"),
 ];
 
 /// 虚方法的 op 号（没登记就是 None）
@@ -210,6 +238,7 @@ pub fn object_protocol(name: &str, argc: usize) -> Option<String> {
         ("toString", 0) => Some("()Ljava/lang/String;".to_string()),
         ("hashCode", 0) => Some("()I".to_string()),
         ("equals", 1) => Some("(Ljava/lang/Object;)Z".to_string()),
+        ("getClass", 0) => Some("()Ljava/lang/Class;".to_string()),
         _ => None,
     }
 }

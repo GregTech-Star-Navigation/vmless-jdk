@@ -6,7 +6,7 @@
 
 use crate::jdk;
 
-use super::heap::{RefKind, STR_BASE};
+use super::heap::{java_class_name, RefKind, STR_BASE};
 use super::slot::Slot;
 use super::Vm;
 use super::VmError;
@@ -236,6 +236,12 @@ impl Vm {
         let name = jdk::VIRTUALS[op as usize].name;
         let a = args.first().copied().unwrap_or(Slot::I(0));
         let b = args.get(1).copied().unwrap_or(Slot::I(0));
+        // `getClass()` 对所有接收者都一样（字符串句柄 / 包装类 / 数组 / lambda / 普通对象），
+        // 所以放在 String / 包装类分支之前
+        if name == "getClass" {
+            let desc = self.class_of(recv).unwrap_or_else(|| "java/lang/Object".to_string());
+            return Ok(Slot::I(self.class_obj(&desc)));
+        }
         // ---- String ----
         if matches!(self.ref_kind(recv), RefKind::Str) {
             return self.string_op(name, desc, recv, a, b);
@@ -247,6 +253,17 @@ impl Vm {
         }
         // ---- Object 协议（toString / hashCode / equals 的默认实现）----
         match name {
+            "getName" => {
+                // `Class.getName()`：类对象里的名字是**二进制名**（`int` / `java.lang.String` /
+                // `[Ljava.lang.String;`）—— 用描述符映射一次，与 `class_obj` 填的字段一致
+                match self.class_obj_name(recv) {
+                    Some(d) => Ok(Slot::I(self.str_new(java_class_name(&d)))),
+                    None => Err(VmError {
+                        msg: format!("getName() 的接收者不是类对象（{}）", self.type_name(recv)),
+                        exc: None,
+                    }),
+                }
+            }
             "hashCode" => Ok(Slot::I(self.identity_hash(recv))),
             "toString" => {
                 let text = self.obj_to_string(recv);
@@ -516,8 +533,30 @@ impl Vm {
                     Err(_) => Err(self.throw("java/lang/NumberFormatException")),
                 }
             }
-            ("java/lang/Integer", "toString") => Ok(Slot::I(self.str_new(a.as_i32().to_string()))),
-            ("java/lang/Long", "toString") => Ok(Slot::I(self.str_new(a.as_i64().to_string()))),
+            ("java/lang/Integer", "toString") => Ok(Slot::I(self.str_new(a.as_i32().to_string()))),            ("java/lang/Long", "toString") => Ok(Slot::I(self.str_new(a.as_i64().to_string()))),
+            ("java/lang/String", "valueOf") => {
+                // 重载按描述符区分（`String.valueOf` 有 7 个重载，返回值都是 String）
+                let text = match e.desc {
+                    "(Ljava/lang/Object;)Ljava/lang/String;" => self.obj_to_string(a.as_i32()),
+                    "(I)Ljava/lang/String;" => a.as_i32().to_string(),
+                    "(J)Ljava/lang/String;" => a.as_i64().to_string(),
+                    "(Z)Ljava/lang/String;" => {
+                        (if a.as_i32() != 0 { "true" } else { "false" }).to_string()
+                    }
+                    "(C)Ljava/lang/String;" => {
+                        char::from_u32(a.as_i32() as u32).unwrap_or('\u{fffd}').to_string()
+                    }
+                    "(D)Ljava/lang/String;" => crate::java_double_to_string(a.as_f64()),
+                    "(F)Ljava/lang/String;" => crate::java_float_to_string(a.as_f32()),
+                    other => {
+                        return Err(VmError {
+                            msg: format!("内建 String.valueOf{other} 未实现"),
+                            exc: None,
+                        })
+                    }
+                };
+                Ok(Slot::I(self.str_new(text)))
+            }
             ("java/lang/Double", "toString") => {
                 Ok(Slot::I(self.str_new(crate::java_double_to_string(a.as_f64()))))
             }
@@ -546,6 +585,24 @@ impl Vm {
 
     /// 内建静态字段的值（`Integer.MAX_VALUE` 这类）
     pub(super) fn builtin_static_field(&mut self, class: &str, name: &str) -> Option<Slot> {
+        // `Integer.TYPE` 这一族：值是**基本类型的类对象**（要真的建出来，不是常量）
+        if name == "TYPE" {
+            let prim = match class {
+                "java/lang/Integer" => Some("I"),
+                "java/lang/Long" => Some("J"),
+                "java/lang/Float" => Some("F"),
+                "java/lang/Double" => Some("D"),
+                "java/lang/Boolean" => Some("Z"),
+                "java/lang/Character" => Some("C"),
+                "java/lang/Byte" => Some("B"),
+                "java/lang/Short" => Some("S"),
+                "java/lang/Void" => Some("V"),
+                _ => None,
+            };
+            if let Some(p) = prim {
+                return Some(Slot::I(self.class_obj(p)));
+            }
+        }
         Some(match (class, name) {
             ("java/lang/Integer", "MAX_VALUE") => Slot::I(i32::MAX),
             ("java/lang/Integer", "MIN_VALUE") => Slot::I(i32::MIN),

@@ -34,6 +34,34 @@ pub(crate) fn builtin_super(class: &str) -> Option<&'static str> {
         "java/lang/StackOverflowError" | "java/lang/OutOfMemoryError" | "java/lang/AssertionError" => {
             Some("java/lang/Error")
         }
+        // ---- java.lang.invoke ----
+        // 这一支要么由 VM 接管（句柄/调用点/VarHandle 的语义都在 Rust 里），要么在
+        // 独立模式（没挂 java.base）下**根本没有字节码** —— 继承链只能写死，
+        // 否则 `instanceof CallSite` / `catch (BootstrapMethodError)` 都会判错。
+        "java/lang/invoke/MethodHandle"
+        | "java/lang/invoke/MethodType"
+        | "java/lang/invoke/MethodHandles"
+        | "java/lang/invoke/MethodHandles$Lookup"
+        | "java/lang/invoke/VarHandle"
+        | "java/lang/invoke/CallSite"
+        | "java/lang/invoke/StringConcatFactory"
+        | "java/lang/invoke/LambdaMetafactory"
+        | "java/lang/invoke/ConstantBootstraps"
+        | "java/lang/invoke/MethodHandleInfo" => Some("java/lang/Object"),
+        "java/lang/invoke/ConstantCallSite"
+        | "java/lang/invoke/MutableCallSite"
+        | "java/lang/invoke/VolatileCallSite" => Some("java/lang/invoke/CallSite"),
+        "java/lang/invoke/BootstrapMethodError" => Some("java/lang/LinkageError"),
+        "java/lang/LinkageError" => Some("java/lang/Error"),
+        "java/lang/invoke/WrongMethodTypeException" | "java/lang/invoke/VarHandleAccessException" => {
+            Some("java/lang/RuntimeException")
+        }
+        "java/lang/NoSuchMethodException"
+        | "java/lang/NoSuchFieldException"
+        | "java/lang/IllegalAccessException"
+        | "java/lang/InvocationTargetException" => Some("java/lang/ReflectiveOperationException"),
+        "java/lang/ReflectiveOperationException" => Some("java/lang/Exception"),
+        "java/lang/UnsupportedOperationException" => Some("java/lang/RuntimeException"),
         _ => None,
     }
 }
@@ -99,7 +127,14 @@ impl Vm {
             RefKind::Null => false,
             _ if target == "java/lang/Object" => true,
             RefKind::Str => target == "java/lang/String",
-            RefKind::Obj(c) => self.is_subclass(&c, target),
+            RefKind::Obj(c) => {
+                // lambda 对象：它实现的是若干个接口，而这个合成类**不在类表里** ——
+                // 只能按登记过的接口集合判（`instanceof Runnable` / checkcast 都靠这里）
+                if let Some(l) = self.lambdas.get(&handle) {
+                    return l.ifaces.iter().any(|i| self.is_subclass(i, target));
+                }
+                self.is_subclass(&c, target)
+            }
             RefKind::Arr(d) => d == target,
         }
     }

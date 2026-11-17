@@ -53,6 +53,22 @@ impl Jit {
             (ml, ms, body, table, is_static)
         };
 
+        // `invokedynamic` 在**进任何分析之前**就挡住：这个方法整体交给解释器执行，
+        // 所以不能让同一方法里别的 JIT 限制（比如 switch 汇合点的栈模型）抢先报错 ——
+        // 那样 `run_jit` 会看到一个与 indy 无关的失败，降级判据就失效了。
+        if let Some(pc) = find_invokedynamic(&body) {
+            return Err(JitError(format!(
+                "JIT 不支持 invokedynamic（0xba@{pc}）：{class}.{name}{desc} 里的 lambda / \
+                 字符串拼接只能由解释器执行（JIT 未接入调用点缓存）"
+            )));
+        }
+        // 同一个道理：`java.lang.invoke.*` 的调用 JIT 也没有接手的地方
+        if let Some(m) = find_invoke_api(&cf, &body) {
+            return Err(JitError(format!(
+                "JIT 不接管 java.lang.invoke（{m}）：{class}.{name}{desc} 只能由解释器执行"
+            )));
+        }
+
         // 方法签名：(locals_ptr: i64) -> 返回值
         // 返回值必须按描述符给出真类型：long → i64、double → f64。
         // 统一返回 i32 再在调用点还原会把 long/double 截断掉，跨调用就丢精度。
@@ -2014,6 +2030,17 @@ impl Jit {
                     };
                     stack.push(v);
                 }
+                // invokedynamic：JIT 侧**明确不支持**，不假装支持。
+                // 这个 opcode 要跑引导方法、构造/缓存 CallSite，属于解释器那条路径
+                // （`vm::indy` 已完整实现：字符串拼接、lambda、方法引用、condy）。
+                // 真正接进 JIT 需要把调用点缓存做成机器码里的可替换跳板，是另一件事；
+                // 在那之前 `run_jit` 看到这个错误会整体退回解释器执行。
+                0xba => {
+                    return Err(JitError(format!(
+                        "JIT 不支持 invokedynamic（0xba@{pc}）：{class}.{name}{desc} 里的 \
+                         lambda/字符串拼接只能由解释器执行（JIT 未接入调用点缓存）"
+                    )))
+                }
                 other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
             }
         }
@@ -2363,4 +2390,40 @@ impl Jit {
     ) -> Result<(), JitError> {
         self.emit_roots(fb, root, n, false)
     }
+}
+
+/// 方法体里第一条 `invokedynamic`（0xba）的偏移。
+///
+/// 按指令长度走，不会把操作数里的 0xba 当成指令（`insn_len_at` 处理变长的 switch）。
+fn find_invokedynamic(body: &[u8]) -> Option<usize> {
+    let mut pc = 0usize;
+    while pc < body.len() {
+        if body[pc] == 0xba {
+            return Some(pc);
+        }
+        pc += insn_len_at(body, pc).max(1);
+    }
+    None
+}
+
+/// 方法体里第一条打向 `java.lang.invoke.*` 的调用（返回 `类.方法描述符`）。
+///
+/// JIT 完全没有这一层：方法句柄/调用点的语义在解释器的 side table 里，JIT 有自己的
+/// 堆和静态区，吞不进去。所以这里**明确拒绝**，而不是让它在链接阶段报
+/// 「调用目标未编译」那种让人看不懂的错。
+fn find_invoke_api(cf: &ClassFile, body: &[u8]) -> Option<String> {
+    let mut pc = 0usize;
+    while pc < body.len() {
+        let op = body[pc];
+        if matches!(op, 0xb6..=0xb9) && pc + 2 < body.len() {
+            let idx = u16::from_be_bytes([body[pc + 1], body[pc + 2]]);
+            if let Ok((c, n, d)) = method_ref_of(cf, idx) {
+                if c.starts_with("java/lang/invoke/") {
+                    return Some(format!("{c}.{n}{d}"));
+                }
+            }
+        }
+        pc += insn_len_at(body, pc).max(1);
+    }
+    None
 }

@@ -719,3 +719,35 @@ crypto(1) / kerberos(2) / attach+JFR(8) / GUI 无障碍(4) / 其它(2)。
 **生产级**：600000 例 fuzz（kdc-req / as-rep / ccache）**0 panic**；AS 交换 19–26ms。
 
 **已知限制**：仅 aes128/aes256-cts；无 rc4/des3/AES-SHA2、无跨 realm referral、无 replay cache、无 PAC。
+
+## 0.51.0 — 2026-11-17 · invokedynamic + MethodHandles（解释器侧生产级）
+
+**这是「能跑现代 Java 字节码」的最后一块字节码层拼图。**
+
+- **常量池**：解析 `BootstrapMethods` 属性；`ldc` 支持 `MethodType`(16) / `MethodHandle`(15) / `Dynamic`(17)
+- **执行**：`0xba` 按调用点描述符弹参（不看 bsm 描述符）；**调用点缓存** `(类,常量池索引) → 目标句柄`；
+  `asType` 语义（宽化/装箱/拆箱/引用；`invokeExact` 完全一致、`asType` 窄化当场抛 `WrongMethodTypeException`）
+- **`java.lang.invoke.*`**：`Lookup.find*`、`MethodHandle.invoke*/asType/bindTo/insertArguments/constant/identity`、
+  `CallSite`/`MutableCallSite`、`VarHandle`（get/set 全族 + `compareAndSet`/`getAndSet`/`getAndAdd`）
+- **bsm 子集**：`StringConcatFactory.makeConcatWithConstants`（`\u0001`/`\u0002` 规范语义 + 常量折叠）、
+  **`LambdaMetafactory.metafactory` 与 `altMetafactory`**（捕获/方法引用/bridge/marker/`FLAG_SERIALIZABLE`）、
+  `ConstantBootstraps`
+
+**实测（11 个样例 × 四路逐字节比对：HotSpot / 真字节码 / 独立模式 / JIT 降级）**
+```
+ours: a1b2.5 / n=42, s=a1b2.5 / big=1234567890123 z=true c=x
+java: a1b2.5 / n=42, s=a1b2.5 / big=1234567890123 z=true c=x
+```
+`I1`–`I11` 全一致（含 record 模式匹配、switch 表达式、10 万次循环拼接、错误路径的异常类名）。
+**调用点缓存**：`调用点解析 2 次，执行 100001 次，lambda 实例 1 个，缓存命中 99999 次`。
+
+**JIT 侧明确拒绝**：`0xba` 在**任何分析之前**预扫并报「JIT 不支持 invokedynamic」，
+`run_jit` 命中就整体退回解释器并在 stderr 明说，stdout 与解释器逐字节一致 —— 不假装支持。
+
+**修了 3 个既有 bug**：虚分派没给字符串句柄/数组的运行时类（`String.contains` 静默返回 false）、
+无目录 class 路径报「classpath 为空」、refmap 报错的 off-by-one。
+
+**验证**：`verify.sh` 103/103；`cargo test` 50 passed。
+
+**已知缺口**：`SwitchBootstraps.typeSwitch/enumSwitch`（`case null ->`）、
+`ObjectMethods.bootstrap`（record 的 equals/hashCode/toString）、`Lookup.unreflect*`。

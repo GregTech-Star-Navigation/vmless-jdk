@@ -21,7 +21,7 @@ pub(super) enum RefKind {
 ///
 /// 基本类型用 Java 的写法（`I` → `int`）；数组是 `[` + 元素名
 /// （`[I` → `[I`，`[Ljava/lang/String;` → `[Ljava.lang.String;`）。
-fn java_class_name(desc: &str) -> String {
+pub(super) fn java_class_name(desc: &str) -> String {
     match desc {
         "I" => "int".into(),
         "J" => "long".into(),

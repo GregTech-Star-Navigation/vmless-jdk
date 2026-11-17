@@ -266,12 +266,17 @@ impl ClassStore {
         self.by_name.contains_key(name)
     }
 
-    /// 从 `from` 开始沿继承链解析方法；类链上找不到再找接口的 **default 实现**
+    /// 从 `from` 开始沿继承链解析方法；类链上找不到再找接口的 **default 实现**。
+    ///
+    /// **抽象方法不算实现**：它们没有 Code 属性，解析到了也执行不了。跳过它们才能让
+    /// 「接口方法调用」正确落到 default 实现（或落到调用点的 lambda/内建分流）。
     pub(super) fn resolve_method(&self, from: &str, name: &str, desc: &str) -> Option<(usize, usize)> {
         let key = (name.to_string(), desc.to_string());
         for c in self.chain(from) {
             if let Some(v) = self.methods.get(&(c, key.0.clone(), key.1.clone())) {
-                return Some(*v);
+                if !self.is_abstract(*v) {
+                    return Some(*v);
+                }
             }
         }
         // 接口里的 default 方法：实现类没覆写时落在这里
@@ -279,13 +284,19 @@ impl ClassStore {
             if let Some(v) = self.methods.get(&(i, key.0.clone(), key.1.clone())) {
                 // 抽象声明（没有 Code）不能当实现用
                 let (ci, mi) = *v;
-                if self.classes[ci].methods[mi].attributes.is_empty() {
+                if self.classes[ci].methods[mi].attributes.is_empty() || self.is_abstract(*v) {
                     continue;
                 }
                 return Some(*v);
             }
         }
         None
+    }
+
+    /// 这个方法有没有实现体（抽象方法没有）
+    fn is_abstract(&self, (ci, mi): (usize, usize)) -> bool {
+        const ACC_ABSTRACT: u16 = 0x0400;
+        self.classes[ci].methods[mi].access_flags & ACC_ABSTRACT != 0
     }
 
     /// 只在这个类**自己**里找方法（`<clinit>` 不继承，不能用 resolve_method）

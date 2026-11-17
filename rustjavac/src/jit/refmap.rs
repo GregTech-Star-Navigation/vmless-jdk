@@ -60,7 +60,7 @@ pub(super) fn analyze(
             if stack.pop().is_none() {
                 return Err(JitError(format!(
                     "pc={pc} 栈下溢（引用分析）：op=0x{op:02x} 需要弹出 {pops} 个，实际只有 {}",
-                    stack.len() + 1
+                    stack.len()
                 )));
             }
         }
@@ -235,6 +235,16 @@ fn effect(
         0xc1 => (1, vec![V]),                     // instanceof
         0xc5 => (body.get(pc + 3).copied().unwrap_or(0) as usize, vec![R]), // multianewarray
         0xc6 | 0xc7 => (1, vec![]),               // ifnull / ifnonnull
+        // invokedynamic：JIT 编不出调用点（机器码里要留可替换跳板，没做）。
+        // 这里直接给出带 "invokedynamic" 字样的明确错误 —— `run_jit` 按它整体退回解释器。
+        0xba => {
+            let idx = u2();
+            return Err(JitError(format!(
+                "JIT 不支持 invokedynamic（0xba@{pc}，{} 常量池 #{idx}）：\
+                 lambda / 字符串拼接只能由解释器执行（JIT 未接入调用点缓存）",
+                cf.this_class_name().unwrap_or_default()
+            )));
+        }
         other => return Err(JitError(format!("JIT 暂不支持字节码 0x{other:02x}"))),
     })
 }

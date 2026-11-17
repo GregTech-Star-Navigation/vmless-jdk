@@ -5,17 +5,20 @@
 //! rustjava <class 文件>                    # 目录当 classpath（原来的行为）
 //! rustjava -cp <路径[;:路径...]> <主类名>  # 目录 / jar / jimage 都行，按顺序查找
 //! rustjava -jar <jar 文件>                 # 从 MANIFEST.MF 读 Main-Class
+//! rustjava -Dk=v …                        # 系统属性（目前认 `-Dvmless.indy.stats`）
 //! ```
 fn usage() -> ! {
     eprintln!("用法:");
     eprintln!("  rustjava <class 文件>");
     eprintln!("  rustjava -cp <路径[;:路径...]> <主类名>");
     eprintln!("  rustjava -jar <jar 文件>");
+    eprintln!("  -D<键>=<值> 可以出现在最前面（例如 -Dvmless.indy.stats=1）");
     std::process::exit(2);
 }
 
 fn main() {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let args: Vec<String> =
+        classfile::vm::take_property_args(&std::env::args().skip(1).collect::<Vec<_>>());
     if args.is_empty() {
         usage();
     }
