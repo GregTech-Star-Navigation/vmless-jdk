@@ -946,8 +946,11 @@ impl Vm {
         }
         let nm = self.str_new("main".to_string());
         let _ = self.put_named(h, "java/lang/ThreadGroup", "name", Slot::I(nm));
-        // `parent` 取自己（根组没有父组）；`ngroups`/`nthreads` 由字段默认值 0 兜住
-        let _ = self.put_named(h, "java/lang/ThreadGroup", "parent", Slot::I(h));
+        // `parent` **必须是 null**（根组没有父组）。
+        // 千万不要填成自己：`InnocuousThread.<clinit>` 是
+        // `while (tg != null) { parent = UNSAFE.getReference(tg, PARENT); if (parent == null) break; tg = parent; }`
+        // —— 自指会让这个「爬到根组」的循环永远出不来，症状是整个程序卡死。
+        let _ = self.put_named(h, "java/lang/ThreadGroup", "parent", Slot::I(0));
         lk(&self.sh.statics).insert(key, Slot::I(h));
         h
     }

@@ -307,6 +307,153 @@ fn register_all(r: &mut NativeRegistry) {
     nat_intrinsics::register(r);
     nat_os::register(r);
     nat_util::register(r);
+
+    register_classloaders(r);
+}
+
+/// 合成一个「系统类加载器」对象。
+///
+/// 我们的类加载在 Rust 侧完成，没有真 `BuiltinClassLoader` 实例；但 JDK 里
+/// `ClassLoader.getSystemClassLoader()` / `Thread.getContextClassLoader()` 只要返回 null，
+/// 就会有一大片代码走 `Class.forName(name, false, null)` 或直接 NPE。
+/// 这里给一个**不跑构造器**的 `ClassLoader` 壳（只填 `name`），够所有「拿它当令牌」的路径用。
+fn synth_loader(vm: &mut Vm) -> i32 {
+    let key = ("java/lang/ClassLoader".to_string(), "$vmless_system".to_string());
+    if let Some(Slot::I(h)) = lk(&vm.sh.statics).get(&key).copied() {
+        if h > 0 {
+            return h;
+        }
+    }
+    if !vm.store.has_class("java/lang/ClassLoader") {
+        return 0;
+    }
+    let h = vm.alloc_vmobj("java/lang/ClassLoader");
+    if h <= 0 {
+        return 0;
+    }
+    let nm = vm.str_new("app".to_string());
+    let _ = vm.put_named(h, "java/lang/ClassLoader", "name", Slot::I(nm));
+    // `parent` 为 null（我们的加载器没有父链）
+    lk(&vm.sh.statics).insert(key, Slot::I(h));
+    h
+}
+
+fn register_classloaders(r: &mut NativeRegistry) {
+    // ---- java.lang.ref.Reference：`Cleaner` 整套建立在这上面 ----
+    // `refersTo0` 是比较「引用对象内部的 referent」与实参；我们的对象槽直接可读。
+    r.add_override(
+        "java/lang/ref/Reference",
+        "refersTo0",
+        "(Ljava/lang/Object;)Z",
+        |vm, f| {
+            let this = f.this();
+            let other = f.arg(0);
+            let r = vm.get_named(this, "java/lang/ref/Reference", "referent");
+            Ok(Slot::I(i32::from(r.as_i32() == other.as_i32())))
+        },
+    );
+    r.add_override(
+        "java/lang/ref/Reference",
+        "clear0",
+        "()V",
+        |vm, f| {
+            let this = f.this();
+            let _ = vm.put_named(this, "java/lang/ref/Reference", "referent", Slot::I(0));
+            Ok(Slot::I(0))
+        },
+    );
+    r.add_override(
+        "java/lang/ref/PhantomReference",
+        "clear0",
+        "()V",
+        |vm, f| {
+            let this = f.this();
+            let _ = vm.put_named(this, "java/lang/ref/Reference", "referent", Slot::I(0));
+            Ok(Slot::I(0))
+        },
+    );
+    // `Reference.get()` 只在 referent 还没被清时返回它
+    r.add_override(
+        "java/lang/ref/Reference",
+        "get0",
+        "()Ljava/lang/Object;",
+        |vm, f| {
+            let this = f.this();
+            Ok(vm.get_named(this, "java/lang/ref/Reference", "referent"))
+        },
+    );
+    // `ClassLoader.registerAsParallelCapable()` —— 直接返回 true。
+    //
+    // 真 JDK 用它把「这个加载器支持并行注册类」记进一张 `Set<Class<?>>`，
+    // 判据是 `Reflection.getCallerClass()`（要跳过反射帧才算得出真正的子类）。
+    // 我们的类加载在 Rust 侧、且全程持有全局锁，**本来就不存在并行注册问题**，
+    // 所以两个重载都直接答 true。少了这条，`ClassLoader.<clinit>` 会抛
+    // `InternalError: Unable to register as parallel capable`，整条类加载链断掉。
+    for d in ["()Z", "(Ljava/lang/Class;)Z"] {
+        r.add_override(
+            "java/lang/ClassLoader",
+            "registerAsParallelCapable",
+            d,
+            |_, _| Ok(Slot::I(1)),
+        );
+    }
+    // `Reflection.getCallerClass()` —— `@CallerSensitive` 系列的基石。
+    // **`ClassLoader.registerAsParallelCapable()` 就是靠它拿调用者类**：
+    // 每个真类加载器的 `<clinit>` 都会调它，拿不到类（或拿到 Object）就抛
+    // `IllegalCallerException: class java.lang.Object not a subclass of ClassLoader`，
+    // 于是 `ClassLoader.getSystemClassLoader()` 整条链断掉 —— `Cleaner.create()` 也跟着断。
+    r.add_override(
+        "jdk/internal/reflect/Reflection",
+        "getCallerClass",
+        "()Ljava/lang/Class;",
+        |vm, _| {
+            let n = if vm.last_caller == usize::MAX {
+                "java/lang/Object".to_string()
+            } else {
+                vm.store
+                    .name_of_index(vm.last_caller)
+                    .unwrap_or_else(|| "java/lang/Object".to_string())
+            };
+            Ok(Slot::I(vm.class_obj(&n)))
+        },
+    );
+    r.add_override(
+        "java/lang/ClassLoader",
+        "getSystemClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        |vm, _| Ok(Slot::I(synth_loader(vm))),
+    );
+    r.add_override(
+        "java/lang/ClassLoader",
+        "getPlatformClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        |vm, _| Ok(Slot::I(synth_loader(vm))),
+    );
+    r.add_override(
+        "java/lang/Thread",
+        "getContextClassLoader",
+        "()Ljava/lang/ClassLoader;",
+        |vm, f| {
+            let this = f.this();
+            let v = vm.get_named(this, "java/lang/Thread", "contextClassLoader");
+            if v.as_i32() > 0 {
+                Ok(v)
+            } else {
+                Ok(Slot::I(synth_loader(vm)))
+            }
+        },
+    );
+    r.add_override(
+        "java/lang/Thread",
+        "setContextClassLoader",
+        "(Ljava/lang/ClassLoader;)V",
+        |vm, f| {
+            let this = f.this();
+            let v = f.arg(0);
+            let _ = vm.put_named(this, "java/lang/Thread", "contextClassLoader", v);
+            Ok(Slot::I(0))
+        },
+    );
 }
 
 /// `java.lang.Thread`：native 部分 + **VM 接管**的构造器 / `start()`。

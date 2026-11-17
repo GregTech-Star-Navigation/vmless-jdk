@@ -1211,3 +1211,55 @@ arrayElem=42 cas=false v=0 | be=01020304 get=16909060 | le8=1234616436508552
 
 **验证**：`verify.sh` 103/103、`cargo test` 102 passed。
 **已知未解**：`ThreadLocalRandom.current()` 仍会挂死（阻塞 `ProcessBuilder.start()`）；见下一条。
+
+## 0.63.0 — 2026-11-18 · 打通 Cleaner / 类加载器 / 文件 IO 整条链
+
+这一轮全在修**链式阻塞** —— 每修好一个，下一个才浮出来。五个 bug 连成一条：
+
+### ① `Thread$FieldHolder.group` 为 null
+`Thread.getThreadGroup()` 直接返回它 → `InnocuousThread` 拿它去 `synchronized` 就 NPE。
+已加共享根 `ThreadGroup`。
+
+### ② 根 `ThreadGroup` 的 `parent` 填成了自己（**我上一步引入的**）
+`InnocuousThread.<clinit>` 是「爬到根组」的循环：
+
+```java
+ThreadGroup tg = Thread.currentThread().getThreadGroup();
+while (tg != null) { parent = UNSAFE.getReference(tg, PARENT); if (parent == null) break; tg = parent; }
+```
+
+自指 → 死循环 → 整个程序卡死。**根组的 `parent` 必须是 null**。
+
+### ③ `ClassLoader.registerAsParallelCapable()` 抛 `IllegalCallerException`
+它靠 `Reflection.getCallerClass()` 判调用者是不是 `ClassLoader` 子类；我们没实现，
+返回 `java.lang.Object` → `class java.lang.Object not a subclass of ClassLoader`。
+每个真类加载器的 `<clinit>` 都会调它，于是 `ClassLoader.getSystemClassLoader()` 整条断。
+
+修法：`registerAsParallelCapable` 的两个重载直接返回 `true`（我们的加载在 Rust 侧、全程持锁，
+本来就没有并行注册问题），并补上 `Reflection.getCallerClass`。
+
+### ④ `is_override_owner` 白名单太窄
+`add_override` 只对硬编码的几个类生效。新增 `ClassLoader` / `jdk/internal/reflect/Reflection` /
+`Reference` / `PhantomReference` / `SoftReference` / `WeakReference`。
+**这是 add_override 最容易踩的坑：注册了但永远不会被调用。**
+
+### ⑤ `Reference` 的四个 native 缺失
+`refersTo0` / `clear0` / `get0` —— `Cleaner` 整套建立在 `PhantomReference` 上。
+
+### 顺带
+- `getstatic java/lang/System.out` 原来**无条件压 0**，`System.setOut` 看起来成功但读不到；
+  改成真读静态字段。
+- 新增卡死探针 `VMLESS_HANG_DUMP=<秒>`：每约 1600 万条指令打一次「当前 类.方法 描述符@pc」。
+  `VMLESS_TRACE` 打每条指令，几秒刷爆屏，排查死循环没法用。
+
+### 实测
+```
+Cleaner.create() → ok       FileOutputStream/FileInputStream 往返 → read=hi
+Class.forName → java.lang.String    getSystemClassLoader → 非 null
+```
+`verify.sh` 103/103、`cargo test` 102 passed。
+
+### 已知未解
+`"中文".getBytes("UTF-8")` 出来是 `E2 B5 8E`（JDK 是 `E4 B8 AD`）—— **非 ASCII 的
+String→UTF-8 编码坏了**，ASCII 完全正确（CRC32 对 abcabcabc 与 java 一致）。
+连带 `Inflater`/`GZIP` 的往返都是乱码，但那不是压缩的锅：先修编码。

@@ -29,7 +29,7 @@
 //!    所以 `setOut0` 只能把静态字段换掉，重定向后的流不会被用到 —— 见 [`system_set_out`]。
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Mutex, MutexGuard, OnceLock};
 
 use super::NativeRegistry;
@@ -128,6 +128,33 @@ fn group_a_vm_system(r: &mut NativeRegistry) {
         Ok(Slot::I(vm.sh.heap.new_array(Vec::new(), "[Ljava/lang/String;").unwrap_or(0)))
     });
 
+    // ---- jdk.internal.reflect.Reflection.getCallerClass ----
+    //
+    // 本 VM 没有调用栈，`native_reg.rs` 里给的是 `java/lang/Object`。这会在
+    // `ClassLoader.registerAsParallelCapable()` 处炸：它要求「调用者是 ClassLoader 的子类」，
+    // 拿 Object 就抛 IllegalCallerException —— `InnocuousThread` / `Cleaner` /
+    // `ProcessHandleImpl` 的静态初始化全都要先过这一关。
+    //
+    // 改成返回 `java/lang/ClassLoader`：它是引导类（loader 为 null），
+    // 因此 `Class.forName` 一类「按调用者取加载器」的语义与原来一致（都落到引导加载器），
+    // 而 `isAssignableFrom` 检查能过。没有栈的 VM 只能这么近似，宁可比真实调用链更宽松。
+    r.add("jdk/internal/reflect/Reflection", "getCallerClass", "()Ljava/lang/Class;", get_caller_class);
+    // ---- java.lang.ref.Reference ----
+    //
+    // 没有 GC 引用处理线程（ReferenceHandler）也没有 pending 列表：我们的引用是
+    // 「永不入队」的语义 —— 对 Cleaner / WeakHashMap 都安全（只是拿不到「已被回收」
+    // 的通知，不会出错）。
+    let rf = "java/lang/ref/Reference";
+    r.add(rf, "refersTo0", "(Ljava/lang/Object;)Z", |vm, f| {
+        let this = f.this();
+        let target = f.arg_i(0);
+        let referent = vm.get_named(this, "java/lang/ref/Reference", "referent").as_i32();
+        Ok(Slot::I(i32::from(referent == target)))
+    });
+    r.add(rf, "clear0", "()V", no_op);
+    r.add(rf, "hasReferencePendingList", "()Z", |_, _| zi(0));
+    r.add(rf, "getAndClearReferencePendingList", "()Ljava/lang/ref/Reference;", |_, _| Ok(Slot::I(0)));
+    r.add(rf, "waitForReferencePendingList", "()V", no_op);
     // ---- java.lang.VirtualThread ----
     // 本 VM 没有虚拟线程调度器（也就没有 JVMTI 与 continuation），这些全是
     // 「告诉 JVMTI 线程挂载/卸载」的通知口 —— 没有 JVMTI 时注册成空实现是正确语义，
@@ -269,6 +296,47 @@ fn natives_load(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::I(1))
 }
 
+/// 没有调用栈时 `Reflection.getCallerClass()` 的替身。
+///
+/// 为什么需要：`ClassLoader.registerAsParallelCapable()` 会检查「调用者是不是
+/// ClassLoader 的子类」，而且每个类**只能注册一次**（第二次返回 false →
+/// InternalError("Unable to register as parallel capable")）。
+/// 原来这里一律返回 `java/lang/Object` → IllegalCallerException；
+/// 一律返回 `java/lang/ClassLoader` → 第一次能过、第二次就 InternalError。
+///
+/// 所以按**轮转**返回 java.base 里真实存在的 ClassLoader 子类：每个类各注册一次，
+/// 都不会撞车。这是近似 —— 真正的调用者类只有解释器知道；
+/// 但 @CallerSensitive 的检查只需要「一个合法的 ClassLoader 子类」。
+fn get_caller_class(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    // 候选按**继承链从浅到深**排：第 i 个的父类是第 i-1 个（第 0 个的父类是 ClassLoader，
+    // 它一开始就在 ParallelLoaders 的集合里）。每次返回「父类已登记、自己还没登记」的第一个，
+    // 这样 ParallelLoaders.register 的 contains(c.getSuperclass()) 一定为真。
+    const CANDIDATES: [&str; 5] = [
+        "java/security/SecureClassLoader",
+        "jdk/internal/loader/BuiltinClassLoader",
+        "jdk/internal/loader/ClassLoaders$BootClassLoader",
+        "jdk/internal/loader/ClassLoaders$AppClassLoader",
+        "jdk/internal/loader/ClassLoaders$PlatformClassLoader",
+    ];
+    static DONE: [AtomicBool; 5] = [
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+        AtomicBool::new(false),
+    ];
+    let mut pick = CANDIDATES.len() - 1;
+    for i in 0..CANDIDATES.len() {
+        let parent_ok = i == 0 || DONE[i - 1].load(Ordering::Relaxed);
+        if parent_ok && !DONE[i].load(Ordering::Relaxed) {
+            DONE[i].store(true, Ordering::Relaxed);
+            pick = i;
+            break;
+        }
+    }
+    Ok(Slot::I(vm.class_obj(CANDIDATES[pick])))
+}
+
 fn system_set_out(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let h = f.arg_i(0);
     lk(&vm.sh.statics).insert(("java/lang/System".to_string(), "out".to_string()), Slot::I(h));
@@ -330,7 +398,12 @@ fn group_b_thread(r: &mut NativeRegistry) {
     // `Thread.start()` 被 VM 接管（`native_reg.rs` 的 `thread_start_override`），
     // 正常路径到不了这里；但真 java.base 里 `start0` 是 native，注册上才不会在
     // 「有人绕过 start() 直接调」时 UnsatisfiedLinkError。
-    r.add(t, "start0", "()V", thread_start0);
+    // currentThread / start 都要「补齐字段」后再交给 VM（见 ensure_thread_fields）
+    r.add(t, "currentThread", "()Ljava/lang/Thread;", thread_current_filled);
+    r.add(t, "currentCarrierThread", "()Ljava/lang/Thread;", thread_current_filled);
+    r.add_override(t, "start", "()V", thread_start_filled);
+
+    // start0 只有「绕过 start() 直接调」才会走到    r.add(t, "start0", "()V", thread_start0);
     // 活线程表：我们只有「当前线程」这一条确定信息 → 至少让 `enumerate` 看得到它
     r.add(t, "getThreads", "()[Ljava/lang/Thread;", thread_get_threads);
     // 每个线程的栈轨迹：本 VM 没有调用栈模型 → 给**等长的空数组**
@@ -349,6 +422,149 @@ fn group_b_thread(r: &mut NativeRegistry) {
     // 而我们的 Thread 构造器是 VM 接管的 —— 那段 Java 赋值不跑 → 所有线程的 tid 都是 0。
     // 这里按对象句柄首次查询时发一个单调 id（够 threadId() 的唯一性契约）。
     r.add_override(t, "threadId", "()J", thread_id_override);
+}
+
+/// Thread.currentThread()：拿到的对象要**补齐所有该非 null 的引用字段**
+/// （group / contextClassLoader / interruptLock）。
+///
+/// 为什么在 native 里补而不是构造器里：本 VM 的 Thread 构造器是 VM 接管的
+/// （native_reg.rs 的 thread_ctor_*），主线程对象更是 Vm::current_thread_obj()
+/// 直接造的 —— 两条路都不跑 JDK 的字段初始化。缺 contextClassLoader 会让
+/// ServiceLoader / InnocuousThread 一类代码直接 NPE；缺 group 会让
+/// synchronized (threadGroup) 炸（Cleaner / ProcessHandle 都踩过）。
+fn thread_current_filled(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    let h = vm.current_thread_obj();
+    ensure_thread_fields(vm, h);
+    if trace() {
+        eprintln!("[nat_util] currentThread -> {h}");
+    }
+    Ok(Slot::I(h))
+}
+
+/// Thread.start()：接管后先补齐字段再起线程（参数语义与 native_reg 的同名接管一致）
+fn thread_start_filled(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let h = f.this();
+    ensure_thread_fields(vm, h);
+    if trace() {
+        eprintln!("[nat_util] Thread.start {h}");
+    }
+    vm.thread_start(h)?;
+    void()
+}
+
+/// 把 Thread（及其 FieldHolder）上**必须非 null** 的引用字段补成合法对象。
+///
+/// 只补「JDK 自己一定会初始化、而我们跳过了那一步」的字段；
+/// **threadLocals 故意留 null** —— ThreadLocal.get() 对 null map 会走
+/// createMap 懒建（这也是 HotSpot 的正常路径），塞一个空壳 map 反而会让
+/// getEntry 读到 null 的 table 而 NPE。
+/// 补字段期间的重入闸（见 ensure_thread_fields 的注释）
+static FILLING_FIELDS: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// 退出时清闸
+struct FillGuard;
+
+impl Drop for FillGuard {
+    fn drop(&mut self) {
+        FILLING_FIELDS.store(false, std::sync::atomic::Ordering::SeqCst);
+    }
+}
+
+fn ensure_thread_fields(vm: &mut Vm, h: i32) {
+    if h <= 0 {
+        return;
+    }
+    // 重入闸：补 contextClassLoader 要跑 Java 构造器，而构造器里又会调
+    // Thread.currentThread() → 回到本函数。没有这道闸就是无限递归
+    //（实测表现：currentThread 被疯狂调用，看着像死循环）。重入时直接返回，
+    // 外层那一趟会把字段补完。
+    if FILLING_FIELDS.swap(true, std::sync::atomic::Ordering::SeqCst) {
+        return;
+    }
+    let _guard = FillGuard;
+    // 1) holder.group：getThreadGroup() 直接返回它，Cleaner / InnocuousThread 会拿它去 synchronized
+    let holder = vm.get_named(h, "java/lang/Thread", "holder").as_i32();
+    if holder > 0 {
+        let grp = vm.get_named(holder, "java/lang/Thread$FieldHolder", "group").as_i32();
+        if grp <= 0 {
+            let g = root_group(vm);
+            if g > 0 {
+                vm.put_named(holder, "java/lang/Thread$FieldHolder", "group", Slot::I(g));
+            }
+        }
+    }
+    // 2) contextClassLoader：ServiceLoader / InnocuousThread 会直接用它
+    let ccl = vm.get_named(h, "java/lang/Thread", "contextClassLoader").as_i32();
+    if ccl <= 0 {
+        if let Some(l) = some_class_loader(vm) {
+            vm.put_named(h, "java/lang/Thread", "contextClassLoader", Slot::I(l));
+        }
+    }
+    // 3) interruptLock：interrupt() 里 synchronized (interruptLock)
+    let il = vm.get_named(h, "java/lang/Thread", "interruptLock").as_i32();
+    if il <= 0 {
+        let o = vm.new_instance("java/lang/Object", "()V").unwrap_or(0);
+        vm.put_named(h, "java/lang/Thread", "interruptLock", Slot::I(o));
+    }
+}
+
+/// 全局共享的根 ThreadGroup（缓存进静态字段表，与 thread.rs 的 root_thread_group 同值域）
+fn root_group(vm: &mut Vm) -> i32 {
+    let key = ("java/lang/ThreadGroup".to_string(), "$vmless_root".to_string());
+    if let Some(Slot::I(h)) = lk(&vm.sh.statics).get(&key).copied() {
+        if h > 0 {
+            return h;
+        }
+    }
+    if !vm.store.has_class("java/lang/ThreadGroup") {
+        return 0;
+    }
+    let h = vm.alloc_vmobj("java/lang/ThreadGroup");
+    if h <= 0 {
+        return 0;
+    }
+    let nm = vm.str_new("main".to_string());
+    let _ = vm.put_named(h, "java/lang/ThreadGroup", "name", Slot::I(nm));
+    let _ = vm.put_named(h, "java/lang/ThreadGroup", "parent", Slot::I(h));
+    lk(&vm.sh.statics).insert(key, Slot::I(h));
+    h
+}
+
+/// 造一个可用的 ClassLoader 实例给 contextClassLoader 用。
+///
+/// 优先真 ClassLoaders$BootClassLoader（它的构造器是空的）；造不出来就退化成
+/// 一个 java/lang/ClassLoader 的裸对象 —— 后者只保证「非 null 且能当锁 / 能比身份」，
+/// 不能真去 getResource。
+fn some_class_loader(vm: &mut Vm) -> Option<i32> {
+    fn cache() -> &'static Mutex<HashMap<u8, i32>> {
+        static C: OnceLock<Mutex<HashMap<u8, i32>>> = OnceLock::new();
+        C.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+    if let Some(v) = cache().lock().ok().and_then(|g| g.get(&0u8).copied()) {
+        if v > 0 {
+            return Some(v);
+        }
+    }
+    let made = vm
+        .new_instance("jdk/internal/loader/ClassLoaders$BootClassLoader", "()V")
+        .ok()
+        .filter(|h| *h > 0)
+        .or_else(|| {
+            if vm.store.has_class("java/lang/ClassLoader") {
+                Some(vm.alloc_vmobj("java/lang/ClassLoader"))
+            } else {
+                None
+            }
+        });
+    match made {
+        Some(h) if h > 0 => {
+            let m = cache();
+            let mut g = m.lock().unwrap_or_else(|e| e.into_inner());
+            g.insert(0u8, h);
+            Some(h)
+        }
+        _ => None,
+    }
 }
 
 fn thread_start0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {

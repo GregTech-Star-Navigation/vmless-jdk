@@ -236,11 +236,41 @@ impl Vm {
         }
 
         let trace = std::env::var_os("VMLESS_TRACE").is_some();
+        // 「卡住时它在哪个方法里」的探针：设了 `VMLESS_HANG_DUMP=<秒>` 后，
+        // 解释器每跑约 1600 万条指令就往 stderr 打一次当前 类.方法 描述符@pc。
+        // 排查死循环时的唯一入口 —— `VMLESS_TRACE` 打的是每条指令，几秒就把屏刷爆了。
+        let hang_n: u64 = std::env::var_os("VMLESS_HANG_DUMP")
+            .and_then(|v| v.to_string_lossy().parse().ok())
+            .map(|s: f64| (s * 25_000_000.0) as u64)
+            .unwrap_or(0);
+        let mut ticks: u64 = 0;
+        let dump_ctx = if hang_n > 0 {
+            Some((
+                cf.this_class_name().unwrap_or_default(),
+                String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned(),
+                String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned(),
+            ))
+        } else {
+            None
+        };
         let mut pc = 0usize;
         while pc < body.len() {
             // 让 GC 知道「当前执行到哪条指令」：栈上只多一个 usize，换来的是任何时刻
             // （包括被调方正在跑、本帧停着不动）都能拿到**精确**的引用位图。
             frame.pc = pc;
+            // 卡死探针：每 ~1600 万条指令打一次「我在哪」
+            if hang_n > 0 {
+                ticks += 1;
+                if ticks % 16_000_000 == 0 {
+                    if let Some((c, n, d)) = &dump_ctx {
+                        eprintln!(
+                            "[hang] {} ms  {}.{}{}  pc={pc}",
+                            ticks / 25_000,
+                            c, n, d
+                        );
+                    }
+                }
+            }
             // 抢占点：多线程时定期交还 GIL。没有它，一个死循环（或长计算）线程会把
             // 别的 Java 线程饿死 —— `Thread.start` 之后对方永远跑不上来。
             // 单线程时这里只是一次整数比较，不进函数。
@@ -974,7 +1004,13 @@ impl Vm {
                         // 先把 `System` 自己初始化好：`SharedSecrets` 的 `JavaLangAccess`
                         // 就是它 `<clinit>` 里挂上去的（`StringJoiner.toString` 要用）
                         self.ensure_init("java/lang/System")?;
-                        frame.push(Slot::I(0));
+                        // 真读静态字段：`System.setOut(x)` 之后这里必须拿到新值。
+                        // （原来无条件压 0，`setOut` 看起来"成功"但读取端永远拿不到。）
+                        let v = lk(&self.sh.statics)
+                            .get(&("java/lang/System".to_string(), "out".to_string()))
+                            .copied()
+                            .unwrap_or(Slot::I(0));
+                        frame.push(v);
                     } else if let Some(v) = self.builtin_static_field(&info.class, &info.name) {
                         // 内建常量：`Integer.MAX_VALUE` / `Long.MIN_VALUE`（没有 .class）
                         frame.push(v);
@@ -1511,6 +1547,12 @@ fn is_override_owner(cf: &crate::ClassFile) -> bool {
     matches!(
         bytes,
         b"java/lang/Thread"
+            | b"java/lang/ClassLoader"
+            | b"jdk/internal/reflect/Reflection"
+            | b"java/lang/ref/Reference"
+            | b"java/lang/ref/PhantomReference"
+            | b"java/lang/ref/SoftReference"
+            | b"java/lang/ref/WeakReference"
             // ---- 反射层（`vm/reflect.rs`）：反射对象上的访问器语义必须由 VM 给 ----
             | b"java/lang/Class"
             | b"java/lang/reflect/AccessibleObject"
