@@ -19,6 +19,7 @@ mod indy;
 mod load;
 mod native_reg;
 mod natives;
+mod reflect;
 mod rt;
 mod slot;
 mod thread;
@@ -179,6 +180,12 @@ pub struct Vm {
     thread_seq: u32,
     /// 死锁 watchdog 的停滞计数（连续几次 tick 所有线程都不在 RUNNABLE）
     stalled: u32,
+    /// 运行期类加载用的 classpath（`Class.forName` 靠它；`None` = 独立模式，只能找到已加载的类）
+    cp: Option<crate::load::ClassPath>,
+    /// 注解代理对象：句柄 → 注解实例（`java.lang.reflect.Proxy` 的替身，语义在 `reflect.rs`）
+    ann_objs: HashMap<i32, reflect::AnnInst>,
+    /// 最近一次字节码调用点的类下标（反射的访问检查要「调用者是谁」；`usize::MAX` = 无）
+    last_caller: usize,
 }
 
 impl Vm {
@@ -234,6 +241,9 @@ impl Vm {
             tick: 0,
             thread_seq: 0,
             stalled: 0,
+            cp: None,
+            ann_objs: HashMap::new(),
+            last_caller: usize::MAX,
         }
     }
 
@@ -280,7 +290,6 @@ impl Vm {
         // JVM 在调 main 之前会先初始化入口类
         let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
         self.ensure_init(&main_name)?;
-        // 主线程进 VM：登记 tid=1 + 拿到 GIL（此后 main 的一切都在锁里跑）
         thread::set_vm_ptr(self as *mut Vm);
         thread::set_main_tid();
         thread::gil_lock();
@@ -312,7 +321,14 @@ impl Vm {
                     exception: Some(format!("Exception in thread \"main\" {text}")),
                 })
             }
-            Err(e) => Err(e),
+            // VM 内部错误（不是 Java 异常）：已经打印的行**先刷出去**再报错 ——
+            // 否则「前面跑得好好的、后面炸了」的诊断信息全被缓冲区吞掉，排查时活受罪
+            Err(e) => {
+                for line in self.output.drain(..) {
+                    println!("{line}");
+                }
+                Err(e)
+            }
         }
     }
 
@@ -352,7 +368,10 @@ impl Vm {
         let mut cp = crate::load::ClassPath::from_spec(spec).map_err(|e| VmError { msg: e, exc: None })?;
         push_jdk(&mut cp);
         let name = internal_name(main_class);
-        Ok(Self::from_store(ClassStore::load_path(&cp, &name)?))
+        let mut vm = Self::from_store(ClassStore::load_path(&cp, &name)?);
+        // classpath 留着：`Class.forName` 要在运行期按需加载闭包（见 `reflect.rs`）
+        vm.cp = Some(cp);
+        Ok(vm)
     }
 }
 

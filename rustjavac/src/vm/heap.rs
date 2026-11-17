@@ -82,6 +82,14 @@ impl Vm {
     /// `getfield`/`putfield` 才能照常工作。`name` 字段先填好（`getName` 是 Java 代码，
     /// 它自己也会在第一次访问时补上）。
     pub(crate) fn class_obj(&mut self, desc: &str) -> i32 {
+        // 两种写法都收：内部名（`java/lang/String`）与字段描述符（`Ljava/lang/String;`）。
+        // 不归一化的话 `[Ljava/lang/String;` 的元素会被当成一个叫 `Ljava/lang/String;`
+        // 的类 —— `getComponentType().getName()` 就变成 `Ljava.lang.String;`（踩过）
+        let desc = if desc.len() >= 2 && desc.starts_with('L') && desc.ends_with(';') {
+            &desc[1..desc.len() - 1]
+        } else {
+            desc
+        };
         if let Some(h) = self.class_obj_cache.get(desc) {
             return *h;
         }
@@ -96,12 +104,65 @@ impl Vm {
                 slots[i] = Slot::I(name_h);
             }
         }
+        // 反射要看的那三个字段也一起填好 —— 填了 `modifiers`/`primitive`/`componentType`
+        // 之后，`isInterface()` / `isArray()` / `isPrimitive()` / `isAnnotation()` /
+        // `getModifiers()` / `getComponentType()` 这些**纯字节码**方法就都对了，
+        // 一行 Rust 都不用写（HotSpot 也是 VM 在 `Class` 对象上填这几个字段）。
+        let (flags, primitive) = self.class_flags_and_primitive(desc);
+        if let Some(i) = self.store.field_index("java/lang/Class", "modifiers") {
+            if i < slots.len() {
+                slots[i] = Slot::I(i32::from(flags));
+            }
+        }
+        if let Some(i) = self.store.field_index("java/lang/Class", "primitive") {
+            if i < slots.len() {
+                slots[i] = Slot::I(i32::from(primitive));
+            }
+        }
+        if let Some(comp) = desc.strip_prefix('[') {
+            let ch = self.class_obj(comp);
+            if let Some(i) = self.store.field_index("java/lang/Class", "componentType") {
+                if i < slots.len() {
+                    slots[i] = Slot::I(ch);
+                }
+            }
+        }
         self.objects.push(slots);
         self.object_class.push("java/lang/Class".to_string());
         let h = self.objects.len() as i32;
         self.class_obj_cache.insert(desc.to_string(), h);
         self.class_objs.insert(h, desc.to_string());
         h
+    }
+
+    /// 类对象的 `modifiers` 字段（`char`）与 `primitive` 字段。
+    ///
+    /// 口径按 `Class.getModifiers` 的 javadoc：
+    /// - 数组：元素的 PUBLIC/PRIVATE/PROTECTED + ABSTRACT + FINAL（INTERFACE 位一律不带）；
+    /// - 基本类型与 void：PUBLIC + ABSTRACT + FINAL；
+    /// - 其余：class 文件的 `access_flags`。
+    fn class_flags_and_primitive(&self, desc: &str) -> (u16, bool) {
+        const PUBLIC: u16 = 0x0001;
+        const FINAL: u16 = 0x0010;
+        const ABSTRACT: u16 = 0x0400;
+        if let Some(comp) = desc.strip_prefix('[') {
+            let (cf_flags, _) = self.class_flags_and_primitive(comp);
+            return (cf_flags & 0x0007 | FINAL | ABSTRACT, false);
+        }
+        if desc.len() == 1 {
+            return (PUBLIC | FINAL | ABSTRACT, true);
+        }
+        // `ACC_SUPER`(0x0020) 是 class 文件里的历史标志，**不是** Java 修饰符 ——
+        // 不摘掉它 `Modifier.toString` 会多出一个 `synchronized`（踩过）
+        const ACC_SUPER: u16 = 0x0020;
+        let mut flags = self.store.class_file(desc).map(|cf| cf.access_flags).unwrap_or(PUBLIC);
+        // 成员类（`Outer$Inner`）的 `static` / `private` 等标志**不在**自己 class 文件的
+        // access_flags 里，而在 `InnerClasses` 属性那一项上 —— 不并进来 `Modifier.toString`
+        // 会把 `static class A` 显示成空字符串（踩过）
+        if let Some(inner) = self.refl_inner_flags(desc) {
+            flags |= inner;
+        }
+        (flags & !ACC_SUPER, false)
     }
 
     /// 类对象句柄 → 它代表的类描述符（数组是 `[I` / `[Ljava/lang/String;` 这种）

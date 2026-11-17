@@ -38,15 +38,16 @@ impl NativeRegistry {
     pub(super) fn new() -> Self {
         let mut r = NativeRegistry { map: HashMap::new(), overrides: HashMap::new() };
         register_all(&mut r);
+        super::reflect::register(&mut r);
         r
     }
 
-    fn add(&mut self, class: &'static str, name: &'static str, desc: &'static str, f: NativeFn) {
+    pub(super) fn add(&mut self, class: &'static str, name: &'static str, desc: &'static str, f: NativeFn) {
         self.map.insert((class, name, desc), f);
     }
 
     /// 登记一个「VM 接管」的方法（非 native，执行前拦下来）
-    fn add_override(&mut self, class: &'static str, name: &'static str, desc: &'static str, f: NativeFn) {
+    pub(super) fn add_override(&mut self, class: &'static str, name: &'static str, desc: &'static str, f: NativeFn) {
         self.overrides.insert((class, name, desc), f);
     }
 
@@ -129,6 +130,8 @@ fn register_all(r: &mut NativeRegistry) {
     // ---- java.lang.Class ----
     // `<clinit>` 第一句就是 `registerNatives()`，不接住它连类都初始化不了
     r.add("java/lang/Class", "registerNatives", "()V", no_op);
+    // `ClassLoader.<clinit>` 第一步就调它（HotSpot 里同样是空的 native 注册点）
+    r.add("java/lang/ClassLoader", "registerNatives", "()V", no_op);
     r.add("java/lang/Class", "initClassName", "()Ljava/lang/String;", cls_init_name);
     r.add(
         "java/lang/Class",
@@ -281,6 +284,14 @@ fn register_unsafe(r: &mut NativeRegistry) {
     // 字段/数组布局：`objectFieldOffset0` 要真偏移（`String.value`/`coder` 靠它）；
     // 我们的「偏移」= 字段槽下标，只能按名字从类的布局里查
     r.add(u, "objectFieldOffset0", "(Ljava/lang/reflect/Field;)J", unsafe_field_offset);
+    // `Unsafe.objectFieldOffset(Field)` 在 JDK 21+ 走的是「(Class, String)」那条重载
+    // （`Field.getFieldAccessor` / `MethodHandles.Lookup` 都会问它），同一个语义按名字查
+    r.add(
+        u,
+        "objectFieldOffset1",
+        "(Ljava/lang/Class;Ljava/lang/String;)J",
+        unsafe_field_offset_by_name,
+    );
     r.add(u, "staticFieldOffset0", "(Ljava/lang/reflect/Field;)J", |_, _| Ok(Slot::L(0)));
     r.add(u, "staticFieldBase0", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;", |_, _| Ok(Slot::I(0)));
     r.add(u, "shouldBeInitialized0", "(Ljava/lang/Class;)Z", |_, _| Ok(Slot::I(1)));
@@ -588,7 +599,7 @@ fn cls_is_assignable(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         Some(o) => o,
         None => return Ok(Slot::I(0)),
     };
-    Ok(Slot::I(if vm.is_subclass(&other, &me) { 1 } else { 0 }))
+    Ok(Slot::I(if vm.type_assignable(&other, &me) { 1 } else { 0 }))
 }
 
 fn cls_super(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -934,6 +945,13 @@ fn unsafe_field_offset(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         (Some(c), Some(n)) => Ok(Slot::L(vm.store.field_index(&c, &n).map(|i| i as i64).unwrap_or(-1))),
         _ => Ok(Slot::L(-1)),
     }
+}
+
+/// `objectFieldOffset1(Class, String)`：与 `objectFieldOffset0` 同一个语义，参数形式不同
+fn unsafe_field_offset_by_name(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let cls = vm.class_obj_name(f.arg_i(0)).unwrap_or_default();
+    let name = vm.text_of(f.arg_i(1));
+    Ok(Slot::L(vm.store.field_index(&cls, &name).map(|i| i as i64).unwrap_or(-1)))
 }
 
 fn unsafe_ensure_init(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {

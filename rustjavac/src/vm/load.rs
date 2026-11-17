@@ -278,6 +278,75 @@ impl ClassStore {
         self.by_name.contains_key(name)
     }
 
+    /// 类内部名 → 已解析的 class 文件
+    pub(super) fn class_file(&self, name: &str) -> Option<Rc<ClassFile>> {
+        self.by_name.get(name).map(|&i| self.classes[i].clone())
+    }
+
+    /// 类下标 → 内部名（反射的「调用者是谁」用；越界返回 None）
+    pub(super) fn name_of_index(&self, idx: usize) -> Option<String> {
+        if idx >= self.classes.len() {
+            return None;
+        }
+        self.classes[idx].this_class_name()
+    }
+
+    /// 运行期按需加载一个类**及其引用的闭包**（`Class.forName` 用）。
+    ///
+    /// 与 `load_path` 是同一套闭包规则，区别是它发生在运行中途：新类直接 `add_class`
+    /// 进类表（会顺带重建方法表与字段布局）。已经加载的类不重复加载，所以对
+    /// `forName("java.lang.String")` 这类调用是空操作。
+    ///
+    /// 返回**新加入**的类名。找不到 `root` 自己就返回错误（这是 `ClassNotFoundException`
+    /// 的来源），闭包里别的类找不到只跳过（JVMS 允许链接期再报）。
+    pub(super) fn load_closure(
+        &mut self,
+        cp: &ClassPath,
+        root: &str,
+    ) -> Result<Vec<String>, VmError> {
+        let mut added = Vec::new();
+        let mut queue: Vec<String> = vec![root.to_string()];
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let jdk_present = self.has_class("java/lang/Object");
+        while let Some(name) = queue.pop() {
+            if name.is_empty() || name.starts_with('[') || !seen.insert(name.clone()) {
+                continue;
+            }
+            if self.has_class(&name) {
+                continue;
+            }
+            let bytes = match cp.find(&name) {
+                Ok(Some(b)) => b,
+                Ok(None) => {
+                    if name == root {
+                        return err(format!("classpath 里找不到 {root}"));
+                    }
+                    continue;
+                }
+                Err(e) => return err(e),
+            };
+            let cf = crate::parse(&bytes)
+                .map_err(|e| VmError { msg: format!("解析 {name} 失败: {e}"), exc: None })?;
+            for e in &cf.constant_pool {
+                if let Some(CpEntry::Class(ix)) = e {
+                    if let Some(raw) = cf.utf8(*ix) {
+                        let n = String::from_utf8_lossy(raw).into_owned();
+                        if !n.starts_with('[')
+                            && !n.contains('<')
+                            && !n.contains(';')
+                            && pull_jdk(jdk_present, &n)
+                        {
+                            queue.push(n);
+                        }
+                    }
+                }
+            }
+            self.add_class(cf);
+            added.push(name);
+        }
+        Ok(added)
+    }
+
     /// 从 `from` 开始沿继承链解析方法；类链上找不到再找接口的 **default 实现**。
     ///
     /// **抽象方法不算实现**：它们没有 Code 属性，解析到了也执行不了。跳过它们才能让

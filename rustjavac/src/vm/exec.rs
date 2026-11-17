@@ -907,6 +907,9 @@ impl Vm {
                     pc += 2;
                     let info = self.method_ref(&cf, idx)?;
                     if info.class == "java/lang/System" && info.name == "out" {
+                        // 先把 `System` 自己初始化好：`SharedSecrets` 的 `JavaLangAccess`
+                        // 就是它 `<clinit>` 里挂上去的（`StringJoiner.toString` 要用）
+                        self.ensure_init("java/lang/System")?;
                         frame.push(Slot::I(0));
                     } else if let Some(v) = self.builtin_static_field(&info.class, &info.name) {
                         // 内建常量：`Integer.MAX_VALUE` / `Long.MIN_VALUE`（没有 .class）
@@ -1019,6 +1022,25 @@ impl Vm {
                         args.reverse();
                         let mut all = vec![recv];
                         all.extend(args);
+                        // 注解代理对象：运行时类 = 注解接口、成员值在 `Vm::ann_objs` 里。
+                        // 接口方法都是抽象的，所以必须在方法解析之前分流（与 lambda 同一层）。
+                        if !self.ann_objs.is_empty() {
+                            if let Some(r) = self.ann_dispatch(recv.as_i32(), &info.name, &info.desc) {
+                                match call_or_handle!(r, op_pc) {
+                                    CallOutcome::Value(v) => {
+                                        if !info.desc.ends_with(")V") {
+                                            frame.push(v);
+                                        }
+                                    }
+                                    CallOutcome::Handler(t, h) => {
+                                        pc = t;
+                                        frame.stack.clear();
+                                        frame.push(Slot::I(h));
+                                    }
+                                }
+                                continue;
+                            }
+                        }
                         // lambda 对象：它的类是 VM 生成的合成类，**不在类表里** ——
                         // 必须在方法解析之前分流（接口方法是抽象的，解析到了也执行不了）。
                         if let Some(r) = self.lambda_dispatch(recv.as_i32(), &info.name, &info.desc, &all[1..]) {
@@ -1080,8 +1102,14 @@ impl Vm {
                                     None => {
                                         return Err(VmError {
                                             msg: format!(
-                                                "找不到方法 {}.{}{}",
-                                                info.class, info.name, info.desc
+                                                "找不到方法 {}.{}{}（调用点 {}，接收者 {}）",
+                                                info.class,
+                                                info.name,
+                                                info.desc,
+                                                self.store
+                                                    .name_of_index(self.last_caller)
+                                                    .unwrap_or_else(|| "?".into()),
+                                                self.type_name(recv.as_i32())
                                             ),
                                             exc: None,
                                         })
@@ -1090,6 +1118,7 @@ impl Vm {
                             }
                         };
                         self.depth += 1;
+                        self.last_caller = class;
                         let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &all, true), op_pc);
                         self.depth -= 1;
                         match r {
@@ -1148,6 +1177,7 @@ impl Vm {
                         }
                         continue;
                     }
+                    self.last_caller = class;
                     match self.store.resolve_method(&info.class, &info.name, &info.desc) {
                         Some((ci, mi)) => {
                             self.depth += 1;
@@ -1256,6 +1286,7 @@ impl Vm {
                         }
                         continue;
                     };
+                    self.last_caller = class;
                     self.depth += 1;
                     let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &args, false), op_pc);
                     self.depth -= 1;
@@ -1400,7 +1431,18 @@ fn is_override_owner(cf: &crate::ClassFile) -> bool {
         Some(CpEntry::Class(n)) => cf.utf8(*n).unwrap_or_default(),
         _ => return false,
     };
-    matches!(bytes, b"java/lang/Thread")
+    matches!(
+        bytes,
+        b"java/lang/Thread"
+            // ---- 反射层（`vm/reflect.rs`）：反射对象上的访问器语义必须由 VM 给 ----
+            | b"java/lang/Class"
+            | b"java/lang/reflect/AccessibleObject"
+            | b"java/lang/reflect/Executable"
+            | b"java/lang/reflect/Field"
+            | b"java/lang/reflect/Method"
+            | b"java/lang/reflect/Constructor"
+            | b"java/util/StringJoiner"
+    )
 }
 
 /// 返回 (max_locals, 字节码, 异常表)。异常表每项 (start, end, handler, catch_type)，

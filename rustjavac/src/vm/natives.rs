@@ -208,6 +208,31 @@ impl Vm {
         VmError { msg: format!("抛出 {class}"), exc: Some(h) }
     }
 
+    /// 抛一个**带消息**的 Java 异常。
+    ///
+    /// 真字节码的 `Throwable` 有 `detailMessage` 字段，异常对象的运行时类也必须是
+    /// 那个类（`catch (IllegalAccessException e)` 才对得上），所以这里走 `new_instance`；
+    /// 造不出来（独立模式没有 java.base）就退回裸对象 —— 语义优先，消息其次。
+    pub(super) fn throw_msg(&mut self, class: &str, msg: String) -> VmError {
+        if self.ensure_class_loaded(class) {
+            let text = self.str_new(msg.clone());
+            match self.new_instance_args(
+                class,
+                "(Ljava/lang/String;)V",
+                &[Slot::I(text)],
+            ) {
+                Ok(h) => return VmError { msg: format!("抛出 {class}: {msg}"), exc: Some(h) },
+                Err(e) => return e,
+            }
+        }
+        let h = {
+            self.objects.push(vec![Slot::I(0)]);
+            self.object_class.push(class.to_string());
+            self.objects.len() as i32
+        };
+        VmError { msg: format!("抛出 {class}: {msg}"), exc: Some(h) }
+    }
+
     // ---------- 调用分派 ----------
 
     /// 虚方法内建分派：None 表示「不是内建，按正常方法解析走」
@@ -678,49 +703,78 @@ impl Vm {
     pub(super) fn array_copy(&mut self, src: i32, sp: i32, dst: i32, dp: i32, n: i32) -> Result<(), VmError> {
         let sd = self.array_desc(src);
         let dd = self.array_desc(dst);
-        if sd.is_none() || sd != dd || n < 0 || sp < 0 || dp < 0 {
-            return Err(VmError { msg: "System.arraycopy 参数非法".into(), exc: None });
-        }
-        match sd.as_deref() {
-            // 引用元素的数组：搬句柄即可（句柄就是 GC 的引用本身）
-            Some(d) if d.starts_with("[L") || d.starts_with("[[") => {
-                let mut tmp = Vec::with_capacity(n as usize);
-                {
-                    let a = &self.arrays[(-src - 1) as usize];
-                    for i in 0..n as usize {
-                        tmp.push(*a.get(sp as usize + i).ok_or_else(|| VmError {
-                            msg: "System.arraycopy 越界".into(),
-                            exc: None,
-                        })?);
-                    }
-                }
-                let d = &mut self.arrays[(-dst - 1) as usize];
-                for (i, v) in tmp.into_iter().enumerate() {
-                    if dp as usize + i >= d.len() {
-                        return Err(VmError { msg: "System.arraycopy 越界".into(), exc: None });
-                    }
-                    d[dp as usize + i] = v;
-                }
-            }
+        let (sd, dd) = match (sd, dd) {
+            (Some(a), Some(b)) => (a, b),
             _ => {
-                let mut tmp = Vec::with_capacity(n as usize);
-                {
-                    let a = &self.arrays[(-src - 1) as usize];
-                    for i in 0..n as usize {
-                        tmp.push(*a.get(sp as usize + i).ok_or_else(|| VmError {
-                            msg: "System.arraycopy 越界".into(),
-                            exc: None,
-                        })?);
+                return Err(self.java_exception(
+                    "java/lang/NullPointerException",
+                    "arraycopy: 源或目标不是数组".to_string(),
+                ))
+            }
+        };
+        if n < 0 || sp < 0 || dp < 0 {
+            return Err(self
+                .throw_msg("java/lang/IndexOutOfBoundsException", format!("arraycopy: 偏移为负（{sp}/{dp}/n={n}）")));
+        }
+        // 类型兼容按 `System.arraycopy` 的规范：**不要求两边类型相同**，
+        // 只要求「源的元素能存进目标」（`Object[] ← String[]` 合法）。
+        // 以前写成 `sd != dd` 一律拒绝 —— 于是 `Arrays.copyOf(TypeVariable[0], n)`
+        // 这种「数组元素类型是接口」的复制全被拦下（连泛型签名解析都过不去）。
+        let (s_elem, d_elem) = (&sd[1..], &dd[1..]);
+        let both_ref = !is_prim_desc(s_elem) && !is_prim_desc(d_elem);
+        if !both_ref {
+            if sd != dd {
+                return Err(self.java_exception(
+                    "java/lang/ArrayStoreException",
+                    format!("arraycopy: 类型不兼容 {sd} -> {dd}"),
+                ));
+            }
+        }
+        // 引用元素：搬句柄（句柄本身就是引用），逐个按目标元素类型验一遍
+        let mut tmp = Vec::with_capacity(n as usize);
+        {
+            let Some(a) = self.arrays.get((-src - 1) as usize) else {
+                return Err(VmError { msg: "arraycopy: 源句柄无效".into(), exc: None });
+            };
+            for i in 0..n as usize {
+                match a.get(sp as usize + i) {
+                    Some(v) => tmp.push(*v),
+                    None => {
+                        return Err(self.throw_msg(
+                            "java/lang/IndexOutOfBoundsException",
+                            format!("arraycopy: 源越界 {sp}+{n} > {}", a.len()),
+                        ))
                     }
-                }
-                let d = &mut self.arrays[(-dst - 1) as usize];
-                for (i, v) in tmp.into_iter().enumerate() {
-                    if dp as usize + i >= d.len() {
-                        return Err(VmError { msg: "System.arraycopy 越界".into(), exc: None });
-                    }
-                    d[dp as usize + i] = v;
                 }
             }
+        }
+        let d_elem_name = if both_ref { Some(internal_of_elem(d_elem)) } else { None };
+        // 越界与元素类型先**验证完**再取可变借用（Rust 的借用检查逼出来的顺序，正好也更清楚）
+        let d_len = match self.arrays.get((-dst - 1) as usize) {
+            Some(a) => a.len(),
+            None => return Err(VmError { msg: "arraycopy: 目标句柄无效".into(), exc: None }),
+        };
+        if dp as usize + tmp.len() > d_len {
+            return Err(self.throw_msg(
+                "java/lang/IndexOutOfBoundsException",
+                format!("arraycopy: 目标越界 {dp}+{n} > {d_len}"),
+            ));
+        }
+        if let Some(comp) = d_elem_name.as_deref() {
+            for v in &tmp {
+                let h = v.as_i32();
+                if h != 0 && !self.is_instance(h, comp) {
+                    let actual = self.type_name(h);
+                    return Err(self.java_exception(
+                        "java/lang/ArrayStoreException",
+                        format!("arraycopy: 元素 {actual} 不能存进 [{comp}"),
+                    ));
+                }
+            }
+        }
+        let d = &mut self.arrays[(-dst - 1) as usize];
+        for (i, v) in tmp.into_iter().enumerate() {
+            d[dp as usize + i] = v;
         }
         Ok(())
     }
@@ -1665,4 +1719,18 @@ fn now_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+/// 数组元素描述符 → 类型名（`Ljava/lang/TypeVariable;` → `java/lang/TypeVariable`）
+fn internal_of_elem(desc: &str) -> String {
+    if desc.len() >= 2 && desc.starts_with('L') && desc.ends_with(';') {
+        desc[1..desc.len() - 1].to_string()
+    } else {
+        desc.to_string()
+    }
+}
+
+/// 是不是基本类型的元素描述符
+fn is_prim_desc(desc: &str) -> bool {
+    desc.len() == 1 && "ZBCSIJFDV".contains(desc)
 }

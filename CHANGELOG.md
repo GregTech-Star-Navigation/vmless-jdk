@@ -869,3 +869,37 @@ Math、Integer/Long 进制、Character、Arrays）；解释器与 JIT 侧的集�
 
 **边界**：**不并行执行字节码**（一把 GIL，代价是多核用不上）；解释器堆没有 GC（只增不减，但不会回收错）；
 `jstack` 只给锁图不给帧列表；虚拟线程不做。
+
+## 0.56.0 — 2026-11-17 · 反射 + 运行期注解
+
+**「跑 Minecraft」四块硬骨头里的第三块。**
+
+新增 `src/vm/reflect.rs`（2364 行）+ `src/classfile/annot.rs`（211 行）：
+
+- **`Class`**：`forName`、`getDeclared/Fields/Methods/Constructors`（含继承）、按名+签名查找、
+  `getSuperclass`/`getInterfaces`/`isAssignableFrom`/`isInstance`/`cast`/`getModifiers`/`getSimpleName`/`getName`
+- **`Field`/`Method`/`Constructor`**：全 18 个 `get/set` 类型变体、`setAccessible`、
+  `Method.invoke`（参数转换、可变参数、**`InvocationTargetException.getCause`**）、`Constructor.newInstance`
+- **关键取舍**：反射对象用 **java.base 自己的构造器**造（填 `clazz/slot/name/type/modifiers/signature`），
+  于是 `getName/getType/getModifiers/equals/toString/Modifier.toString` 这些**纯字节码方法一行没写**
+- **注解**：`RuntimeVisibleAnnotations` / `ParameterAnnotations` / `AnnotationDefault` / `Signature` 解析，
+  `getAnnotation`/`getAnnotations`/`isAnnotationPresent`、默认值、嵌套注解、数组、枚举、Class 字面量
+- **泛型签名**：`ParameterizedType`/`TypeVariable`/`GenericArrayType`/`WildcardType`
+- 运行期按 classpath 加载闭包（`Class.forName` 命中未加载类时）
+
+**实测 R1–R8 与 JDK 25 逐字节一致**（含迷你 DI 容器：扫注解、注入字段、调用）：
+```
+R2  ours=[type: int mods: private | declaring: R2$Holder name: value | no exception]
+    java=[type: int mods: private | declaring: R2$Holder name: value | no exception]
+R8  ours=[inject counter <- Counter | inject greeter <- Greeter | value config | call ...]
+```
+
+**顺带**：`array_copy` 按规范放宽（元素级 `ArrayStoreException`，之前 `Object[] ← TypeVariable[]` 一律拒绝，
+泛型签名直接卡死）；`type_assignable` 支持数组可赋值与字符串真继承链。
+
+**回归**：`verify.sh` 103/103、`cargo test` **56 passed**、corpus 40/45。
+
+**已知缺口**：注解 `toString()` 的成员顺序（HotSpot 会重排方法表，无法复现）、
+`getAnnotationsByType`、`AnnotatedType`、`Proxy` + 运行期字节码生成、`Method.getParameters()`。
+
+**顺手发现、没修**：数组读写越界**不抛异常**、静默返回 0（修它会改到 JIT 与三路一致行为，另开一件）。

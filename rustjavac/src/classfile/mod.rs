@@ -6,6 +6,7 @@
 
 use std::fmt;
 
+pub mod annot;
 pub mod attr;
 pub mod pool;
 pub mod read;

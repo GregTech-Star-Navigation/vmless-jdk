@@ -59,7 +59,7 @@ pub(crate) fn builtin_super(class: &str) -> Option<&'static str> {
         "java/lang/NoSuchMethodException"
         | "java/lang/NoSuchFieldException"
         | "java/lang/IllegalAccessException"
-        | "java/lang/InvocationTargetException" => Some("java/lang/ReflectiveOperationException"),
+        | "java/lang/reflect/InvocationTargetException" => Some("java/lang/ReflectiveOperationException"),
         "java/lang/ReflectiveOperationException" => Some("java/lang/Exception"),
         "java/lang/UnsupportedOperationException" => Some("java/lang/RuntimeException"),
         _ => None,
@@ -153,12 +153,43 @@ impl Vm {
             }
     }
 
+    /// **类型之间**的可赋值关系（`isAssignableFrom` / 数组的 `instanceof` 共用）。
+    ///
+    /// 比 `is_subclass` 多出来的只有数组那一支：JVMS 4.10.1.2 规定
+    /// `String[]` 可以赋给 `Object[]`（元素类型可赋即可）、任何数组都能赋给
+    /// `Object` / `Cloneable` / `java.io.Serializable`，而**元素是基本类型时必须完全相等**
+    /// （`int[]` 不是 `Object[]` —— 这正是不做这一支会判错的地方）。
+    pub(super) fn type_assignable(&self, from: &str, to: &str) -> bool {
+        if from == to {
+            return true;
+        }
+        let (fa, ta) = (from.starts_with('['), to.starts_with('['));
+        match (fa, ta) {
+            (false, false) => self.is_subclass(from, to),
+            (true, true) => {
+                let (fc, tc) = (&from[1..], &to[1..]);
+                // 基本类型元素：只能完全相同（上面已经判过相等）
+                if fc.len() == 1 || tc.len() == 1 {
+                    return false;
+                }
+                self.type_assignable(elem_class_name(fc), elem_class_name(tc))
+            }
+            (true, false) => {
+                matches!(to, "java/lang/Object" | "java/lang/Cloneable" | "java/io/Serializable")
+            }
+            (false, true) => false,
+        }
+    }
+
     /// `instanceof` 的判定：null 对任何类型都是 false（含 Object）
     pub(super) fn is_instance(&self, handle: i32, target: &str) -> bool {
         match self.ref_kind(handle) {
             RefKind::Null => false,
             _ if target == "java/lang/Object" => true,
-            RefKind::Str => target == "java/lang/String",
+            // 字符串句柄的运行时类**就是** `java.lang.String`：它实现了
+            // `CharSequence` / `Comparable` / `Serializable` …，只认名字会让
+            // `Collections.sort(List<String>)` 里的那个 checkcast 判失败
+            RefKind::Str => self.type_assignable("java/lang/String", target),
             RefKind::Obj(c) => {
                 // lambda 对象：它实现的是若干个接口，而这个合成类**不在类表里** ——
                 // 只能按登记过的接口集合判（`instanceof Runnable` / checkcast 都靠这里）
@@ -167,7 +198,7 @@ impl Vm {
                 }
                 self.is_subclass(&c, target)
             }
-            RefKind::Arr(d) => d == target,
+            RefKind::Arr(d) => self.type_assignable(&d, target),
         }
     }
 
@@ -179,5 +210,14 @@ impl Vm {
             RefKind::Obj(c) => c.replace('/', "."),
             RefKind::Arr(d) => d.replace('/', "."),
         }
+    }
+}
+
+/// 数组元素描述符 → 类型名（`Ljava/lang/String;` → `java/lang/String`，`[I` → `[I`）
+fn elem_class_name(desc: &str) -> &str {
+    if desc.len() >= 2 && desc.starts_with('L') && desc.ends_with(';') {
+        &desc[1..desc.len() - 1]
+    } else {
+        desc
     }
 }
