@@ -1166,3 +1166,48 @@ java : caught: ctor-boom | after
 每条工作线只改自己那份，`native_reg.rs` 不再成为冲突点。
 
 **验证**：`verify.sh` 103/103、`cargo test` 全绿。
+
+## 0.62.0 — 2026-11-18 · native 分组落地：Unsafe / Array / Class / ConstantPool 全通、数组形态 VarHandle
+
+### 内存与反射核心（`nat_intrinsics.rs`，1328 行）
+| 类 | 声明 | 改前 | 改后 |
+|---|---|---|---|
+| `jdk/internal/misc/Unsafe` | 68 | 54 | **68** |
+| `java/lang/reflect/Array` | 21 | 0 | **21** |
+| `java/lang/Class` | 28 | 16 | **28** |
+| `jdk/internal/reflect/ConstantPool` | 18 | 0 | **18** |
+
+**`Arrays.copyOf` / `String.join` / `Arrays.sort/fill/asList` / `String.split` 全部通了** ——
+它们卡在 `Array.newArray` 上，这是其它两组的共同前置条件。
+
+三个非显然的实现要点：
+- **裸内存 arena**：`allocateMemory` 发的是句柄，`o == null` 的 `get/put/copy/setMemory` 全走它
+- **`UnsafeConstants` 要补值**：本机 `patch/img` 里该类 `<clinit>` 全写 0（JDK 构建期才填），
+  于是 `alignToHeapWordSize` 变 0 → `allocateMemory` 返回 0、`pageSize()=0`。
+  借 `Unsafe.<clinit>` 里的 `registerNatives()` 钩子把 8/4096/小端/允许非对齐写进静态字段
+- **槽是带类型的**：`putDouble` 按宽度存 `Slot::L` 会让随后 `getfield` 读出 `4.6e18`；
+  按「类+槽下标」反查声明类型才对
+
+### 数组形态 VarHandle（`indy.rs`）
+`MethodHandles.arrayElementVarHandle` 与 `byteArrayViewVarHandle` 之前没有，于是
+`RandomAccessFile.writeInt/readInt/writeLong` 全家不可用（JDK 里整数读写走 byte array view）。
+两个工厂 + `varhandle_op` 的数组分支已实现（`S/C/I/J/F/D` 宽度与字节序、越界与空引用异常）。
+
+实测与 java 逐字节一致：
+```
+arrayElem=42 cas=false v=0 | be=01020304 get=16909060 | le8=1234616436508552
+```
+
+### 文件与进程（`nat_os.rs`）
+68 个 native：`FileDescriptor` 5 · `FileInputStream` 9 · `FileOutputStream` 4 · `RandomAccessFile` 10 ·
+`FileCleanable` 1 · **`WinNTFileSystem` 19**（File 的整套语义）· `ProcessImpl` 10 · `ProcessEnvironment` 1 ·
+`ProcessHandleImpl` 7 + `$Info` 2。错误路径语义按 `java.io`（`FileNotFoundException` 带 Win32 本地化文本）。
+
+### 修的阻塞 bug
+- **`Thread$FieldHolder.group` 为 null** → `Thread.getThreadGroup()` 返回 null →
+  `InnocuousThread` / `Cleaner` 拿它 `synchronized` 就 NPE → **`FileCleanable.register` 炸，
+  每一个 `FileInputStream/FileOutputStream/RandomAccessFile` 构造器都失败**。
+  已加共享的根 `ThreadGroup` 对象。
+
+**验证**：`verify.sh` 103/103、`cargo test` 102 passed。
+**已知未解**：`ThreadLocalRandom.current()` 仍会挂死（阻塞 `ProcessBuilder.start()`）；见下一条。

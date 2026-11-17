@@ -194,6 +194,27 @@ pub(super) struct VarHandleInfo {
     /// 字段类型
     pub desc: String,
     pub is_static: bool,
+    /// 这是不是数组形态（`arrayElementVarHandle` / `byteArrayViewVarHandle` 造出来的）
+    pub kind: VhKind,
+}
+
+/// VarHandle 的三种形态。字段形态用上面那四个字段描述；数组形态不用。
+#[derive(Clone, PartialEq)]
+pub(super) enum VhKind {
+    /// 字段（`findVarHandle` / `staticFieldVarHandle` 那一族）
+    Field,
+    /// `MethodHandles.arrayElementVarHandle(T[].class)`：坐标是 `(数组, 下标)`
+    ArrayElem {
+        /// 元素类型描述符，如 `I` / `Ljava/lang/String;`
+        elem: String,
+    },
+    /// `MethodHandles.byteArrayViewVarHandle(int[].class, order)`：
+    /// 坐标是 `(byte[], 字节下标)`，按 `view` 宽度一次性读写，注意字节序
+    ByteView {
+        /// 视图类型描述符（`S`/`C`/`I`/`J`/`F`/`D`）
+        view: String,
+        big_endian: bool,
+    },
 }
 
 
@@ -1254,6 +1275,7 @@ impl Vm {
                         name: site_name.to_string(),
                         desc: ftype,
                         is_static: name == "staticFieldVarHandle",
+                        kind: VhKind::Field,
                     },
                 );
                 Ok(Slot::I(h))
@@ -1297,10 +1319,157 @@ impl Vm {
         desc: &str,
         args: &[Slot],
     ) -> Result<Option<Slot>, VmError> {
-        let Some(info) = self.indy().varhandles.get(&vh).map(|i| (i.class.clone(), i.name.clone(), i.desc.clone(), i.is_static)) else {
+        let Some((kind, class, fname, fdesc, is_static)) = self.indy().varhandles.get(&vh).map(|i| {
+            (
+                i.kind.clone(),
+                i.class.clone(),
+                i.name.clone(),
+                i.desc.clone(),
+                i.is_static,
+            )
+        }) else {
             return Ok(None);
         };
-        let (class, fname, fdesc, is_static) = info;
+        // ---- 数组形态：坐标是 (数组引用, 下标)，不是 (holder) ----
+        if !matches!(kind, VhKind::Field) {
+            let arr = args.first().copied().unwrap_or(Slot::I(0)).as_i32();
+            let idx = args.get(1).copied().unwrap_or(Slot::I(0)).as_i32();
+            if arr == 0 {
+                return Err(self.java_exception(
+                    "java/lang/NullPointerException",
+                    "VarHandle 访问数组时数组引用是 null".to_string(),
+                ));
+            }
+            let len = self.sh.heap.array_len(arr).unwrap_or(0);
+            // 元素宽度（ByteView 按字节寻址，余量要够一次读写）
+            let width = match &kind {
+                VhKind::ByteView { view, .. } => match view.as_str() {
+                    "S" | "C" => 2,
+                    "I" | "F" => 4,
+                    "J" | "D" => 8,
+                    _ => 1,
+                },
+                _ => 1,
+            };
+            if idx < 0 || (idx as usize) + width > len.max(1) {
+                return Err(self.java_exception(
+                    "java/lang/IndexOutOfBoundsException",
+                    format!("VarHandle 下标 {idx} 越界（长度 {len}，一次读 {width} 字节）"),
+                ));
+            }
+            // 读：把 idx 起的 width 字节按字节序拼成一个 Slot
+            let read = |vm: &mut Vm| -> Result<Slot, VmError> {
+                match &kind {
+                    VhKind::ArrayElem { .. } => {
+                        Ok(vm.sh.heap.get(arr, idx as usize).unwrap_or(Slot::I(0)))
+                    }
+                    VhKind::ByteView { view, big_endian } => {
+                        let mut raw = [0u8; 8];
+                        for k in 0..width {
+                            let b = vm.sh.heap.get(arr, idx as usize + k).map(|s| s.as_i32()).unwrap_or(0) as u8;
+                            // 大端：低地址是高字节
+                            if *big_endian { raw[k] = b } else { raw[width - 1 - k] = b }
+                        }
+                        Ok(match view.as_str() {
+                            "S" => Slot::I(i16::from_be_bytes([raw[0], raw[1]]) as i32),
+                            "C" => Slot::I(u16::from_be_bytes([raw[0], raw[1]]) as i32),
+                            "I" => Slot::I(i32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]])),
+                            "F" => Slot::Fl(f32::from_bits(u32::from_be_bytes([raw[0], raw[1], raw[2], raw[3]]))),
+                            "J" => Slot::L(i64::from_be_bytes(raw)),
+                            "D" => Slot::F(f64::from_bits(u64::from_be_bytes(raw))),
+                            _ => Slot::I(raw[0] as i32),
+                        })
+                    }
+                    VhKind::Field => unreachable!(),
+                }
+            };
+            let write = |vm: &mut Vm, v: Slot| -> Result<(), VmError> {
+                match &kind {
+                    VhKind::ArrayElem { .. } => {
+                        vm.sh.heap.set(arr, idx as usize, v);
+                    }
+                    VhKind::ByteView { view, big_endian } => {
+                        let raw: [u8; 8] = match view.as_str() {
+                            "S" => {
+                                let mut b = [0u8; 8];
+                                b[..2].copy_from_slice(&(v.as_i32() as i16).to_be_bytes());
+                                b
+                            }
+                            "C" => {
+                                let mut b = [0u8; 8];
+                                b[..2].copy_from_slice(&(v.as_i32() as u16).to_be_bytes());
+                                b
+                            }
+                            "I" => {
+                                let mut b = [0u8; 8];
+                                b[..4].copy_from_slice(&v.as_i32().to_be_bytes());
+                                b
+                            }
+                            "F" => {
+                                let mut b = [0u8; 8];
+                                b[..4].copy_from_slice(&v.as_f32().to_bits().to_be_bytes());
+                                b
+                            }
+                            "J" => v.as_i64().to_be_bytes(),
+                            "D" => v.as_f64().to_bits().to_be_bytes(),
+                            _ => [0u8; 8],
+                        };
+                        for k in 0..width {
+                            let b = if *big_endian { raw[k] } else { raw[width - 1 - k] };
+                            vm.sh.heap.set(arr, idx as usize + k, Slot::I(b as i32));
+                        }
+                    }
+                    VhKind::Field => unreachable!(),
+                }
+                Ok(())
+            };
+            let coord = 2usize; // (数组, 下标) 之后才是值
+            let params = param_descs(desc);
+            return Ok(Some(match name {
+                "get" | "getVolatile" | "getAcquire" | "getOpaque" | "getPlain" => {
+                    let v = read(self)?;
+                    self.coerce(v, &fdesc, &ret_desc(desc), name)?
+                }
+                "set" | "setVolatile" | "setRelease" | "setOpaque" | "setPlain" => {
+                    let v = args[coord];
+                    let v = self.coerce(v, &params[coord], &fdesc, name)?;
+                    write(self, v)?;
+                    Slot::I(0)
+                }
+                "getAndSet" => {
+                    let old = read(self)?;
+                    let v = args[coord];
+                    let v = self.coerce(v, &params[coord], &fdesc, name)?;
+                    write(self, v)?;
+                    self.coerce(old, &fdesc, &ret_desc(desc), name)?
+                }
+                "compareAndSet" | "weakCompareAndSet" => {
+                    let expected = self.coerce(args[coord], &params[coord], &fdesc, name)?;
+                    let newv = self.coerce(args[coord + 1], &params[coord + 1], &fdesc, name)?;
+                    let old = read(self)?;
+                    let same = old == expected;
+                    if same {
+                        write(self, newv)?;
+                    }
+                    Slot::I(if same { 1 } else { 0 })
+                }
+                "compareAndExchange" => {
+                    let expected = self.coerce(args[coord], &params[coord], &fdesc, name)?;
+                    let newv = self.coerce(args[coord + 1], &params[coord + 1], &fdesc, name)?;
+                    let old = read(self)?;
+                    if old == expected {
+                        write(self, newv)?;
+                    }
+                    old
+                }
+                other => {
+                    return Err(self.bsm_error(format!(
+                        "VM 未实现的数组形态 VarHandle.{other}{desc}"
+                    )))
+                }
+            }));
+        }
+        let (class, fname, fdesc, is_static) = (class, fname, fdesc, is_static);
         // 坐标参数：静态字段 0 个，实例字段 1 个（holder）
         let coord = usize::from(!is_static);
         let _ = desc;
@@ -1462,6 +1631,74 @@ impl Vm {
                         .unwrap_or_else(|| "Ljava/lang/Object;".into());
                     let mh = self.mh_obj(MhKind::Identity, format!("({ty}){ty}"));
                     Slot::I(mh)
+                }
+                // `MethodHandles.arrayElementVarHandle(T[].class)`：坐标 `(数组, 下标)`。
+                // 少了它，`Arrays.copyOf` 之后一大堆走 VarHandle 的 JDK 代码全部不可用。
+                "arrayElementVarHandle" => {
+                    let adesc = self
+                        .class_desc_of(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                        .ok_or_else(|| self.bsm_error("arrayElementVarHandle 的参数不是 Class".to_string()))?;
+                    let elem = adesc
+                        .strip_prefix('[')
+                        .ok_or_else(|| {
+                            self.bsm_error(format!("arrayElementVarHandle 收到非数组类型 {adesc}"))
+                        })?
+                        .to_string();
+                    let h = self.alloc_vmobj("java/lang/invoke/VarHandle");
+                    self.indy().varhandles.insert(
+                        h,
+                        VarHandleInfo {
+                            class: String::new(),
+                            name: String::new(),
+                            desc: elem.clone(),
+                            is_static: false,
+                            kind: VhKind::ArrayElem { elem },
+                        },
+                    );
+                    Slot::I(h)
+                }
+                // `MethodHandles.byteArrayViewVarHandle(int[].class, order)`：
+                // 坐标 `(byte[], 字节下标)`，一次读写 view 宽度，按字节序拼。
+                // `RandomAccessFile.writeInt/readLong` 全家都走这条。
+                "byteArrayViewVarHandle" => {
+                    let vdesc = self
+                        .class_desc_of(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                        .ok_or_else(|| {
+                            self.bsm_error("byteArrayViewVarHandle 的第 1 个参数不是 Class".to_string())
+                        })?;
+                    let view = vdesc
+                        .strip_prefix('[')
+                        .ok_or_else(|| {
+                            self.bsm_error(format!("byteArrayViewVarHandle 收到非数组类型 {vdesc}"))
+                        })?
+                        .to_string();
+                    // 第 2 个参数是 ByteOrder：BIG_ENDIAN / LITTLE_ENDIAN 的句柄。
+                    // 我们没有真对象可比，按「非 null 就查它的单例名」处理；查不到按 native order。
+                    let order = args.get(1).copied().unwrap_or(Slot::I(0)).as_i32();
+                    let big_endian = if order == 0 {
+                        cfg!(target_endian = "big")
+                    } else {
+                        // `ByteOrder.BIG_ENDIAN` / `LITTLE_ENDIAN` 的 `name` 字段区分
+                        let n = self.get_named(order, "java/nio/ByteOrder", "name");
+                        let txt = self.text_of(n.as_i32());
+                        if txt.is_empty() {
+                            cfg!(target_endian = "big")
+                        } else {
+                            txt != "LITTLE_ENDIAN"
+                        }
+                    };
+                    let h = self.alloc_vmobj("java/lang/invoke/VarHandle");
+                    self.indy().varhandles.insert(
+                        h,
+                        VarHandleInfo {
+                            class: String::new(),
+                            name: String::new(),
+                            desc: view.clone(),
+                            is_static: false,
+                            kind: VhKind::ByteView { view, big_endian },
+                        },
+                    );
+                    Slot::I(h)
                 }
                 other => {
                     return Err(self.bsm_error(format!(
@@ -1647,6 +1884,7 @@ impl Vm {
                         name: f,
                         desc: fdesc,
                         is_static: name.starts_with("findStatic"),
+                        kind: VhKind::Field,
                     },
                 );
                 Ok(Slot::I(h))

@@ -89,6 +89,7 @@ const FORMAT_MESSAGE_IGNORE_INSERTS: u32 = 0x200;
 const HANDLE_FLAG_INHERIT: u32 = 0x1;
 
 const MOVEFILE_REPLACE_EXISTING: u32 = 0x1;
+const MOVEFILE_WRITE_THROUGH: u32 = 0x8;
 
 const WAIT_OBJECT_0: u32 = 0;
 const WAIT_TIMEOUT: u32 = 258;
@@ -270,7 +271,9 @@ extern "system" {
         fs_name_len: u32,
     ) -> Bool;
     fn GetStdHandle(which: u32) -> Handle;
+    fn GetConsoleMode(h: Handle, mode: *mut u32) -> Bool;
     fn SetHandleInformation(h: Handle, mask: u32, flags: u32) -> Bool;
+    fn GetHandleInformation(h: Handle, flags: *mut u32) -> Bool;
     fn DuplicateHandle(
         process: Handle,
         src: Handle,
@@ -410,27 +413,6 @@ pub(super) fn register(r: &mut NativeRegistry) {
     register_streams(r);
     register_fs(r);
     register_process(r);
-
-    // ---- 启动期的一次性铺垫 ----
-    //
-    // `FileOutputStream.<clinit>` 里第一句就是
-    // `SharedSecrets.getJavaIOFileDescriptorAccess()`；这个 access 是
-    // `FileDescriptor.<clinit>` 装上的。装之前 SharedSecrets 会走
-    // `MethodHandles.lookup().ensureInitialized(FileDescriptor.class)`，
-    // 而 VM 的 indy 层目前没实现 `Lookup.ensureInitialized`
-    //（`src/vm/indy.rs:1643` 的兜底分支）—— 于是**任何文件写入**在类初始化阶段
-    // 就 BootstrapMethodError，连我这些 native 都轮不到跑。
-    //
-    // 这里借 `System.<clinit>` 的 `registerNatives()`（`run_main` 保证跑在
-    // `initPhase1` 与用户 `main` 之前）把 `FileDescriptor` 提前初始化，
-    // 让 SharedSecrets 那条「缺失就初始化」的分支根本不会走到。
-    // 正解仍是给 indy 补上 `ensureInitialized`，那是另一个文件的事。
-    r.add("java/lang/System", "registerNatives", "()V", |vm, _| {
-        if vm.store.class_file("java/io/FileDescriptor").is_some() {
-            let _ = vm.ensure_init("java/io/FileDescriptor");
-        }
-        Ok(Slot::I(0))
-    });
 }
 
 // ---------------------------------------------------------------- 句柄
@@ -438,6 +420,19 @@ pub(super) fn register(r: &mut NativeRegistry) {
 fn register_fd(r: &mut NativeRegistry) {
     let fd = "java/io/FileDescriptor";
     r.add(fd, "initIDs", "()V", |_, _| Ok(Slot::I(0)));
+    // `java.io.Console.<clinit>`：哪一路标准流是**字符设备**（控制台），按位报。
+    // TTY_STDIN_MASK=1 / TTY_STDOUT_MASK=2 / TTY_STDERR_MASK=4
+    r.add("java/io/Console", "ttyStatus", "()I", |_, _| {
+        let mut status = 0;
+        for (i, which) in [STD_INPUT_HANDLE, STD_OUTPUT_HANDLE, STD_ERROR_HANDLE].iter().enumerate() {
+            let h = unsafe { GetStdHandle(*which) };
+            if h != 0 && h != INVALID_HANDLE_VALUE && unsafe { GetConsoleMode(h, std::ptr::null_mut()) } != 0
+            {
+                status |= 1 << i;
+            }
+        }
+        Ok(Slot::I(status))
+    });
     // 标准句柄：`FileDescriptor.<clinit>` 里 `new FileDescriptor(0/1/2)` 就靠它，
     // 拿不到的话 `System.out` 整条链写不出去。
     r.add(fd, "getHandle", "(I)J", |_, f| {
@@ -574,10 +569,7 @@ fn raf_open(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let mode = f.arg_i(1);
     let fd_obj = this_fd(vm, f.this(), "java/io/RandomAccessFile");
     let read_only = mode & 2 == 0;
-    let mut access = if read_only { GENERIC_READ } else { GENERIC_READ | GENERIC_WRITE };
-    if read_only {
-        access = GENERIC_READ;
-    }
+    let access = if read_only { GENERIC_READ } else { GENERIC_READ | GENERIC_WRITE };
     let mut flags = FILE_ATTRIBUTE_NORMAL;
     if mode & 12 != 0 {
         flags |= FILE_FLAG_WRITE_THROUGH;
@@ -586,7 +578,6 @@ fn raf_open(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         flags |= FILE_FLAG_DELETE_ON_CLOSE;
     }
     let disposition = if read_only { OPEN_EXISTING } else { OPEN_ALWAYS };
-    let _ = &mut access;
     match open_file(&path, access, disposition, flags) {
         Ok(h) => {
             set_fd_handle(vm, fd_obj, h);
@@ -637,14 +628,10 @@ fn check_range(vm: &mut Vm, arr: i32, off: i32, len: i32) -> Result<bool, VmErro
     Ok(len == 0)
 }
 
-fn read_stream(vm: &mut Vm, f: &mut Frame, this_class: &str, with_offset: bool) -> Result<Slot, VmError> {
+fn read_stream(vm: &mut Vm, f: &mut Frame, this_class: &str) -> Result<Slot, VmError> {
     let this = f.this();
     let h = fd_handle(vm, this_fd(vm, this, this_class));
-    let (arr, off, len) = if with_offset {
-        (f.arg_i(0), f.arg_i(1), f.arg_i(2))
-    } else {
-        (f.arg_i(0), f.arg_i(1), f.arg_i(2))
-    };
+    let (arr, off, len) = (f.arg_i(0), f.arg_i(1), f.arg_i(2));
     if h == INVALID_HANDLE_VALUE || h == 0 {
         return Err(vm.throw_msg("java/io/IOException", "Stream Closed".to_string()));
     }
@@ -677,7 +664,7 @@ fn fis_read0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn fis_read_bytes(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    read_stream(vm, f, "java/io/FileInputStream", true)
+    read_stream(vm, f, "java/io/FileInputStream")
 }
 
 fn raf_read0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -692,7 +679,7 @@ fn raf_read0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn raf_read_bytes(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    read_stream(vm, f, "java/io/RandomAccessFile", true)
+    read_stream(vm, f, "java/io/RandomAccessFile")
 }
 
 // ---- 写 ----
@@ -1102,37 +1089,31 @@ fn fs_set_readonly(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn fs_delete(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    // 与 HotSpot 的 `wdelete` 一致：**按属性分派**，目录走 `RemoveDirectoryW`
+    // （`DeleteFileW` 对目录一律 ACCESS_DENIED，靠错误码猜是错的）。
     let path = file_path(vm, f.arg_i(0));
     let allow_ro = f.arg_i(1) != 0;
     let w = to_wide(&path);
-    if unsafe { DeleteFileW(w.as_ptr()) } != 0 {
-        return Ok(Slot::I(1));
+    let attrs = unsafe { GetFileAttributesW(w.as_ptr()) };
+    if attrs == u32::MAX {
+        return Ok(Slot::I(0));
     }
-    let code = last_error();
-    if code == ERROR_ACCESS_DENIED && allow_ro {
-        // 只读文件：清掉 READONLY 再删
-        let attrs = unsafe { GetFileAttributesW(w.as_ptr()) };
-        if attrs != u32::MAX {
-            unsafe { SetFileAttributesW(w.as_ptr(), attrs & !FILE_ATTRIBUTE_READONLY) };
-            if unsafe { DeleteFileW(w.as_ptr()) } != 0 {
-                return Ok(Slot::I(1));
-            }
-        }
+    if allow_ro && attrs & FILE_ATTRIBUTE_READONLY != 0 {
+        unsafe { SetFileAttributesW(w.as_ptr(), attrs & !FILE_ATTRIBUTE_READONLY) };
     }
-    if code == ERROR_ACCESS_DENIED {
-        // 目录：`File.delete` 也负责删空目录
-        if unsafe { RemoveDirectoryW(w.as_ptr()) } != 0 {
-            return Ok(Slot::I(1));
-        }
-    }
-    Ok(Slot::I(0))
+    let ok = if attrs & FILE_ATTRIBUTE_DIRECTORY != 0 {
+        unsafe { RemoveDirectoryW(w.as_ptr()) }
+    } else {
+        unsafe { DeleteFileW(w.as_ptr()) }
+    };
+    Ok(Slot::I(i32::from(ok != 0)))
 }
 
 fn fs_rename(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let from = file_path(vm, f.arg_i(0));
     let to = file_path(vm, f.arg_i(1));
     let (wf, wt) = (to_wide(&from), to_wide(&to));
-    let ok = unsafe { MoveFileExW(wf.as_ptr(), wt.as_ptr(), MOVEFILE_REPLACE_EXISTING) };
+    let ok = unsafe { MoveFileExW(wf.as_ptr(), wt.as_ptr(), MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH) };
     Ok(Slot::I(i32::from(ok != 0)))
 }
 
@@ -1428,9 +1409,15 @@ fn proc_create(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     } else {
         let t = vm.text_of(env_obj);
         let mut v: Vec<u16> = t.encode_utf16().collect();
-        if v.last() != Some(&0) {
+        // 环境块必须以**两个** NUL 收尾（一个结束最后一条，一个结束整块）；
+        // Java 那边的 `toEnvironmentBlock` 只给每条一个，所以这里补齐。
+        while v.last() == Some(&0) {
+            v.pop();
+        }
+        if !v.is_empty() {
             v.push(0);
         }
+        v.push(0);
         Some(v)
     };
 
@@ -1443,32 +1430,36 @@ fn proc_create(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let mut si = StartupInfoW { cb: std::mem::size_of::<StartupInfoW>() as u32, ..Default::default() };
     si.flags = STARTF_USESTDHANDLES;
 
-    // child_ends：给 STARTUPINFO 用；parent_ends：写回 stdHandles
+    // child_ends：喂给 STARTUPINFO；parent_ends：写回 stdHandles
     let mut child_ends = [0 as Handle; 3];
     let mut parent_ends = [0 as Handle; 3];
     let mut created_pipes = [false; 3];
-
-    let fail = |vm: &mut Vm, code: u32, what: &str| -> VmError {
-        // 把已经建好的管道收掉，别漏句柄
-        io_error(vm, what, code)
-    };
+    /// 外部传进来的句柄原本是否可继承（跑完要还原，别改坏调用方的状态）
+    let mut was_inheritable = [false; 3];
 
     for i in 0..3 {
+        // stderr 合并到 stdout 时不要第三条管道：Java 侧 `stdHandles[2] == -1`
+        // 会走 `NullInputStream`，我们再建一条只会漏掉一个写端、让读端永远等不到 EOF。
+        if i == 2 && redirect_err {
+            child_ends[i] = child_ends[1];
+            continue;
+        }
         if std_handles[i] == -1 {
             let (mut rd, mut wr) = (0 as Handle, 0 as Handle);
             if unsafe { CreatePipe(&mut rd, &mut wr, &sa, 0) } == 0 {
                 let code = last_error();
                 for j in 0..3 {
-                    if created_pipes[j] {
-                        if parent_ends[j] != 0 {
-                            unsafe { CloseHandle(parent_ends[j]) };
-                        }
-                        if child_ends[j] != 0 {
-                            unsafe { CloseHandle(child_ends[j]) };
-                        }
+                    if !created_pipes[j] {
+                        continue;
+                    }
+                    if parent_ends[j] != 0 {
+                        unsafe { CloseHandle(parent_ends[j]) };
+                    }
+                    if child_ends[j] != 0 {
+                        unsafe { CloseHandle(child_ends[j]) };
                     }
                 }
-                return Err(fail(vm, code, "创建管道失败"));
+                return Err(io_error(vm, "创建管道失败", code));
             }
             // 父端不可继承：否则下一次 CreateProcess 会把它们也带进子进程
             if i == 0 {
@@ -1481,13 +1472,20 @@ fn proc_create(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
             unsafe { SetHandleInformation(parent_ends[i], HANDLE_FLAG_INHERIT, 0) };
             created_pipes[i] = true;
         } else {
-            child_ends[i] = std_handles[i] as Handle;
+            // 调用方给的现成句柄（`Redirect.INHERIT`、`Redirect.to(file)` 打开的流）：
+            // 子进程要被继承给它，所以先临时把 inherit 位打开，跑完还原。
+            let h = std_handles[i] as Handle;
+            child_ends[i] = h;
+            let mut flags: u32 = 0;
+            if h != 0 && unsafe { GetHandleInformation(h, &mut flags) } != 0 {
+                was_inheritable[i] = flags & HANDLE_FLAG_INHERIT != 0;
+                if !was_inheritable[i] {
+                    unsafe { SetHandleInformation(h, HANDLE_FLAG_INHERIT, HANDLE_FLAG_INHERIT) };
+                }
+            }
         }
     }
 
-    if redirect_err {
-        child_ends[2] = child_ends[1];
-    }
     si.std_input = child_ends[0];
     si.std_output = child_ends[1];
     si.std_error = child_ends[2];
@@ -1508,18 +1506,15 @@ fn proc_create(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         )
     };
 
-    // 子进程那一端的副本在父进程里一律关掉（读端/写端都是）
+    // 子进程那一端的副本在父进程里一律关掉（读端/写端都是）；
+    // 外部传进来的句柄是别人的，不能关，只还原 inherit 位。
     for i in 0..3 {
         if created_pipes[i] {
-            // 冻结：保留父端，关掉子端
-            let child = child_ends[i];
-            if child != 0 && (i == 0 || !redirect_err || i != 2) {
-                // stdout 与 stderr 可能共用同一个句柄（redirectErrorStream），只关一次
-                if i == 2 && redirect_err {
-                    continue;
-                }
-                unsafe { CloseHandle(child) };
+            if child_ends[i] != 0 {
+                unsafe { CloseHandle(child_ends[i]) };
             }
+        } else if std_handles[i] != -1 && !was_inheritable[i] && child_ends[i] != 0 {
+            unsafe { SetHandleInformation(child_ends[i], HANDLE_FLAG_INHERIT, 0) };
         }
     }
 
@@ -1530,7 +1525,7 @@ fn proc_create(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
                 unsafe { CloseHandle(parent_ends[i]) };
             }
         }
-        return Err(fail(vm, code, "创建进程失败"));
+        return Err(io_error(vm, "创建进程失败", code));
     }
     // 线程句柄用不到，立刻关
     if pi.thread != 0 {

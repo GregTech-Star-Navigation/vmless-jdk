@@ -12,7 +12,7 @@
 //! | C | `java.util.zip.{Inflater,Deflater,CRC32,Adler32}` | jar / gzip 读取，**自己写的 DEFLATE**（无外部依赖） |
 //! | D | `jdk.internal.foreign.abi.fallback.LibFallback` | FFM 兜底链接器（本机没有 libffi） |
 //! | E | `sun.util.locale.provider.HostLocaleProviderAdapterImpl` | 本地化数据（日期/数字格式） |
-//! | F | `ScopedMemoryAccess` / `Unsafe` 内存族 | 直接内存（`ZipUtils.defaultBuf` 用 `allocateDirect`） |
+//! | F | `ScopedMemoryAccess` | `ByteBuffer.allocateDirect` 链上的 `<clinit>`（`Unsafe` 内存族归 `nat_intrinsics.rs`） |
 //!
 //! ## 几条不要踩的
 //!
@@ -48,6 +48,12 @@ pub(super) fn register(r: &mut NativeRegistry) {
 }
 
 // ---------------------------------------------------------------- 公共小工具
+
+/// 调试用：`VMLESS_NAT_TRACE=1` 时把 nat_util 的关键节点打到 stderr
+fn trace() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMLESS_NAT_TRACE").is_some())
+}
 
 fn void() -> Result<Slot, VmError> {
     Ok(Slot::I(0))
@@ -113,23 +119,76 @@ fn group_a_vm_system(r: &mut NativeRegistry) {
     // 没有用户自定义类加载器的调用栈 → 与 HotSpot「只有引导帧」时一样返回 null
     r.add(vm, "latestUserDefinedLoader0", "()Ljava/lang/ClassLoader;", |_, _| Ok(Slot::I(0)));
     // uid 一族：Windows 上 HotSpot 返回 0（没有 getuid）
-    for (n, d) in [("getuid", "()J"), ("geteuid", "()J"), ("getgid", "()J"), ("getegid", "()J")] {
-        r.add(vm, n, d, |_, _| Ok(Slot::L(0)));
-    }
+    r.add(vm, "getuid", "()J", |_, _| Ok(Slot::L(0)));
+    r.add(vm, "geteuid", "()J", |_, _| Ok(Slot::L(0)));
+    r.add(vm, "getgid", "()J", |_, _| Ok(Slot::L(0)));
+    r.add(vm, "getegid", "()J", |_, _| Ok(Slot::L(0)));
     // 启动参数：我们没有 JVM 参数（`-D` 走属性表），给空数组而不是 null
     r.add(vm, "getRuntimeArguments", "()[Ljava/lang/String;", |vm, _| {
         Ok(Slot::I(vm.sh.heap.new_array(Vec::new(), "[Ljava/lang/String;").unwrap_or(0)))
     });
 
-    // `System.lineSeparator()` 读的是 `System.lineSeparator` **静态字段**，而它由
-    // `System.initPhase1`（启动流程）赋值 —— 我们没有那段启动流程，字段永远是 null。
-    // 属性表里 `line.separator` 是对的，所以这里按属性值直接给（等同 initPhase1 的那一步）。
-    r.add_override("java/lang/System", "lineSeparator", "()Ljava/lang/String;", |vm, _| {
-        let sep = crate::vm::property("line.separator").unwrap_or_else(|| "
-".to_string());
-        let h = vm.str_new(sep);
-        Ok(Slot::I(h))
+    // ---- java.lang.VirtualThread ----
+    // 本 VM 没有虚拟线程调度器（也就没有 JVMTI 与 continuation），这些全是
+    // 「告诉 JVMTI 线程挂载/卸载」的通知口 —— 没有 JVMTI 时注册成空实现是正确语义，
+    // 不是偷懒：HotSpot 里没有 JVMTI 时这些 native 也只做一次判空就返回。
+    let vt = "java/lang/VirtualThread";
+    r.add(vt, "postPinnedEvent", "(Ljava/lang/String;)V", no_op);
+    r.add(vt, "notifyJvmtiStart", "()V", no_op);
+    r.add(vt, "notifyJvmtiEnd", "()V", no_op);
+    r.add(vt, "notifyJvmtiMount", "(Z)V", no_op);
+    r.add(vt, "notifyJvmtiUnmount", "(Z)V", no_op);
+    r.add(vt, "notifyJvmtiDisableSuspend", "(Z)V", no_op);
+    // 没有调度器 → 没有「待解除阻塞的虚拟线程」
+    r.add(vt, "takeVirtualThreadListToUnblock", "()Ljava/lang/VirtualThread;", |_, _| Ok(Slot::I(0)));
+
+    // ---- 内置库（libzip / libjava）----
+    //
+    // `ZipUtils.<clinit>` 第一件事是 `BootLoader.loadLibrary("zip")`，而 HotSpot 的
+    // `findBuiltinLib` 会对 java/zip/nio 这类**静态链进 libjava 的库**返回原名
+    // （= 「这是内置库，不要去文件系统找 .dll」）。我们所有 zip native 都是自己实现的，
+    // 所以正解是：认下「内置」标记，不 dlopen。
+    r.add(
+        "jdk/internal/loader/NativeLibraries",
+        "findBuiltinLib",
+        "(Ljava/lang/String;)Ljava/lang/String;",
+        find_builtin_lib,
+    );
+    // 内置库的「装载」= 记一个假句柄后返回成功；非内置库交回 jni_lib 的真实现
+    r.add(
+        "jdk/internal/loader/NativeLibraries",
+        "load",
+        "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
+        natives_load,
+    );
+
+    // `jdk.internal.loader.BootLoader`：`ZipUtils.loadLibrary()`（zip 各类的 <clinit>）会走到
+    // `BootLoader.loadLibrary`，它要先把「引导加载器的未命名模块」挂上。我们没有模块系统 → no-op。
+    // 真写静态字段 `UNNAMED_MODULE`（HotSpot 的 native 也是这么干的）：
+    // 不写的话 `BootLoader.getUnnamedModule()` 返回 null，后面 `synchronized (module)` 直接 NPE。
+    r.add("jdk/internal/loader/BootLoader", "setBootLoaderUnnamedModule0", "(Ljava/lang/Module;)V", |vm, f| {
+        let m = f.arg_i(0);
+        lk(&vm.sh.statics)
+            .insert(("jdk/internal/loader/BootLoader".to_string(), "UNNAMED_MODULE".to_string()), Slot::I(m));
+        void()
     });
+    // 引导模块里的包名表：我们没有 JPMS 运行时镜像 → 空数组 / null（都表示「找不到」）
+    r.add("jdk/internal/loader/BootLoader", "getSystemPackageNames", "()[Ljava/lang/String;", |vm, _| {
+        Ok(Slot::I(vm.sh.heap.new_array(Vec::new(), "[Ljava/lang/String;").unwrap_or(0)))
+    });
+    r.add("jdk/internal/loader/BootLoader", "getSystemPackageLocation", "(Ljava/lang/String;)Ljava/lang/String;", |_, _| {
+        Ok(Slot::I(0))
+    });
+
+    // **启动早期把 `java.nio.Buffer` 初始化掉**。
+    //
+    // 为什么：`java.util.zip.ZipUtils.<clinit>` 第一句就是
+    // `SharedSecrets.getJavaNioAccess()`，而 SharedSecrets 在该接口对象为 null 时会走
+    // `ensureClassInitialized(Buffer.class)` → `MethodHandles.lookup().ensureInitialized(...)`，
+    // 这条 **indy 接管里没有实现**（`src/vm/indy.rs:1643`，不在本文件范围内）。
+    // 只要 Buffer 先初始化过，`setJavaNioAccess` 就把对象填上了，那条路不会再走。
+    // 触发点选在 `VM.initialize()`（`VM.<clinit>` 里调用，早于任何 zip 类）。
+    r.add("jdk/internal/misc/VM", "initialize", "()V", vm_initialize_with_nio);
 
     // `Console.ttyStatus()`：不是 tty → 0（与「输出被重定向」的 JVM 一致）
     r.add("java/io/Console", "ttyStatus", "()I", |_, _| zi(0));
@@ -147,6 +206,69 @@ fn group_a_vm_system(r: &mut NativeRegistry) {
 /// 局限（不在本文件能修的范围内）：`exec.rs:1044` 把 `println` 按**方法名**拦截成
 /// `Vm::println`，不看接收者，所以 `System.setOut(x); System.out.println(..)` 仍然
 /// 打到宿主 stdout。字段本身是真换掉了 —— `System.out == x` 成立。
+/// `VM.initialize()`：与 `native_reg.rs` 的同名实现同样的两件事，
+/// 外加「提前把 `java.nio.Buffer` 初始化掉」（理由见 `group_a_vm_system` 里那段注释）。
+/// 本文件在 `register_all` 末尾注册，所以这条会**覆盖**前面的同名项。
+fn vm_initialize_with_nio(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    // `VM.getSavedProperty` 在 `savedProps == null` 时直接抛 IllegalStateException，
+    // 而 `Integer.IntegerCache.<clinit>` 就读它 → 必须真建一个空 Map
+    let map = vm.new_instance("java/util/HashMap", "()V")?;
+    lk(&vm.sh.statics).insert(("jdk/internal/misc/VM".to_string(), "savedProps".to_string()), Slot::I(map));
+    // `java.lang.System.lineSeparator` 是 `initPhase1` 赋值的静态字段；我们没有那段启动流程，
+    // 字段永远是 null，而 `System.lineSeparator()` 读的就是它 → 这里按平台属性补上。
+    // 此刻 System 还没初始化（属性表是它 <clinit> 里建的），所以不能读属性，直接按平台给
+    let sep: &str = if cfg!(windows) { "\r\n" } else { "\n" };
+    let sep_h = vm.str_new(sep.to_string());
+    lk(&vm.sh.statics)
+        .insert(("java/lang/System".to_string(), "lineSeparator".to_string()), Slot::I(sep_h));
+    // Buffer.<clinit> 会 setJavaNioAccess；失败也不该拖死 VM.initialize（zip 用不了而其它照跑）
+    let r = vm.ensure_init("java/nio/Buffer");
+    if trace() {
+        eprintln!("[nat_util] VM.initialize: Buffer 预初始化 = {:?}", r.is_ok());
+    }
+    void()
+}
+
+/// 内置库名单：这些库的符号由 VM 自己提供（HotSpot 里它们静态链进 libjava）
+fn find_builtin_lib(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let name = arg_text(vm, f, 0);
+    if trace() {
+        eprintln!("[nat_util] findBuiltinLib({name})");
+    }
+    let base = std::path::Path::new(&name)
+        .file_name()
+        .map(|s| s.to_string_lossy().into_owned())
+        .unwrap_or_else(|| name.clone());
+    let stem = base.trim_end_matches(".dll").trim_end_matches(".so").trim_end_matches(".dylib");
+    let builtin = matches!(stem, "zip" | "java" | "nio" | "jimage" | "net" | "extnet" | "management");
+    if builtin {
+        let h = new_text(vm, name);
+        Ok(Slot::I(h))
+    } else {
+        Ok(Slot::I(0))
+    }
+}
+
+/// `NativeLibraries.load(impl, name, isBuiltin, throwIfFail)`：
+/// 内置库给假句柄就返回 true（符号由本注册表提供）；其它库转给 `jni_lib` 的真 dlopen。
+fn natives_load(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let impl_obj = f.arg_i(0);
+    if trace() {
+        eprintln!("[nat_util] NativeLibraries.load builtin={}", f.arg_i(2) != 0);
+    }
+    let is_builtin = f.arg_i(2) != 0;
+    if !is_builtin {
+        return super::jni_lib::native_libraries_load(vm, f);
+    }
+    vm.put_named(
+        impl_obj,
+        "jdk/internal/loader/NativeLibraries$NativeLibraryImpl",
+        "handle",
+        Slot::L(0x1000_0000),
+    );
+    Ok(Slot::I(1))
+}
+
 fn system_set_out(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let h = f.arg_i(0);
     lk(&vm.sh.statics).insert(("java/lang/System".to_string(), "out".to_string()), Slot::I(h));
@@ -223,6 +345,10 @@ fn group_b_thread(r: &mut NativeRegistry) {
     // 当前线程走 `new Exception().getStackTrace()` → 我们的 `Throwable` 没有栈 → 空数组。
     // 用 VM 接管把它换成「一条合成帧」，于是 `getStackTrace()` 非空。
     r.add_override(t, "getStackTrace", "()[Ljava/lang/StackTraceElement;", thread_get_stack_trace);
+    // 线程 id：JDK 的 tid 由 ThreadIdentifiers.next()（Unsafe.getAndAddLong(null, 偏移, 1)）发，
+    // 而我们的 Thread 构造器是 VM 接管的 —— 那段 Java 赋值不跑 → 所有线程的 tid 都是 0。
+    // 这里按对象句柄首次查询时发一个单调 id（够 threadId() 的唯一性契约）。
+    r.add_override(t, "threadId", "()J", thread_id_override);
 }
 
 fn thread_start0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -251,6 +377,19 @@ fn thread_dump_threads(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 
 fn thread_stack_trace0(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::I(fake_stack_trace(vm)))
+}
+
+fn thread_id_override(_vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    static NEXT: AtomicU64 = AtomicU64::new(1);
+    let this = f.this();
+    let mut g = thread_ids().lock().unwrap_or_else(|e| e.into_inner());
+    let id = *g.entry(this).or_insert_with(|| NEXT.fetch_add(1, Ordering::Relaxed));
+    Ok(Slot::L(id as i64))
+}
+
+fn thread_ids() -> &'static Mutex<HashMap<i32, u64>> {
+    static M: OnceLock<Mutex<HashMap<i32, u64>>> = OnceLock::new();
+    M.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
 fn thread_get_stack_trace(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
@@ -347,8 +486,8 @@ struct Inflate {
     /// 整条流解完（含 zlib 尾）
     finished: bool,
     phase: Phase,
-    /// 位读取器残留（跨调用）
-    bitbuf: u32,
+    /// 位读取器残留（跨调用）：buf 用 u64 存到 56 位
+    bitbuf: u64,
     bitcnt: u32,
     /// stored 块剩余字节（`NONE` = 还没读 LEN/NLEN）
     stored_left: u32,
@@ -356,11 +495,16 @@ struct Inflate {
     dist: Huff,
     /// 回溯窗口（最多 32K）；`setDictionary` 时当成前缀
     win: Vec<u8>,
+    /// 跨调用残留：已经解出「长度」但还没读到「距离」的那一次匹配
+    /// （位读不够时必须把长度存下来，否则下次会重读长度符号 → 全乱）
+    pending_len: Option<usize>,
+    /// 跨调用残留：回溯拷贝拷到一半，输出缓冲满了（(距离, 还剩几个字节)）
+    pending_copy: Option<(usize, usize)>,
 }
 
 const STORED_NONE: u32 = u32::MAX;
 
-#[derive(Clone, Copy, PartialEq)]
+#[derive(Clone, Copy, PartialEq, Debug)]
 enum Phase {
     /// 块头（或 zlib 头）
     Head,
@@ -435,6 +579,8 @@ fn fresh_inflate(nowrap: bool) -> Inflate {
         lit: Huff::new(),
         dist: Huff::new(),
         win: Vec::new(),
+        pending_len: None,
+        pending_copy: None,
     }
 }
 
@@ -611,23 +757,26 @@ enum ZErr {
 
 /// 位读取器。**不借用 `Inflate`**（否则解压循环里无法同时改窗口和表）。
 /// 残留（`buf`/`cnt`）在循环结束时写回 `Inflate`，下次调用接着用。
+///
+/// 用 `u64` 而不是 `u32` 缓冲：一个「长度 + 额外位 + 距离 + 额外位」的单位最长
+/// 15+5+15+13 = 48 位，必须能一次看全 `u32` 存不下。
 struct Bits<'a> {
     input: &'a [u8],
     pos: usize,
-    buf: u32,
+    buf: u64,
     cnt: u32,
 }
 
 impl<'a> Bits<'a> {
     fn refill(&mut self) {
-        while self.cnt <= 24 && self.pos < self.input.len() {
-            self.buf |= (self.input[self.pos] as u32) << self.cnt;
+        while self.cnt <= 56 && self.pos < self.input.len() {
+            self.buf |= (self.input[self.pos] as u64) << self.cnt;
             self.pos += 1;
             self.cnt += 8;
         }
     }
 
-    /// 取 `n`（≤16）位。`None` = 输入不够（**不消耗**任何位，所以调用点可以安全重试）。
+    /// 取 `n`（≤32）位。`None` = 输入不够（**不消耗**任何位）
     fn take(&mut self, n: u32) -> Option<u32> {
         if n == 0 {
             return Some(0);
@@ -636,24 +785,42 @@ impl<'a> Bits<'a> {
         if self.cnt < n {
             return None;
         }
-        let v = self.buf & ((1u32 << n) - 1);
+        let v = (self.buf & ((1u64 << n) - 1)) as u32;
         self.buf >>= n;
         self.cnt -= n;
         Some(v)
     }
 
-    /// 丢掉制裁到字节边界的残余位，并把「读进来但没用的整字节」还给 `pos`
+    /// 保证至少 `n` 位可用（不够就返回 false，且不消耗）
+    fn has(&mut self, n: u64) -> bool {
+        self.refill();
+        self.cnt as u64 >= n
+    }
+
+    fn consume(&mut self, n: u32) {
+        if n == 0 {
+            return;
+        }
+        self.buf >>= n;
+        self.cnt -= n;
+    }
+
+    /// 丢掉到字节边界的残余位，并把「读进来但没用的整字节」还给 `pos`
     fn byte_align(&mut self) {
         let r = self.cnt % 8;
         if r > 0 {
             self.buf >>= r;
             self.cnt -= r;
         }
+        self.rewind_whole_bytes();
+    }
+
+    fn rewind_whole_bytes(&mut self) {
         let k = (self.cnt / 8) as usize;
         if k > 0 {
             self.cnt -= 8 * k as u32;
             self.pos = self.pos.saturating_sub(k);
-            self.buf = if self.cnt == 0 { 0 } else { self.buf & ((1u32 << self.cnt) - 1) };
+            self.buf = if self.cnt == 0 { 0 } else { self.buf & ((1u64 << self.cnt) - 1) };
         }
     }
 
@@ -669,12 +836,7 @@ impl<'a> Bits<'a> {
 
     /// 收工：把没用完的整字节还回输入，返回「本次消耗了多少输入」
     fn finish(&mut self) -> usize {
-        let k = (self.cnt / 8) as usize;
-        if k > 0 {
-            self.cnt -= 8 * k as u32;
-            self.pos = self.pos.saturating_sub(k);
-            self.buf = if self.cnt == 0 { 0 } else { self.buf & ((1u32 << self.cnt) - 1) };
-        }
+        self.rewind_whole_bytes();
         self.pos
     }
 }
@@ -685,33 +847,56 @@ enum Dec {
     Bad,
 }
 
-/// 规范哈夫曼解码（puff 的 counts/symbols 算法，按位读）
-fn decode(b: &mut Bits, h: &Huff) -> Dec {
+/// 解码结果（**不消耗位**）：符号 + 码长
+enum Peek {
+    Sym(u16, u32),
+    NeedInput,
+    Bad,
+}
+
+/// 规范哈夫曼解码（puff 的 counts/symbols 算法）：**只看不取**。
+///
+/// 必须不取：跨调用时位可能不够解完一个符号，而「解了一半」的位状态是没法存的
+/// （这正是本实现第一版踩的坑 —— 分块喂输入时第 12 个字节就解歪了）。
+fn decode_peek(b: &mut Bits, h: &Huff) -> Peek {
     if h.empty() {
-        return Dec::Bad;
+        return Peek::Bad;
     }
     let mut code: i32 = 0;
     let mut first: i32 = 0;
     let mut index: i32 = 0;
-    for len in 1..16usize {
-        let bit = match b.take(1) {
-            Some(v) => v,
-            None => return Dec::NeedInput,
-        };
-        code |= bit as i32;
-        let count = h.counts[len] as i32;
+    for len in 1..=15u32 {
+        b.refill();
+        if b.cnt < len {
+            return Peek::NeedInput;
+        }
+        let bit = ((b.buf >> (len - 1)) & 1) as i32;
+        code |= bit;
+        let count = h.counts[len as usize] as i32;
         if code - first < count {
             let i = (index + (code - first)) as usize;
             return match h.symbols.get(i) {
-                Some(s) => Dec::Sym(*s),
-                None => Dec::Bad,
+                Some(sym) => Peek::Sym(*sym, len),
+                None => Peek::Bad,
             };
         }
         index += count;
         first = (first + count) << 1;
         code <<= 1;
     }
-    Dec::Bad
+    Peek::Bad
+}
+
+/// 解一个符号并**取走**它的位
+fn decode(b: &mut Bits, h: &Huff) -> Dec {
+    match decode_peek(b, h) {
+        Peek::Sym(sym, len) => {
+            b.consume(len);
+            Dec::Sym(sym)
+        }
+        Peek::NeedInput => Dec::NeedInput,
+        Peek::Bad => Dec::Bad,
+    }
 }
 
 const LEN_BASE: [u16; 29] = [
@@ -912,60 +1097,102 @@ fn inflate_run(inf: &mut Inflate, input: &[u8], out: &mut [u8]) -> Result<(usize
             }
             Phase::Codes => {
                 let mut done_block = false;
-                while produced < out.len() {
-                    let sym = match decode(&mut b, &inf.lit) {
-                        Dec::Sym(s) => s,
-                        Dec::NeedInput => break,
-                        Dec::Bad => {
+                // 0) 上一次拷到一半的匹配：先把剩下的字节补完
+                if let Some((dist, mut rem)) = inf.pending_copy.take() {
+                    while rem > 0 && produced < out.len() {
+                        if dist == 0 || dist > inf.win.len() {
                             err = Some(ZErr::Bad);
-                            break;
-                        }
-                    };
-                    if sym < 256 {
-                        push_out(&mut inf.win, out, &mut produced, sym as u8);
-                        continue;
-                    }
-                    if sym == 256 {
-                        done_block = true;
-                        break;
-                    }
-                    let li = (sym - 257) as usize;
-                    if li >= 29 {
-                        err = Some(ZErr::Bad);
-                        break;
-                    }
-                    let len = LEN_BASE[li] as usize
-                        + match b.take(LEN_EXTRA[li] as u32) {
-                            Some(v) => v as usize,
-                            None => break,
-                        };
-                    let dsym = match decode(&mut b, &inf.dist) {
-                        Dec::Sym(s) => s as usize,
-                        Dec::NeedInput => break,
-                        Dec::Bad => {
-                            err = Some(ZErr::Bad);
-                            break;
-                        }
-                    };
-                    if dsym >= 30 {
-                        err = Some(ZErr::Bad);
-                        break;
-                    }
-                    let dist = DIST_BASE[dsym] as usize
-                        + match b.take(DIST_EXTRA[dsym] as u32) {
-                            Some(v) => v as usize,
-                            None => break,
-                        };
-                    if dist == 0 || dist > inf.win.len() {
-                        err = Some(ZErr::Bad);
-                        break;
-                    }
-                    for _ in 0..len {
-                        if produced >= out.len() {
                             break;
                         }
                         let byte = inf.win[inf.win.len() - dist];
                         push_out(&mut inf.win, out, &mut produced, byte);
+                        rem -= 1;
+                    }
+                    if err.is_some() {
+                        break;
+                    }
+                    if rem > 0 {
+                        inf.pending_copy = Some((dist, rem));
+                        break; // 输出还是满的
+                    }
+                }
+                while produced < out.len() {
+                    // 1) 长度（257..285）。跨调用残留时直接复用，不重读符号
+                    let len = match inf.pending_len {
+                        Some(l) => l,
+                        None => {
+                            let (sym, slen) = match decode_peek(&mut b, &inf.lit) {
+                                Peek::Sym(sym, slen) => (sym, slen),
+                                Peek::NeedInput => break,
+                                Peek::Bad => {
+                                    err = Some(ZErr::Bad);
+                                    break;
+                                }
+                            };
+                            if sym < 256 {
+                                b.consume(slen);
+                                push_out(&mut inf.win, out, &mut produced, sym as u8);
+                                continue;
+                            }
+                            if sym == 256 {
+                                b.consume(slen);
+                                done_block = true;
+                                break;
+                            }
+                            let li = (sym - 257) as usize;
+                            if li >= 29 {
+                                err = Some(ZErr::Bad);
+                                break;
+                            }
+                            // 长度符号 + 它的额外位必须一次看全，否则一位都不取
+                            let need = slen as u64 + LEN_EXTRA[li] as u64;
+                            if !b.has(need) {
+                                break;
+                            }
+                            b.consume(slen);
+                            let extra = b.take(LEN_EXTRA[li] as u32).unwrap_or(0);
+                            let l = LEN_BASE[li] as usize + extra as usize;
+                            inf.pending_len = Some(l);
+                            l
+                        }
+                    };
+                    // 2) 距离（0..29）
+                    let dist = {
+                        let (dsym, dlen) = match decode_peek(&mut b, &inf.dist) {
+                            Peek::Sym(sym, dlen) => (sym as usize, dlen),
+                            Peek::NeedInput => break, // 长度已存进 pending_len
+                            Peek::Bad => {
+                                err = Some(ZErr::Bad);
+                                break;
+                            }
+                        };
+                        if dsym >= 30 {
+                            err = Some(ZErr::Bad);
+                            break;
+                        }
+                        let need = dlen as u64 + DIST_EXTRA[dsym] as u64;
+                        if !b.has(need) {
+                            break;
+                        }
+                        b.consume(dlen);
+                        let extra = b.take(DIST_EXTRA[dsym] as u32).unwrap_or(0);
+                        DIST_BASE[dsym] as usize + extra as usize
+                    };
+                    inf.pending_len = None;
+                    // 3) 从窗口回溯拷贝（可能拷一半就被输出缓冲截断）
+                    if dist == 0 || dist > inf.win.len() {
+                        err = Some(ZErr::Bad);
+                        break;
+                    }
+                    let mut rem = len;
+                    while rem > 0 && produced < out.len() {
+                        let byte = inf.win[inf.win.len() - dist];
+                        push_out(&mut inf.win, out, &mut produced, byte);
+                        rem -= 1;
+                    }
+                    if rem > 0 {
+                        inf.pending_copy = Some((dist, rem));
+                        break; // 输出满
                     }
                 }
                 if err.is_some() {
@@ -1271,25 +1498,19 @@ fn group_d_libfallback(r: &mut NativeRegistry) {
     r.add(fb, "ffi_type_struct", "()S", |_, _| zi(13));
     // `ffi_type*`：没有 libffi → 给固定假地址（只要非 0，`Linker` 侧的尺寸推算就能继续；
     // 这些值没人解引用）
-    let types = [
-        "ffi_type_void",
-        "ffi_type_uint8",
-        "ffi_type_sint8",
-        "ffi_type_uint16",
-        "ffi_type_sint16",
-        "ffi_type_uint32",
-        "ffi_type_sint32",
-        "ffi_type_uint64",
-        "ffi_type_sint64",
-        "ffi_type_float",
-        "ffi_type_double",
-        "ffi_type_pointer",
-    ];
-    // 注意：捕获变量的闭包转不成 `fn` 指针，所以逐个写死（id 只是「非 0 假地址」）
-    for (i, n) in types.iter().enumerate() {
-        let id = (0x1000_0000u64 + i as u64) as i64;
-        r.add(fb, n, "()J", const_type_addr(id));
-    }
+    // ffi_type_* 的假地址（每个类型一个固定值，只要非 0）
+    r.add(fb, "ffi_type_void", "()J", const_type_addr(0x1000_0000));
+    r.add(fb, "ffi_type_uint8", "()J", const_type_addr(0x1000_0001));
+    r.add(fb, "ffi_type_sint8", "()J", const_type_addr(0x1000_0002));
+    r.add(fb, "ffi_type_uint16", "()J", const_type_addr(0x1000_0003));
+    r.add(fb, "ffi_type_sint16", "()J", const_type_addr(0x1000_0004));
+    r.add(fb, "ffi_type_uint32", "()J", const_type_addr(0x1000_0005));
+    r.add(fb, "ffi_type_sint32", "()J", const_type_addr(0x1000_0006));
+    r.add(fb, "ffi_type_uint64", "()J", const_type_addr(0x1000_0007));
+    r.add(fb, "ffi_type_sint64", "()J", const_type_addr(0x1000_0008));
+    r.add(fb, "ffi_type_float", "()J", const_type_addr(0x1000_0009));
+    r.add(fb, "ffi_type_double", "()J", const_type_addr(0x1000_000a));
+    r.add(fb, "ffi_type_pointer", "()J", const_type_addr(0x1000_000b));
     // cif 准备：给 FFI_OK(0)
     r.add(fb, "ffi_prep_cif", "(JIIJJ)I", |_, _| zi(0));
     r.add(fb, "ffi_prep_cif_var", "(JIIIJJ)I", |_, _| zi(0));
@@ -1343,13 +1564,17 @@ fn group_e_host_locale(r: &mut NativeRegistry) {
     });
     r.add(h, "getDateTimePattern", "(IILjava/lang/String;)Ljava/lang/String;", hl_datetime_pattern);
     r.add(h, "getCalendarID", "(Ljava/lang/String;)I", |_, _| zi(-1));
-    let arr = "(Ljava/lang/String;[Ljava/lang/String;)[Ljava/lang/String;";
-    r.add(h, "getAmPmStrings", arr, hl_ampm);
-    r.add(h, "getEras", arr, hl_eras);
-    r.add(h, "getMonths", arr, hl_months);
-    r.add(h, "getShortMonths", arr, hl_short_months);
-    r.add(h, "getWeekdays", arr, hl_weekdays);
-    r.add(h, "getShortWeekdays", arr, hl_short_weekdays);
+    r.add(h, "getAmPmStrings", "(Ljava/lang/String;[Ljava/lang/String;)[Ljava/lang/String;", hl_ampm);
+    r.add(h, "getEras", "(Ljava/lang/String;[Ljava/lang/String;)[Ljava/lang/String;", hl_eras);
+    r.add(h, "getMonths", "(Ljava/lang/String;[Ljava/lang/String;)[Ljava/lang/String;", hl_months);
+    r.add(h, "getShortMonths", "(Ljava/lang/String;[Ljava/lang/String;)[Ljava/lang/String;", hl_short_months);
+    r.add(h, "getWeekdays", "(Ljava/lang/String;[Ljava/lang/String;)[Ljava/lang/String;", hl_weekdays);
+    r.add(
+        h,
+        "getShortWeekdays",
+        "(Ljava/lang/String;[Ljava/lang/String;)[Ljava/lang/String;",
+        hl_short_weekdays,
+    );
     r.add(h, "getNumberPattern", "(ILjava/lang/String;)Ljava/lang/String;", hl_number_pattern);
     r.add(h, "isNativeDigit", "(Ljava/lang/String;)Z", |_, _| zi(0));
 
@@ -1679,7 +1904,9 @@ fn hl_display_string(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 // **归 `nat_intrinsics.rs`**（另一条工作线），本文件不重复注册 —— 注册顺序是
 // `nat_intrinsics → nat_os → nat_util`，在这里再注册一次会把它们整组覆盖掉。
 //
-// 这里只补两个 `Unsafe` 之外、但 zip 初始化就需要的点。
+// 这里只补一个 `Unsafe` 之外、但 `ByteBuffer.allocateDirect` 链上会碰到的类。
+// 附注：JDK 25 的 `ZipUtils.defaultBuf` 已经是 `ByteBuffer.allocate(0)`（堆上），
+// 不再需要直接内存。
 
 fn group_f_raw_memory(r: &mut NativeRegistry) {
     // `ByteBuffer.allocateDirect` 链上 `ScopedMemoryAccess.<clinit>` 会调它
@@ -1720,9 +1947,9 @@ mod tests {
     #[test]
     fn pack_layout_matches_jdk_bytecode() {
         assert_eq!(pack(1, 0, false, false), 1);
-        assert_eq!(pack(0, 1, false, false), 1 << 31);
-        assert_eq!(pack(0, 0, true, false), 1 << 62);
-        assert_eq!(pack(0, 0, false, true), 1u64 as i64 << 63);
+        assert_eq!(pack(0, 1, false, false), 1i64 << 31);
+        assert_eq!(pack(0, 0, true, false), 1i64 << 62);
+        assert_eq!(pack(0, 0, false, true), (1i64) << 63);
     }
 
     #[test]
@@ -1755,13 +1982,26 @@ mod tests {
         emit_stored(&mut d);
         emit_final(&mut d, 1);
         let mut inf = fresh_inflate(true);
-        let mut out = vec![0u8; src.len()];
-        let (used, produced) = match inflate_run(&mut inf, &d.out_pending, &mut out) {
-            Ok(v) => v,
-            Err(_) => panic!("inflate 失败"),
-        };
+        let mut out = vec![0u8; src.len() + 8];
+        let mut used = 0usize;
+        let mut produced = 0usize;
+        // 输出缓冲区大小有限，可能要调多次（与 Java 侧的循环一致）
+        for _ in 0..8 {
+            if inf.finished {
+                break;
+            }
+            let (u, pr) = match inflate_run(&mut inf, &d.out_pending[used..], &mut out[produced..]) {
+                Ok(v) => v,
+                Err(_) => panic!("inflate 失败"),
+            };
+            used += u;
+            produced += pr;
+            if u == 0 && pr == 0 {
+                break;
+            }
+        }
         assert_eq!(produced, src.len());
-        assert_eq!(&out[..], &src[..]);
+        assert_eq!(&out[..produced], &src[..]);
         assert_eq!(used, d.out_pending.len());
         assert!(inf.finished);
     }
@@ -1782,4 +2022,123 @@ mod tests {
         };
         assert_eq!(sym, 256);
     }
+
+    /// 真 java 压出来的 zlib 流（`new Deflater()` + 2033 字节 UTF-8 文本，
+    /// 见 `D:/vmless/nat/g/Gen.java`）：解出来必须是同一份原文。
+    ///
+    /// 这是**动态哈夫曼 + 回溯引用 + zlib 包装（含 adler32 尾）**的端到端证据 ——
+    /// 只靠自压自解证明不了解码器对真 zlib 流有效。
+    #[test]
+    fn inflates_real_zlib_stream_from_jdk() {
+        let hex = "789c0bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb29848c2a1e553caa7854f1a8e251c5c34b716252724a6a5a7a466656764e6e5e7e41615171496959794565d5d09279b263edb369ed0aa1216eba160acfb676bf583f150086f2e5ad";
+        let mut src = Vec::new();
+        let b = hex.as_bytes();
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let hi = (b[i] as char).to_digit(16).unwrap() as u8;
+            let lo = (b[i + 1] as char).to_digit(16).unwrap() as u8;
+            src.push((hi << 4) | lo);
+            i += 2;
+        }
+        // 原文：与 Gen.java 的 payload() 一致
+        let mut text = String::new();
+        for _ in 0..40 {
+            text.push_str("The quick brown fox jumps over the lazy dog. ");
+        }
+        for k in 0..200 {
+            text.push((b'a' + (k % 26) as u8) as char);
+        }
+        text.push_str("中文 UTF-8 测试");
+        let want = text.as_bytes();
+        assert_eq!(want.len(), 2019);
+
+        let mut inf = fresh_inflate(false);
+        let mut out = vec![0u8; want.len() + 16];
+        let (used, produced) = match inflate_run(&mut inf, &src, &mut out) {
+            Ok(v) => v,
+            Err(_) => panic!("解 zlib 流失败"),
+        };
+        assert_eq!(produced, want.len(), "解出来的长度不对");
+        assert_eq!(&out[..produced], want, "解出来的内容不对");
+        assert_eq!(used, src.len(), "应当把整条流（含 adler 尾）都吃掉");
+        assert!(inf.finished);
+    }
+
+    /// 输出驱动的分块：每次只给 37 字节输出，输入一次给全
+    /// （这正是 `Inflater.inflate(byte[],off,len)` 的典型用法）
+    #[test]
+    fn inflates_with_tiny_output_buffer() {
+        let src = real_zlib_stream();
+        let mut inf = fresh_inflate(false);
+        let mut out_all = Vec::new();
+        let mut buf = [0u8; 37];
+        let mut fed = 0usize;
+        for _ in 0..200 {
+            if inf.finished {
+                break;
+            }
+            let (used, produced) = match inflate_run(&mut inf, &src[fed..], &mut buf) {
+                Ok(v) => v,
+                Err(_) => panic!("输出分块解失败 fed={fed}"),
+            };
+            fed += used;
+            out_all.extend_from_slice(&buf[..produced]);
+            if used == 0 && produced == 0 {
+                break;
+            }
+        }
+        assert_eq!(out_all.len(), 2019, "输出分块解出来的长度不对");
+    }
+
+    /// 输入驱动的分块：每次只喂 3 字节（不够就再补 8 字节），
+    /// 逼出「位不够 → 不消耗、等输入」这条路径
+    #[test]
+    fn inflates_in_small_input_chunks() {
+        let src = real_zlib_stream();
+        let mut inf = fresh_inflate(false);
+        let mut out_all = Vec::new();
+        let mut buf = [0u8; 4096];
+        let mut fed = 0usize;
+        let mut window = 3usize;
+        for _ in 0..4000 {
+            if inf.finished {
+                break;
+            }
+            let end = src.len().min(fed + window);
+            let (used, produced) = match inflate_run(&mut inf, &src[fed..end], &mut buf) {
+                Ok(v) => v,
+                Err(_) => panic!("输入分块解失败 fed={fed} window={window}"),
+            };
+            fed += used;
+            out_all.extend_from_slice(&buf[..produced]);
+            if used == 0 && produced == 0 {
+                // 这次一位都没吃得下（需要的位比窗口多）：窗口翻倍再喂，最多到 64 字节
+                if fed >= src.len() {
+                    break;
+                }
+                window = (window * 2).min(64);
+            } else {
+                window = 3;
+            }
+        }
+        assert_eq!(fed, src.len(), "应当把整条流都吃掉");
+        assert_eq!(out_all.len(), 2019, "输入分块解出来的长度不对");
+        assert!(inf.finished);
+    }
+
+    /// 真 java 压出来的 zlib 流（`new Deflater()` + 2033 字节 UTF-8 文本）
+    fn real_zlib_stream() -> Vec<u8> {
+        let hex = "789c0bc94855282ccd4cce56482aca2fcf5348cbaf50c82acd2d2856c82f4b2d5228014ae72456552aa4e4a7eb29848c2a1e553caa7854f1a8e251c5c34b716252724a6a5a7a466656764e6e5e7e41615171496959794565d5d09279b263edb369ed0aa1216eba160acfb676bf583f150086f2e5ad";
+        let mut src = Vec::new();
+        let b = hex.as_bytes();
+        let mut i = 0;
+        while i + 1 < b.len() {
+            let hi = (b[i] as char).to_digit(16).unwrap() as u8;
+            let lo = (b[i + 1] as char).to_digit(16).unwrap() as u8;
+            src.push((hi << 4) | lo);
+            i += 2;
+        }
+        src
+    }
+
 }

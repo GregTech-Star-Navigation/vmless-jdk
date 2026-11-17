@@ -925,9 +925,44 @@ impl Vm {
         self.thread_fill_impl(h, name, task, daemon)
     }
 
+    /// 全局共享的「根」`ThreadGroup` 对象句柄（首次使用时创建，缓存在静态字段表里）。
+    ///
+    /// 真 JDK 里每个线程都挂在一个 `ThreadGroup` 上；我们不分组建，
+    /// 但**不能给 null** —— `Thread.getThreadGroup()` 会把 null 直接交给调用方，
+    /// 而 `InnocuousThread` / `Cleaner` 会拿它去 `synchronized`。
+    fn root_thread_group(&mut self) -> i32 {
+        let key = ("java/lang/ThreadGroup".to_string(), "$vmless_root".to_string());
+        if let Some(Slot::I(h)) = lk(&self.sh.statics).get(&key).copied() {
+            if h > 0 {
+                return h;
+            }
+        }
+        if !self.store.has_class("java/lang/ThreadGroup") {
+            return 0;
+        }
+        let h = self.alloc_vmobj("java/lang/ThreadGroup");
+        if h <= 0 {
+            return 0;
+        }
+        let nm = self.str_new("main".to_string());
+        let _ = self.put_named(h, "java/lang/ThreadGroup", "name", Slot::I(nm));
+        // `parent` 取自己（根组没有父组）；`ngroups`/`nthreads` 由字段默认值 0 兜住
+        let _ = self.put_named(h, "java/lang/ThreadGroup", "parent", Slot::I(h));
+        lk(&self.sh.statics).insert(key, Slot::I(h));
+        h
+    }
+
     fn thread_fill_impl(&mut self, h: i32, name: &str, task: i32, daemon: bool) -> Result<(), VmError> {
         self.ensure_init("java/lang/Thread")?;
         let fh = self.alloc_vmobj("java/lang/Thread$FieldHolder");
+        // `Thread$FieldHolder.group` **必须**是个真对象：
+        // `Thread.getThreadGroup()` 直接返回它，而 `InnocuousThread.<clinit>` /
+        // `Cleaner.create()` 会拿它去 `synchronized` —— 为 null 就是 NPE，
+        // 后果是 `FileCleanable.register` 炸、**每一个 FileInputStream/FileOutputStream 构造器都失败**。
+        let grp = self.root_thread_group();
+        if self.store.has_class("java/lang/ThreadGroup") {
+            self.put_named(fh, "java/lang/Thread$FieldHolder", "group", Slot::I(grp));
+        }
         self.put_named(fh, "java/lang/Thread$FieldHolder", "task", Slot::I(task));
         self.put_named(fh, "java/lang/Thread$FieldHolder", "stackSize", Slot::L(0));
         self.put_named(fh, "java/lang/Thread$FieldHolder", "priority", Slot::I(5));

@@ -7,11 +7,11 @@
 //!
 //! | 类 | native 数 | 说明 |
 //! | --- | --- | --- |
-//! | `jdk/internal/misc/Unsafe` | 68 | 内存读写 + 裸内存（malloc 替身）+ CAS + 栅栏 |
-//! | `java/lang/reflect/Array` | 21 | **`newArray` 是 `Arrays.copyOf` / `String.join` 的关键** |
-//! | `java/lang/Class` | 28 | 补齐 `reflect.rs` 没管的 11 个 |
-//! | `java/lang/invoke/VarHandle` | 31 | 转给 `indy::varhandle_op`（语义不重复实现） |
-//! | `jdk/internal/reflect/ConstantPool` | 18 | 默认值（本 VM 的 `getConstantPool` 不承载常量池） |
+//! | `jdk/internal/misc/Unsafe` | 68/68 | 内存读写 + 裸内存（malloc 替身）+ CAS + 栅栏 |
+//! | `java/lang/reflect/Array` | 21/21 | **`newArray` 是 `Arrays.copyOf` / `String.join` 的关键** |
+//! | `java/lang/Class` | 28/28 | 补齐 `reflect.rs` 没管的 12 个 |
+//! | `jdk/internal/reflect/ConstantPool` | 18/18 | 默认值（本 VM 的 `getConstantPool` 不承载常量池） |
+//! | `java/lang/invoke/{VarHandle,MethodHandle,MethodHandleNatives}` | **0** | 故意不注册，见文件里那节说明（`invoke_api` 抢先截走） |
 //!
 //! ## 两个地址空间
 //!
@@ -31,7 +31,6 @@ pub(super) fn register(r: &mut NativeRegistry) {
     unsafe_reg(r);
     array_reg(r);
     class_reg(r);
-    varhandle_reg(r);
     constant_pool_reg(r);
 }
 
@@ -322,13 +321,13 @@ fn w_ref(s: Slot) -> u64 {
 // 符号扩展」三件事写在同一行里 —— 手抄 40 个必然抄错一个，而描述符差一个字符
 // 就匹配不上（注册那半边仍然逐个手写，因为那才是验收要核对的东西）。
 macro_rules! accessors {
-    ($($get:ident, $put:ident, $w:expr, $o:ident, $s:ident, $wrap:ident;)*) => {
+    ($($get:ident, $put:ident, $w:expr, $gord:ident, $pord:ident, $s:ident, $wrap:ident;)*) => {
         $(
             fn $get(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-                Ok($s(load(vm, f, $w, Ord::$o)))
+                Ok($s(load(vm, f, $w, Ord::$gord)))
             }
             fn $put(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-                store(vm, f, $w, ($wrap)(f.arg(2)), Ord::$o);
+                store(vm, f, $w, ($wrap)(f.arg(2)), Ord::$pord);
                 super::void()
             }
         )*
@@ -337,31 +336,31 @@ macro_rules! accessors {
 
 accessors! {
     // ---- 普通 ----
-    u_get_boolean, u_put_boolean, 1, Plain, s_bool, w_bool;
-    u_get_byte, u_put_byte, 1, Plain, s_byte, w_byte;
-    u_get_char, u_put_char, 2, Plain, s_char, w_char;
-    u_get_short, u_put_short, 2, Plain, s_short, w_short;
-    u_get_int, u_put_int, 4, Plain, s_int, w_int;
-    u_get_long, u_put_long, 8, Plain, s_long, w_long;
-    u_get_float, u_put_float, 4, Plain, s_float, w_float;
-    u_get_double, u_put_double, 8, Plain, s_double, w_double;
-    u_get_ref, u_put_ref, 8, Plain, s_ref, w_ref;
+    u_get_boolean, u_put_boolean, 1, Plain, Plain, s_bool, w_bool;
+    u_get_byte, u_put_byte, 1, Plain, Plain, s_byte, w_byte;
+    u_get_char, u_put_char, 2, Plain, Plain, s_char, w_char;
+    u_get_short, u_put_short, 2, Plain, Plain, s_short, w_short;
+    u_get_int, u_put_int, 4, Plain, Plain, s_int, w_int;
+    u_get_long, u_put_long, 8, Plain, Plain, s_long, w_long;
+    u_get_float, u_put_float, 4, Plain, Plain, s_float, w_float;
+    u_get_double, u_put_double, 8, Plain, Plain, s_double, w_double;
+    u_get_ref, u_put_ref, 8, Plain, Plain, s_ref, w_ref;
     // ---- volatile（SeqCst）----
-    u_get_boolean_v, u_put_boolean_v, 1, Volatile, s_bool, w_bool;
-    u_get_byte_v, u_put_byte_v, 1, Volatile, s_byte, w_byte;
-    u_get_char_v, u_put_char_v, 2, Volatile, s_char, w_char;
-    u_get_short_v, u_put_short_v, 2, Volatile, s_short, w_short;
-    u_get_int_v, u_put_int_v, 4, Volatile, s_int, w_int;
-    u_get_long_v, u_put_long_v, 8, Volatile, s_long, w_long;
-    u_get_float_v, u_put_float_v, 4, Volatile, s_float, w_float;
-    u_get_double_v, u_put_double_v, 8, Volatile, s_double, w_double;
-    u_get_ref_v, u_put_ref_v, 8, Volatile, s_ref, w_ref;
+    u_get_boolean_v, u_put_boolean_v, 1, Volatile, Volatile, s_bool, w_bool;
+    u_get_byte_v, u_put_byte_v, 1, Volatile, Volatile, s_byte, w_byte;
+    u_get_char_v, u_put_char_v, 2, Volatile, Volatile, s_char, w_char;
+    u_get_short_v, u_put_short_v, 2, Volatile, Volatile, s_short, w_short;
+    u_get_int_v, u_put_int_v, 4, Volatile, Volatile, s_int, w_int;
+    u_get_long_v, u_put_long_v, 8, Volatile, Volatile, s_long, w_long;
+    u_get_float_v, u_put_float_v, 4, Volatile, Volatile, s_float, w_float;
+    u_get_double_v, u_put_double_v, 8, Volatile, Volatile, s_double, w_double;
+    u_get_ref_v, u_put_ref_v, 8, Volatile, Volatile, s_ref, w_ref;
     // ---- opaque（Relaxed）/ acquire / release：JDK 25 的 Unsafe 不再声明这几个，
     //      但老版本与 `VarHandle` 语义要用，留着按名字注册（多注册不会误伤）----
-    u_get_int_o, u_put_int_o, 4, Opaque, s_int, w_int;
-    u_get_ref_o, u_put_ref_o, 8, Opaque, s_ref, w_ref;
-    u_get_int_a, u_put_int_r, 4, Acquire, s_int, w_int;
-    u_get_ref_a, u_put_ref_r, 8, Acquire, s_ref, w_ref;
+    u_get_int_o, u_put_int_o, 4, Opaque, Opaque, s_int, w_int;
+    u_get_ref_o, u_put_ref_o, 8, Opaque, Opaque, s_ref, w_ref;
+    u_get_int_a, u_put_int_r, 4, Acquire, Release, s_int, w_int;
+    u_get_ref_a, u_put_ref_r, 8, Acquire, Release, s_ref, w_ref;
 }
 
 // ---- CAS / 原子算术 ----
@@ -1074,13 +1073,6 @@ fn arr_get_double(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 // getDeclaringClass0 / getSimpleBinaryName0 / getGenericSignature0；
 // 这里补它没管的那些。判据仍是「OpenJDK 里带 native 关键字」。
 
-fn cls_arg(vm: &mut Vm, f: &mut Frame) -> Result<String, VmError> {
-    match vm.class_obj_name(f.this()) {
-        Some(c) if !c.is_empty() => Ok(c),
-        _ => Err(vm.java_exception("java/lang/IllegalArgumentException", "Class: 不是类对象")),
-    }
-}
-
 /// 成员类 / 局部类 / 匿名类的外层方法：本 VM 不解析 `EnclosingMethod` → null（= 不在方法里）
 fn cls_enclosing_method(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::I(0))
@@ -1263,153 +1255,33 @@ fn class_reg(r: &mut NativeRegistry) {
     r.add(C, "getNestMembers0", "()[Ljava/lang/Class;", cls_nest_members);
     r.add(C, "getPermittedSubclasses0", "()[Ljava/lang/Class;", cls_permitted);
     r.add(C, "getClassFileVersion0", "()I", cls_file_version);
-    r.add(C, "getClassAccessFlagsRaw0", "()I", cls_class_flags_raw_trampoline);
-    // `reflect.rs` 里已注册的这 6 个不重复登记（重复登记会顶掉它的实现，得不偿失）
-    let _ = cls_arg;
+    r.add(C, "getClassAccessFlagsRaw0", "()I", cls_access_flags_raw);
+    // 注意：`reflect.rs` 已经接管了 forName0 / getDeclared{Fields,Methods,Constructors}0 /
+    // getInterfaces0 / getDeclaringClass0 / getSimpleBinaryName0 / getGenericSignature0，
+    // 这里**不重复登记**（重复登记会顶掉它那份实现，得不偿失）。
 }
 
-/// `getClassAccessFlagsRaw0`
-fn cls_class_flags_raw_trampoline(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    cls_access_flags_raw(vm, f)
-}
-
-// ================================================================ java.lang.invoke.VarHandle
+// ================================================================ java.lang.invoke.VarHandle（**不注册**）
 //
-// **主路径不走 native**：`exec` 对 `java/lang/invoke/*` 的调用一律先交给
-// `indy::invoke_api`（见 `exec.rs` 的 `is_invoke_api_class`），VarHandle 的
-// `get/set/compareAndSet` 在那里已经按**调用点描述符**（签名多态）实现好了。
+// VarHandle 的 31 个 native **故意一个都不注册**，理由是实测出来的、不是省事：
 //
-// 这里登记的是**类文件里声明的那 31 个 native**（描述符 `([Ljava/lang/Object;)Ljava/lang/Object;`
-// 那一版）。走得到它们的只有「反射调用 VarHandle.get」这类路径 —— 那条路把参数装箱成
-// `Object[]`，所以转发时按 `(Ljava/lang/Object;…)Ljava/lang/Object;` 合成描述符，
-// 让 `indy::varhandle_op` 的装箱/拆箱（`coerce`）照常生效。
-
-/// 转发到 `indy::varhandle_op`
-fn vh_forward(vm: &mut Vm, f: &mut Frame, name: &'static str, values: usize) -> Result<Slot, VmError> {
-    let vh = f.this();
-    let arr = f.arg_i(0);
-    let args: Vec<Slot> = match vm.sh.heap.snapshot(arr) {
-        Some(v) => v,
-        None => {
-            return Err(vm.java_exception(
-                "java/lang/NullPointerException",
-                "VarHandle native：参数数组是 null",
-            ))
-        }
-    };
-    // 静态字段的坐标参数是 0 个，实例字段是 1 个（holder）
-    let is_static = vm.indy().varhandles.get(&vh).map(|i| i.is_static).unwrap_or(false);
-    let coord = usize::from(!is_static);
-    if args.len() != coord + values {
-        return Err(vm.java_exception(
-            "java/lang/WrongMethodTypeException",
-            format!("VarHandle.{name} 参数个数不对：需要 {} 个，给了 {}", coord + values, args.len()),
-        ));
-    }
-    // 合成一份「全是 Object」的描述符：`varhandle_op` 只用它做 `coerce` 的源/目标类型，
-    // 而 `Object` ↔ 字段类型的拆装箱正是我们要它做的事
-    let mut desc = String::from("(");
-    for _ in 0..coord + values {
-        desc.push_str("Ljava/lang/Object;");
-    }
-    desc.push_str(")Ljava/lang/Object;");
-    let r = vm.invoke_api(0, "java/lang/invoke/VarHandle", name, &desc, vh, &args)?;
-    Ok(r.unwrap_or(Slot::I(0)))
-}
-
-macro_rules! vh_natives {
-    ($($fn_name:ident, $op:literal, $n:literal;)*) => {
-        $(
-            fn $fn_name(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-                vh_forward(vm, f, $op, $n)
-            }
-        )*
-    };
-}
-
-vh_natives! {
-    vh_get, "get", 0;
-    vh_set, "set", 1;
-    vh_get_volatile, "getVolatile", 0;
-    vh_set_volatile, "setVolatile", 1;
-    vh_get_opaque, "getOpaque", 0;
-    vh_set_opaque, "setOpaque", 1;
-    vh_get_acquire, "getAcquire", 0;
-    vh_set_release, "setRelease", 1;
-    vh_compare_and_set, "compareAndSet", 2;
-    vh_compare_and_exchange, "compareAndExchange", 2;
-    vh_compare_and_exchange_acquire, "compareAndExchangeAcquire", 2;
-    vh_compare_and_exchange_release, "compareAndExchangeRelease", 2;
-    vh_weak_cas_plain, "compareAndSet", 2;
-    vh_weak_cas, "compareAndSet", 2;
-    vh_weak_cas_acquire, "compareAndSet", 2;
-    vh_weak_cas_release, "compareAndSet", 2;
-    vh_get_and_set, "getAndSet", 1;
-    vh_get_and_set_acquire, "getAndSet", 1;
-    vh_get_and_set_release, "getAndSet", 1;
-    vh_get_and_add, "getAndAdd", 1;
-    vh_get_and_add_acquire, "getAndAdd", 1;
-    vh_get_and_add_release, "getAndAdd", 1;
-    vh_get_and_or, "getAndBitwiseOr", 1;
-    vh_get_and_or_acquire, "getAndBitwiseOr", 1;
-    vh_get_and_or_release, "getAndBitwiseOr", 1;
-    vh_get_and_and, "getAndBitwiseAnd", 1;
-    vh_get_and_and_acquire, "getAndBitwiseAnd", 1;
-    vh_get_and_and_release, "getAndBitwiseAnd", 1;
-    vh_get_and_xor, "getAndBitwiseXor", 1;
-    vh_get_and_xor_acquire, "getAndBitwiseXor", 1;
-    vh_get_and_xor_release, "getAndBitwiseXor", 1;
-}
-
-fn varhandle_reg(r: &mut NativeRegistry) {
-    const V: &str = "java/lang/invoke/VarHandle";
-    const D: &str = "([Ljava/lang/Object;)Ljava/lang/Object;";
-    const DB: &str = "([Ljava/lang/Object;)Z";
-    const DV: &str = "([Ljava/lang/Object;)V";
-    for (name, f) in [
-        ("get", vh_get as super::NativeFn),
-        ("getVolatile", vh_get_volatile),
-        ("getOpaque", vh_get_opaque),
-        ("getAcquire", vh_get_acquire),
-        ("compareAndExchange", vh_compare_and_exchange),
-        ("compareAndExchangeAcquire", vh_compare_and_exchange_acquire),
-        ("compareAndExchangeRelease", vh_compare_and_exchange_release),
-        ("getAndSet", vh_get_and_set),
-        ("getAndSetAcquire", vh_get_and_set_acquire),
-        ("getAndSetRelease", vh_get_and_set_release),
-        ("getAndAdd", vh_get_and_add),
-        ("getAndAddAcquire", vh_get_and_add_acquire),
-        ("getAndAddRelease", vh_get_and_add_release),
-        ("getAndBitwiseOr", vh_get_and_or),
-        ("getAndBitwiseOrAcquire", vh_get_and_or_acquire),
-        ("getAndBitwiseOrRelease", vh_get_and_or_release),
-        ("getAndBitwiseAnd", vh_get_and_and),
-        ("getAndBitwiseAndAcquire", vh_get_and_and_acquire),
-        ("getAndBitwiseAndRelease", vh_get_and_and_release),
-        ("getAndBitwiseXor", vh_get_and_xor),
-        ("getAndBitwiseXorAcquire", vh_get_and_xor_acquire),
-        ("getAndBitwiseXorRelease", vh_get_and_xor_release),
-    ] {
-        r.add(V, name, D, f);
-    }
-    for (name, f) in [
-        ("set", vh_set as super::NativeFn),
-        ("setVolatile", vh_set_volatile),
-        ("setOpaque", vh_set_opaque),
-        ("setRelease", vh_set_release),
-    ] {
-        r.add(V, name, DV, f);
-    }
-    for (name, f) in [
-        ("compareAndSet", vh_compare_and_set as super::NativeFn),
-        ("weakCompareAndSetPlain", vh_weak_cas_plain),
-        ("weakCompareAndSet", vh_weak_cas),
-        ("weakCompareAndSetAcquire", vh_weak_cas_acquire),
-        ("weakCompareAndSetRelease", vh_weak_cas_release),
-    ] {
-        r.add(V, name, DB, f);
-    }
-}
+// 1. **主路径在查注册表之前就被截走了**。`exec.rs` 的 invokevirtual / invokestatic /
+//    invokespecial 三个分支都是先判 `is_invoke_api_class(&info.class)`
+//    （`indy.rs:1418`：`class.starts_with("java/lang/invoke/")`），命中就交给
+//    `indy::invoke_api`，**根本走不到 `require_native`**。VarHandle 的
+//    `get/set/compareAndSet/…` 在 `indy::varhandle_op`（`indy.rs:1293` 起）里按
+//    **调用点描述符**（签名多态）实现，字段 / 静态 / 数组元素 / 字节视图四种形态都在那边。
+//
+// 2. **唯一走得到的路径是反射**（`Method.invoke(vh, (Object) new Object[]{holder})`），
+//    而那条路上 HotSpot 自己就拒绝：`VarHandle.get` 是签名多态方法，反射调用它会抛
+//    `InvocationTargetException`（实测 JDK 25；本 VM 里注册过时会返回 5，等于**造出一个
+//    和 HotSpot 不一致的行为**）。见 `D:/vmless/nat/VhReflect.java`。
+//
+// 3. 所以注册在这里是**死代码**，而且会误导下一个人「VarHandle 是 native 实现的」。
+//    要改 VarHandle 语义，改 `indy.rs`，不要改本文件。
+//
+// 同理 `java.lang.invoke.MethodHandle`（8 个）与 `MethodHandleNatives`（12 个）也不注册：
+// 它们的调用全被 `invoke_api` 截走，注册了永远不会被调用。
 
 // ================================================================ jdk.internal.reflect.ConstantPool
 //
