@@ -32,10 +32,11 @@
 //! 这正是旧 `objects: Vec<Vec<Slot>>` 做不到的（扩容会让别的线程读到半搬的引用）。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::load::ClassPath;
+use crate::ClassFile;
 
 use super::indy;
 use super::load::ClassStore;
@@ -112,9 +113,55 @@ fn decode(tag: u8, v: u64) -> Slot {
 
 // ---------------------------------------------------------------- 对象块
 
+/// 一个对象/数组里**哪些槽是引用**。
+///
+/// GC 必须精确知道这件事：多标一个（把 int 当句柄）只会多留一点垃圾，少标一个就是
+/// 把活对象回收掉 —— 后者是段错误。所以「不知道」时一律退化成 `All`（逐个用页表验证）。
+pub(crate) enum RefBits {
+    /// 没有引用槽（字段全是基本类型 / 基本类型数组）
+    None,
+    /// 每个槽都可能是引用（引用数组；或类布局未知时的保守答案）
+    All,
+    /// 位图（bit i = 第 i 个槽是引用）；≤64 槽用内联，超了才装箱
+    Small(u64),
+    Big(Box<[u64]>),
+}
+
+impl RefBits {
+    #[inline]
+    pub(crate) fn is_ref(&self, i: usize) -> bool {
+        match self {
+            RefBits::None => false,
+            RefBits::All => true,
+            RefBits::Small(w) => (i as u32) < 64 && (w & (1u64 << i)) != 0,
+            RefBits::Big(w) => w.get(i >> 6).map(|x| (x >> (i & 63)) & 1 != 0).unwrap_or(false),
+        }
+    }
+
+    /// `(槽数, 是不是引用)` 列表 → 位图
+    pub(crate) fn from_iter(n: usize, is_ref: impl Fn(usize) -> bool) -> RefBits {
+        let mut any = false;
+        let mut bits = vec![0u64; (n + 63) / 64];
+        for i in 0..n {
+            if is_ref(i) {
+                bits[i >> 6] |= 1 << (i & 63);
+                any = true;
+            }
+        }
+        if !any {
+            return RefBits::None;
+        }
+        if n <= 64 {
+            RefBits::Small(bits.first().copied().unwrap_or(0))
+        } else {
+            RefBits::Big(bits.into_boxed_slice())
+        }
+    }
+}
+
 /// 一个对象/数组在堆里的家：类名、长度、thin lock 字、槽位数组。
 ///
-/// 地址稳定（`Box`），多线程并发访问只碰 `cells` / `lock` 两个原子域。
+/// 地址稳定（`Box`），多线程并发访问只碰 `cells` / `lock` / `epoch` 三个原子域。
 pub(crate) struct ObjHdr {
     /// 运行时类：对象是内部类名，数组是描述符（`[I` / `[Ljava/lang/String;`）
     pub(crate) class: Arc<str>,
@@ -122,6 +169,11 @@ pub(crate) struct ObjHdr {
     pub(crate) len: u32,
     /// thin lock 字：`0` = 未锁；`tid << 8 | 重入计数` = 持有者
     pub(crate) lock: AtomicU32,
+    /// GC 标记世代（`== Heap.gc_epoch` 就是本轮存活）。用世代号而不是清除位，
+    /// 是因为清扫要遍历所有条目，没法先来一遍 O(n) 的清零。
+    pub(crate) epoch: AtomicU32,
+    /// 引用槽位图（分配时按类布局算好，扫描时零查表）
+    pub(crate) refs: Arc<RefBits>,
     cells: Box<[Cell]>,
 }
 
@@ -208,8 +260,7 @@ impl<T> PtrTable<T> {
     }
 
     /// 追加一个对象，返回它的下标。多线程安全（页用 CAS 建、条目用 Release 发布）。
-    fn push(&self, v: T) -> Option<u32> {
-        let idx = self.count.fetch_add(1, Ordering::AcqRel);
+    fn push(&self, v: T) -> Option<u32> {        let idx = self.count.fetch_add(1, Ordering::AcqRel);
         let p = (idx as usize) >> PAGE_BITS;
         if p >= self.pages.len() {
             // 页表用尽：对象数上限，明确失败（调用方报 OutOfMemoryError），不静默丢
@@ -239,9 +290,39 @@ impl<T> PtrTable<T> {
         unsafe { (*page).entries[idx as usize & (PAGE - 1)].store(obj, Ordering::Release) };
         Some(idx)
     }
+
+    /// 清扫：对 `0..count` 的每个非空条目调 `keep(下标, &对象)`，返回 `false` 就
+    /// **释放**它（`Box::from_raw` + 条目置空）。返回释放掉的对象数。
+    ///
+    /// 索引**不复用**：句柄就是索引，复用会让「某个还活在别处的陈旧句柄」指向另一台
+    /// 对象 —— 那是静默数据损坏，比多占一点页表内存糟得多。
+    fn sweep(&self, mut keep: impl FnMut(u32, &T) -> bool) -> u32 {
+        let n = self.count.load(Ordering::Acquire);
+        let mut freed = 0u32;
+        for i in 0..n {
+            let p = (i as usize) >> PAGE_BITS;
+            let Some(page) = self.page(p) else { continue };
+            let slot = &page.entries[i as usize & (PAGE - 1)];
+            let e = slot.load(Ordering::Acquire);
+            if e.is_null() {
+                continue;
+            }
+            if keep(i, unsafe { &*e }) {
+                continue;
+            }
+            if slot
+                .compare_exchange(e, std::ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                drop(unsafe { Box::from_raw(e) });
+                freed += 1;
+            }
+        }
+        freed
+    }
 }
 
-// 页表里的内存是进程寿命的（VM 不回收堆），所以跨线程共享它是安全的；
+// 页表里**已发布**的条目不搬动（对象地址因此稳定），所以跨线程共享它是安全的；
 // `T: Send + Sync` 保证条目本身可以跨线程读。
 unsafe impl<T: Send + Sync> Send for PtrTable<T> {}
 unsafe impl<T: Send + Sync> Sync for PtrTable<T> {}
@@ -277,7 +358,7 @@ impl Tlab {
 pub(crate) struct Heap {
     objs: PtrTable<ObjHdr>,
     arrs: PtrTable<ObjHdr>,
-    /// 字符串池：句柄 = `STR_BASE + 下标`
+    /// 字符串池：句柄 = `STR_BASE + 下标`（字符串**不回收**：它们是不可变常量/驻留串）
     pub(crate) strings: RwLock<Vec<Arc<str>>>,
     /// 字符串常量 → 句柄（同一常量池项必须得到同一句柄，否则引用相等会错）
     pub(crate) str_handles: Mutex<HashMap<(usize, u16), i32>>,
@@ -287,6 +368,20 @@ pub(crate) struct Heap {
     pub(crate) sb_bufs: Mutex<HashMap<i32, String>>,
     /// 包装类的小整数缓存：`Integer#5` → 对象句柄
     pub(crate) wrapper_cache: Mutex<HashMap<String, i32>>,
+
+    // ---- GC ----
+    /// 当前标记世代：`ObjHdr.epoch == 这个数` 就是「本轮活着」
+    pub(crate) gc_epoch: AtomicU32,
+    /// 上一次回收之后的分配次数（触发阈值用它）
+    pub(crate) allocs_since_gc: AtomicU64,
+    /// 上一次回收后有多少个对象/数组活着（阈值与统计用）
+    pub(crate) live_after_gc: AtomicU64,
+    /// 累计已释放的对象数（`live()` 用它把页表高水位折成活对象数）
+    pub(crate) reclaimed: AtomicU64,
+    /// 类表快照（算字段引用位图用；`store_publish` 与构造时挂上）
+    store: RwLock<Option<Arc<ClassStore>>>,
+    /// 类名 → 字段引用位图（每个类只算一次）
+    layouts: RwLock<HashMap<String, Arc<RefBits>>>,
 }
 
 impl Heap {
@@ -299,14 +394,48 @@ impl Heap {
             str_fields: Mutex::new(HashMap::new()),
             sb_bufs: Mutex::new(HashMap::new()),
             wrapper_cache: Mutex::new(HashMap::new()),
+            gc_epoch: AtomicU32::new(1),
+            allocs_since_gc: AtomicU64::new(0),
+            live_after_gc: AtomicU64::new(0),
+            reclaimed: AtomicU64::new(0),
+            store: RwLock::new(None),
+            layouts: RwLock::new(HashMap::new()),
         }
     }
 
+    /// 挂上一份类表快照（`Shared::new` / `store_publish` 调；GC 算位图要用）
+    pub(crate) fn attach_store(&self, s: Arc<ClassStore>) {
+        *self.store.write().unwrap_or_else(|e| e.into_inner()) = Some(s);
+    }
+
+
     // ---------- 分配 ----------
+
+    /// 对象的字段引用位图（按类布局算，按类名缓存）。
+    ///
+    /// 算不出来（类不在类表里 / 槽数和布局对不上）就退化成 `All`：GC 会把每个槽都
+    /// 拿页表验证一遍 —— 多留一点垃圾，但绝不会漏掉一个真引用。
+    fn obj_refbits(&self, class: &str, n: usize) -> Arc<RefBits> {
+        if let Some(b) = self.layouts.read().unwrap_or_else(|e| e.into_inner()).get(class) {
+            return Arc::clone(b);
+        }
+        let g = self.store.read().unwrap_or_else(|e| e.into_inner()).clone();
+        let bits = match g {
+            Some(store) => class_layout(&store, class, n),
+            None => RefBits::All,
+        };
+        let a = Arc::new(bits);
+        self.layouts
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(class.to_string(), Arc::clone(&a));
+        a
+    }
 
     /// 分配一个对象，返回句柄（> 0）。类名决定字段数由调用方给。
     pub(crate) fn new_object(&self, slots: Vec<Slot>, class: &str) -> Option<i32> {
         let n = slots.len().max(1);
+        let refs = self.obj_refbits(class, n);
         let mut cells = Vec::with_capacity(n);
         for i in 0..n {
             cells.push(Cell::new(slots.get(i).copied().unwrap_or(Slot::I(0))));
@@ -315,21 +444,35 @@ impl Heap {
             class: intern_class(class),
             len: 0,
             lock: AtomicU32::new(0),
+            epoch: AtomicU32::new(self.gc_epoch.load(Ordering::Acquire)),
+            refs,
             cells: cells.into_boxed_slice(),
         };
+        self.allocs_since_gc.fetch_add(1, Ordering::Relaxed);
         self.objs.push(hdr).map(|i| i as i32 + 1)
     }
 
     /// 分配一个数组，返回句柄（< 0）
     pub(crate) fn new_array(&self, elems: Vec<Slot>, desc: &str) -> Option<i32> {
         let n = elems.len();
+        // 数组元素类型由描述符决定：`[L…;` / `[[…` 是引用数组，其余是基本类型
+        let refs: Arc<RefBits> = if n == 0 {
+            Arc::new(RefBits::None)
+        } else if is_ref_array_desc(desc) {
+            Arc::new(RefBits::All)
+        } else {
+            Arc::new(RefBits::None)
+        };
         let cells: Vec<Cell> = elems.into_iter().map(Cell::new).collect();
         let hdr = ObjHdr {
             class: intern_class(desc),
             len: n as u32,
             lock: AtomicU32::new(0),
+            epoch: AtomicU32::new(self.gc_epoch.load(Ordering::Acquire)),
+            refs,
             cells: cells.into_boxed_slice(),
         };
+        self.allocs_since_gc.fetch_add(1, Ordering::Relaxed);
         self.arrs.push(hdr).map(|i| -(i as i32) - 1)
     }
 
@@ -501,6 +644,128 @@ impl Heap {
     pub(crate) fn counts(&self) -> (u32, u32) {
         (self.objs.count(), self.arrs.count())
     }
+
+    // ---------- GC ----------
+
+    /// 任意句柄 → 对象头（字符串句柄没有对象头，返回 None）
+    #[inline]
+    pub(crate) fn hdr(&self, h: i32) -> Option<&ObjHdr> {
+        self.obj(h).or_else(|| self.arr(h))
+    }
+
+    /// 句柄指向的对象还存在吗？（页表里有条目 = 还在；被回收过就是 None）
+    #[inline]
+    pub(crate) fn is_live_handle(&self, h: i32) -> bool {
+        self.hdr(h).is_some()
+    }
+
+    /// 标记：返回 true = 这一轮**第一次**标到它（调用方要把它的槽也扫一遍）
+    #[inline]
+    pub(crate) fn mark(&self, h: i32, epoch: u32) -> bool {
+        let Some(o) = self.hdr(h) else { return false };
+        if o.epoch.load(Ordering::Acquire) == epoch {
+            return false;
+        }
+        o.epoch.store(epoch, Ordering::Release);
+        true
+    }
+
+    /// 已经拿到对象头指针时的标记（并行标记的批处理路径用）
+    #[inline]
+    pub(crate) fn mark_ptr(&self, o: *const ObjHdr, epoch: u32) -> bool {
+        let o = unsafe { &*o };
+        if o.epoch.load(Ordering::Acquire) == epoch {
+            return false;
+        }
+        o.epoch.store(epoch, Ordering::Release);
+        true
+    }
+
+    /// 清扫一轮：释放所有 `epoch != 本轮` 的对象/数组。返回 `(对象数, 数组数, 字节数)`
+    pub(crate) fn sweep(&self, epoch: u32) -> (u32, u32, u64) {
+        let mut bytes = 0u64;
+        let o = self.objs.sweep(|_, obj| {
+            if obj.epoch.load(Ordering::Acquire) == epoch {
+                return true;
+            }
+            bytes += obj.bytes();
+            false
+        });
+        let a = self.arrs.sweep(|_, obj| {
+            if obj.epoch.load(Ordering::Acquire) == epoch {
+                return true;
+            }
+            bytes += obj.bytes();
+            false
+        });
+        self.reclaimed.fetch_add(o as u64 + a as u64, Ordering::AcqRel);
+        (o, a, bytes)
+    }
+
+    /// 现在堆里活着的对象数（对象 + 数组）
+    pub(crate) fn live(&self) -> u64 {
+        let (o, a) = self.counts();
+        let dead = self.reclaimed.load(Ordering::Acquire);
+        (o as u64 + a as u64).saturating_sub(dead)
+    }
+
+    /// 再分配多少次就该回收一轮（「存活 × 2」与下限取大）
+    pub(crate) fn gc_threshold(&self) -> u64 {
+        (self.live_after_gc.load(Ordering::Acquire) * 2).max(MIN_GC_THRESHOLD)
+    }
+}
+
+/// 触发阈值下限：不管堆里有多少活对象，至少分配这么多次才考虑回收
+pub(crate) const MIN_GC_THRESHOLD: u64 = 262_144;
+
+impl ObjHdr {
+    /// 这个对象在堆里大约占多少字节（统计用：48 字节头 + 每槽 16 字节）
+    pub(crate) fn bytes(&self) -> u64 {
+        48 + 16 * self.cells.len() as u64
+    }
+}
+
+/// 描述符是不是引用类型
+#[inline]
+pub(crate) fn is_ref_desc(d: &str) -> bool {
+    d.starts_with('L') || d.starts_with('[')
+}
+
+/// 数组描述符的元素是不是引用（`[Ljava/…;` / `[[…`）
+#[inline]
+pub(crate) fn is_ref_array_desc(desc: &str) -> bool {
+    let b = desc.as_bytes();
+    b.len() >= 2 && b[0] == b'[' && (b[1] == b'L' || b[1] == b'[')
+}
+
+/// 类布局 → 字段引用位图。
+///
+/// 槽位顺序必须和 `load.rs::build_metas` 完全一致（它决定 `field_index`，也就是
+/// 对象里第 i 个槽是谁）：继承链**从根往本类**走，每个类按声明顺序、跳过静态字段。
+/// 任何一步对不上就返回 `All`（保守）—— 位图算错是 GC 的头号事故来源。
+fn class_layout(store: &ClassStore, class: &str, n: usize) -> RefBits {
+    let count = store.field_count(class);
+    if count == 0 {
+        return RefBits::All;
+    }
+    let chain = store.chain(class); // [本类, 父类, …]
+    let mut refs: Vec<bool> = Vec::with_capacity(count);
+    for name in chain.iter().rev() {
+        let Some(&ci) = store.by_name.get(name) else { continue };
+        let cf = &store.classes[ci];
+        for f in &cf.fields {
+            if f.access_flags & 0x0008 != 0 {
+                continue; // 静态字段不在对象里
+            }
+            let d = String::from_utf8_lossy(cf.utf8(f.descriptor_index).unwrap_or_default()).into_owned();
+            refs.push(is_ref_desc(&d));
+        }
+    }
+    if refs.len() != count {
+        return RefBits::All;
+    }
+    // 下标 ≥ count 的是调用方补的填充槽（`new_object` 会 `.max(1)`）：当引用看
+    RefBits::from_iter(n, |i| refs.get(i).copied().unwrap_or(true))
 }
 
 /// 类名驻留：同一个类名在堆里只存一份 `Arc<str>`
@@ -531,6 +796,73 @@ pub(crate) struct IndyState {
     pub(crate) indy_resolved: usize,
     pub(crate) indy_calls: usize,
     pub(crate) lambda_seq: usize,
+}
+
+/// indy 状态里所有的候选句柄（GC 根扫描用）。
+///
+/// 这些表里存的是**方法句柄对象 / 调用点 / 捕获值**的句柄 —— 它们没有任何 Java 侧
+/// 的引用指着（就是 VM 自己造的元数据），所以必须显式当根，否则会被回收掉。
+impl IndyState {
+    pub(crate) fn each_handle(&self, mut f: impl FnMut(i32)) {
+        for (k, v) in self.mhs.iter() {
+            f(*k);
+            match &v.kind {
+                indy::MhKind::Bound { target, bindings, .. } => {
+                    f(*target);
+                    for b in bindings {
+                        if let Slot::I(h) = *b {
+                            f(h);
+                        }
+                    }
+                }
+                indy::MhKind::Constant(v) => {
+                    if let Slot::I(h) = *v {
+                        f(h);
+                    }
+                }
+                indy::MhKind::Adapter { target } => f(*target),
+                indy::MhKind::Concat { consts, .. } => {
+                    for (_, v) in consts.iter() {
+                        if let Slot::I(h) = *v {
+                            f(h);
+                        }
+                    }
+                }
+                indy::MhKind::LambdaCtor(t) => f(t.target),
+                indy::MhKind::Direct { .. } | indy::MhKind::Identity => {}
+            }
+        }
+        for k in self.mtypes.keys() {
+            f(*k);
+        }
+        for k in self.lookups.keys() {
+            f(*k);
+        }
+        for (k, v) in self.callsites.iter() {
+            f(*k);
+            f(v.target);
+        }
+        for (k, v) in self.lambdas.iter() {
+            f(*k);
+            f(v.target);
+            for c in &v.captured {
+                if let Slot::I(h) = *c {
+                    f(h);
+                }
+            }
+        }
+        for k in self.varhandles.keys() {
+            f(*k);
+        }
+        for v in self.indy_sites.values() {
+            f(*v);
+        }
+        for (_, v) in self.condy_values.iter() {
+            if let Slot::I(h) = v.1 {
+                f(h);
+            }
+        }
+    }
 }
 
 // ---------------------------------------------------------------- 共享根
@@ -576,8 +908,22 @@ pub(crate) struct Shared {
     pub(crate) jdk_loaded: bool,
     pub(crate) prefer_builtin: bool,
     pub(crate) indy_stats: bool,
-    /// 全局停靠点（GC 用；当前 GC 未接，见 `gc.rs`）
+    /// 全局停靠点（GC 停世界用）
     pub(crate) safepoint: super::gc::Safepoint,
+    /// `VMLESS_GC_STATS=1`：每轮回收打一行统计
+    pub(crate) gc_stats: bool,
+    /// `VMLESS_GC_STRESS=1`：每次 GC 检查点都回收（把漏根立刻打成崩溃）
+    pub(crate) gc_stress: bool,
+    /// `VMLESS_GC_OFF=1`：完全关掉回收（量「改前」基线用；其余行为不变）
+    pub(crate) gc_off: bool,
+    /// 清扫线程在跑（这段时间不开始新的一轮，否则标记世代与清扫目标世代会打架）
+    pub(crate) sweeping: AtomicBool,
+    /// 同一时刻只允许一个线程发起回收
+    pub(crate) gc_lock: Mutex<()>,
+    /// 上一次「停世界」失败的退避截止时间（毫秒，相对进程启动）
+    pub(crate) gc_backoff: AtomicU64,
+    /// 每帧引用位图缓存：`(ClassFile 地址, 方法下标) → 位图`
+    pub(crate) refmaps: RwLock<HashMap<(usize, usize), (Arc<ClassFile>, Arc<super::gc::MethodRefs>)>>,
 }
 
 impl Shared {
@@ -588,8 +934,10 @@ impl Shared {
             .unwrap_or_else(|| {
                 std::env::var("VMLESS_INDY_STATS").map(|v| v == "1").unwrap_or(false)
             });
+        let heap = Heap::new();
+        heap.attach_store(Arc::clone(&store));
         Shared {
-            heap: Heap::new(),
+            heap,
             monitors: MonitorTable::new(),
             store: RwLock::new(store),
             store_ver: AtomicU64::new(0),
@@ -614,6 +962,13 @@ impl Shared {
             prefer_builtin: std::env::var("VMLESS_PREFER_BUILTIN").map(|v| v == "1").unwrap_or(false),
             indy_stats,
             safepoint: super::gc::Safepoint::new(),
+            gc_stats: std::env::var("VMLESS_GC_STATS").map(|v| v != "0" && v != "false").unwrap_or(false),
+            gc_stress: std::env::var("VMLESS_GC_STRESS").map(|v| v != "0" && v != "false").unwrap_or(false),
+            gc_off: std::env::var("VMLESS_GC_OFF").map(|v| v != "0" && v != "false").unwrap_or(false),
+            sweeping: AtomicBool::new(false),
+            gc_lock: Mutex::new(()),
+            gc_backoff: AtomicU64::new(0),
+            refmaps: RwLock::new(HashMap::new()),
         }
     }
 
@@ -625,6 +980,7 @@ impl Shared {
 
     /// 用一份新快照替换权威类表，并推进版本号
     pub(crate) fn store_publish(&self, s: Arc<ClassStore>) -> u64 {
+        self.heap.attach_store(Arc::clone(&s));
         *self.store.write().unwrap_or_else(|e| e.into_inner()) = s;
         self.store_ver.fetch_add(1, Ordering::AcqRel) + 1
     }

@@ -1044,3 +1044,52 @@ ours : v=42        ← 修前是 v=0
 ```
 
 回归：`verify.sh` 103/103、`cargo test` 73 passed。
+
+## 0.59.0 — 2026-11-18 · JNI、并行堆 GC（精确引用位图）、JIT 内联
+
+### JNI（Minecraft 的最后一道硬门槛）
+新增 `src/vm/jni.rs`（2644 行）+ `jni_lib.rs`（563 行）。
+`JNINativeInterface_` **236 槽位：196 真实现**（31 个 `va_list` 形式显式不支持，9 个未实现），
+槽位顺序**从 JDK `include/jni.h` 逐行抓取**（名字→实现，槽位顺序只存一份，错位不可能发生）。
+
+实测（真 C 动态库，MSVC 编译，与 HotSpot 逐字节一致）
+| 验收 | 输出 |
+|---|---|
+| `System.loadLibrary` + 短名绑定 + `JNI_OnLoad` | `hello: JNI_OnLoad ok` / `add=5` / `hi from C` |
+| **`RegisterNatives`**（LWJGL 走的这条） | `triple=42` / `greet=hello world` |
+| 全局引用 1000 次建删 | 全局表回基线 |
+| `ThrowNew` → Java `catch` | `caught=boom 中文` |
+| 字符串往返（中文） | `echo=C[Hello, 中文]9/13` |
+| `GetIntArrayElements` 改内容 | `sum=10 first=100 last=200` |
+| **回调进 Java** | `box=42`、`scale=5.0`（double 走 xmm）、`cb=来自 C 的回调`、字段与 monitor |
+
+`CallXMethod` 的 varargs 用**手写汇编垫片**按 Win64 ABI 取参（rcx/rdx/r8/r9 + xmm0-3 + 栈，浮点返回写回 xmm0）。
+
+### 并行堆 GC（精确引用位图）
+- **引用位图是精确的**：来源是**字节码数据流分析**（等价 verifier 的 ref/prims 分析，每条指令按语义弹/压，
+  跳转点取并集），比 `StackMapTable` 覆盖更全
+- **标记-清扫、不搬动、索引不复用**（句柄=页表下标，复用会让陈旧句柄指向别的对象）；
+  清扫在暂停之外并发做；停不全就放弃这一轮（`sync` 超时）
+- 阈值 = max(存活×2, 262144)；`VMLESS_GC_STATS` / `VMLESS_GC_STRESS` / `VMLESS_GC_OFF` 三个开关
+
+| 指标 | 改前 | 改后 | G1 对照 |
+|---|---|---|---|
+| **GC 最大停顿** | 46.3 ms | **13.8 ms** | 12.7 ms |
+| 2M 短命对象峰值 RSS | 296.6 MB（关回收）| **58.6 MB** | — |
+| 1M/2M/4M 三档 RSS | — | **50/58/76 MB**，不随分配量线性增长 | — |
+
+### JIT 内联
+`P2`：解释器 7010 → **JIT 119 ms**（HotSpot 71 ms，**落后从 5.73× 缩到 1.7×**）。
+
+踩的两个坑值得记：① 拼被调方方法体时**只平移了长形式局部变量指令**，漏了 `iload_0..3` 等短形式
+→ 拼进调用方后读到的是**调用方**的槽（症状是「值变成 48/0、循环次数错」，很容易误判成位宽问题）；
+② `translate`/`refmap` 有条硬不变式「跳转点操作数栈必空」，最初「换等长 goto + 搬到方法尾部」
+两条跳转的栈都不空 → 编译直接失败，改成**就地替换**才对。
+
+**当前内联只收直筒子（无分支）的被调方**；有分支的要在调用点做栈深分析 + 活值溢出，是下一步。
+
+### 顺带修
+真字节码模式下 `System.getProperties()` 恒 null（`System.loadLibrary` 会 `InternalError: null property: java.home`）——
+根因是启动时没执行 `System.initPhase1()`，已在 `run_main` 补上。
+
+**验证**：`verify.sh` **103/103**、`cargo test` **85 passed**、`run_jdk M2` 与 java 逐行一致。

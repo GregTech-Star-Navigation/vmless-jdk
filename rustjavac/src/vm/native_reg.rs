@@ -22,6 +22,14 @@ use super::slot::Slot;
 use super::{Vm, VmError};
 use std::collections::HashMap;
 
+// JNI 的两个子模块挂在这里（`#[path]`），不是挂在 `vm/mod.rs` 上：
+// `mod.rs` 是几条并行工作线都会碰的文件，少改一行就少一次冲突。
+// 路径相对本文件所在目录（`src/vm/`），所以这里写的还是 `jni.rs` / `jni_lib.rs`。
+#[path = "jni.rs"]
+pub(crate) mod jni;
+#[path = "jni_lib.rs"]
+pub(crate) mod jni_lib;
+
 /// native 方法的 Rust 实现。参数在 `frame.locals` 里按 JVM 槽位落位
 /// （实例方法 `this` 在槽 0），返回值由 `Result<Slot, VmError>` 给出（`void` 返回 `Slot::I(0)`）。
 pub(crate) type NativeFn = fn(&mut Vm, &mut Frame) -> Result<Slot, VmError>;
@@ -61,10 +69,19 @@ impl NativeRegistry {
     }
 
     pub(crate) fn lookup(&self, class: &str, name: &str, desc: &str) -> Option<NativeFn> {
-        self.map
+        if let Some(f) = self
+            .map
             .get(&(class.to_string().as_str(), name, desc))
             .copied()
             .or_else(|| self.map.get(&("", name, desc)).copied())
+        {
+            return Some(f);
+        }
+        // 静态表里没有 → 问 JNI 的动态绑定表：
+        //   * `System.loadLibrary` 装进来的库里 `RegisterNatives` 注册过的函数指针；
+        //   * 库里按 JNI 短名（`Java_pkg_Class_method`）能 `GetProcAddress` 到的符号。
+        // 命中时 `jni_lib::lookup` 把目标放在线程本地，返回的跳板紧接着就会被调用。
+        jni_lib::lookup(class, name, desc)
     }
 
     /// 已注册的全部条目（按类名排序）—— 报告/`docs` 用
@@ -164,17 +181,74 @@ fn register_all(r: &mut NativeRegistry) {
     );
     r.add("java/lang/System", "identityHashCode", "(Ljava/lang/Object;)I", sys_identity_hash);
 
+    // ---- JNI：动态库装载 ----
+    //
+    // 真 java.base 里 `System.loadLibrary` / `System.load` 是**普通方法**（→
+    // `Runtime.loadLibrary0` → `ClassLoader.loadLibrary`），那两条链最后由
+    // `jdk.internal.loader.NativeLibraries` 的 native 落地。这两行则覆盖
+    // 「类自己把 loadLibrary 声明成 native」的写法（自造的 System 替身、嵌入式场景）。
+    r.add("java/lang/System", "loadLibrary", "(Ljava/lang/String;)V", jni_lib::system_load_library);
+    r.add("java/lang/System", "load", "(Ljava/lang/String;)V", jni_lib::system_load);
+
+    // ---- JNI：真 java.base 的装载链落地（`NativeLibraries.load` 是唯一的 native）----
+    r.add(
+        "jdk/internal/loader/NativeLibraries",
+        "load",
+        "(Ljdk/internal/loader/NativeLibraries$NativeLibraryImpl;Ljava/lang/String;ZZ)Z",
+        jni_lib::native_libraries_load,
+    );
+    // 内置库（libjava/libzip…）我们没有；返回 null = "不是内置库"
+    r.add("jdk/internal/loader/NativeLibraries", "findBuiltinLib", "(Ljava/lang/String;)Ljava/lang/String;", |_, _| {
+        Ok(Slot::I(0))
+    });
+    r.add("jdk/internal/loader/NativeLibraries", "unload", "(Ljava/lang/String;ZJ)V", no_op);
+    r.add("jdk/internal/loader/NativeLibraries", "findEntry0", "(JLjava/lang/String;)J", |_, _| Ok(Slot::L(0)));
+    // `java.io.File` 依赖它：`WinNTFileSystem.<clinit>` 里 native 侧缓存字段 ID。
+    // 我们的文件操作不走那条路（JNI 也不碰），所以是空的。
+    r.add("java/io/WinNTFileSystem", "initIDs", "()V", no_op);
+
+    // ---- 系统属性（真 java.base 的 `System.getProperties()` 靠这两个 native 落地）----
+    // `System.loadLibrary` 的整条 Java 链都要读 `java.home` / `os.name`，缺了它
+    // 第一步就 `InternalError: null property: java.home`。
+    r.add(
+        "jdk/internal/util/SystemProps$Raw",
+        "platformProperties",
+        "()[Ljava/lang/String;",
+        sysprops_platform,
+    );
+    r.add("jdk/internal/util/SystemProps$Raw", "vmProperties", "()[Ljava/lang/String;", sysprops_vm);
+
     // ---- java.lang.Shutdown（System.exit 的落地：刷输出 + 立刻退出）----
     r.add("java/lang/Shutdown", "beforeHalt", "()V", no_op);
     r.add("java/lang/Shutdown", "halt0", "(I)V", shutdown_halt0);
 
     // ---- jdk.internal.reflect.Reflection ----
     r.add("jdk/internal/reflect/Reflection", "getCallerClass", "()Ljava/lang/Class;", reflection_caller);
+    // `Class.getModifiers()` / 反射层要知道类的 access_flags（`initPhase1` 里就会问）
+    r.add(
+        "jdk/internal/reflect/Reflection",
+        "getClassAccessFlags",
+        "(Ljava/lang/Class;)I",
+        |vm, f| {
+            let h = f.arg(0).as_i32();
+            let flags = vm
+                .class_obj_name(h)
+                .and_then(|n| vm.store.class_file(&n))
+                .map(|cf| cf.access_flags as i32)
+                .unwrap_or(0);
+            Ok(Slot::I(flags))
+        },
+    );
 
     // ---- java.lang.Runtime ----
     // `ArrayList.sort` → `Arrays.sort` 一族的路径上会问到 CPU 数（并行排序的门槛判断）。
     // 这条不补，任何 `list.sort(...)` 都会在这里断。
     r.add("java/lang/Runtime", "availableProcessors", "()I", runtime_available_processors);
+    // 内存数字：只是给 `System.initPhase1` / `Runtime` 一个能用的值（VM 没有堆上限的概念）
+    r.add("java/lang/Runtime", "maxMemory", "()J", |_, _| Ok(Slot::L(4 * 1024 * 1024 * 1024)));
+    r.add("java/lang/Runtime", "totalMemory", "()J", |_, _| Ok(Slot::L(2 * 1024 * 1024 * 1024)));
+    r.add("java/lang/Runtime", "freeMemory", "()J", |_, _| Ok(Slot::L(2 * 1024 * 1024 * 1024)));
+    r.add("java/lang/Runtime", "gc", "()V", no_op);
 
     // ---- java.lang.String ----
     r.add("java/lang/String", "intern", "()Ljava/lang/String;", |_, f| Ok(Slot::I(f.this())));
@@ -961,4 +1035,163 @@ fn now_nanos() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos() as i64)
         .unwrap_or(0)
+}
+
+// ---- 系统属性：JNI（以及整个真 java.base 路径）的前置条件 ----
+//
+// 真 java.base 模式下 `System.getProperties()` 是 null —— 因为 `System.initPhase1()`
+// 本该由 **VM 启动时**调用，而我们之前没调。它的第一步是问 native 要属性：
+//
+//   * `jdk.internal.util.SystemProps$Raw.platformProperties()` → **按位置**的 String[40]
+//     （下标常量 `_os_name_NDX = 21` 之类是编译进 class 文件的，所以位置不能错）
+//   * `jdk.internal.util.SystemProps$Raw.vmProperties()` → 键/值**成对**交替的 String[]
+//
+// 缺了它们：`System.loadLibrary` 在 `InternalError: null property: java.home` 上死，
+// LWJGL 的 `Library` / `Configuration` 也拿不到 `os.name`。
+
+fn jdk_home() -> String {
+    if let Ok(p) = std::env::var("VMLESS_JDK") {
+        let p = p.trim().to_string();
+        if !p.is_empty() {
+            let path = std::path::Path::new(&p);
+            if path.join("lib").is_dir() && path.join("bin").is_dir() {
+                return p;
+            }
+            // `VMLESS_JDK` 也可能指向 `lib/modules` 或解包目录：往上找带 bin+lib 的那层
+            let mut cur = Some(path);
+            for _ in 0..3 {
+                cur = cur.and_then(|c| c.parent());
+                if let Some(c) = cur {
+                    if c.join("lib").is_dir() && c.join("bin").is_dir() {
+                        return c.to_string_lossy().into_owned();
+                    }
+                }
+            }
+            return p;
+        }
+    }
+    for cand in [
+        r"C:\Program Files\Eclipse Adoptium\jdk-25.0.4.101-hotspot",
+        r"C:\Program Files\Java\jdk-25",
+    ] {
+        if std::path::Path::new(cand).is_dir() {
+            return cand.to_string();
+        }
+    }
+    ".".to_string()
+}
+
+fn env_or(name: &str, alt: &str) -> String {
+    std::env::var(name).unwrap_or_else(|_| alt.to_string())
+}
+
+fn cwd() -> String {
+    std::env::current_dir().map(|p| p.to_string_lossy().into_owned()).unwrap_or_else(|_| ".".into())
+}
+
+/// `platformProperties()`：**位置**固定，见 `SystemProps$Raw` 的 `_xxx_NDX` 常量。
+fn platform_props() -> Vec<Option<String>> {
+    let win = cfg!(windows);
+    let mut v: Vec<Option<String>> = vec![None; 40];
+    let mut set = |i: usize, s: String| v[i] = Some(s);
+    // 0..3 display.*，5..8 format.*（本地化信息没有就用空串）
+    for i in [0usize, 1, 2, 3, 5, 6, 7, 8] {
+        set(i, String::new());
+    }
+    set(4, if win { "\\".into() } else { "/".into() }); // file.separator
+    // 9..16 代理相关：不设（null = 属性不存在），和没配代理的 JVM 一致
+    set(17, std::env::temp_dir().to_string_lossy().into_owned()); // java.io.tmpdir
+    set(18, if win { "\r\n".into() } else { "\n".into() }); // line.separator
+    set(19, if win { "GBK".into() } else { "UTF-8".into() }); // native.encoding
+    set(20, if cfg!(target_arch = "x86_64") { "amd64".into() } else { "x86".into() }); // os.arch
+    set(
+        21,
+        if win {
+            "Windows 11".into()
+        } else if cfg!(target_os = "macos") {
+            "Mac OS X".into()
+        } else {
+            "Linux".into()
+        },
+    ); // os.name
+    set(22, "10.0".into()); // os.version
+    set(23, if win { ";".into() } else { ":".into() }); // path.separator
+    set(27, "utf-8".into()); // stderr.encoding
+    set(28, "utf-8".into()); // stdin.encoding
+    set(29, "utf-8".into()); // stdout.encoding
+    set(30, String::new()); // sun.arch.abi
+    set(31, "64".into()); // sun.arch.data.model
+    set(32, "little".into()); // sun.cpu.endian
+    set(33, if cfg!(target_arch = "x86_64") { "amd64".into() } else { "x86".into() }); // sun.cpu.isalist
+    set(34, "UnicodeLittle".into()); // sun.io.unicode.encoding
+    set(35, if win { "GBK".into() } else { "UTF-8".into() }); // sun.jnu.encoding
+    set(36, String::new()); // sun.os.patch.level
+    set(37, cwd()); // user.dir
+    set(38, env_or("USERPROFILE", &env_or("HOME", "."))); // user.home
+    set(39, env_or("USERNAME", &env_or("USER", "user"))); // user.name
+    v
+}
+
+/// `vmProperties()`：键/值成对的列表（`java.home` 等 VM 侧属性 + 命令行 `-D`）
+fn vm_props() -> Vec<(String, String)> {
+    let mut p: Vec<(String, String)> = Vec::new();
+    let mut push = |k: &str, v: String| p.push((k.to_string(), v));
+    push("java.home", jdk_home());
+    push("java.vendor", "vmless".into());
+    push("java.vendor.url", "https://example.invalid/vmless".into());
+    push("java.version", "25.0.4".into());
+    push("java.version.date", "2026-01-20".into());
+    push("java.runtime.name", "vmless Java Runtime".into());
+    push("java.runtime.version", "25.0.4".into());
+    push("java.vm.name", "vmless".into());
+    push("java.vm.version", env!("CARGO_PKG_VERSION").into());
+    push("java.vm.vendor", "vmless".into());
+    push("java.vm.info", "interpreter".into());
+    push("java.specification.name", "Java Platform API Specification".into());
+    push("java.specification.vendor", "Oracle Corporation".into());
+    push("java.specification.version", "25".into());
+    push("java.class.version", "69.0".into());
+    push("java.class.path", ".".into());
+    push("java.library.path", cwd());
+    push("jdk.debug", "release".into());
+    push("file.encoding", "UTF-8".into());
+    push("stdout.encoding", "utf-8".into());
+    push("stderr.encoding", "utf-8".into());
+    // 命令行 `-Dk=v` 最后并进来（后写的赢）
+    if let Ok(g) = crate::vm::PROPS.lock() {
+        for (k, v) in g.iter() {
+            p.push((k.clone(), v.clone()));
+        }
+    }
+    p
+}
+
+/// 把 `Vec<Option<String>>` 变成 `String[]`（`None` → null）
+fn positional_array(vm: &mut Vm, vals: Vec<Option<String>>) -> Slot {
+    let mut slots = Vec::with_capacity(vals.len());
+    for v in vals {
+        slots.push(Slot::I(match v {
+            Some(s) => vm.str_new(s),
+            None => 0,
+        }));
+    }
+    let h = vm.sh.heap.new_array(slots, "[Ljava/lang/String;").unwrap_or(0);
+    Slot::I(h)
+}
+
+fn sysprops_platform(vm: &mut Vm, _f: &mut Frame) -> Result<Slot, VmError> {
+    Ok(positional_array(vm, platform_props()))
+}
+
+fn sysprops_vm(vm: &mut Vm, _f: &mut Frame) -> Result<Slot, VmError> {
+    let pairs = vm_props();
+    let mut slots = Vec::with_capacity(pairs.len() * 2);
+    for (k, v) in pairs {
+        let kh = vm.str_new(k);
+        let vh = vm.str_new(v);
+        slots.push(Slot::I(kh));
+        slots.push(Slot::I(vh));
+    }
+    let h = vm.sh.heap.new_array(slots, "[Ljava/lang/String;").unwrap_or(0);
+    Ok(Slot::I(h))
 }

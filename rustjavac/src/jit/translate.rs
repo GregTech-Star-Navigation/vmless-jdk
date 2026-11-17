@@ -10,6 +10,7 @@ use crate::{ClassFile, CpEntry};
 use super::call::{
     argc_of, code_of, convert_to, method_ref_of, param_descs, param_slots, ret_type, zero_of,
 };
+use super::divmod;
 use super::exc::{class_uses_exceptions, ExcHelpers};
 use super::insn::{insn_len, insn_len_at};
 use super::layout::{
@@ -69,7 +70,7 @@ impl Jit {
             .classes
             .get(class)
             .ok_or_else(|| JitError(format!("类 {class} 没有加载")))?;
-        let (max_locals, max_stack, body, exc_table, is_static, is_sync) = {
+        let (max_locals, max_stack0, body, exc_table0, is_static, is_sync) = {
             let m = cf
                 .methods
                 .iter()
@@ -109,6 +110,22 @@ impl Jit {
                 "JIT 不接管 java.lang.invoke（{m}）：{class}.{name}{desc} 只能由解释器执行"
             )));
         }
+
+        // ---- 小方法内联 ----
+        // 在**字节码层**把「小 + 纯基本类型 + 无异常表 + 单态」的调用点就地展开
+        // （见 `inline.rs`）。跳转/switch 偏移与异常表由它一起重定位，所以后面的
+        // 块划分与栈形状分析看到的就是一份自洽的普通字节码。
+        // `max_locals` / `max_stack` 都会变大（内联体的槽位排在后面），根区大小随之算。
+        let (body, max_locals, stack_extra, exc_table) = {
+            let (b, ml, ms, tbl, n) = super::inline::inline_all(
+                &self.classes, &cf, class, name, desc, &body, max_locals, max_stack0, &exc_table0,
+            );
+            self.n_inlined += n;
+            (b, ml, ms, tbl)
+        };
+        // 内联体让操作数栈也可能变深：根区大小是 max_locals + max_stack，
+        // 两边都得跟着涨（内联体本身没有 GC 点，但把余量算足不给以后埋雷）
+        let max_stack = max_stack0 + stack_extra;
 
         // 方法签名：(locals_ptr: i64) -> 返回值
         // 返回值必须按描述符给出真类型：long → i64、double → f64。
@@ -545,15 +562,17 @@ impl Jit {
             self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
         }
 
-        // 局部变量在内存里：locals_ptr + i*4
-        let load_local = |fb: &mut FunctionBuilder, ptr: Value, slot: usize| -> Value {
-            let addr = fb.ins().iadd_imm(ptr, (slot * 8) as i64);
-            fb.ins().load(types::I32, MemFlags::new(), addr, 0)
-        };
-        let store_local = |fb: &mut FunctionBuilder, ptr: Value, slot: usize, v: Value| {
-            let addr = fb.ins().iadd_imm(ptr, (slot * 8) as i64);
-            fb.ins().store(MemFlags::new(), v, addr, 0);
-        };
+        // ---- 局部变量驻留寄存器 ----
+        // 以前每条 iload/istore 都是一次 `load.i64 locals_ptr+off` / `store`：既付
+        // 4~5 周期的 store→load 转发延迟，又让 Cranelift 没法把它们当 SSA 值优化
+        // —— 对 locals 的 store 会让它后面的所有 load 全部失效，GVN/常量折叠/LICM
+        // 一个也用不上。改成 `cranelift_frontend::Variable`：块边界由
+        // FunctionBuilder 自动插 phi 参数（配合收尾的 `seal_all_blocks`），
+        // 只有在**真的需要内存**时才落盘：
+        //   * 引用型局部变量仍然只住根区（GC 要就地改写它们）
+        //   * 同一个槽被两种宽度访问（多类型复用 / 非法字节码）→ 退回内存，行为不变
+        let mut lvars = LocalVars::plan(&body, max_locals);
+        lvars.init(&mut fb, locals_ptr, desc, is_static);
 
         // 先把本方法里所有 invokestatic 目标编译好，得到 FuncId 映射
         let mut call_targets: std::collections::HashMap<u16, (cranelift_module::FuncId, usize, i32)> =
@@ -678,54 +697,51 @@ impl Jit {
                 0x15 => {
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let v = load_local(&mut fb, locals_ptr, slot);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::I32);
                     stack.push(v);
                 }
                 // fload / fload_0..3：局部变量按 F32 读（槽是 8 字节，只读低 4 字节）
                 0x17 => {
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::F32, MemFlags::new(), addr, 0);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::F32);
                     stack.push(v);
                 }
                 0x22..=0x25 => {
                     let slot = (op - 0x22) as usize;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::F32, MemFlags::new(), addr, 0);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::F32);
                     stack.push(v);
                 }
                 0x43..=0x46 => {
                     // fstore_0..3
                     let slot = (op - 0x43) as usize;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    lvars.store(&mut fb, locals_ptr, slot, types::F32, v);
                 }
                 0x1a..=0x1d => {
                     let slot = (op - 0x1a) as usize;
-                    let v = load_local(&mut fb, locals_ptr, slot);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::I32);
                     stack.push(v);
                 }
                 0x36 => {
                     let slot = body[pc] as usize;
                     pc += 1;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    store_local(&mut fb, locals_ptr, slot, v);
+                    lvars.store(&mut fb, locals_ptr, slot, types::I32, v);
                 }
                 0x3b..=0x3e => {
                     let slot = (op - 0x3b) as usize;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    store_local(&mut fb, locals_ptr, slot, v);
+                    lvars.store(&mut fb, locals_ptr, slot, types::I32, v);
                 }
                 0x84 => {
                     // iinc
                     let slot = body[pc] as usize;
                     let delta = body[pc + 1] as i8 as i64;
                     pc += 2;
-                    let v = load_local(&mut fb, locals_ptr, slot);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::I32);
                     let nv = fb.ins().iadd_imm(v, delta);
-                    store_local(&mut fb, locals_ptr, slot, nv);
+                    lvars.store(&mut fb, locals_ptr, slot, types::I32, nv);
                 }
                 0x57 | 0x58 => {
                     // pop / pop2：栈上一个条目就是一个 JVM 值，宽值也只占一条
@@ -826,8 +842,30 @@ impl Jit {
                 0x60 => bin(&mut fb, &mut stack, |f, a, b| f.ins().iadd(a, b))?,
                 0x64 => bin(&mut fb, &mut stack, |f, a, b| f.ins().isub(a, b))?,
                 0x68 => bin(&mut fb, &mut stack, |f, a, b| f.ins().imul(a, b))?,
-                0x6c => bin(&mut fb, &mut stack, |f, a, b| f.ins().sdiv(a, b))?,
-                0x70 => bin(&mut fb, &mut stack, |f, a, b| f.ins().srem(a, b))?,
+                // idiv / irem：除数是编译期常量时换乘魔数（idiv 是 20~40 周期的串行指令）
+                0x6c | 0x70 => {
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    // 除数 0 不能走乘魔数（那会变成一次不抛异常的除法），留着走 idiv
+                    let dv = iconst_of(&fb, b).filter(|d| *d != 0);
+                    let v = match (dv, op) {
+                        (Some(d), 0x6c) => divmod::emit_sdiv_const(
+                            &mut fb,
+                            a,
+                            d as i32 as i64,
+                            32,
+                        ),
+                        (Some(d), _) => divmod::emit_srem_const(
+                            &mut fb,
+                            a,
+                            d as i32 as i64,
+                            32,
+                        ),
+                        (None, 0x6c) => fb.ins().sdiv(a, b),
+                        (None, _) => fb.ins().srem(a, b),
+                    };
+                    stack.push(v);
+                }
                 0x74 => {
                     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     stack.push(fb.ins().ineg(a));
@@ -1310,15 +1348,13 @@ impl Jit {
                     // dload
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::F64, MemFlags::new(), addr, 0);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::F64);
                     stack.push(v);
                 }
                 0x26..=0x29 => {
                     // dload_0..3
                     let slot = (op - 0x26) as usize;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::F64, MemFlags::new(), addr, 0);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::F64);
                     stack.push(v);
                 }
                 0x38 | 0x39 => {
@@ -1326,49 +1362,55 @@ impl Jit {
                     let slot = body[pc] as usize;
                     pc += 1;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    // 按**值本身的类型**存（不按操作码猜），与旧行为一致
+                    let ty = fb.func.dfg.value_type(v);
+                    lvars.store(&mut fb, locals_ptr, slot, ty, v);
                 }
                 0x47..=0x4a => {
                     // dstore_0..3
                     let slot = (op - 0x47) as usize;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    lvars.store(&mut fb, locals_ptr, slot, types::F64, v);
                 }
                 0x16 => {
                     // lload
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::I64);
                     stack.push(v);
                 }
                 0x1e..=0x21 => {
                     // lload_0..3
                     let slot = (op - 0x1e) as usize;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    let v = fb.ins().load(types::I64, MemFlags::new(), addr, 0);
+                    let v = lvars.load(&mut fb, locals_ptr, slot, types::I64);
                     stack.push(v);
                 }
                 0x37 => {
                     let slot = body[pc] as usize;
                     pc += 1;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    lvars.store(&mut fb, locals_ptr, slot, types::I64, v);
                 }
                 0x3f..=0x42 => {
                     let slot = (op - 0x3f) as usize;
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let addr = fb.ins().iadd_imm(locals_ptr, (slot * 8) as i64);
-                    fb.ins().store(MemFlags::new(), v, addr, 0);
+                    lvars.store(&mut fb, locals_ptr, slot, types::I64, v);
                 }
                 0x61 => lng(&mut fb, &mut stack, |f, a, b| f.ins().iadd(a, b))?,
                 0x65 => lng(&mut fb, &mut stack, |f, a, b| f.ins().isub(a, b))?,
                 0x69 => lng(&mut fb, &mut stack, |f, a, b| f.ins().imul(a, b))?,
-                0x6d => lng(&mut fb, &mut stack, |f, a, b| f.ins().sdiv(a, b))?,
-                0x71 => lng(&mut fb, &mut stack, |f, a, b| f.ins().srem(a, b))?,
+                0x6d | 0x71 => {
+                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let dv = iconst_of(&fb, b).filter(|d| *d != 0);
+                    let v = match (dv, op) {
+                        (Some(d), 0x6d) => divmod::emit_sdiv_const(&mut fb, a, d, 64),
+                        (Some(d), _) => divmod::emit_srem_const(&mut fb, a, d, 64),
+                        (None, 0x6d) => fb.ins().sdiv(a, b),
+                        (None, _) => fb.ins().srem(a, b),
+                    };
+                    stack.push(v);
+                }
                 0x75 => {
                     let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     stack.push(fb.ins().ineg(b));
@@ -2432,8 +2474,31 @@ fn bin(
     Ok(())
 }
 
-fn const_int(cf: &ClassFile, idx: u16) -> i64 {
-    match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
+/// 该 `Value` 是不是 `iconst` 直接定义的常量（`ldc` / `bipush` / `iconst_*` 都编成它）。
+/// 用来做「除数是常量 → 换乘魔数」「移位量是常量 → 用 imm 形式」这类判定。
+fn iconst_of(fb: &FunctionBuilder, v: Value) -> Option<i64> {
+    match fb.func.dfg.value_def(v) {
+        cranelift_codegen::ir::ValueDef::Result(inst, 0) => {
+            match fb.func.dfg.insts[inst] {
+                cranelift_codegen::ir::InstructionData::UnaryImm {
+                    opcode: cranelift_codegen::ir::Opcode::Iconst,
+                    imm,
+                } => {
+                    let bits = imm.bits();
+                    if fb.func.dfg.value_type(v) == types::I32 {
+                        Some(bits as i32 as i64)
+                    } else {
+                        Some(bits)
+                    }
+                }
+                _ => None,
+            }
+        }
+        _ => None,
+    }
+}
+
+fn const_int(cf: &ClassFile, idx: u16) -> i64 {    match cf.constant_pool.get(idx as usize).and_then(|e| e.as_ref()) {
         Some(CpEntry::Integer(v)) => *v as i32 as i64,
         _ => 0,
     }
@@ -2470,7 +2535,168 @@ fn lng(
     Ok(())
 }
 
-// ---------- 影子栈（根区）辅助 ----------
+// ---------- 局部变量驻留 ----------
+
+/// 一个 local 槽的驻留方案
+#[derive(Clone, Copy, PartialEq)]
+enum SlotTy {
+    /// 还没被任何 load/store 碰过
+    Unseen,
+    /// 只被一种类型访问过 → 可以驻留 SSA
+    One(cranelift_codegen::ir::Type),
+    /// 引用型（住根区，GC 会改写）
+    Ref,
+    /// 多种类型混用同一个槽 → 退回内存
+    Conflict,
+}
+
+/// 局部变量的驻留方案：能进 SSA 的进 SSA，不能的还住 `locals_ptr` 指向的内存。
+///
+/// 为什么要这么做：`load.i64 locals_ptr+off` / `store` 每字节码一次，除了付
+/// store→load 的 4~5 周期转发延迟，更要命的是**对 locals 的 store 会让它后面
+/// 所有的 load 失效** —— Cranelift 的 GVN/常量折叠/LICM 因此全部白给。
+/// 改成 SSA 值之后，块边界由 `FunctionBuilder` 自动插 phi（收尾的
+/// `seal_all_blocks` 负责补齐前驱传参）。
+struct LocalVars {
+    ty: Vec<SlotTy>,
+    var: Vec<Option<cranelift_frontend::Variable>>,
+}
+
+impl LocalVars {
+    /// 预扫一遍字节码，按访问它的 load/store 决定每个槽的类型
+    fn plan(body: &[u8], max_locals: usize) -> Self {
+        let mut ty = vec![SlotTy::Unseen; max_locals];
+        let mut mark = |ty: &mut Vec<SlotTy>, slot: usize, t: Option<cranelift_codegen::ir::Type>| {
+            if slot >= ty.len() {
+                return;
+            }
+            ty[slot] = match (&ty[slot], t) {
+                (_, None) => SlotTy::Ref,
+                (SlotTy::Unseen, Some(t)) => SlotTy::One(t),
+                (SlotTy::One(prev), Some(t)) if *prev == t => SlotTy::One(t),
+                _ => SlotTy::Conflict,
+            };
+        };
+        let mut pc = 0usize;
+        while pc < body.len() {
+            let op = body[pc];
+            match op {
+                // 变长形式：操作数里带槽号
+                0x15 => mark(&mut ty, body[pc + 1] as usize, Some(types::I32)), // iload
+                0x16 => mark(&mut ty, body[pc + 1] as usize, Some(types::I64)), // lload
+                0x17 => mark(&mut ty, body[pc + 1] as usize, Some(types::F32)), // fload
+                0x18 => mark(&mut ty, body[pc + 1] as usize, Some(types::F64)), // dload
+                0x19 => mark(&mut ty, body[pc + 1] as usize, None),            // aload
+                0x36 => mark(&mut ty, body[pc + 1] as usize, Some(types::I32)), // istore
+                0x37 => mark(&mut ty, body[pc + 1] as usize, Some(types::I64)), // lstore
+                0x38 => mark(&mut ty, body[pc + 1] as usize, Some(types::F32)), // fstore
+                0x39 => mark(&mut ty, body[pc + 1] as usize, Some(types::F64)), // dstore
+                0x3a => mark(&mut ty, body[pc + 1] as usize, None),            // astore
+                0x84 => mark(&mut ty, body[pc + 1] as usize, Some(types::I32)), // iinc
+                // 短形式：槽号编在操作码里
+                0x1a..=0x1d => mark(&mut ty, (op - 0x1a) as usize, Some(types::I32)),
+                0x1e..=0x21 => mark(&mut ty, (op - 0x1e) as usize, Some(types::I64)),
+                0x22..=0x25 => mark(&mut ty, (op - 0x22) as usize, Some(types::F32)),
+                0x26..=0x29 => mark(&mut ty, (op - 0x26) as usize, Some(types::F64)),
+                0x2a..=0x2d => mark(&mut ty, (op - 0x2a) as usize, None),
+                0x3b..=0x3e => mark(&mut ty, (op - 0x3b) as usize, Some(types::I32)),
+                0x3f..=0x42 => mark(&mut ty, (op - 0x3f) as usize, Some(types::I64)),
+                0x43..=0x46 => mark(&mut ty, (op - 0x43) as usize, Some(types::F32)),
+                0x47..=0x4a => mark(&mut ty, (op - 0x47) as usize, Some(types::F64)),
+                0x4b..=0x4e => mark(&mut ty, (op - 0x4b) as usize, None),
+                _ => {}
+            }
+            // 用 insn_len_at：tableswitch/lookupswitch 是变长的，按 op 猜长度会
+            // 走进 switch 的数据里，把偏移字节当成操作码（最坏只是多标一个保守类型，
+            // 但没理由留着这个噪声源）
+            pc += insn_len_at(body, pc).max(1);
+        }
+        let var = (0..max_locals)
+            .map(|i| match ty[i] {
+                SlotTy::One(_) => Some(cranelift_frontend::Variable::from_u32(i as u32)),
+                _ => None,
+            })
+            .collect();
+        LocalVars { ty, var }
+    }
+
+    /// 在入口块里声明所有 SSA 槽并垫零值，再把**形参**从调用方写好的 locals 区搬进来。
+    /// 形参在字节码里只被读不被写，所以不在这里搬一次的话它们永远是零。
+    fn init(&mut self, fb: &mut FunctionBuilder, ptr: Value, desc: &str, is_static: bool) {
+        for i in 0..self.var.len() {
+            let (Some(var), SlotTy::One(t)) = (self.var[i], self.ty[i]) else {
+                continue;
+            };
+            fb.declare_var(var, t);
+            let z = zero_of(fb, t);
+            fb.def_var(var, z);
+        }
+        let mut slots = param_slots(desc);
+        let mut kinds: Vec<Option<cranelift_codegen::ir::Type>> = Vec::new();
+        if !is_static {
+            for s in slots.iter_mut() {
+                *s += 1;
+            }
+            slots.insert(0, 0);
+            kinds.push(None); // this 是引用，住根区
+        }
+        for d in param_descs(desc) {
+            kinds.push(if is_ref_desc(&d) { None } else { Some(desc_ty(&d)) });
+        }
+        for (k, slot) in slots.iter().enumerate() {
+            let Some(t) = kinds.get(k).copied().flatten() else { continue };
+            let Some(var) = self.var.get(*slot).copied().flatten() else { continue };
+            if self.ty[*slot] != SlotTy::One(t) {
+                continue;
+            }
+            let addr = fb.ins().iadd_imm(ptr, (*slot * 8) as i64);
+            let v = fb.ins().load(t, MemFlags::new(), addr, 0);
+            fb.def_var(var, v);
+        }
+    }
+
+    /// 读一个 local：驻留了就直接 `use_var`，否则退回内存
+    fn load(&mut self, fb: &mut FunctionBuilder, ptr: Value, slot: usize, want: cranelift_codegen::ir::Type) -> Value {
+        if let Some(var) = self.var.get(slot).copied().flatten() {
+            if self.ty[slot] == SlotTy::One(want) {
+                return fb.use_var(var);
+            }
+        }
+        let addr = fb.ins().iadd_imm(ptr, (slot * 8) as i64);
+        fb.ins().load(want, MemFlags::new(), addr, 0)
+    }
+
+    /// 写一个 local：驻留了就 `def_var`，否则退回内存
+    fn store(
+        &mut self,
+        fb: &mut FunctionBuilder,
+        ptr: Value,
+        slot: usize,
+        want: cranelift_codegen::ir::Type,
+        v: Value,
+    ) {
+        let v = convert_to(fb, v, want);
+        if let Some(var) = self.var.get(slot).copied().flatten() {
+            if self.ty[slot] == SlotTy::One(want) {
+                fb.def_var(var, v);
+                return;
+            }
+        }
+        let addr = fb.ins().iadd_imm(ptr, (slot * 8) as i64);
+        fb.ins().store(MemFlags::new(), v, addr, 0);
+    }
+}
+
+/// 形参描述符 → 驻留类型（引用型不会走到这里）
+fn desc_ty(d: &str) -> cranelift_codegen::ir::Type {
+    match d.as_bytes().first() {
+        Some(b'J') => types::I64,
+        Some(b'D') => types::F64,
+        Some(b'F') => types::F32,
+        _ => types::I32,
+    }
+}
+
 
 /// 把引用型局部变量写进根区（局部变量区只放基本类型，引用只住根区）
 fn store_root(fb: &mut FunctionBuilder, root_ptr: Value, slot: usize, v: Value) {

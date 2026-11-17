@@ -1,0 +1,746 @@
+warning: unused import: `compile_expr`
+  --> src\codegen\class.rs:12:19
+   |
+12 | use super::expr::{compile_expr, emit_init, emit_val, needs_scratch, spill, unspill};
+   |                   ^^^^^^^^^^^^
+   |
+   = note: `#[warn(unused_imports)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused import: `std::collections::HashMap`
+  --> src\vm\mod.rs:25:5
+   |
+25 | use std::collections::HashMap;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+    --> src\vm\jni.rs:1260:1
+     |
+1260 | /// `...` 版 JNI 入口（x86_64 Windows 走裸汇编；其它架构先记一条"不支持"）
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+     = note: `#[warn(unused_doc_comments)]` (part of `#[warn(unused)]`) on by default
+
+warning: unused doc comment
+    --> src\vm\jni.rs:1343:1
+     |
+1343 | /// `NewObjectA`：分配 + 调 `<init>`，返回值是新对象
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused import: `crate::vm::heap::RefKind`
+  --> src\vm\jni.rs:44:5
+   |
+44 | use crate::vm::heap::RefKind;
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: unused doc comment
+    --> src\vm\natives.rs:1278:1
+     |
+1278 | /// `Math.random()` 的固定种子 LCG 状态（序列与 HotSpot 不同，**不能**进三路一致的样例）
+     | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ rustdoc does not generate documentation for macro invocations
+     |
+     = help: to document an item produced by a macro, the macro must produce the documentation as part of its expansion
+
+warning: unused import: `STR_BASE`
+  --> src\vm\natives.rs:10:45
+   |
+10 | use super::heap::{java_class_name, RefKind, STR_BASE};
+   |                                             ^^^^^^^^
+
+warning: unreachable pattern
+   --> src\front\parser\expr.rs:230:15
+    |
+227 |             Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Semi
+    |                                      --------- matches all the relevant values
+...
+230 |             | Tok::Star | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Bar | Tok::Caret => {
+    |               ^^^^^^^^^ no value can reach this
+    |
+    = note: `#[warn(unreachable_patterns)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+   --> src\front\parser\expr.rs:230:27
+    |
+227 |             Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Semi
+    |                                                  ---------- matches all the relevant values
+...
+230 |             | Tok::Star | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Bar | Tok::Caret => {
+    |                           ^^^^^^^^^^ no value can reach this
+
+warning: unreachable pattern
+   --> src\front\parser\expr.rs:230:40
+    |
+227 |             Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Semi
+    |                                                               ------------ matches all the relevant values
+...
+230 |             | Tok::Star | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Bar | Tok::Caret => {
+    |                                        ^^^^^^^^^^^^ no value can reach this
+
+warning: unused variable: `cp`
+    --> src\codegen\expr.rs:1100:5
+     |
+1100 |     cp: &mut CpBuilder,
+     |     ^^ help: if this is intentional, prefix it with an underscore: `_cp`
+     |
+     = note: `#[warn(unused_variables)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+  --> src\vm\class.rs:65:9
+   |
+22 | /         "java/lang/ArithmeticException"
+23 | |         | "java/lang/ArrayStoreException"
+24 | |         | "java/lang/ClassCastException"
+25 | |         | "java/lang/IllegalArgumentException"
+...  |
+32 | |         | "java/lang/SecurityException"
+33 | |         | "java/lang/ArrayIndexOutOfBoundsException" => Some("java/lang/RuntimeException"),
+   | |____________________________________________________- matches all the relevant values
+...
+65 |           "java/lang/UnsupportedOperationException" => Some("java/lang/RuntimeException"),
+   |           ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ no value can reach this
+
+warning: unused variable: `clazz`
+    --> src\vm\jni.rs:211:50
+     |
+ 209 | / macro_rules! jni {
+ 210 | |     ($fname:ident, ($($a:ident : $t:ty),* $(,)?) => $ret:ty, $default:expr, $body:block) => {
+ 211 | |         pub(crate) unsafe extern "C" fn $fname($($a: $t),*) -> $ret {
+     | |                                                  ^^
+ 212 | |             match std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || $body)) {
+...    |
+ 220 | |     };
+ 221 | | }
+     | |_- this warning originates in the macro `jni` which comes from the expansion of the macro `field_ops`
+...
+ 986 | / field_ops! {
+ 987 | |     (GetObjectField, SetObjectField, GetStaticObjectField, SetStaticObjectField, jobject,
+ 988 | |      |v: Slot| v.as_i32() as jobject,
+ 989 | |      |w: jobject| Slot::I(w as usize as i32));
+...    |
+1013 | |      |w: jdouble| Slot::F(w));
+1014 | | }
+     | |_- in this macro invocation
+     |
+help: `clazz` is captured in macro and introduced a unused variable
+    --> src\vm\jni.rs:211:50
+     |
+ 211 |           pub(crate) unsafe extern "C" fn $fname($($a: $t),*) -> $ret {
+     |                                                    ^^
+...
+ 986 | / field_ops! {
+ 987 | |     (GetObjectField, SetObjectField, GetStaticObjectField, SetStaticObjectField, jobject,
+ 988 | |      |v: Slot| v.as_i32() as jobject,
+ 989 | |      |w: jobject| Slot::I(w as usize as i32));
+...    |
+1013 | |      |w: jdouble| Slot::F(w));
+1014 | | }
+     | |_- in this macro invocation
+
+warning: variable does not need to be mutable
+   --> src\vm\mod.rs:366:13
+    |
+366 |         let mut vm = Self::from_store(ClassStore::load_path(&cp, &name)?);
+    |             ----^^
+    |             |
+    |             help: remove this `mut`
+    |
+    = note: `#[warn(unused_mut)]` (part of `#[warn(unused)]`) on by default
+
+warning: unreachable pattern
+    --> src\jit\translate.rs:1242:17
+     |
+ 745 |                 0x59 => {
+     |                 ---- matches all the relevant values
+...
+1242 |                 0x59 => {
+     |                 ^^^^ no value can reach this
+
+warning: variable does not need to be mutable
+    --> src\jit\translate.rs:2550:13
+     |
+2550 |         let mut mark = |ty: &mut Vec<SlotTy>, slot: usize, t: Option<cranelift_codegen::ir::Type>| {
+     |             ----^^^^
+     |             |
+     |             help: remove this `mut`
+
+warning: type `Frame` is more private than the item `vm::Vm::require_native`
+   --> src\vm\mod.rs:258:5
+    |
+258 | /     pub(super) fn require_native(
+259 | |         &mut self,
+260 | |         class: &str,
+261 | |         name: &str,
+262 | |         desc: &str,
+263 | |     ) -> Result<native_reg::NativeFn, VmError> {
+    | |______________________________________________^ method `vm::Vm::require_native` is reachable at visibility `pub(crate)`
+    |
+note: but type `Frame` is only usable at visibility `pub(in crate::vm)`
+   --> src\vm\frame.rs:9:1
+    |
+  9 | pub(super) struct Frame {
+    | ^^^^^^^^^^^^^^^^^^^^^^^
+    = note: `#[warn(private_interfaces)]` on by default
+
+warning: type `Frame` is more private than the item `gc::<impl vm::Vm>::gc_poll`
+    --> src\vm\gc.rs:1329:5
+     |
+1329 |     pub(crate) fn gc_poll(&mut self, frame: &mut Frame, pc: usize) {
+     |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `gc::<impl vm::Vm>::gc_poll` is reachable at visibility `pub(crate)`
+     |
+note: but type `Frame` is only usable at visibility `pub(in crate::vm)`
+    --> src\vm\frame.rs:9:1
+     |
+   9 | pub(super) struct Frame {
+     | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `Frame` is more private than the item `NativeRegistry::lookup`
+  --> src\vm\native_reg.rs:71:5
+   |
+71 |     pub(crate) fn lookup(&self, class: &str, name: &str, desc: &str) -> Option<NativeFn> {
+   |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ method `NativeRegistry::lookup` is reachable at visibility `pub(crate)`
+   |
+note: but type `Frame` is only usable at visibility `pub(in crate::vm)`
+  --> src\vm\frame.rs:9:1
+   |
+ 9 | pub(super) struct Frame {
+   | ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `MhInfo` is more private than the item `IndyState::mhs`
+   --> src\vm\shared.rs:776:5
+    |
+776 |     pub(crate) mhs: HashMap<i32, indy::MhInfo>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `IndyState::mhs` is reachable at visibility `pub(crate)`
+    |
+note: but type `MhInfo` is only usable at visibility `pub(in crate::vm)`
+   --> src\vm\indy.rs:140:1
+    |
+140 | pub(super) struct MhInfo {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `CallSiteInfo` is more private than the item `IndyState::callsites`
+   --> src\vm\shared.rs:779:5
+    |
+779 |     pub(crate) callsites: HashMap<i32, indy::CallSiteInfo>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `IndyState::callsites` is reachable at visibility `pub(crate)`
+    |
+note: but type `CallSiteInfo` is only usable at visibility `pub(in crate::vm)`
+   --> src\vm\indy.rs:185:1
+    |
+185 | pub(super) struct CallSiteInfo {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `LambdaInfo` is more private than the item `IndyState::lambdas`
+   --> src\vm\shared.rs:780:5
+    |
+780 |     pub(crate) lambdas: HashMap<i32, indy::LambdaInfo>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `IndyState::lambdas` is reachable at visibility `pub(crate)`
+    |
+note: but type `LambdaInfo` is only usable at visibility `pub(in crate::vm)`
+   --> src\vm\indy.rs:173:1
+    |
+173 | pub(super) struct LambdaInfo {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `VarHandleInfo` is more private than the item `IndyState::varhandles`
+   --> src\vm\shared.rs:781:5
+    |
+781 |     pub(crate) varhandles: HashMap<i32, indy::VarHandleInfo>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `IndyState::varhandles` is reachable at visibility `pub(crate)`
+    |
+note: but type `VarHandleInfo` is only usable at visibility `pub(in crate::vm)`
+   --> src\vm\indy.rs:190:1
+    |
+190 | pub(super) struct VarHandleInfo {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `AnnInst` is more private than the item `Shared::ann_objs`
+   --> src\vm\shared.rs:881:5
+    |
+881 |     pub(crate) ann_objs: Mutex<HashMap<i32, AnnInst>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `Shared::ann_objs` is reachable at visibility `pub(crate)`
+    |
+note: but type `AnnInst` is only usable at visibility `pub(in crate::vm)`
+   --> src\vm\reflect.rs:55:1
+    |
+ 55 | pub(super) struct AnnInst {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: type `ThreadRec` is more private than the item `Shared::threads`
+   --> src\vm\shared.rs:886:5
+    |
+886 |     pub(crate) threads: Mutex<HashMap<u64, ThreadRec>>,
+    |     ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ field `Shared::threads` is reachable at visibility `pub(crate)`
+    |
+note: but type `ThreadRec` is only usable at visibility `pub(in crate::vm)`
+   --> src\vm\thread.rs:134:1
+    |
+134 | pub(super) struct ThreadRec {
+    | ^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: methods `sync_store` and `output_snapshot` are never used
+   --> src\vm\mod.rs:196:19
+    |
+151 | impl Vm {
+    | ------- methods in this implementation
+...
+196 |     pub(crate) fn sync_store(&mut self) {
+    |                   ^^^^^^^^^^
+...
+217 |     pub(crate) fn output_snapshot(&self) -> Vec<String> {
+    |                   ^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: fields `precise` and `total` are never read
+  --> src\vm\gc.rs:89:16
+   |
+84 | pub(crate) struct MethodRefs {
+   |                   ---------- fields in this struct
+...
+89 |     pub(crate) precise: usize,
+   |                ^^^^^^^
+90 |     pub(crate) total: usize,
+   |                ^^^^^
+
+warning: method `is_conservative` is never used
+   --> src\vm\gc.rs:103:19
+    |
+ 93 | impl MethodRefs {
+    | --------------- method in this implementation
+...
+103 |     pub(crate) fn is_conservative(&self) -> bool {
+    |                   ^^^^^^^^^^^^^^^
+
+warning: function `is_ref_ty` is never used
+   --> src\vm\gc.rs:223:4
+    |
+223 | fn is_ref_ty(ty: &str) -> bool {
+    |    ^^^^^^^^^
+
+warning: function `temp_root` is never used
+   --> src\vm\gc.rs:828:15
+    |
+828 | pub(crate) fn temp_root(h: i32) -> usize {
+    |               ^^^^^^^^^
+
+warning: function `temp_unroot` is never used
+   --> src\vm\gc.rs:846:15
+    |
+846 | pub(crate) fn temp_unroot(idx: usize) {
+    |               ^^^^^^^^^^^
+
+warning: function `cards_enable` is never used
+   --> src\vm\gc.rs:956:15
+    |
+956 | pub(crate) fn cards_enable(on: bool) {
+    |               ^^^^^^^^^^^^
+
+warning: method `requested` is never used
+    --> src\vm\gc.rs:1050:19
+     |
+ 969 | impl Safepoint {
+     | -------------- method in this implementation
+...
+1050 |     pub(crate) fn requested(&self) -> bool {
+     |                   ^^^^^^^^^
+
+warning: function `in_safepoint_thread` is never used
+    --> src\vm\gc.rs:1060:15
+     |
+1060 | pub(crate) fn in_safepoint_thread() -> bool {
+     |               ^^^^^^^^^^^^^^^^^^^
+
+warning: method `meta` is never used
+   --> src\vm\load.rs:284:19
+    |
+ 67 | impl ClassStore {
+    | --------------- method in this implementation
+...
+284 |     pub(crate) fn meta(&self, class: &str) -> Option<&ClassMeta> {
+    |                   ^^^^
+
+warning: methods `inflate` and `forget` are never used
+   --> src\vm\monitors.rs:91:19
+    |
+ 82 | impl MonitorTable {
+    | ----------------- methods in this implementation
+...
+ 91 |     pub(crate) fn inflate(&self, handle: i32, owner: u64, count: u32) -> Arc<WaitSet> {
+    |                   ^^^^^^^
+...
+121 |     pub(crate) fn forget(&self, handle: i32) {
+    |                   ^^^^^^
+
+warning: function `arg_slot` is never used
+  --> src\vm\native_reg.rs:98:15
+   |
+98 | pub(super) fn arg_slot(desc: &str, i: usize) -> usize {
+   |               ^^^^^^^^
+
+warning: function `si` is never used
+   --> src\vm\native_reg.rs:115:4
+    |
+115 | fn si(f: &Frame, i: usize) -> i32 {
+    |    ^^
+
+warning: function `sl` is never used
+   --> src\vm\native_reg.rs:118:4
+    |
+118 | fn sl(f: &Frame, i: usize) -> i64 {
+    |    ^^
+
+warning: function `sf` is never used
+   --> src\vm\native_reg.rs:121:4
+    |
+121 | fn sf(f: &Frame, i: usize) -> f32 {
+    |    ^^
+
+warning: function `sd` is never used
+   --> src\vm\native_reg.rs:124:4
+    |
+124 | fn sd(f: &Frame, i: usize) -> f64 {
+    |    ^^
+
+warning: constant `JNI_WEAK_GLOBAL_REF` is never used
+  --> src\vm\jni.rs:78:18
+   |
+78 | pub(crate) const JNI_WEAK_GLOBAL_REF: jint = 3;
+   |                  ^^^^^^^^^^^^^^^^^^^
+
+warning: variant `Object` is never constructed
+   --> src\vm\jni.rs:347:5
+    |
+338 | enum ElemKind {
+    |      -------- variant in this enum
+...
+347 |     Object,
+    |     ^^^^^^
+    |
+    = note: `ElemKind` has a derived impl for the trait `Clone`, but this is intentionally ignored during dead code analysis
+
+warning: function `is_str` is never used
+   --> src\vm\jni.rs:515:4
+    |
+515 | fn is_str(h: i32) -> bool {
+    |    ^^^^^^
+
+warning: function `slot_to_bits` is never used
+    --> src\vm\jni.rs:1117:4
+     |
+1117 | fn slot_to_bits(v: Slot) -> u64 {
+     |    ^^^^^^^^^^^^
+
+warning: field `version` is never read
+   --> src\vm\jni_lib.rs:107:5
+    |
+103 | struct Lib {
+    |        --- field in this struct
+...
+107 |     version: i32,
+    |     ^^^^^^^
+
+warning: type alias `OnUnload` is never used
+   --> src\vm\jni_lib.rs:376:6
+    |
+376 | type OnUnload = unsafe extern "C" fn(*mut c_void, *mut c_void);
+    |      ^^^^^^^^
+
+warning: function `unload_library` is never used
+   --> src\vm\jni_lib.rs:457:15
+    |
+457 | pub(crate) fn unload_library(vm: &mut Vm, path: &str) {
+    |               ^^^^^^^^^^^^^^
+
+warning: function `bound_count` is never used
+   --> src\vm\jni_lib.rs:524:15
+    |
+524 | pub(crate) fn bound_count() -> usize {
+    |               ^^^^^^^^^^^
+
+warning: function `bound_entries` is never used
+   --> src\vm\jni_lib.rs:529:15
+    |
+529 | pub(crate) fn bound_entries() -> Vec<(String, String, String)> {
+    |               ^^^^^^^^^^^^^
+
+warning: constant `ACC_SYNTHETIC` is never used
+  --> src\vm\reflect.rs:49:18
+   |
+49 | pub(super) const ACC_SYNTHETIC: u16 = 0x1000;
+   |                  ^^^^^^^^^^^^^
+
+warning: constant `ACC_ANNOTATION` is never used
+  --> src\vm\reflect.rs:50:18
+   |
+50 | pub(super) const ACC_ANNOTATION: u16 = 0x2000;
+   |                  ^^^^^^^^^^^^^^
+
+warning: constant `ACC_ENUM` is never used
+  --> src\vm\reflect.rs:51:18
+   |
+51 | pub(super) const ACC_ENUM: u16 = 0x4000;
+   |                  ^^^^^^^^
+
+warning: methods `ann_member` and `class_desc` are never used
+   --> src\vm\reflect.rs:308:8
+    |
+225 | impl Vm {
+    | ------- methods in this implementation
+...
+308 |     fn ann_member(&self, recv: i32, name: &str) -> Option<AnnVal> {
+    |        ^^^^^^^^^^
+...
+420 |     pub(super) fn class_desc(&self, h: i32) -> Option<String> {
+    |                   ^^^^^^^^^^
+
+warning: constant `TLAB_CELLS` is never used
+   --> src\vm\shared.rs:337:7
+    |
+337 | const TLAB_CELLS: usize = 256;
+    |       ^^^^^^^^^^
+
+warning: struct `Tlab` is never constructed
+   --> src\vm\shared.rs:344:8
+    |
+344 | struct Tlab {
+    |        ^^^^
+
+warning: associated constant `EMPTY` is never used
+   --> src\vm\shared.rs:352:11
+    |
+351 | impl Tlab {
+    | --------- associated constant in this implementation
+352 |     const EMPTY: Tlab = Tlab { owner: 0, start: 0, next: 0, end: 0 };
+    |           ^^^^^
+
+warning: methods `len`, `is_string`, `str_handles_clear`, `str_fields_ensure`, and `is_live_handle` are never used
+   --> src\vm\shared.rs:503:19
+    |
+387 | impl Heap {
+    | --------- methods in this implementation
+...
+503 |     pub(crate) fn len(&self, h: i32) -> usize {
+    |                   ^^^
+...
+569 |     pub(crate) fn is_string(&self, h: i32) -> bool {
+    |                   ^^^^^^^^^
+...
+586 |     pub(crate) fn str_handles_clear(&self) {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+613 |     pub(crate) fn str_fields_ensure(&self, h: i32, n: usize) -> Vec<Slot> {
+    |                   ^^^^^^^^^^^^^^^^^
+...
+658 |     pub(crate) fn is_live_handle(&self, h: i32) -> bool {
+    |                   ^^^^^^^^^^^^^^
+
+warning: field `gc_lock` is never read
+   --> src\vm\shared.rs:909:16
+    |
+860 | pub(crate) struct Shared {
+    |                   ------ field in this struct
+...
+909 |     pub(crate) gc_lock: Mutex<()>,
+    |                ^^^^^^^
+
+warning: methods `output_push`, `output_take`, and `output_drain` are never used
+   --> src\vm\shared.rs:971:19
+    |
+914 | impl Shared {
+    | ----------- methods in this implementation
+...
+971 |     pub(crate) fn output_push(&self, line: String) {
+    |                   ^^^^^^^^^^^
+...
+975 |     pub(crate) fn output_take(&self) -> Vec<String> {
+    |                   ^^^^^^^^^^^
+...
+979 |     pub(crate) fn output_drain(&self) -> Vec<String> {
+    |                   ^^^^^^^^^^^^
+
+warning: methods `thread_is_alive` and `thread_join` are never used
+   --> src\vm\thread.rs:180:19
+    |
+155 | impl Vm {
+    | ------- methods in this implementation
+...
+180 |     pub(super) fn thread_is_alive(&self, tid: u64) -> bool {
+    |                   ^^^^^^^^^^^^^^^
+...
+847 |     pub(super) fn thread_join(&mut self, target: i32, timeout: Option<Duration>) -> Result<(), VmError> {
+    |                   ^^^^^^^^^^^
+
+warning: function `entries_push` is never used
+   --> src\jit\natives.rs:982:4
+    |
+982 | fn entries_push(v: &mut Vec<i64>, x: i64) {
+    |    ^^^^^^^^^^^^
+
+warning: function `is_ref_desc` is never used
+   --> src\jit\refmap.rs:272:4
+    |
+272 | fn is_ref_desc(d: &str) -> bool {
+    |    ^^^^^^^^^^^
+
+warning: function `find_invokedynamic` is never used
+    --> src\jit\translate.rs:2759:4
+     |
+2759 | fn find_invokedynamic(body: &[u8]) -> Option<usize> {
+     |    ^^^^^^^^^^^^^^^^^^
+
+warning: comparison is useless due to type limits
+   --> src\vm\gc.rs:371:20
+    |
+371 |                 if pc >= 0 {
+    |                    ^^^^^^^
+    |
+    = note: `#[warn(unused_comparisons)]` on by default
+
+warning: direct cast of function item into an integer
+    --> src\vm\jni.rs:2620:55
+     |
+2620 |         let (rax, _) = unsafe { call_native_ffi(c_add as usize, &[2, 3], &[0, 0]) };
+     |                                                       ^^^^^^^^
+     |
+     = note: `#[warn(function_casts_as_integer)]` on by default
+help: first cast to a pointer `as *const ()`
+     |
+2620 |         let (rax, _) = unsafe { call_native_ffi(c_add as *const () as usize, &[2, 3], &[0, 0]) };
+     |                                                       ++++++++++++
+
+warning: direct cast of function item into an integer
+    --> src\vm\jni.rs:2629:23
+     |
+2629 |                 c_mix as usize,
+     |                       ^^^^^^^^
+     |
+help: first cast to a pointer `as *const ()`
+     |
+2629 |                 c_mix as *const () as usize,
+     |                       ++++++++++++
+
+warning: direct cast of function item into an integer
+    --> src\vm\jni.rs:2640:56
+     |
+2640 |         let (rax, _) = unsafe { call_native_ffi(c_many as usize, &[1, 2, 3, 4, 5, 6, 7], &[0; 7]) };
+     |                                                        ^^^^^^^^
+     |
+help: first cast to a pointer `as *const ()`
+     |
+2640 |         let (rax, _) = unsafe { call_native_ffi(c_many as *const () as usize, &[1, 2, 3, 4, 5, 6, 7], &[0; 7]) };
+     |                                                        ++++++++++++
+
+warning: direct cast of function item into an integer
+    --> src\jit\natives.rs:1178:22
+     |
+1178 |         itr_has_next as usize,
+     |                      ^^^^^^^^
+     |
+help: first cast to a pointer `as *const ()`
+     |
+1178 |         itr_has_next as *const () as usize,
+     |                      ++++++++++++
+
+warning: direct cast of function item into an integer
+    --> src\jit\natives.rs:1184:18
+     |
+1184 |         itr_next as usize,
+     |                  ^^^^^^^^
+     |
+help: first cast to a pointer `as *const ()`
+     |
+1184 |         itr_next as *const () as usize,
+     |                  ++++++++++++
+
+warning: `rustjavac` (lib test) generated 87 warnings (17 duplicates) (run `cargo fix --lib -p rustjavac --tests` to apply 12 suggestions)
+    Finished `release` profile [optimized] target(s) in 0.11s
+     Running unittests src\lib.rs (D:\vmless\rt_jni2\release\build\rustjavac/8234b0025d2b0f27\out\classfile-8234b0025d2b0f27.exe)
+
+running 85 tests
+test classfile::annot::tests::reads_class_annotations_when_present ... ok
+test classfile::tests::float_text_matches_java ... ok
+test classfile::tests::reads_this_class_name ... ok
+test classfile::tests::double_text_matches_java ... ok
+test classfile::tests::roundtrip_is_byte_identical ... ok
+test codegen::simple::tests::code_attribute_is_well_formed ... ok
+test codegen::simple::tests::constant_pool_dedupes ... ok
+test front::lexer::tests::skips_comments ... ok
+test codegen::simple::tests::generates_parsable_class ... ok
+test front::lexer::tests::handles_unicode_escape ... ok
+test front::lexer::tests::lexes_basic_java ... ok
+test codegen::tests::method_descriptors_are_correct ... ok
+test front::parser::tests::parses_record_and_sealed ... ok
+test front::lexer::tests::lexes_text_block_and_lambda ... ok
+test load::cli::tests::describe_module_flag ... ok
+test front::parser::tests::parses_enum_with_body ... ok
+test load::cli::tests::parses_module_path_short_and_long ... ok
+test codegen::tests::compiles_main_with_println ... ok
+test load::jhash::tests::set_iteration_is_bucket_order ... ok
+test codegen::tests::compiles_addition_method ... ok
+test front::parser::tests::parses_hello ... ok
+test front::parser::tests::parses_switch_arrow_and_pattern ... ok
+test load::cli::tests::add_opens_repeatable_last_wins ... ok
+test load::modgraph::tests::detects_split_package ... ok
+test load::cli::tests::module_launch_parsed ... ok
+test jit::divmod::tests::magic_precondition_holds ... ok
+test load::jhash::tests::table_sizes ... ok
+test load::jhash::tests::string_hash_matches_java ... ok
+test load::modgraph::tests::detects_cycle ... ok
+test load::cli::tests::bad_rule_reports ... ok
+test front::parser::tests::parses_generics_and_lambda ... ok
+test load::modgraph::tests::requires_flags_printed ... ok
+test load::modules::tests::add_exports_opens_the_door ... ok
+test load::modules::tests::exported_package_ok_others_denied ... ok
+test load::modules::tests::qualified_export_only_for_named_target ... ok
+test load::modules::tests::reflect_needs_opens_for_private ... ok
+test load::modgraph::tests::topo_puts_dependencies_first ... ok
+test load::modules::tests::same_module_always_ok ... ok
+test lower::tests::lowers_ref_bitmap_to_runtime_meta ... ok
+test sema::enums::tests::desugars_enum_with_constant_args ... ok
+test sema::enums::tests::desugars_simple_enum ... ok
+test sema::enums::tests::rejects_constant_args_without_ctor ... ok
+test sema::erase::tests::array_of_type_parameter_erases ... ok
+test sema::erase::tests::bound_is_used_when_present ... ok
+test sema::erase::tests::method_type_parameter_erases ... ok
+test sema::erase::tests::type_parameter_becomes_object ... ok
+test sema::qualify::tests::no_package_keeps_types_as_is ... ok
+test sema::tests::builds_symbol_table_with_field_kinds ... ok
+test sema::qualify::tests::qualifies_same_package_types ... ok
+test sema::tests::constructors_are_not_methods ... ok
+test sema::tests::nested_types_are_collected ... ok
+test sema::tests::record_components_become_fields ... ok
+test vm::indy::tests::as_type_conversions ... ok
+test vm::indy::tests::converts_primitives ... ok
+test vm::indy::tests::handle_types_include_receiver ... ok
+test vm::indy::tests::method_type_to_string_uses_simple_names ... ok
+test vm::indy::tests::parses_concat_recipes ... ok
+test vm::indy::tests::parses_descriptors ... ok
+test vm::native_reg::jni::tests::calls_c_with_integer_args ... ok
+test vm::native_reg::jni::tests::calls_c_with_mixed_float_args ... ok
+test vm::native_reg::jni::tests::calls_c_with_stack_args ... ok
+test vm::native_reg::jni::tests::global_ref_table_returns_to_baseline ... ok
+test vm::native_reg::jni::tests::reports_implemented_vs_missing_slots ... ok
+test vm::native_reg::jni::tests::slot_table_matches_jni_h_ordering ... ok
+test vm::native_reg::jni::tests::table_has_no_null_slots ... ok
+test vm::native_reg::jni_lib::tests::mangles_jni_symbol_names ... ok
+test vm::native_reg::jni_lib::tests::maps_library_names_per_platform ... ok
+test vm::reflect::tests::hashmap_iteration_order_matches_java ... ok
+test vm::reflect::tests::maps_descriptors_to_class_names ... ok
+test vm::reflect::tests::nest_prefix_is_top_level_class ... ok
+test vm::reflect::tests::quotes_annotation_strings_like_jdk ... ok
+test vm::reflect::tests::splits_method_descriptors ... ok
+test vm::tests::counts_descriptor_args ... ok
+test vm::tests::define_class_at_runtime ... ok
+test vm::tests::boxes_and_unboxes_implicitly ... ok
+test vm::tests::runs_arithmetic ... ok
+test vm::tests::not_equal_operator_is_not_swallowed ... ok
+test vm::tests::builtin_string_methods ... ok
+test vm::tests::runs_if_else ... ok
+test vm::tests::object_protocol_defaults ... ok
+test vm::tests::runs_while_loop ... ok
+test vm::tests::runs_objects_and_fields ... ok
+test vm::tests::runs_long_and_double ... ok
+test jit::divmod::tests::divmod_const_i64_sampled ... ok
+test jit::divmod::tests::divmod_const_i32_exhaustive has been running for over 60 seconds

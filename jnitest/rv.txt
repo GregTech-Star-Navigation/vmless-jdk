@@ -1,0 +1,3 @@
+reg: JNI_OnLoad + RegisterNatives ok
+triple=42
+greet=hello world

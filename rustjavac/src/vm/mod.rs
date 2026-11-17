@@ -288,6 +288,20 @@ impl Vm {
         thread::set_main_tid();
         self.sh.safepoint.register();
         self.thread_register(1, 0, "main", false);
+        // 真字节码模式下，JVM 在跑 main 之前会先执行 `System.initPhase1()`：
+        // 它填 `System.props`（`java.home`/`java.class.path` 等）、装 `SharedSecrets`
+        // （`JavaLangAccess` / `JavaLangReflectAccess`）、设置 `System.out/err/in`。
+        // 不跑这一步，`System.getProperties()` 恒为 null，`System.loadLibrary` 之类
+        // 会直接 `InternalError: null property: java.home`。
+        //
+        // 独立模式（没有 java.base 字节码）里没有这个方法，`resolve_method` 返回 None，跳过即可。
+        if self.store.resolve_method("java/lang/System", "initPhase1", "()V").is_some() {
+            self.ensure_init("java/lang/System")?;
+            if let Some((ci, mi)) = self.store.resolve_method("java/lang/System", "initPhase1", "()V") {
+                // 失败不致命：有些 JDK 版本里它有前置条件。后面真出错会以更具体的错误暴露。
+                let _ = self.execute(ci, mi, "()V", &[], false);
+            }
+        }
         let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);
         // 主线程返回 ≠ 进程退出：非 daemon 线程要继续跑完（`System.exit` 已经在 native 里直接退）
         self.wait_non_daemon();

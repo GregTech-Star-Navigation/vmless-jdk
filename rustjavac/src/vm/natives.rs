@@ -536,6 +536,19 @@ impl Vm {
         desc: &str,
         args: &[Slot],
     ) -> Option<Result<Slot, VmError>> {
+        // `System.loadLibrary` / `System.load`：内建方法表里没有它们（真 java.base 里
+        // 这两个是**普通方法**，走 Runtime → ClassLoader 那条链），但**独立模式**下
+        // `java.lang.System` 就是内建替身类，调用会落到这里 —— JNI 的库装载入口。
+        if class == "java/lang/System" && (name == "loadLibrary" || name == "load") && desc == "(Ljava/lang/String;)V"
+        {
+            let h = args.first().copied().unwrap_or(Slot::I(0)).as_i32();
+            let lib = self.text_of(h);
+            let r = super::native_reg::jni_lib::load_library(self, &lib, name == "load");
+            return Some(match r {
+                Ok(()) => Ok(Slot::I(0)),
+                Err(e) => Err(e),
+            });
+        }
         let op = jdk::sop(class, name, desc)?;
         Some(self.builtin_static_op(op, args))
     }

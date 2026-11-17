@@ -1,5 +1,8 @@
 //! 栈帧：局部槽（按 JVM 槽编号，宽值占两槽）与操作数栈。
 
+use std::sync::Arc;
+
+use super::gc::MethodRefs;
 use super::slot::Slot;
 use super::VmError;
 
@@ -13,6 +16,14 @@ pub(super) struct Frame {
     pub(super) arg_slots: Vec<usize>,
     /// 参数从哪个槽开始（实例方法 1 = this 占槽 0；静态方法 0）
     pub(super) arg_base: usize,
+    /// 当前字节码偏移（**GC 找根用**）：`gc_tick` / 调用点会把它写成「下一条要执行的
+    /// 指令偏移」，GC 拿 `refs[pc]` 得到这一点的引用位图。停在别的值时保守扫描。
+    pub(super) pc: usize,
+    /// 本方法的引用位图（`gc::MethodRefs`）。None = 没有（native 帧 / 未算出来）→
+    /// GC 对这个帧退化成「所有槽都当潜在引用，逐个用页表验证」。
+    pub(super) refs: Option<Arc<MethodRefs>>,
+    /// native 帧的引用位图（按描述符算，locals 里只有参数）
+    pub(super) nrefs: Option<Arc<[u64]>>,
 }
 
 impl Frame {
@@ -22,6 +33,9 @@ impl Frame {
             stack: Vec::new(),
             arg_slots: Vec::new(),
             arg_base: 0,
+            pc: usize::MAX,
+            refs: None,
+            nrefs: None,
         }
     }
     pub(super) fn push(&mut self, v: Slot) {

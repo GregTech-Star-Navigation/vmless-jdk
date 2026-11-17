@@ -15,8 +15,10 @@ use crate::{parse, ClassFile};
 
 mod call;
 mod classes;
+mod divmod;
 mod exc;
 mod indy;
+mod inline;
 mod insn;
 mod pure;
 mod layout;
@@ -47,6 +49,8 @@ pub struct Jit {
     interpreted: std::collections::HashMap<(String, String, String), String>,
     /// 成功编译的方法个数（= `compiled` 里真正 define 过的那些）
     n_compiled: usize,
+    /// 内联掉的调用点个数（`jit::inline` 的账）
+    n_inlined: usize,
 }
 
 #[derive(Debug)]
@@ -59,6 +63,10 @@ impl Jit {
         let mut flag_builder = settings::builder();
         flag_builder.set("use_colocated_libcalls", "false").unwrap();
         flag_builder.set("is_pic", "false").unwrap();
+        // Cranelift 的默认 opt_level 是 **none**：不跑 egraph 那一套
+        // （GVN/CSE、常量折叠、别名分析、LICM、死代码消除全在里面）。
+        // 不设这个等于把生成代码的质量白白交出去 —— 实测把 P2 从 390ms 压到 ~250ms。
+        flag_builder.set("opt_level", "speed").unwrap();
         let isa_builder = cranelift_native::builder().expect("native isa");
         let isa = isa_builder
             .finish(settings::Flags::new(flag_builder))
@@ -127,6 +135,7 @@ impl Jit {
             clinit_started: std::collections::HashSet::new(),
             interpreted: std::collections::HashMap::new(),
             n_compiled: 0,
+            n_inlined: 0,
         }
     }
 
@@ -253,8 +262,9 @@ impl Jit {
             format!("（原因：{}）", parts.join("、"))
         };
         format!(
-            "JIT: 编译 {} 个方法，解释 {} 个{}",
+            "JIT: 编译 {} 个方法，内联 {} 个调用点，解释 {} 个{}",
             self.n_compiled,
+            self.n_inlined,
             self.interpreted.len(),
             detail
         )

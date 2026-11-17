@@ -1,0 +1,11 @@
+hello: JNI_OnLoad ok
+add=5
+echo=C[Hello, 中文]9/13
+sum=10 first=100 last=200
+caught=boom 中文
+globalRefs=100
+box=42
+scale=5.0
+cb=来自 C 的回调
+fieldOld=42 fieldNew=49
+hi from C

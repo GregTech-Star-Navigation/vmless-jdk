@@ -31,6 +31,42 @@ fn is_str_handle(h: i32) -> bool {
 }
 
 impl Vm {
+    /// 这个方法的引用位图（按 `(ClassFile 地址, 方法下标)` 缓存，第一次执行时算）。
+    ///
+    /// 缓存里连 `Arc<ClassFile>` 一起存 —— 这样 ClassFile 不会被释放、指针不会被复用，
+    /// 也就不会出现「拿到另一份类文件的位图」这种灾难。
+    #[allow(clippy::too_many_arguments)]
+    fn method_refs(
+        &self,
+        cf: &std::sync::Arc<crate::ClassFile>,
+        method: usize,
+        desc: &str,
+        max_locals: usize,
+        is_static: bool,
+        body: &[u8],
+        exc: &[(u16, u16, u16, u16)],
+    ) -> std::sync::Arc<super::gc::MethodRefs> {
+        let key = (std::sync::Arc::as_ptr(cf) as usize, method);
+        if let Some((c, m)) = self
+            .sh
+            .refmaps
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+        {
+            if std::sync::Arc::ptr_eq(c, cf) {
+                return std::sync::Arc::clone(m);
+            }
+        }
+        let m = std::sync::Arc::new(super::gc::analyze(cf, body, desc, max_locals, is_static, exc));
+        self.sh
+            .refmaps
+            .write()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(key, (std::sync::Arc::clone(cf), std::sync::Arc::clone(&m)));
+        m
+    }
+
     /// `ldc` / `ldc_w`：int / float / String / **Class** / **MethodHandle** / **MethodType** /
     /// **CONSTANT_Dynamic** 常量（都只占一个槽）
     pub(super) fn ldc(&mut self, class: usize, index: u16) -> Result<Slot, VmError> {
@@ -166,6 +202,12 @@ impl Vm {
 
         let mut frame = Frame::new(max_locals);
         native_reg::place_args(&mut frame, desc, args, receiver);
+        // 引用位图：这个方法的每个 pc 上「哪些槽是引用」（GC 找根的唯一依据）。
+        // 算一次缓存起来，之后每个调用点只是一次读锁 + 一次哈希。
+        let is_static = m.access_flags & 0x0008 != 0;
+        frame.refs = Some(self.method_refs(&cf, method, desc, max_locals, is_static, body, &exc_table));
+        // 登记到本线程的根集（异常/提前返回时由 Drop 摘掉）
+        let _frame_guard = super::gc::FrameGuard::push(&frame, self as *const Vm);
 
         // 调用点上的异常：被调方抛出来的 Java 异常不能直接往上冒 ——
         // 先看本方法的异常表接不接得住（接住就按 handler 入口继续跑）。
@@ -192,13 +234,24 @@ impl Vm {
         let trace = std::env::var_os("VMLESS_TRACE").is_some();
         let mut pc = 0usize;
         while pc < body.len() {
+            // 让 GC 知道「当前执行到哪条指令」：栈上只多一个 usize，换来的是任何时刻
+            // （包括被调方正在跑、本帧停着不动）都能拿到**精确**的引用位图。
+            frame.pc = pc;
             // 抢占点：多线程时定期交还 GIL。没有它，一个死循环（或长计算）线程会把
             // 别的 Java 线程饿死 —— `Thread.start` 之后对方永远跑不上来。
             // 单线程时这里只是一次整数比较，不进函数。
             self.tick += 1;
-            if self.tick >= super::thread::SAFEPOINT_EVERY {
+            if self.sh.gc_stress {
+                // 压力模式：GC 检查点密得多（把漏根立刻打成崩溃，而不是攒到后面）
+                if self.tick >= 64 {
+                    self.tick = 0;
+                    self.safepoint();
+                    self.gc_poll(&mut frame, pc);
+                }
+            } else if self.tick >= super::thread::SAFEPOINT_EVERY {
                 self.tick = 0;
                 self.safepoint();
+                self.gc_poll(&mut frame, pc);
             }
             let op = body[pc];
             if trace {
