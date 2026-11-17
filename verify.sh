@@ -37,11 +37,15 @@ Float1 Float2 Float3 FloatMath FloatPrint Cast1 SwitchTable ArrInit1 ArrInit2"
 # 跑一遍三方，回填全局 jo/io/to/je/ie/te
 run_three() {
     local c="$1" d="$2" cls="$3"
-    jo=$("$JAVA" -cp "$d" "$c" 2>/dev/null | tr -d '\r'); je=$?
-    io=$("$BIN/rustjava.exe" "$cls" 2>/dev/null | tr -d '\r'); ie=$?
-    to=$("$BIN/run_jit.exe" "$cls" 2>/dev/null | tr -d '\r'); te=$?
+    # 一律带超时：挂死不能伪装成「跑完了，只是慢」。124 = timeout，会被 same() 判成不一致
+    jo=$(timeout 30 "$JAVA" -cp "$d" "$c" 2>/dev/null | tr -d '\r'); je=$?
+    io=$(timeout 30 "$BIN/rustjava.exe" "$cls" 2>/dev/null | tr -d '\r'); ie=$?
+    to=$(timeout 30 "$BIN/run_jit.exe" "$cls" 2>/dev/null | tr -d '\r'); te=$?
 }
 same() {
+    # 退出码相等 + 输出逐字节相等；另外空输出一律算失败
+    # （曾经出现过 exit=0 但一行没输出的假绿，那是输出没刷出来）
+    [ -n "$jo" ] || return 1
     [ "$jo" = "$io" ] && [ "$jo" = "$to" ] && [ "$je" = "$ie" ] && [ "$je" = "$te" ]
 }
 
