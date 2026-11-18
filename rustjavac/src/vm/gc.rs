@@ -29,6 +29,7 @@
 //! 3. 共享冷表（静态字段、类对象表、字符串常量表、indy 状态、监视器表、线程表…），
 //!    一律按「表里出现的 i32 都可能是句柄」处理并逐个用页表验证（表都很小，多标有界）。
 
+use super::shared::GcKind;
 use std::collections::{HashMap, VecDeque};
 use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
@@ -1118,6 +1119,12 @@ struct Marker<'a> {
     marked: u64,
     /// 只标记不扫槽（`VMLESS_GC_NOSCAN=1`，量时间构成用）
     noscan: bool,
+    /// 只收年轻代：老对象一律**不追**（它的年轻代引用由脏位图负责，见 `heap.set_ref`）
+    minor: bool,
+    lo_obj: u32,
+    lo_arr: u32,
+    /// 本轮标到的年轻代字节数（存活率反馈给 eden 自适应）
+    marked_bytes: u64,
     /// 校验/统计：精确帧 / 保守帧 / 位图失配帧
     verify: bool,
     f_precise: u64,
@@ -1135,6 +1142,10 @@ impl<'a> Marker<'a> {
             marked: 0,
             verify: std::env::var("VMLESS_GC_VERIFY").map(|v| v != "0").unwrap_or(false),
             noscan: std::env::var("VMLESS_GC_NOSCAN").map(|v| v != "0").unwrap_or(false),
+            minor: false,
+            lo_obj: 0,
+            lo_arr: 0,
+            marked_bytes: 0,
             f_precise: 0,
             f_conservative: 0,
             f_mismatch: 0,
@@ -1152,21 +1163,30 @@ impl<'a> Marker<'a> {
             return;
         }
         let heap = &self.sh.heap;
-        if !heap.mark(h, self.epoch) {
-            // 要么已经标过，要么句柄早就失效（已回收）
-            return;
+        // 页表只查一次：句柄已失效（已回收）/ 堆外句柄直接返回
+        let Some(o) = heap.hdr(h) else { return };
+        if self.minor && self.is_old(h, o) {
+            return; // 老对象这轮不收也不追：它的年轻代引用已经从脏位图来的
+        }
+        if !heap.mark_ptr(o as *const _, self.epoch) {
+            return; // 已经标过
         }
         self.marked += 1;
-        let Some(o) = heap.hdr(h) else { return };
-        let n = o.len();
-        for i in 0..n {
-            if o.refs.is_ref(i) {
-                if let Some(Slot::I(v)) = o.get(i) {
-                    if v != 0 {
-                        self.work.push(v);
-                    }
-                }
-            }
+        if self.minor {
+            self.marked_bytes += o.bytes();
+            o.scan_refs_young(&mut self.work, self.lo_obj, self.lo_arr);
+        } else {
+            o.scan_refs(&mut self.work);
+        }
+    }
+
+    /// 这个句柄指向的是不是老对象（`minor` 用）
+    #[inline]
+    fn is_old(&self, h: i32, _o: &super::shared::ObjHdr) -> bool {
+        if h > 0 {
+            ((h - 1) as u32) < self.lo_obj
+        } else {
+            ((-h - 1) as u32) < self.lo_arr
         }
     }
 
@@ -1188,24 +1208,25 @@ impl<'a> Marker<'a> {
         if o.is_null() {
             return;
         }
+        if self.minor && self.is_old(h, unsafe { &*o }) {
+            return;
+        }
         let heap = &self.sh.heap;
         if !heap.mark_ptr(o, self.epoch) {
             return;
         }
         self.marked += 1;
         let o = unsafe { &*o };
+        if self.minor {
+            self.marked_bytes += o.bytes();
+        }
         if self.noscan {
             return; // 只做「标记」不扫槽（量时间构成用，结果不完整）
         }
-        let n = o.len();
-        for i in 0..n {
-            if o.refs.is_ref(i) {
-                if let Some(Slot::I(v)) = o.get(i) {
-                    if v != 0 {
-                        self.work.push(v);
-                    }
-                }
-            }
+        if self.minor {
+            o.scan_refs_young(&mut self.work, self.lo_obj, self.lo_arr);
+        } else {
+            o.scan_refs(&mut self.work);
         }
         let _ = h;
     }
@@ -1435,20 +1456,35 @@ fn scan_shared_roots(m: &mut Marker) {
 ///
 /// 标记是**幂等**的（同一对象只扫一次，靠 epoch 的原子读写；重复扫描只是白干，无害），
 /// 所以不需要给堆分区，抢一个全局队列最简单也最不容易错。
-fn mark_all(sh: &Arc<Shared>, epoch: u32, seeds: &mut Vec<i32>) -> u64 {
+fn mark_all(sh: &Arc<Shared>, epoch: u32, seeds: &mut Vec<i32>, kind: GcKind) -> (u64, u64) {
+    let (minor, lo_obj, lo_arr) =
+        (kind == GcKind::Minor, sh.heap.young_lo_obj(), sh.heap.young_lo_arr());
     let threads = gc_threads();
     // 并行实际能省多少，取决于**这一轮有多少活干**；起一个线程约 60µs（Windows），
-    // 7 个就是 0.4ms —— 那比标一千个对象还贵。所以判据取「上一轮真正标了多少」
-    // （`last_marked`）；第一轮还没有历史值时才退回 `live()`。
-    let hint = match sh.heap.last_marked.load(Ordering::Acquire) {
-        0 => sh.heap.live(),
-        n => n,
+    // 7 个就是 0.4ms —— 那比标一千个对象还贵。所以判据取「同类上一轮真正标了多少」；
+    // 第一轮还没有历史值时才退回 `live()`。
+    //
+    // **全量必须看全量自己的历史**：年轻代回收只标几千个对象，若共用一份 `last_marked`，
+    // 每次全量都会因为「上一轮是年轻代回收」而判成单线程 —— 那是本文件里最容易
+    // 悄悄退化的地方（实测 GcBench 8M/1M：单线程 47ms，8 线程 7ms）。
+    let hint = match kind {
+        GcKind::Major => match sh.heap.last_major_marked.load(Ordering::Acquire) {
+            0 => sh.heap.live(),
+            n => n,
+        },
+        _ => match sh.heap.last_marked.load(Ordering::Acquire) {
+            0 => sh.heap.live(),
+            n => n,
+        },
     };
     if threads <= 1 || seeds.is_empty() || hint < 20_000 {
         let mut m = Marker::new(sh, epoch);
+        m.minor = minor;
+        m.lo_obj = lo_obj;
+        m.lo_arr = lo_arr;
         m.work.append(seeds);
         m.drain();
-        return m.marked;
+        return (m.marked, m.marked_bytes);
     }
     let shared = Arc::new(Work {
         m: Mutex::new(WorkQ { q: std::mem::take(seeds), busy: 0 }),
@@ -1460,8 +1496,11 @@ fn mark_all(sh: &Arc<Shared>, epoch: u32, seeds: &mut Vec<i32>) -> u64 {
         let s2 = Arc::clone(sh);
         match std::thread::Builder::new().name("gc-mark".into()).spawn(move || {
             let mut m = Marker::new(&s2, epoch);
+            m.minor = minor;
+            m.lo_obj = lo_obj;
+            m.lo_arr = lo_arr;
             mark_worker(&w, &mut m);
-            m.marked
+            (m.marked, m.marked_bytes)
         }) {
             Ok(h) => handles.push(h),
             Err(_) => break,
@@ -1469,19 +1508,24 @@ fn mark_all(sh: &Arc<Shared>, epoch: u32, seeds: &mut Vec<i32>) -> u64 {
     }
     // 发起者自己也干活（否则白等一个核）
     let mut m = Marker::new(sh, epoch);
+    m.minor = minor;
+    m.lo_obj = lo_obj;
+    m.lo_arr = lo_arr;
     mark_worker(&shared, &mut m);
     let mut total = m.marked;
+    let mut tbytes = m.marked_bytes;
     for h in handles {
         if let Ok(v) = h.join() {
-            total += v;
+            total += v.0;
+            tbytes += v.1;
         }
     }
-    total
+    (total, tbytes)
 }
 
-const MARK_BATCH: usize = 1024;
-const MARK_FLUSH: usize = 4096;
-const MARK_CHUNK: usize = 32;
+const MARK_BATCH: usize = 16384;
+const MARK_FLUSH: usize = 16384;
+const MARK_CHUNK: usize = 512;
 
 struct WorkQ {
     q: Vec<i32>,
@@ -1566,7 +1610,9 @@ fn gc_threads() -> usize {
     if let Some(v) = std::env::var("VMLESS_GC_THREADS").ok().and_then(|v| v.parse::<usize>().ok()) {
         return v.max(1);
     }
-    std::thread::available_parallelism().map(|n| n.get().min(8)).unwrap_or(1).max(1)
+    // 上限 16：实测 8→16 线程全量标记 16.8ms → 13.7ms，24 线程以上不再涨
+    // （瓶颈是内存延迟/带宽，不是线程数）。再多只是白起线程。
+    std::thread::available_parallelism().map(|n| n.get().min(16)).unwrap_or(1).max(1)
 }
 
 /// 进程启动时刻（退避计时用；懒初始化，只在真要发起回收时才读时钟）
@@ -1579,6 +1625,7 @@ fn now_ms() -> u64 {
 
 /// 一轮回收的统计
 pub(crate) struct GcStats {
+    pub minor: bool,
     pub pause_us: u64,
     pub freed: u32,
     pub freed_bytes: u64,
@@ -1587,19 +1634,30 @@ pub(crate) struct GcStats {
 }
 
 impl Shared {
-    /// 现在轮到 GC 了吗（分配量超过阈值）
+    /// 这一轮该做哪种回收（`None` = 还不用收）
+    ///
+    /// 三条判据，都是**字节**口径：
+    /// 1. `VMLESS_GC_OFF` → 不收（量「改前」基线用，其余行为一模一样）；
+    /// 2. `VMLESS_GC_STRESS` → 只要这一小段分配过就收，**且在全量与年轻代之间交替**
+    ///    （两条回收路径都必须被漏根检测覆盖到 —— 只跑全量的话年轻代的漏根永远抓不住）；
+    /// 3. 正常：eden 满 → 年轻代回收；页表长得比活对象多太多 → 全量回收。
     #[inline]
-    pub(crate) fn gc_should_run(&self) -> bool {
+    pub(crate) fn gc_want(&self) -> GcKind {
         if self.gc_off {
-            return false; // 量「改前」用：整个关掉回收，别的行为一模一样
+            return GcKind::None;
         }
-        let n = self.heap.allocs_since_gc.load(Ordering::Relaxed);
         if self.gc_stress {
-            return n > 0;
+            if self.heap.young_bytes() == 0 {
+                return GcKind::None;
+            }
+            return if self.heap.minor_count.load(Ordering::Relaxed) % 2 == 0 {
+                GcKind::Minor
+            } else {
+                GcKind::Major
+            };
         }
-        n >= self.heap.gc_threshold()
+        self.heap.gc_kind()
     }
-
 }
 
 impl Vm {
@@ -1609,8 +1667,9 @@ impl Vm {
     /// 本身只累加计数，绝不自己触发回收（那样 `pc` 会停在半条指令上，位图对不上）。
     #[inline]
     pub(super) fn gc_poll(&mut self, frame: &mut Frame, pc: usize) {
-        // 压力模式下 gc_should_run 就是「这一小段有没有分配过」—— 没分配就不必回收
-        if !self.sh.gc_should_run() {
+        // 压力模式下判据就是「这一小段有没有分配过」—— 没分配就不必回收
+        let kind = self.sh.gc_want();
+        if kind == GcKind::None {
             return;
         }
         frame.pc = pc;
@@ -1633,10 +1692,11 @@ impl Vm {
             self.sh.gc_backoff.store(now_ms() + 50, Ordering::Relaxed);
             return;
         }
-        let st = self.collect();
+        let st = self.collect(kind);
         if self.sh.gc_stats {
             eprintln!(
-                "[gc] pause={:.2}ms live={} 位图:精确/总={}/{}{}",
+                "[gc] {} pause={:.2}ms live={} 位图:精确/总={}/{}{}",
+                if st.minor { "minor" } else { "major" },
                 st.pause_us as f64 / 1000.0,
                 st.live,
                 self.sh.refmap_total.load(Ordering::Relaxed)
@@ -1648,11 +1708,17 @@ impl Vm {
     }
 
     /// 一轮完整回收（调用方必须已经把世界停住）
-    fn collect(&mut self) -> GcStats {
+    fn collect(&mut self, kind: GcKind) -> GcStats {
         let t0 = std::time::Instant::now();
         let sh = Arc::clone(&self.sh);
         let epoch = sh.heap.gc_epoch.fetch_add(1, Ordering::AcqRel) + 1;
+        let minor = kind == GcKind::Minor;
+        let lo_obj = sh.heap.young_lo_obj();
+        let lo_arr = sh.heap.young_lo_arr();
         let mut m = Marker::new(&sh, epoch);
+        m.minor = minor;
+        m.lo_obj = lo_obj;
+        m.lo_arr = lo_arr;
         // 第一阶段只**收候选**（不追对象图），第二阶段再并行标记
         m.gathering = true;
 
@@ -1674,19 +1740,39 @@ impl Vm {
             unsafe { scan_thread(&mut m, &*p) };
         }
         scan_shared_roots(&mut m);
+        // 跨代引用：老对象里被写过的那些，它们的引用槽必须当根再扫一遍。
+        // 不扫就会把「只被老对象指着的年轻对象」回收掉 —— 这是分代回收唯一的正确性支点。
+        let ndirty = if minor {
+            let mut n = 0u32;
+            let mut kids: Vec<i32> = Vec::new();
+            sh.heap.dirty_drain(|h| {
+                n += 1;
+                if let Some(o) = sh.heap.hdr(h) {
+                    o.scan_refs_young(&mut kids, lo_obj, lo_arr);
+                }
+            });
+            m.work.append(&mut kids);
+            n
+        } else {
+            0
+        };
         m.gathering = false;
         // 到这里 m.work 里是全部根候选句柄；下面并行标记
         let t_roots = t0.elapsed();
         let nroots = m.work.len();
         let mut seeds = std::mem::take(&mut m.work);
-        let marked = mark_all(&sh, epoch, &mut seeds);
+        let (marked, marked_bytes) = mark_all(&sh, epoch, &mut seeds, kind);
         // 下一轮并行与否按**这一轮真正标了多少**决定（见 mark_all 里的阈值）
         sh.heap.last_marked.store(marked, Ordering::Release);
+        if !minor {
+            sh.heap.last_major_marked.store(marked, Ordering::Release);
+        }
         if sh.gc_stats {
             eprintln!(
-                "[gc]   根 {} 个（{:.2}ms）/ 标记 {} 个（{:.2}ms）/ 线程 {}",
+                "[gc]   根 {} 个（{:.2}ms）/ 脏老对象 {} 个 / 标记 {} 个（{:.2}ms）/ 线程 {}",
                 nroots,
                 t_roots.as_secs_f64() * 1000.0,
+                ndirty,
                 marked,
                 (t0.elapsed() - t_roots).as_secs_f64() * 1000.0,
                 gc_threads()
@@ -1699,21 +1785,40 @@ impl Vm {
                 m.f_precise, m.f_conservative, m.f_mismatch
             );
         }
+        // 晋升 + 清脏账必须在**暂停之内**完成：一旦放开世界，新分配的对象就会落进
+        // 这一轮的清扫区间。顺序不能反 —— 清扫只碰 [老下界, 本轮高水位)。
+        let young_before = sh.heap.young_bytes();
+        if minor {
+            sh.heap.young_after(young_before, marked_bytes);
+        } else {
+            sh.heap.major_after();
+        }
+        // 清扫区间：年轻代回收只碰新生段，全量回收从 0 开始
+        let (sl_obj, sl_arr) = if minor { (lo_obj, lo_arr) } else { (0, 0) };
+
         let pause_us = t0.elapsed().as_micros() as u64;
-        let live_before = sh.heap.live();
-        sh.heap.allocs_since_gc.store(0, Ordering::Release);
-        // 阈值材料是「回收**后**的存活数」，清扫完才更新（见下面两处 live_after_gc）
-        let _ = live_before;
+        sh.heap.young_bytes.store(0, Ordering::Release);
 
         // 清扫：小堆就地做完（起线程比扫一遍还贵），大堆丢给后台线程（不占停顿）
         let (o, a) = sh.heap.counts();
-        if (o as u64 + a as u64) < 131_072 {
-            let (fo, fa, fb) = sh.heap.sweep(epoch);
+        if minor || (o as u64 + a as u64) < 131_072 {
+            let (fo, fa, fb) = sh.heap.sweep_from(sl_obj, sl_arr, epoch);
             sh.heap.live_after_gc.store(sh.heap.live(), Ordering::Release);
+            if !minor {
+                sh.heap.major_settle();
+            }
             if sh.gc_stats {
-                eprintln!("[gc] sweep freed={} bytes={}KB live={}", fo + fa, fb / 1024, sh.heap.live());
+                eprintln!(
+                    "[gc] sweep freed={} bytes={}KB live={} eden={}MB 存活率={}‱",
+                    fo + fa,
+                    fb / 1024,
+                    sh.heap.live(),
+                    sh.heap.eden_bytes() / (1 << 20),
+                    sh.heap.survivor_bp()
+                );
             }
             return GcStats {
+                minor,
                 pause_us,
                 freed: fo + fa,
                 freed_bytes: fb,
@@ -1724,10 +1829,14 @@ impl Vm {
         sh.sweeping.store(true, Ordering::Release);
         let sh2 = Arc::clone(&sh);
         let e = epoch;
+        let (so, sa, mi) = (sl_obj, sl_arr, minor);
         let stats = sh.gc_stats;
         let spawn = std::thread::Builder::new().name("gc-sweep".into()).spawn(move || {
-            let (o, a, b) = sh2.heap.sweep(e);
+            let (o, a, b) = sh2.heap.sweep_from(so, sa, e);
             sh2.heap.live_after_gc.store(sh2.heap.live(), Ordering::Release);
+            if !mi {
+                sh2.heap.major_settle();
+            }
             if stats {
                 eprintln!(
                     "[gc] sweep freed={} (obj {} arr {}) bytes={}MB live={}",
@@ -1742,10 +1851,11 @@ impl Vm {
         });
         if spawn.is_err() {
             // 起不了线程就在当前线程做完（仍然正确，只是停顿长一点）
-            let (_o, _a, _b) = sh.heap.sweep(epoch);
+            let (_o, _a, _b) = sh.heap.sweep_from(sl_obj, sl_arr, epoch);
             sh.sweeping.store(false, Ordering::Release);
         }
         GcStats {
+            minor,
             pause_us,
             freed: 0,
             freed_bytes: 0,

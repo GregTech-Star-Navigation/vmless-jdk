@@ -26,13 +26,22 @@ pub struct Parser {
     pos: usize,
     pending: Option<Tok>,
     line: u32,
+    /// `case X ->` 的标签位置：那里禁掉 lambda 识别。`case TC_NULL -> …` 看着
+    /// 就是「单参数 lambda」，识别了会把整个 case 当 lambda 吃掉（
+    /// 症状是「期望 Colon，实际 Semi」）。
+    no_lambda: bool,
+    /// 方法体里声明的**局部类**：解析完就被丢掉了，这里先攒着，等外层类型收尾时
+    /// 挂成它的嵌套类型（`Outer$Inner`），checkpoint 用 `local_mark` 定位。
+    local_types: Vec<TypeDecl>,
+    /// 字段多声明符（`int a, b;`）里**第一个之后的**那些，交给成员循环按序取走。
+    pending_members: Vec<Member>,
 }
 
 impl Parser {
     pub fn new(src: &str) -> Result<Self, ParseError> {
         let toks = tokenize(src).map_err(|e| ParseError { line: e.line, msg: e.msg })?;
         let line = toks.last().map(|t| t.line).unwrap_or(1);
-        Ok(Parser { toks, pos: 0, pending: None, line })
+        Ok(Parser { toks, pos: 0, pending: None, line, no_lambda: false, local_types: Vec::new(), pending_members: Vec::new() })
     }
 
     // ---------- token 工具 ----------

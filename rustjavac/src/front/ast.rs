@@ -106,6 +106,8 @@ pub enum Stmt {
     /// 带标签的语句（`outer: for (...) { … }`）。标签只对 `break`/`continue` 可见。
     Labeled { label: String, body: Box<Stmt> },
     Switch { selector: Expr, cases: Vec<SwitchCase> },
+    /// `yield e;` —— switch 表达式里往外交值（只在 `Expr::SwitchExpr` 的语句树里合法）
+    Yield(Expr),
     Try { body: Box<Stmt>, catches: Vec<Catch>, finally: Option<Box<Stmt>> },
     Empty,
 }
@@ -165,7 +167,12 @@ pub enum Expr {
     Cast { ty: Type, expr: Box<Expr> },
     InstanceOf { expr: Box<Expr>, ty: Type, binding: Option<String> },
     Lambda { params: Vec<String>, body: Box<Expr> },
+    /// **块体 lambda**：`(a, b) -> { … }`。语句树放在这里，codegen 会把它编成一个
+    /// 合成方法 `lambda$<方法>$N`。
+    LambdaStmt { params: Vec<String>, body: Box<Stmt> },
     MethodRef { recv: Box<Expr>, name: String },
     ClassLit(Type),
-    SwitchExpr(Box<Expr>),
+    /// `switch (...) { … }` 的**表达式**形态：里面是一棵语句树（`yield e;` 是 `Stmt::Yield`）。
+    /// 语义上它算出一个值，codegen 用一个临时局部收值。
+    SwitchExpr(Box<Stmt>),
 }

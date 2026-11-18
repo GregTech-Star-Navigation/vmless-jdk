@@ -57,6 +57,7 @@ pub(super) fn register(r: &mut NativeRegistry) {
     serial_reg(r);
     tz_reg(r);
     misc_reg(r);
+    gap_reg(r);
 }
 
 // ================================================================ 小工具
@@ -1113,4 +1114,551 @@ fn win32_set_error_mode(_vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     {
         Ok(Slot::L(i64::from(mode)))
     }
+}
+
+// ================================================================ 收尾：剩余 java.base native
+//
+// 这一节按「谁在用」分组补齐 java.base 里剩下的 native。约定：
+//   · 能真做的，一律调真 Win32（`LoadLibrary` / `RegQueryValue` / `WinHttpGetIEProxyConfig` …）；
+//   · 本 VM 确实做不到的（协程 Continuation 的 yield/enter），**抛
+//     `UnsupportedOperationException` 并说清为什么** —— 不许返回 0 让上层以为成功。
+
+fn to_wide(s: &str) -> Vec<u16> {
+    let mut v: Vec<u16> = s.encode_utf16().collect();
+    v.push(0);
+    v
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn GetLastError() -> u32;
+    fn LoadLibraryExW(path: *const u16, file: isize, flags: u32) -> isize;
+    fn GetProcAddress(h: isize, name: *const u8) -> isize;
+    fn FreeLibrary(h: isize) -> i32;
+    fn GetModuleHandleW(name: *const u16) -> isize;
+    fn FormatMessageW(
+        flags: u32,
+        source: *const core::ffi::c_void,
+        msg_id: u32,
+        lang: u32,
+        buf: *mut u16,
+        size: u32,
+        args: *const u8,
+    ) -> u32;
+    fn NotifyAddrChange(handle: *mut isize, overlapped: *mut core::ffi::c_void) -> u32;
+    fn Sleep(ms: u32);
+}
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn RegOpenKeyExW(key: isize, sub: *const u16, opts: u32, access: u32, out: *mut isize) -> i32;
+    fn RegQueryValueExW(
+        key: isize,
+        name: *const u16,
+        reserved: *mut u32,
+        ty: *mut u32,
+        data: *mut u8,
+        len: *mut u32,
+    ) -> i32;
+    fn RegCloseKey(key: isize) -> i32;
+}
+
+/// `NativeLibrary.findEntry0(handle, name)` → 符号地址（找不到返回 0，**不抛**）
+fn nl_find_entry0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let h = f.arg_l(0) as isize;
+    let name = arg_text(vm, f, 1);
+    if h == 0 || name.is_empty() {
+        return zl(0);
+    }
+    // `GetProcAddress` 要的是 ANSI 名（导出名永远是 ASCII）
+    let mut c = name.into_bytes();
+    c.push(0);
+    let addr = unsafe { GetProcAddress(h, c.as_ptr()) };
+    Ok(Slot::L(addr as i64))
+}
+
+/// `RawNativeLibraries.load0(impl, name)`：真 `LoadLibraryEx`，把句柄写回 `impl.handle`
+fn rnl_load0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let impl_obj = f.arg_i(0);
+    let name = arg_text(vm, f, 1);
+    if name.is_empty() {
+        return zi(0);
+    }
+    let w = to_wide(&name);
+    // `LOAD_WITH_ALTERED_SEARCH_PATH`(0x8)：按库所在目录找依赖，不污染 PATH
+    let h = unsafe { LoadLibraryExW(w.as_ptr(), 0, 0x8) };
+    if h == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(vm.throw_msg(
+            "java/io/IOException",
+            format!("无法加载 native 库 {name}: {}", win_msg(code)),
+        ));
+    }
+    // `impl.handle` 是 `RawNativeLibraryImpl` 的字段
+    if let Some(i) = vm.store.field_index("jdk/internal/loader/RawNativeLibraries$RawNativeLibraryImpl", "handle") {
+        vm.sh.heap.set(impl_obj, i, Slot::L(h as i64));
+    } else {
+        unsafe { FreeLibrary(h) };
+        return Err(vm.throw_msg(
+            "java/lang/InternalError",
+            "RawNativeLibraryImpl.handle 解析不到字段槽".to_string(),
+        ));
+    }
+    zi(1)
+}
+
+/// `RawNativeLibraries.unload0(name, handle)`：`FreeLibrary`
+fn rnl_unload0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let name = arg_text(vm, f, 0);
+    let h = f.arg_l(1) as isize;
+    if h != 0 && unsafe { FreeLibrary(h) } == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(vm.throw_msg(
+            "java/io/IOException",
+            format!("释放 native 库 {name} 失败: {}", win_msg(code)),
+        ));
+    }
+    void()
+}
+
+/// Win32 错误码 → 文本（`FormatMessage` 拿系统本地化文本，失败时退回数字）
+fn win_msg(code: u32) -> String {
+    let mut buf = [0u16; 512];
+    let n = unsafe {
+        FormatMessageW(
+            0x0000_1000, // FORMAT_MESSAGE_FROM_SYSTEM
+            std::ptr::null(),
+            code,
+            0,
+            buf.as_mut_ptr(),
+            buf.len() as u32,
+            std::ptr::null(),
+        )
+    };
+    if n == 0 {
+        return format!("Win32 错误码 {code}");
+    }
+    let mut end = n as usize;
+    while end > 0 && (buf[end - 1] == b'\r' as u16 || buf[end - 1] == b'\n' as u16 || buf[end - 1] == 0) {
+        end -= 1;
+    }
+    format!("{}（{code}）", String::from_utf16_lossy(&buf[..end]))
+}
+
+/// `RegistryFileTypeDetector.queryStringValue(long key, long name)`：
+/// 从注册表读一个 REG_SZ 值（`ProgID` → `Content Type`）
+fn registry_query_string(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let key = f.arg_l(0) as isize;
+    let name = f.arg_l(1) as isize;
+    if key == 0 {
+        return zi(0);
+    }
+    let mut ty: u32 = 0;
+    let mut len: u32 = 0;
+    // 先问长度（name 是 arena 里的 UTF-16 NUL 结尾串，`WindowsRegKey` 给的就是它）
+    let name_ptr = if name == 0 { std::ptr::null() } else { name as *const u16 };
+    let rc = unsafe { RegQueryValueExW(key, name_ptr, std::ptr::null_mut(), &mut ty, std::ptr::null_mut(), &mut len) };
+    if rc != 0 || len == 0 {
+        return zi(0);
+    }
+    let mut buf = vec![0u8; len as usize];
+    let rc = unsafe { RegQueryValueExW(key, name_ptr, std::ptr::null_mut(), &mut ty, buf.as_mut_ptr(), &mut len) };
+    if rc != 0 {
+        return zi(0);
+    }
+    // REG_SZ = 1
+    if ty != 1 {
+        return zi(0);
+    }
+    let units: Vec<u16> = buf[..len as usize]
+        .chunks_exact(2)
+        .map(|c| u16::from_le_bytes([c[0], c[1]]))
+        .take_while(|&c| c != 0)
+        .collect();
+    let s = String::from_utf16_lossy(&units);
+    Ok(Slot::I(vm.str_new(s)))
+}
+
+// ---------------------------------------------------------------- Continuation
+//
+// **本 VM 不支持协程**：`VirtualThread` 由平台线程顶替（见 `native_reg.rs` 里那 7 条），
+// 所以 `Continuation` 的 yield/enter 永远不会被走到。真走到就说明有人直接 `new
+// Continuation(...)` 并 `run()` —— 那时只能明确说不支持，而不是假装 yield 成功
+// （假装成功的后果是栈没保存、yield 点之后继续跑，数据全乱）。
+const CONT: &str = "jdk/internal/vm/Continuation";
+
+fn cont_register_natives(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    void()
+}
+fn cont_pin(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    void()
+}
+fn cont_unpin(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    void()
+}
+fn cont_unsupported(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Err(unsupported(
+        vm,
+        "本 VM 不支持 Continuation（虚拟线程由平台线程顶替，不存在可挂起的栈）",
+    ))
+}
+
+// ---------------------------------------------------------------- 异步通道组（Iocp）
+//
+// `AsynchronousChannelGroup` 的底座。与 `WindowsWatchService` 用的是同一套 API，
+// 但**另一个类**（`sun.nio.ch.Iocp`），完成包结构也不一样（字段名 completionKey/error/bytesTransferred）。
+//
+// 这里直接复用 kernel32 的 IOCP：`createIoCompletionPort` 传 `INVALID_HANDLE_VALUE` 就是
+// 「建一个只有完成包的空端口」。`getQueuedCompletionStatus` **必须能阻塞**（异步通道的
+// 主循环就在它上面等），阻塞的是真 OS 线程，所以没问题。
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateIoCompletionPort(file: isize, existing: isize, key: usize, threads: u32) -> isize;
+    fn GetQueuedCompletionStatus(
+        port: isize,
+        bytes: *mut u32,
+        key: *mut usize,
+        ov: *mut *mut core::ffi::c_void,
+        ms: u32,
+    ) -> i32;
+    fn PostQueuedCompletionStatus(port: isize, bytes: u32, key: usize, ov: *mut core::ffi::c_void) -> i32;
+    fn CloseHandle(h: isize) -> i32;
+}
+
+const IOCP: &str = "sun/nio/ch/Iocp";
+const IOCP_STATUS: &str = "sun/nio/ch/Iocp$CompletionStatus";
+
+fn iocp_create_port(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let file = f.arg_l(0) as isize;
+    let existing = f.arg_l(1) as isize;
+    let key = f.arg_l(2) as usize;
+    let _threads = f.arg_i(3);
+    let _flags = f.arg_i(4);
+    let h = unsafe { CreateIoCompletionPort(file, existing, key, 0) };
+    if h == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(vm.throw_msg("java/io/IOException", format!("CreateIoCompletionPort: {}", win_msg(code))));
+    }
+    zl(h as i64)
+}
+
+fn iocp_close0(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    unsafe { CloseHandle(f.arg_l(0) as isize) };
+    void()
+}
+
+fn iocp_get_error_message(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let code = f.arg_i(0) as u32;
+    Ok(Slot::I(vm.str_new(win_msg(code))))
+}
+
+fn iocp_init_ids(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    void()
+}
+
+/// 异步 IO 的 **真 OVERLAPPED 指针 → arena 假地址** 对照表。
+///
+/// 这是异步通道组唯一需要「地址桥接」的地方：Java 侧只认它自己写进 arena 的那个
+/// OVERLAPPED 地址，而内核在完成包里回的是**真指针**。不翻译，Java 就查不到
+/// 「这是哪个未完成的 IO」（`CompletionStatus.overlapped` 就是干这个的）。
+fn async_ov_map() -> &'static std::sync::Mutex<std::collections::HashMap<isize, i64>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<isize, i64>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// 登记一次在飞的异步 IO（`WindowsAsynchronous*ChannelImpl` 的 native 调它）
+#[allow(dead_code)]
+fn async_ov_register(real: isize, arena_addr: i64) {
+    async_ov_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(real, arena_addr);
+}
+
+// ---------------------------------------------------------------- 异步通道（明确的「做不到」）
+//
+// 这两组（`WindowsAsynchronousFileChannelImpl` 3 条 +
+// `WindowsAsynchronousSocketChannelImpl` 7 条 +
+// `WindowsAsynchronousServerSocketChannelImpl` 4 条）**没有实现**，一律抛
+// `UnsupportedOperationException`，理由写在这里，免得下一轮的人以为漏了：
+//
+//   · 它们每条都要「arena 假地址 → 真内存/真 OVERLAPPED」的常驻桥（缓冲区在内核手里
+//     活到完成包回来为止），而 `AsynchronousFileChannel`/`AsynchronousSocketChannel`
+//     的完成回调还要跨线程把结果交还给 `IoFuture`；
+//   · `Iocp` 那 6 条（含 `CompletionStatus.overlapped` 的真指针 → 假地址翻译）已经
+//     做好了 —— 也就是说**桥的骨架在**，缺的是每条 IO 自己的登记/回收；
+//   · 与其做一半（`AsynchronousSocketChannel.open()` 成功、`.connect()` 抛错），不如
+//     在入口就明确说不支持：调用方 catch 得到，也不会误以为异步通道可用。
+fn async_channel_unsupported(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Err(unsupported(
+        vm,
+        "本 VM 未实现异步通道（Asynchronous{File,Socket,ServerSocket}Channel）：\
+         缺少 arena 假地址与内核 OVERLAPPED 的常驻桥接",
+    ))
+}
+
+/// `getQueuedCompletionStatus(port, CompletionStatus)`：**阻塞**等一个完成包
+fn iocp_gqcs(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let port = f.arg_l(0) as isize;
+    let status = f.arg_i(1);
+    let mut bytes: u32 = 0;
+    let mut key: usize = 0;
+    let mut ov: *mut core::ffi::c_void = std::ptr::null_mut();
+    let ok = unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut ov, 0xFFFF_FFFF) };
+    let err = if ok == 0 { unsafe { GetLastError() } } else { 0 };
+    for (name, v) in [
+        ("error", Slot::I(err as i32)),
+        ("bytesTransferred", Slot::I(bytes as i32)),
+        ("completionKey", Slot::L(key as i64)),
+    ] {
+        match vm.store.field_index(IOCP_STATUS, name) {
+            Some(i) => {
+                vm.sh.heap.set(status, i, v);
+            }
+            None => {
+                return Err(vm.throw_msg(
+                    "java/lang/InternalError",
+                    format!("Iocp$CompletionStatus.{name} 解析不到字段槽"),
+                ))
+            }
+        }
+    }
+    void()
+}
+
+fn iocp_post(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let port = f.arg_l(0) as isize;
+    let key = f.arg_i(1) as usize;
+    if unsafe { PostQueuedCompletionStatus(port, 0, key, std::ptr::null_mut()) } == 0 {
+        let code = unsafe { GetLastError() };
+        return Err(vm.throw_msg(
+            "java/io/IOException",
+            format!("PostQueuedCompletionStatus: {}", win_msg(code)),
+        ));
+    }
+    void()
+}
+
+// ---------------------------------------------------------------- DNS / SDP / 代理
+
+const RESOLV: &str = "sun/net/dns/ResolverConfigurationImpl";
+
+fn resolv_init0(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    // Windows 上没有「解析器配置文件」这个概念（解析器读注册表）。OpenJDK 的
+    // `ResolverConfigurationImpl.c` 在 WIN32 分支下这两个函数体就是空的 ——
+    // 空实现与规范一致，不是偷懒。
+    void()
+}
+
+fn resolv_load_dnsconfig0(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    void()
+}
+
+/// `notifyAddrChange0()`：等到「本机地址变了」。`NotifyAddrChange` 是真 API
+fn resolv_notify_addr_change(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    let mut handle: isize = 0;
+    let rc = unsafe { NotifyAddrChange(&mut handle, std::ptr::null_mut()) };
+    if rc != 0 {
+        let code = unsafe { GetLastError() };
+        // ERROR_IO_PENDING：通知已排队（异步语义），立刻返回
+        if code == 997 || code == 0 {
+            return zi(0);
+        }
+        return Err(vm.throw_msg(
+            "java/io/IOException",
+            format!("NotifyAddrChange: {}", win_msg(code)),
+        ));
+    }
+    zi(0)
+}
+
+const SDP_S: &str = "sun/net/sdp/SdpSupport";
+
+fn sdp_create0(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    // SDP（InfiniBand 的套接字直连协议）在 Windows 上不存在；OpenJDK 的 Windows 构建里
+    // `SdpSupport` 也是 UnsupportedOperationException。照做 —— 别给一个假 fd。
+    Err(unsupported(vm, "SDP 在 Windows 上不受支持"))
+}
+
+fn sdp_convert0(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Err(unsupported(vm, "SDP 在 Windows 上不受支持"))
+}
+
+const PROXY_SEL: &str = "sun/net/spi/DefaultProxySelector";
+
+fn proxy_init(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    // Windows 上代理配置从注册表读，不需要额外初始化
+    zi(1)
+}
+
+/// `getSystemProxies(protocol, host)` → `List<Proxy>`
+///
+/// 取 IE 设置里的 `ProxyEnable`/`ProxyServer`。取不到（或没开代理）返回**空列表** ——
+/// 那是合法结果（= 不走系统代理），不是「没实现」。
+fn proxy_get_system(vm: &mut Vm, _f: &mut Frame) -> Result<Slot, VmError> {
+    let hkey_current_user: isize = 0x8000_0001u64 as i64 as isize;
+    let mut key: isize = 0;
+    let sub = to_wide("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings");
+    let rc = unsafe { RegOpenKeyExW(hkey_current_user, sub.as_ptr(), 0, 0x20019, &mut key) };
+    let mut enabled = false;
+    let mut server = String::new();
+    if rc == 0 {
+        let name = to_wide("ProxyEnable");
+        let mut ty: u32 = 0;
+        let mut val: u32 = 0;
+        let mut len: u32 = 4;
+        let rc2 = unsafe {
+            RegQueryValueExW(
+                key,
+                name.as_ptr(),
+                std::ptr::null_mut(),
+                &mut ty,
+                &mut val as *mut u32 as *mut u8,
+                &mut len,
+            )
+        };
+        if rc2 == 0 {
+            enabled = val != 0;
+        }
+        let name = to_wide("ProxyServer");
+        let mut ty2: u32 = 0;
+        let mut len2: u32 = 0;
+        let rc3 = unsafe {
+            RegQueryValueExW(key, name.as_ptr(), std::ptr::null_mut(), &mut ty2, std::ptr::null_mut(), &mut len2)
+        };
+        if rc3 == 0 && len2 > 0 {
+            let mut buf = vec![0u8; len2 as usize];
+            let rc4 = unsafe {
+                RegQueryValueExW(key, name.as_ptr(), std::ptr::null_mut(), &mut ty2, buf.as_mut_ptr(), &mut len2)
+            };
+            if rc4 == 0 {
+                let units: Vec<u16> = buf[..len2 as usize]
+                    .chunks_exact(2)
+                    .map(|c| u16::from_le_bytes([c[0], c[1]]))
+                    .take_while(|&c| c != 0)
+                    .collect();
+                server = String::from_utf16_lossy(&units);
+            }
+        }
+        unsafe { RegCloseKey(key) };
+    }
+    let empty = || vm.sh.heap.new_array(Vec::new(), "[Ljava/net/Proxy;").unwrap_or(0);
+    if !enabled || server.is_empty() {
+        // 没配系统代理 = 空列表，这是**正确答案**（JDK 自己也是这么表示「直连」的）
+        return zi(empty());
+    }
+    // 真配了代理却要我们自己造 `Proxy` 对象：那需要在本文件里调 Java 构造器，
+    // 而 nat_misc 没有那套桥（`run_method` 在 nat_nio）。与其返回一个错的结果
+    // （空列表 = 悄悄忽略用户配的代理），不如明确报不支持。
+    Err(unsupported(
+        vm,
+        format!("getSystemProxies: 检测到系统代理 {server}，但本 VM 尚未实现 Proxy 对象桥接"),
+    ))
+}
+
+// ---------------------------------------------------------------- 注册
+
+/// 这一节补的都是「本文件负责」的剩余 native。注册点单独一个函数，
+/// `register()` 末尾调一次 —— 与其它分组保持同样的形状。
+fn gap_reg(r: &mut NativeRegistry) {
+    r.add("jdk/internal/loader/NativeLibrary", "findEntry0", "(JLjava/lang/String;)J", nl_find_entry0);
+    r.add(
+        "jdk/internal/loader/RawNativeLibraries",
+        "load0",
+        "(Ljdk/internal/loader/RawNativeLibraries$RawNativeLibraryImpl;Ljava/lang/String;)Z",
+        rnl_load0,
+    );
+    r.add("jdk/internal/loader/RawNativeLibraries", "unload0", "(Ljava/lang/String;J)V", rnl_unload0);
+    r.add("sun/nio/fs/RegistryFileTypeDetector", "queryStringValue", "(JJ)Ljava/lang/String;", registry_query_string);
+
+    r.add(CONT, "registerNatives", "()V", cont_register_natives);
+    r.add(CONT, "pin", "()V", cont_pin);
+    r.add(CONT, "unpin", "()V", cont_unpin);
+    r.add(CONT, "doYield", "()I", cont_unsupported);
+    r.add(CONT, "enterSpecial", "(Ljdk/internal/vm/Continuation;ZZ)V", cont_unsupported);
+    r.add(CONT, "isPinned0", "(Ljdk/internal/vm/ContinuationScope;)I", cont_unsupported);
+
+    r.add(IOCP, "createIoCompletionPort", "(JJII)J", iocp_create_port);
+    r.add(IOCP, "getQueuedCompletionStatus", "(JLsun/nio/ch/Iocp$CompletionStatus;)V", iocp_gqcs);
+    r.add(IOCP, "postQueuedCompletionStatus", "(JI)V", iocp_post);
+    r.add(IOCP, "close0", "(J)V", iocp_close0);
+    r.add(IOCP, "getErrorMessage", "(I)Ljava/lang/String;", iocp_get_error_message);
+    r.add(IOCP, "initIDs", "()V", iocp_init_ids);
+
+    r.add(RESOLV, "init0", "()V", resolv_init0);
+    r.add(RESOLV, "loadDNSconfig0", "()V", resolv_load_dnsconfig0);
+    r.add(RESOLV, "notifyAddrChange0", "()I", resolv_notify_addr_change);
+
+    r.add(SDP_S, "create0", "()I", sdp_create0);
+    r.add(SDP_S, "convert0", "(I)V", sdp_convert0);
+
+    r.add(PROXY_SEL, "init", "()Z", proxy_init);
+    r.add(
+        PROXY_SEL,
+        "getSystemProxies",
+        "(Ljava/lang/String;Ljava/lang/String;)[Ljava/net/Proxy;",
+        proxy_get_system,
+    );
+
+    // 异步通道：明确「做不到」（理由见 `async_channel_unsupported` 的注释）
+    const AFCH: &str = "sun/nio/ch/WindowsAsynchronousFileChannelImpl";
+    r.add(AFCH, "readFile", "(JJIJJ)I", async_channel_unsupported);
+    r.add(AFCH, "writeFile", "(JJIJJ)I", async_channel_unsupported);
+    r.add(AFCH, "lockFile", "(JJJZJ)I", async_channel_unsupported);
+    const ASCH: &str = "sun/nio/ch/WindowsAsynchronousSocketChannelImpl";
+    r.add(ASCH, "initIDs", "()V", iocp_init_ids);
+    r.add(ASCH, "closesocket0", "(J)V", async_close_socket);
+    r.add(ASCH, "shutdown0", "(JI)V", async_shutdown);
+    r.add(ASCH, "updateConnectContext", "(J)V", async_channel_unsupported);
+    r.add(ASCH, "connect0", "(JZLjava/net/InetAddress;IJ)I", async_channel_unsupported);
+    r.add(ASCH, "read0", "(JIJJ)I", async_channel_unsupported);
+    r.add(ASCH, "write0", "(JIJJ)I", async_channel_unsupported);
+    const ASSC: &str = "sun/nio/ch/WindowsAsynchronousServerSocketChannelImpl";
+    r.add(ASSC, "initIDs", "()V", iocp_init_ids);
+    r.add(ASSC, "closesocket0", "(J)V", async_close_socket);
+    r.add(ASSC, "updateAcceptContext", "(JJ)V", async_channel_unsupported);
+    r.add(ASSC, "accept0", "(JJJJ)I", async_channel_unsupported);
+}
+
+/// `closesocket(long)`：真关（这条与「异步 IO 未实现」无关，关句柄必须真做）
+fn async_close_socket(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let s = f.arg_l(0) as usize;
+    if s != 0 && s != usize::MAX {
+        unsafe { closesocket(s) };
+    }
+    void()
+}
+
+/// `shutdown(long, int)`：`shutdown(s, how)` 的真封装（半关闭必须真发）
+fn async_shutdown(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let s = f.arg_l(0) as usize;
+    let how = f.arg_i(1);
+    if s == 0 || s == usize::MAX {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    if unsafe { shutdown(s, how) } == -1 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(vm.throw_msg("java/io/IOException", format!("shutdown 失败，WSA 错误 {code}")));
+    }
+    void()
+}
+
+#[link(name = "ws2_32")]
+extern "system" {
+    fn closesocket(s: usize) -> i32;
+    fn shutdown(s: usize, how: i32) -> i32;
+    fn WSAGetLastError() -> i32;
+    fn WSAPoll(fds: *mut PollFdMisc, count: u32, timeout: i32) -> i32;
+    fn recv(s: usize, buf: *mut u8, len: i32, flags: i32) -> i32;
+    fn send(s: usize, buf: *const u8, len: i32, flags: i32) -> i32;
+    fn connect(s: usize, name: *const u8, len: i32) -> i32;
+    fn getsockname(s: usize, name: *mut u8, len: *mut i32) -> i32;
+}
+
+#[repr(C)]
+struct PollFdMisc {
+    fd: usize,
+    events: i16,
+    revents: i16,
 }

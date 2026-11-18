@@ -75,6 +75,14 @@ impl Parser {
             self.expect(&Tok::Semi)?;
             return Ok(Stmt::Return(e));
         }
+        // `yield e;` —— switch 表达式往外交值。`yield` 是**受限标识符**（不是关键字），
+        // 所以按上下文判断。
+        if self.is_ctx("yield") {
+            self.advance();
+            let e = self.parse_expr()?;
+            self.expect(&Tok::Semi)?;
+            return Ok(Stmt::Yield(e));
+        }
         if self.is_kw("throw") {
             self.advance();
             let e = self.parse_expr()?;
@@ -94,7 +102,9 @@ impl Parser {
             return Ok(Stmt::Continue(label));
         }
         if self.is_kw("class") || self.is_kw("interface") || self.is_kw("enum") || self.is_ctx("record") {
-            let _ = self.parse_type_decl()?;
+            // **局部类**：解析出来交给外层类型收尾时挂成嵌套类型（见 `parse_type_decl`）
+            let td = self.parse_type_decl()?;
+            self.local_types.push(td);
             return Ok(Stmt::Empty);
         }
         if self.is_kw("try") {
@@ -256,12 +266,17 @@ impl Parser {
                 labels.push(None);
             } else {
                 self.expect_kw("case")?;
+                // 标签位置禁掉 lambda：`case TC_NULL -> …` 与「单参数 lambda」同形，
+                // 不禁就会被当成 lambda 整段吃掉（报「期望 Colon，实际 Semi」）
+                let saved = self.no_lambda;
+                self.no_lambda = true;
                 loop {
                     labels.push(Some(self.parse_expr()?));
                     if !self.eat(&Tok::Comma) {
                         break;
                     }
                 }
+                self.no_lambda = saved;
             }
             let _ = is_default;
             let arrow = self.eat(&Tok::Arrow);

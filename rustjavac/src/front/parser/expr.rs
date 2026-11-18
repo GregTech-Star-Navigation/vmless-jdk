@@ -38,6 +38,9 @@ impl Parser {
     }
 
     pub(crate) fn try_parse_lambda(&mut self) -> Result<Option<Expr>, ParseError> {
+        if self.no_lambda {
+            return Ok(None);
+        }
         // x -> ...
         if let Tok::Ident(_) = self.cur() {
             if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Arrow)) {
@@ -96,12 +99,11 @@ impl Parser {
     }
 
     pub(crate) fn finish_lambda(&mut self, params: Vec<String>) -> Result<Expr, ParseError> {
-        let body = if matches!(self.cur(), Tok::LBrace) {
+        if matches!(self.cur(), Tok::LBrace) {
             let b = self.parse_block()?;
-            Expr::SwitchExpr(Box::new(Expr::Ident(format!("{b:?}"))))
-        } else {
-            self.parse_expr()?
-        };
+            return Ok(Expr::LambdaStmt { params, body: Box::new(b) });
+        }
+        let body = self.parse_expr()?;
         Ok(Expr::Lambda { params, body: Box::new(body) })
     }
 
@@ -494,7 +496,7 @@ impl Parser {
             }
             Tok::Kw("switch") => {
                 let s = self.parse_switch_stmt()?;
-                Ok(Expr::SwitchExpr(Box::new(Expr::Ident(format!("{s:?}")))))
+                Ok(Expr::SwitchExpr(Box::new(s)))
             }
             Tok::Kw("long") | Tok::Kw("int") | Tok::Kw("byte") | Tok::Kw("short") | Tok::Kw("char")
             | Tok::Kw("boolean") | Tok::Kw("float") | Tok::Kw("double") => {

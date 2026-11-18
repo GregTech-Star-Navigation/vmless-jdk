@@ -63,6 +63,23 @@ impl NativeRegistry {
         let mut r = NativeRegistry { map: HashMap::new(), overrides: HashMap::new() };
         register_all(&mut r);
         super::reflect::register(&mut r);
+        // 帧栈/栈回溯这条线自己的 native（Throwable / Thread / StackWalker）。
+        // 放最后：注册表是 insert，后登记的覆盖先登记的 —— 顺便把上面几条「一条假帧」
+        // 的老实现摘掉（见 stacktrace::register）。
+        super::stacktrace::register(&mut r);
+        // `Class.newInstance()` / `ReflectAccess.newInstance(...)` 那条**内部反射**路径
+        // 不走 `Constructor.newInstance`（reflect.rs 接管的是后者），它在
+        // `Constructor.newInstanceWithCaller` → `DirectConstructorHandleAccessor$NativeAccessor`
+        // → 这个 native 上。`nat_misc` 里把它登记成「死代码」是个假设，实际会被
+        // `System.initPhase1` → `Charset.isSupported` → `Class.newInstance` 走到
+        // （`StandardCharsets` 用 `Class.newInstance` 造 charset 实例）。
+        // 直接复用 reflect.rs 的构造逻辑，不再返回 UnsupportedOperationException。
+        r.add(
+            "jdk/internal/reflect/DirectConstructorHandleAccessor$NativeAccessor",
+            "newInstance0",
+            "(Ljava/lang/reflect/Constructor;[Ljava/lang/Object;)Ljava/lang/Object;",
+            |vm, f| vm.ctor_new_instance(f.arg_i(0), f.arg_i(1)),
+        );
         r
     }
 
@@ -70,9 +87,19 @@ impl NativeRegistry {
         self.map.insert((class, name, desc), f);
     }
 
+    /// 摘掉一条登记（重建/接管用；帧栈那条线用它给旧假实现退场）
+    pub(super) fn remove(&mut self, class: &'static str, name: &'static str, desc: &'static str) {
+        self.map.remove(&(class, name, desc));
+    }
+
     /// 登记一个「VM 接管」的方法（非 native，执行前拦下来）
     pub(super) fn add_override(&mut self, class: &'static str, name: &'static str, desc: &'static str, f: NativeFn) {
         self.overrides.insert((class, name, desc), f);
+    }
+
+    /// 摘掉一条「VM 接管」（`Thread.getStackTrace` 现在由 JDK 真字节码跑，不再接管）
+    pub(super) fn remove_override(&mut self, class: &'static str, name: &'static str, desc: &'static str) {
+        self.overrides.remove(&(class, name, desc));
     }
 
     pub(super) fn has_overrides(&self) -> bool {
@@ -348,6 +375,65 @@ fn synth_loader(vm: &mut Vm) -> i32 {
 }
 
 fn register_classloaders(r: &mut NativeRegistry) {
+    // `SharedSecrets.getJavaLangReflectAccess()` —— **绝不能返回 null**。
+    //
+    // 真 JDK 的安装点是 `AccessibleObject.<clinit>`：
+    //   `static { SharedSecrets.setJavaLangReflectAccess(new ReflectAccess()); }`
+    // 但 `System.initPhase1` 在极早期就会通过 `Class` 走到反射访问，
+    // 那时 `AccessibleObject` 还没初始化 → 拿到 null → `getRoot`/`getExecutableSharedParameterTypes`
+    // 以空接收者被调用 → `initPhase1` 中断 → **`setOut0` 根本没跑到 → `System.out/err/in` 全 null**。
+    // 而 `println` 被 exec 按方法名拦截，所以从 println 完全看不出来；
+    // 只有 `System.out.print/printf`、或把 `System.out` 传出去才 NPE。
+    //
+    // 这里做懒安装：字段为空就先把 `AccessibleObject` 初始化（它会装 secret），
+    // 还不行为我们直接造一个 `ReflectAccess` 实例塞进静态字段。
+    r.add_override(
+        "jdk/internal/access/SharedSecrets",
+        "getJavaLangReflectAccess",
+        "()Ljdk/internal/access/JavaLangReflectAccess;",
+        |vm, _| {
+            let key = ("jdk/internal/access/SharedSecrets".to_string(),
+                       "javaLangReflectAccess".to_string());
+            let cur = lk(&vm.sh.statics).get(&key).copied().unwrap_or(Slot::I(0));
+            if cur.as_i32() > 0 {
+                return Ok(cur);
+            }
+            let _ = vm.ensure_init("java/lang/reflect/AccessibleObject");
+            let cur = lk(&vm.sh.statics).get(&key).copied().unwrap_or(Slot::I(0));
+            if cur.as_i32() > 0 {
+                return Ok(cur);
+            }
+            // 兜底：自己造一个（不跑构造器 —— `ReflectAccess` 没有实例状态）
+            if vm.store.has_class("java/lang/reflect/ReflectAccess") {
+                let h = vm.alloc_vmobj("java/lang/reflect/ReflectAccess");
+                if h > 0 {
+                    lk(&vm.sh.statics).insert(key, Slot::I(h));
+                }
+                return Ok(Slot::I(h));
+            }
+            Ok(Slot::I(0))
+        },
+    );
+    // `JavaLangReflectAccess` 的成员都声明在接口上，而实现在 `ReflectAccess`。
+    // 反射层还有两条 `Executable` 的访问器（`initPhase1` 会先碰到它们）。
+    r.add_override(
+        "java/lang/reflect/ReflectAccess",
+        "getExecutableSharedParameterTypes",
+        "(Ljava/lang/reflect/Executable;)[Ljava/lang/Class;",
+        |vm, f| {
+            let ex = f.arg(0);
+            Ok(vm.get_named(ex.as_i32(), "java/lang/reflect/Executable", "parameterTypes"))
+        },
+    );
+    r.add_override(
+        "java/lang/reflect/ReflectAccess",
+        "getExecutableSharedExceptionTypes",
+        "(Ljava/lang/reflect/Executable;)[Ljava/lang/Class;",
+        |vm, f| {
+            let ex = f.arg(0);
+            Ok(vm.get_named(ex.as_i32(), "java/lang/reflect/Executable", "exceptionTypes"))
+        },
+    );
     // `JavaLangReflectAccess.getRoot(AccessibleObject)`：返回「可访问性根」对象。
     // 我们没有任何 root 机制（每个 `Field`/`Method` 只有它自己），所以**原样返回实参**。
     // 少了它，`System.initPhase1` 在装 `SharedSecrets` 时就断，`System.out/err/in` 全 null。
@@ -1245,7 +1331,21 @@ fn now_nanos() -> i64 {
 // 缺了它们：`System.loadLibrary` 在 `InternalError: null property: java.home` 上死，
 // LWJGL 的 `Library` / `Configuration` 也拿不到 `os.name`。
 
+/// `java.home` 的值。
+///
+/// **`VMLESS_JDK` 只表示「`java.base` 的类从哪来」，不等于 JDK 安装目录。**
+/// 它常常指向 `lib/modules` 或解包出来的 `img/` —— 那里面**没有 `conf/security/java.security`**，
+/// 于是 `java.security` 初始化抛 `InternalError: Error loading java.security file`，
+/// 连带 `SecureRandom` / `Selector` / TLS 全挂（实测：`Selector.open()` 的第一道坎）。
+///
+/// 顺序：`VMLESS_JAVA_HOME` → `VMLESS_JDK` 里真带 `bin`+`lib` 的那层 → 自动探测的常见安装路径。
 fn jdk_home() -> String {
+    if let Ok(p) = std::env::var("VMLESS_JAVA_HOME") {
+        let p = p.trim().to_string();
+        if !p.is_empty() {
+            return p;
+        }
+    }
     if let Ok(p) = std::env::var("VMLESS_JDK") {
         let p = p.trim().to_string();
         if !p.is_empty() {
@@ -1263,15 +1363,23 @@ fn jdk_home() -> String {
                     }
                 }
             }
-            return p;
+            // 到这一步说明 `VMLESS_JDK` 不是 JDK 安装目录（是 `lib/modules` / `img/`）：
+            // **不要把它当 java.home 用**，继续往下探测真正的安装目录。
         }
     }
     for cand in [
         r"C:\Program Files\Eclipse Adoptium\jdk-25.0.4.101-hotspot",
         r"C:\Program Files\Java\jdk-25",
+        r"C:\Program Files\Java\jdk-21",
     ] {
         if std::path::Path::new(cand).is_dir() {
             return cand.to_string();
+        }
+    }
+    // 最后兜底：环境里的 JAVA_HOME
+    if let Ok(h) = std::env::var("JAVA_HOME") {
+        if !h.trim().is_empty() && std::path::Path::new(h.trim()).is_dir() {
+            return h.trim().to_string();
         }
     }
     ".".to_string()

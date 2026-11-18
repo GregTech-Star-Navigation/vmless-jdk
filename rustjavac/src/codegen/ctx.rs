@@ -6,7 +6,26 @@
 //! 接收者静态类型不是本类时（`P p = ...; p.get()`）按它查。
 
 use crate::ast::*;
+use std::cell::RefCell;
 use std::collections::HashMap;
+use std::rc::Rc;
+
+/// 一个**合成方法**：lambda 体，或方法引用的转发体。
+///
+/// 编译 lambda 的那一刻还不知道要产出什么字节码 —— 先把「要编成一个方法」这件事
+/// 记进 `Ctx::synth`，等类里所有成员方法都编完，`class.rs` 再逐个编出来。
+#[derive(Clone, Debug)]
+pub(crate) struct SynthMethod {
+    pub(crate) name: String,
+    pub(crate) desc: String,
+    /// 捕获（按槽序）。实例方法时**不含** `this` —— 它由调用点的 REF_invokeVirtual 传。
+    pub(crate) captures: Vec<(String, Type)>,
+    /// lambda 的形参（方法引用是空表）
+    pub(crate) params: Vec<(String, Type)>,
+    pub(crate) body: Stmt,
+    /// 实例方法（`this` 在槽 0）还是静态方法
+    pub(crate) is_instance: bool,
+}
 
 /// 一个 `break` / `continue` 的落点，外加它的**语句标签**（`outer: for (…)` 里的 `outer`）。
 ///
@@ -24,6 +43,9 @@ pub(crate) struct Ctx {
     pub(crate) next_slot: u8,
     /// 本类里的静态方法名 → 描述符（用于 invokestatic）
     pub(crate) static_methods: HashMap<String, Vec<String>>,
+    /// 从父类/外层类继承来的静态方法：名字 → (声明类, 描述符表)。
+    /// invokestatic 的 owner 必须是**声明它的那个类**，用 <SELF> 会 NoSuchMethodError。
+    pub(crate) inherited_statics: HashMap<String, (String, Vec<String>)>,
     /// 本类**及其父类**的实例方法：名字 → 描述符
     pub(crate) instance_methods: HashMap<String, Vec<String>>,
     /// 本类实例字段（含继承）：名字 → 下标
@@ -74,6 +96,24 @@ pub(crate) struct Ctx {
     /// `new GenBox<>("x")` 的真实描述符是 `(Ljava/lang/Object;)V`（泛型擦除），
     /// 不能拿实参类型现拼。
     pub(crate) type_ctors: HashMap<String, std::sync::Arc<Vec<String>>>,
+    /// 功能性接口 → 唯一抽象方法 `(名字, 描述符)`（见 `Resolver::sam_of`）
+    pub(crate) iface_sam: HashMap<String, (String, String)>,
+    /// 待编的合成方法（lambda 体 / 方法引用转发体），所有方法共享同一个队列
+    pub(crate) synth: Rc<RefCell<Vec<SynthMethod>>>,
+    /// lambda 体的编号（`lambda$foo$0` 的 N）
+    pub(crate) lambda_seq: Rc<RefCell<u32>>,
+    /// 当前所在方法的**源名字**（合成方法名 `lambda$<它>$N` 要用）
+    pub(crate) method_name: String,
+    /// 当前表达式位置的**目标类型**（功能性接口内部名）。
+    ///
+    /// lambda 是**多表达式**：单看 `x -> x + 1` 推不出它要实现哪个接口，必须由
+    /// 上下文（局部变量声明、赋值、实参、return、cast）给。各个「边界位置」在编
+    /// 右侧表达式之前把它设上，编完恢复。用 `Rc<RefCell<_>>` 是因为大量发射函数
+    /// 只拿得到 `&Ctx`（实参/返回值的位置在深处）。
+    /// 当前方法能不能用 `this`（静态方法 / 静态初始化块里不能）。
+    /// 合成方法按自己的形态设：lambda 体编成实例方法置 true，静态方法置 false。
+    pub(crate) has_this: bool,
+    pub(crate) lambda_target: Rc<RefCell<Option<LambdaTarget>>>,
 }
 
 impl Ctx {
@@ -86,4 +126,14 @@ impl Ctx {
         self.tmp_seq += 1;
         self.tmp_seq
     }
+}
+
+/// lambda 的目标：功能性接口 + 它的**类型实参**（`Predicate<String>` 的 `String`）。
+///
+/// 类型实参是擦除后仍然需要的：`Consumer<String>` 的 SAM 擦成 `accept(Object)`，
+/// 不把 `String` 代进去，lambda 体里 `s.isEmpty()` 就会因为接收者是 `Object` 而编不过。
+#[derive(Clone, Debug)]
+pub(crate) struct LambdaTarget {
+    pub(crate) iface: String,
+    pub(crate) args: Vec<Type>,
 }

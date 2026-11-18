@@ -125,6 +125,19 @@ pub(crate) fn emit_array_init(
     ctx: &Ctx,
     cp: &mut CpBuilder,
 ) -> Result<(), CompileError> {
+    // 会分叉的元素（`new boolean[]{a < b, a > b}`）必须**在数组引用还没压栈时**算进
+    // 脏槽：`dup; iconst i; <元素>` 期间操作数栈非空，而跳转点要求栈为空。
+    // 顺序仍然是从左到右，和 Java 的求值顺序一致（建数组本身没有副作用）。
+    let sps: Vec<Option<Spilled>> = items
+        .iter()
+        .map(|it| {
+            if needs_scratch(it) {
+                spill(it, em, ctx, cp).map(Some)
+            } else {
+                Ok(None)
+            }
+        })
+        .collect::<Result<Vec<_>, CompileError>>()?;
     em.const_int(items.len() as i32);
     match elem {
         Type::Prim(p) => {
@@ -167,17 +180,29 @@ pub(crate) fn emit_array_init(
         em.op(0x59); // dup（数组引用）
         em.push(1);
         em.const_int(i as i32);
-        let sp = if needs_scratch(item) { Some(spill(item, em, ctx, cp)?) } else { None };
-        emit_val(item, &sp, em, ctx, cp)?;
+        emit_val(item, &sps[i], em, ctx, cp)?;
         coerce_to(elem, item, ctx, em, cp)?;
         em.op(store_op);
         em.pop(if wide { 4 } else { 3 });
+    }
+    for s in &sps {
+        if let Some(x) = s {
+            em.free_scratch(x.slot);
+        }
     }
     Ok(())
 }
 
 /// 在**已知声明类型**的位置编一个初始化表达式：`int[] a = {1,2,3};` 的元素类型
 /// 只能从声明处拿到（`ArrayInit` 本身不带类型），其余表达式照常编。
+/// 在设置好 `lambda_target` 的作用域里执行 `f`（进去设、出来恢复）。
+pub(crate) fn with_target<R>(ctx: &Ctx, t: Option<super::ctx::LambdaTarget>, f: impl FnOnce() -> R) -> R {
+    let saved = ctx.lambda_target.replace(t);
+    let r = f();
+    ctx.lambda_target.replace(saved);
+    r
+}
+
 pub(crate) fn emit_init(
     ty: &Type,
     e: &Expr,
@@ -189,7 +214,8 @@ pub(crate) fn emit_init(
         let elem = array_init_elem(items, Some(ty), ctx);
         return emit_array_init(&elem, items, em, ctx, cp);
     }
-    compile_expr(e, em, ctx, cp)
+    let t = lambda_target_of_ty(ty, ctx);
+    with_target(ctx, t, || compile_expr(e, em, ctx, cp))
 }
 
 /// Java 整数字面量 → i64：十进制 / `0x` 十六进制 / `0b` 二进制 / `0` 开头八进制，
@@ -393,7 +419,9 @@ pub(crate) fn emit_call_args(
         }
     }
     for (i, a) in args.iter().enumerate().take(fixed.min(argc)) {
-        emit_val(a, &sp[i], em, ctx, cp)?;
+        // 实参位置的 lambda：目标类型来自被调方法的**形参类型**
+        let t = params.get(i).and_then(|pd| lambda_target_of_desc(pd, ctx));
+        with_target(ctx, t, || emit_val(a, &sp[i], em, ctx, cp))?;
         if let Some(pd) = params.get(i) {
             let target = type_from_desc(pd);
             coerce_to(&target, a, ctx, em, cp)?;
@@ -667,6 +695,15 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             let from = expr_kind(expr, ctx);
             let to = kind_of(ty);
+            // VarHandle / MethodHandle 的**签名多态**调用：`(int) vh.getVolatile(o, i)`
+            // 的方法描述符由**调用点**决定（实参静态类型 + 这里的 cast 目标类型），
+            // 不是类文件里声明的那一个。按声明发 `(…)Ljava/lang/Object;` 再拆箱在
+            // 运行时必抛 WrongMethodTypeException，所以必须在这里按多态描述符发。
+            if to != K_REF {
+                if let Some(pc) = poly_call_desc(expr, ty, ctx) {
+                    return emit_poly_call(expr, &pc, em, ctx, cp);
+                }
+            }
             compile_expr(expr, em, ctx, cp)?;
             if to == K_REF {
                 // 引用转换不是数值转换：要发 checkcast（失败抛 ClassCastException）
@@ -684,10 +721,12 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             Ok(())
         }
-        Expr::InstanceOf { expr, ty, binding } => {
-            if binding.is_some() {
-                return err("暂不支持 instanceof 模式绑定（if (o instanceof T t)）");
-            }
+        Expr::InstanceOf { expr, ty, .. } => {
+            // 表达式位置上的 `x instanceof T t`：**绑定在这里用不上**（模式变量只在
+            // 「测试为真」那条路径上可见，那种作用域必须由语句层展开 —— 见
+            // `stmt.rs` 的 `pattern_cond` / `split_pattern_and`）。所以这里只发测试，
+            // 不声明变量：真的有人在这个位置用 t，会在下一处报「未定义的变量」
+            // （明确失败），而不是悄悄算错。
             compile_expr(expr, em, ctx, cp)?;
             let cls = ver_type(cp, ty);
             em.op_u2(0xC1, cls); // instanceof
@@ -728,7 +767,8 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             em.push(2);
             Ok(())
         }
-        Expr::StrLit(s) => {
+        // 文本块（`"""…"""`）：parser 已经把缩进/转义处理成最终内容，字节码里就是普通 String
+        Expr::StrLit(s) | Expr::TextBlock(s) => {
             let idx = cp.string(s);
             em.op_u2(0x13, idx);
             em.push(1);
@@ -755,6 +795,14 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             // 静态字段（本类或继承来的）
             if let Some((owner, desc)) = ctx.static_fields.get(name).cloned() {
+                let f = cp.field_ref(&owner, name, &desc);
+                em.op_u2(0xB2, f); // getstatic
+                em.push(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
+                return Ok(());
+            }
+            // `import static p.C.*;` / `import static p.C.F;` 之后的裸常量名
+            // （`SEMI_BLKSIZE`、`UTF_8` 这类）—— 符号表里有，这里不查就会报「未定义的变量」
+            if let Some((owner, desc)) = static_import_field(name, ctx) {
                 let f = cp.field_ref(&owner, name, &desc);
                 em.op_u2(0xB2, f); // getstatic
                 em.push(if kind_wide(kind_from_desc(&desc)) { 2 } else { 1 });
@@ -876,13 +924,17 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 return Ok(());
             }
             let desc = call_desc(Some(r), name, args, ctx)
-                .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`") })?;
+                .ok_or_else(|| CompileError { msg: format!("未找到实例方法 `{name}`（接收者 {} `{}` / {} 参）", expr_type(r, ctx).as_ref().and_then(crate::codegen::types::type_internal).unwrap_or_else(|| "?".into()), recv_brief(r), args.len()) })?;
             let sp = hoist_args(args, em, ctx, cp)?;
             compile_expr(r, em, ctx, cp)?;
             emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             // 引用类用接收者的**静态类型**：验证器要求接收者可赋给引用类。
             // 分派本身按运行时类走（虚方法覆写），引用类只决定从哪条链开始解析。
-            let owner = expr_type(r, ctx).as_ref().and_then(type_internal).unwrap_or_else(|| ctx.class_name.clone());
+            let owner = expr_type(r, ctx)
+                .as_ref()
+                .and_then(|t| resolve_type_owner(t, ctx))
+                .or_else(|| expr_type(r, ctx).as_ref().and_then(type_internal))
+                .unwrap_or_else(|| ctx.class_name.clone());
             let n = args.len() as u16 + 1;
             if ctx.iface_types.contains(&owner) || is_builtin_iface(&owner) {
                 // 接口方法调用必须是 invokeinterface：index, count(含 this), 0
@@ -912,6 +964,27 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 em.pop(desc_slots(&desc));
                 if !desc.ends_with(")V") {
                     // 返回值占的槽数：long/double 占 2 槽
+                    em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
+                }
+                return Ok(());
+            }
+            // 从**父类/外层类**继承来的静态方法（`createCapacityException(n)`）：
+            // invokestatic 的 owner 必须是声明它的那个类，不能是 <SELF>
+            if let Some((owner, desc)) = ctx
+                .inherited_statics
+                .get(name.as_str())
+                .and_then(|(o, ds)| pick_desc(ds, args, ctx).map(|d| (o.clone(), d)))
+            {
+                let sp = hoist_args(args, em, ctx, cp)?;
+                emit_call_args(args, &desc, &sp, em, ctx, cp)?;
+                let idx = if ctx.iface_types.contains(&owner) {
+                    cp.interface_method_ref(&owner, name, &desc)
+                } else {
+                    cp.method_ref(&owner, name, &desc)
+                };
+                em.op_u2(0xB8, idx);
+                em.pop(desc_slots(&desc));
+                if !desc.ends_with(")V") {
                     em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
                 }
                 return Ok(());
@@ -1088,10 +1161,20 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         // 这里没做，所以那两种仍然报错 —— 报错比按错的顺序算要好。
         Expr::Assign { op: None, lhs, rhs } => {
             let Expr::Ident(name) = &**lhs else {
+                // `this.f = v` / `a[i] = v` 当值用：接收者/下标都只求值一次
+                if let Expr::Field(recv, f) = &**lhs {
+                    if matches!(**recv, Expr::This) {
+                        return assign_expr_this_field(f, rhs, em, ctx, cp);
+                    }
+                }
+                if matches!(&**lhs, Expr::ArrayAccess { .. }) {
+                    return assign_expr_array(lhs, rhs, em, ctx, cp);
+                }
                 return err(format!("赋值作为表达式时只支持局部变量：{lhs:?}"));
             };
             let Some(slot) = ctx.lookup(name) else {
-                return err(format!("赋值作为表达式时目标不是局部变量：`{name}`"));
+                // `f = v` 里的 f 是隐式 this 的字段 / 或者本类的静态字段
+                return assign_expr_this_field(name, rhs, em, ctx, cp);
             };
             let kind = *ctx.local_kind.get(name).unwrap_or(&K_INT);
             compile_expr(rhs, em, ctx, cp)?;
@@ -1106,6 +1189,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         // `c ? a : b`：分叉求值 → 各自写进同一个脏槽 → 汇合点取回。
         // 两个跳转点（假分支入口、汇合点）操作数栈都是空的。
         Expr::Cond { cond, then, els } => compile_cond(cond, then, els, em, ctx, cp),
+        // `switch (...) { … }` 表达式：整块降成
+        //   { <ty> $swN = <零值>; switch (...) { case … -> … } }  ，取值再 load 回来
+        // 箭头体 / `yield e;` 都变成「写 $swN，再 break」。switch 的代码生成完全复用
+        // 语句形态那套（tableswitch / lookupswitch / 比较链都在那里）。
+        Expr::SwitchExpr(_) => return err("switch 表达式只支持语句/赋值/返回位置"),
         // class 字面量：`String.class` / `int.class` → `ldc` 一个 CONSTANT_Class
         Expr::ClassLit(ty) => emit_class_literal(ty, em, ctx, cp),
         // parser 把 `X.class` 记成 `MethodRef { recv: X, name: "class" }`
@@ -1113,6 +1201,142 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             Some(ty) => emit_class_literal(&ty, em, ctx, cp),
             None => err(format!("`X.class` 的左边不是类型名: {recv:?}")),
         },
+        // 表达式体 lambda：`x -> e`
+        Expr::Lambda { params, body } => {
+            let Some(tgt) = ctx.lambda_target.borrow().clone() else {
+                return err("推断不出 lambda 的目标类型（功能性接口）");
+            };
+            let Some((_, sam_desc)) = ctx.iface_sam.get(&tgt.iface).cloned() else {
+                return err(format!("`{}` 不是功能性接口", tgt.iface.replace('/', ".")));
+            };
+            let named = sam_params_named(params, &sam_desc, &tgt.args);
+            let stmt = Stmt::Return(Some((**body).clone()));
+            let inst = body_uses_this(&stmt, ctx);
+            emit_lambda(stmt, named, inst, em, ctx, cp)
+        }
+        // 块体 lambda：`(a, b) -> { … }`
+        Expr::LambdaStmt { params, body } => {
+            let Some(tgt) = ctx.lambda_target.borrow().clone() else {
+                return err("推断不出 lambda 的目标类型（功能性接口）");
+            };
+            let Some((_, sam_desc)) = ctx.iface_sam.get(&tgt.iface).cloned() else {
+                return err(format!("`{}` 不是功能性接口", tgt.iface.replace('/', ".")));
+            };
+            let named = sam_params_named(params, &sam_desc, &tgt.args);
+            let inst = body_uses_this(body, ctx);
+            emit_lambda((**body).clone(), named, inst, em, ctx, cp)
+        }
+        // 方法引用：`Foo::m`（静态 / 未绑定实例）、`o::m`（绑定实例）、`this::m`
+        Expr::MethodRef { recv, name } if name != "class" => {
+            let Some(tgt) = ctx.lambda_target.borrow().clone() else {
+                return err("推断不出方法引用的目标类型（功能性接口）");
+            };
+            let Some((_, sam_desc)) = ctx.iface_sam.get(&tgt.iface).cloned() else {
+                return err(format!("`{}` 不是功能性接口", tgt.iface.replace('/', ".")));
+            };
+            let pnames: Vec<String> =
+                (0..desc_params(&sam_desc).len()).map(|i| format!("$p{i}")).collect();
+            let params = sam_params_named(&pnames, &sam_desc, &tgt.args);
+            let args: Vec<Expr> =
+                pnames.iter().map(|n| Expr::Ident(n.clone())).collect();
+            let recv_local = match &**recv {
+                Expr::Ident(n) if ctx.locals.get(n).is_some() => Some(n.clone()),
+                _ => None,
+            };
+            let (body, inst, used) = if let Some(n) = recv_local {
+                // 绑定到局部变量：接收者本身就是一个捕获
+                (
+                    Stmt::Return(Some(Expr::Call {
+                        recv: Some(Box::new(Expr::Ident(n))),
+                        name: name.clone(),
+                        args,
+                        type_args: Vec::new(),
+                    })),
+                    false,
+                    params.clone(),
+                )
+            } else if matches!(&**recv, Expr::This | Expr::Super) {
+                (
+                    Stmt::Return(Some(Expr::Call {
+                        recv: Some(recv.clone()),
+                        name: name.clone(),
+                        args,
+                        type_args: Vec::new(),
+                    })),
+                    true,
+                    params.clone(),
+                )
+            } else if !class_owner_forms(recv, ctx).is_empty() {
+                // 构造器引用：parser 把 `Foo::new` / `File[]::new` 都记成 `%array-new`
+                if name == "new" || name == "%array-new" {
+                    let Some(ty) = expr_as_type(recv) else {
+                        return err("构造器引用的类名解析失败");
+                    };
+                    let body = if params.len() == 1 {
+                        // `File[]::new`：SAM 那一个参数是数组长度
+                        Stmt::Return(Some(Expr::ArrayNew {
+                            elem: ty,
+                            dims: vec![Expr::Ident(pnames[0].clone())],
+                        }))
+                    } else {
+                        Stmt::Return(Some(Expr::New { ty, args }))
+                    };
+                    (body, false, params.clone())
+                } else {
+                // 类名形态：静态方法引用，或未绑定的实例方法引用（SAM 第一个参数是接收者）。
+                // `String::length` 这种擦除后第一个参数是 Object，接收者要补 checkcast。
+                let static_owner = class_owner_forms(recv, ctx).into_iter().find(|o| {
+                    ctx.type_static_methods.get(o).map(|m| m.contains_key(name.as_str())).unwrap_or(false)
+                });
+                if static_owner.is_some() {
+                    (
+                        Stmt::Return(Some(Expr::Call {
+                            recv: Some(recv.clone()),
+                            name: name.clone(),
+                            args,
+                            type_args: Vec::new(),
+                        })),
+                        false,
+                        params.clone(),
+                    )
+                } else {
+                    let Some(recv_ty) = expr_as_type(recv) else {
+                        return err("方法引用的类名解析失败");
+                    };
+                    if params.is_empty() {
+                        return err("未绑定实例方法引用要求 SAM 至少有一个参数");
+                    }
+                    let first = pnames[0].clone();
+                    (
+                        Stmt::Return(Some(Expr::Call {
+                            recv: Some(Box::new(Expr::Cast {
+                                ty: recv_ty,
+                                expr: Box::new(Expr::Ident(first)),
+                            })),
+                            name: name.clone(),
+                            args: args[1..].to_vec(),
+                            type_args: Vec::new(),
+                        })),
+                        false,
+                        params.clone(),
+                    )
+                }
+                }
+            } else {
+                // `this.field::m` 这类：接收者表达式本身就在实例上下文里
+                (
+                    Stmt::Return(Some(Expr::Call {
+                        recv: Some(recv.clone()),
+                        name: name.clone(),
+                        args,
+                        type_args: Vec::new(),
+                    })),
+                    true,
+                    params.clone(),
+                )
+            };
+            emit_lambda(body, used, inst, em, ctx, cp)
+        }
         other => err(format!("暂不支持的表达式: {other:?}")),
     }
 }
@@ -1202,8 +1426,18 @@ fn compile_inc_dec(
     // `compile_stmt` 降糖成赋值，那里接收者只求值一次；表达式位置（`a[i++]++`）没有
     // 真实需求，报错比悄悄按错的顺序算要好。
     let Expr::Ident(name) = target else {
+        // `this.f++` 与隐式 this 的 `f++` 是同一条路
+        if let Expr::Field(recv, fname) = target {
+            if matches!(**recv, Expr::This) {
+                return inc_dec_this_field(op, fname, em, ctx, cp);
+            }
+        }
         return err(format!("自增/自减作为表达式时只支持局部变量：{target:?}"));
     };
+    if ctx.lookup(name).is_none() {
+        // `f++` 里的 f 可能是**字段**（隐式 this），不是局部变量
+        return inc_dec_this_field(op, name, em, ctx, cp);
+    }
     let Some(slot) = ctx.lookup(name) else {
         return err(format!("自增/自减的目标不是局部变量：`{name}`"));
     };
@@ -1617,4 +1851,608 @@ fn emit_concat(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result
     em.set_local_type(slot as usize, saved);
     em.free_scratch(slot);
     Ok(())
+}
+
+/// `f++` / `++f` / `this.f++` 作为**值**用（隐式 this 的字段）。
+///
+/// 字段读两次是安全的（`aload_0` 没有副作用），所以不用临时槽：
+/// ```text
+///   post: aload_0 ; aload_0 ; getfield f ; dup_x1     ; [old][this][old]
+///         iconst_1 ; iadd ; putfield f                ; [old]
+///   pre : aload_0 ; aload_0 ; getfield f ; iconst_1 ; iadd ; dup_x1
+///         putfield f                                  ; [new]
+/// ```
+/// long/double 用 `dup2_x1`（宽值占两槽，插入点要下移一格）。
+fn inc_dec_this_field(
+    op: UnOp,
+    name: &str,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let Some(&idx) = ctx.fields.get(name) else {
+        return err(format!("自增/自减的目标不是局部变量也不是字段：`{name}`"));
+    };
+    let desc = ctx.field_descs[idx].clone();
+    let kind = kind_from_desc(&desc);
+    let wide = kind_wide(kind);
+    let post = matches!(op, UnOp::PostInc | UnOp::PostDec);
+    let inc = matches!(op, UnOp::PreInc | UnOp::PostInc);
+    let (one, arith) = match kind {
+        K_LONG => (0x0Au8, if inc { 0x61 } else { 0x65 }),
+        K_FLOAT => (0x0Cu8, if inc { 0x62 } else { 0x66 }),
+        K_DOUBLE => (0x0Fu8, if inc { 0x63 } else { 0x67 }),
+        K_INT => (0x04, if inc { 0x60 } else { 0x64 }),
+        _ => return err(format!("自增/自减的目标不是数值：`{name}`")),
+    };
+    let fref = cp.field_ref(&ctx.class_name, name, &desc);
+    let w = if wide { 2 } else { 1 };
+    // [this]
+    em.op(0x2A);
+    em.push(1);
+    // [this] → [this][this] → getfield → [this][old]
+    em.op(0x2A);
+    em.push(1);
+    em.op_u2(0xB4, fref);
+    em.pop(1);
+    em.push(w);
+    let bump = |em: &mut Emit| -> Result<(), CompileError> {
+        em.op(one);
+        em.push(w);
+        em.op(arith);
+        em.pop(w);
+        Ok(())
+    };
+    if post {
+        // [this][old] → [old][this][old]
+        em.op(if wide { 0x5D } else { 0x5A }); // dup2_x1 / dup_x1
+        em.push(w);
+        bump(em)?;
+        em.op_u2(0xB5, fref); // putfield
+        em.pop(w + 1);
+    } else {
+        bump(em)?;
+        // [this][new] → [new][this][new]
+        em.op(if wide { 0x5D } else { 0x5A });
+        em.push(w);
+        em.op_u2(0xB5, fref);
+        em.pop(w + 1);
+    }
+    Ok(())
+}
+
+/// `f = v` / `this.f = v` 当**值**用（隐式 this 的字段或本类静态字段）。
+///
+/// 值要留在栈上：`aload_0; <v>; dup_x1; putfield` 之后栈上还剩 v。
+/// 静态字段更简单：`<v>; dup; putstatic`。
+fn assign_expr_this_field(
+    name: &str,
+    rhs: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let kind;
+    let w;
+    if let Some(&idx) = ctx.fields.get(name) {
+        let desc = ctx.field_descs[idx].clone();
+        kind = kind_from_desc(&desc);
+        w = if kind_wide(kind) { 2 } else { 1 };
+        let fref = cp.field_ref(&ctx.class_name, name, &desc);
+        em.op(0x2A); // aload_0
+        em.push(1);
+        compile_expr(rhs, em, ctx, cp)?;
+        coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
+        em.op(if w == 2 { 0x5D } else { 0x5A }); // dup2_x1 / dup_x1
+        em.push(w);
+        em.op_u2(0xB5, fref); // putfield
+        em.pop(w + 1);
+        return Ok(());
+    }
+    let Some((owner, desc)) = ctx.static_fields.get(name).cloned() else {
+        return err(format!("赋值作为表达式时目标既不是局部变量也不是字段：`{name}`"));
+    };
+    let kind = kind_from_desc(&desc);
+    let w = if kind_wide(kind) { 2 } else { 1 };
+    compile_expr(rhs, em, ctx, cp)?;
+    coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
+    em.op(if w == 2 { 0x5C } else { 0x59 }); // dup2 / dup
+    em.push(w);
+    let fref = cp.field_ref(&owner, name, &desc);
+    em.op_u2(0xB3, fref); // putstatic
+    em.pop(w);
+    Ok(())
+}
+
+/// `a[i] = v` 当**值**用：`<a><i><v>; dup_x2|dup2_x2; <x>astore` —— 之后栈上还剩 v。
+fn assign_expr_array(
+    lhs: &Expr,
+    rhs: &Expr,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let Expr::ArrayAccess { array, index } = lhs else {
+        return err("内部错误：assign_expr_array 收到了非数组下标");
+    };
+    let (_, store) = array_ops(array, ctx);
+    let elem = match expr_type(array, ctx) {
+        Some(Type::Array(inner)) => *inner,
+        _ => Type::Prim("int"),
+    };
+    compile_expr(array, em, ctx, cp)?;
+    em.push(1);
+    compile_expr(index, em, ctx, cp)?;
+    em.push(1);
+    compile_expr(rhs, em, ctx, cp)?;
+    coerce_to(&elem, rhs, ctx, em, cp)?;
+    let w = if kind_wide(kind_of(&elem)) { 2u16 } else { 1u16 };
+    // [arr][idx][v] → [v][arr][idx][v]
+    em.op(if w == 2 { 0x5E } else { 0x5B }); // dup2_x2 / dup_x2
+    em.push(w);
+    em.op(store);
+    em.pop(2 + w);
+    Ok(())
+}
+
+/// VarHandle 的签名多态访问模式（JVMS 2.9.3 / java.lang.invoke.VarHandle）
+const VARHANDLE_MODES: &[&str] = &[
+    "get", "set", "getVolatile", "setVolatile", "getOpaque", "setOpaque", "getAcquire", "setRelease",
+    "compareAndSet", "compareAndExchange", "compareAndExchangeAcquire", "compareAndExchangeRelease",
+    "weakCompareAndSetPlain", "weakCompareAndSet", "weakCompareAndSetAcquire",
+    "weakCompareAndSetRelease", "weakCompareAndSetVolatile", "getAndSet", "getAndSetAcquire",
+    "getAndSetRelease", "getAndAdd", "getAndAddAcquire", "getAndAddRelease", "getAndBitwiseOr",
+    "getAndBitwiseOrAcquire", "getAndBitwiseOrRelease", "getAndBitwiseAnd",
+    "getAndBitwiseAndAcquire", "getAndBitwiseAndRelease", "getAndBitwiseXor",
+    "getAndBitwiseXorAcquire", "getAndBitwiseXorRelease",
+];
+
+/// 一次签名多态调用：谁的方法、是不是静态、调用点描述符
+struct PolyCall {
+    owner: String,
+    is_static: bool,
+    desc: String,
+}
+
+/// 判断 `expr` 是不是签名多态调用；是就给出**调用点**描述符。
+///
+/// `(int) vh.getVolatile(o, i)` 里 `getVolatile` 在类文件里的声明是
+/// `([Ljava/lang/Object;)Ljava/lang/Object;`，但真正要发的指令是
+/// `invokevirtual VarHandle.getVolatile:(Ljava/lang/Object;I)I` —— 描述符由
+/// 「实参静态类型 + 期望返回类型」拼出来，期望返回类型就来自这层 cast。
+///
+/// 静态的四个 `linkTo*` 同理（`(int) MethodHandle.linkToStatic(handle, arg0, mn)`）。
+fn poly_call_desc(expr: &Expr, want: &Type, ctx: &Ctx) -> Option<PolyCall> {
+    let Expr::Call { recv: Some(r), name, args, .. } = expr else { return None };
+    let desc = format!("({}){}", args_desc(args, ctx), descriptor(want));
+    // 静态签名多态：MethodHandle.linkToStatic / linkToVirtual / linkToSpecial / linkToInterface
+    if matches!(name.as_str(), "linkToStatic" | "linkToVirtual" | "linkToSpecial" | "linkToInterface") {
+        if class_owner_forms(r, ctx).iter().any(|o| o == "java/lang/invoke/MethodHandle") {
+            return Some(PolyCall {
+                owner: "java/lang/invoke/MethodHandle".to_string(),
+                is_static: true,
+                desc,
+            });
+        }
+        return None;
+    }
+    let owner = expr_type(r, ctx).as_ref().and_then(|t| resolve_type_owner(t, ctx))?;
+    let is_vh = owner.ends_with("VarHandle");
+    let is_mh = owner == "java/lang/invoke/MethodHandle";
+    let poly = if is_vh {
+        VARHANDLE_MODES.contains(&name.as_str())
+    } else if is_mh {
+        matches!(name.as_str(), "invoke" | "invokeExact" | "invokeBasic")
+    } else {
+        false
+    };
+    if !poly {
+        return None;
+    }
+    Some(PolyCall { owner, is_static: false, desc })
+}
+
+/// 按多态描述符发调用（接收者 + 实参 + invokevirtual / invokestatic）
+fn emit_poly_call(
+    expr: &Expr,
+    pc: &PolyCall,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let Expr::Call { recv: Some(_), name, args, .. } = expr else {
+        return err("内部错误：emit_poly_call 收到了非方法调用");
+    };
+    let sp = hoist_args(args, em, ctx, cp)?;
+    if !pc.is_static {
+        let Expr::Call { recv: Some(r), .. } = expr else { unreachable!() };
+        compile_expr(r, em, ctx, cp)?;
+    }
+    emit_call_args(args, &pc.desc, &sp, em, ctx, cp)?;
+    let idx = cp.method_ref(&pc.owner, name, &pc.desc);
+    if pc.is_static {
+        em.op_u2(0xB8, idx); // invokestatic
+        em.pop(desc_slots(&pc.desc));
+    } else {
+        em.op_u2(0xB6, idx); // invokevirtual
+        em.pop(desc_slots(&pc.desc) + 1);
+    }
+    em.push(if kind_wide(kind_from_ret(&pc.desc)) { 2 } else { 1 });
+    Ok(())
+}
+
+
+// ============================================================ lambda / 方法引用
+//
+// 做法与 javac 一致：把体编成一个**合成方法**，调用点发 `invokedynamic`
+// （引导方法 `LambdaMetafactory.metafactory`）。合成方法统一用**实例方法**，
+// 这样 lambda 体里的 `this` / 实例字段访问原样可用 —— 调用点用
+// `REF_invokeVirtual` 把 `this` 当第一个「捕获实参」压上去即可。
+//
+// 捕获：lambda 体里出现、且在**外层方法**里是局部变量的那些名字。
+// 它们变成合成方法的前若干个形参，调用点按同样的顺序压栈。
+
+/// 收集表达式里出现的**标识符名**（`Expr::Ident` 与 `Field` 的段名）。
+///
+/// 只用来算「lambda 捕获了哪些外层局部变量」：一个名字既要出现在体里、又要
+/// 在外层是局部变量，才算捕获。多算会被 outer-locals 过滤掉，少算会漏传实参。
+fn collect_idents_e(e: &Expr, out: &mut Vec<String>) {
+    let push = |out: &mut Vec<String>, n: &str| {
+        if !out.iter().any(|x| x == n) {
+            out.push(n.to_string());
+        }
+    };
+    match e {
+        Expr::Ident(n) => push(out, n),
+        Expr::Field(r, f) => {
+            collect_idents_e(r, out);
+            push(out, f);
+        }
+        Expr::Call { recv, args, .. } => {
+            if let Some(r) = recv {
+                collect_idents_e(r, out);
+            }
+            for a in args {
+                collect_idents_e(a, out);
+            }
+        }
+        Expr::New { args, .. } => {
+            for a in args {
+                collect_idents_e(a, out);
+            }
+        }
+        Expr::ArrayNew { dims, .. } => {
+            for a in dims {
+                collect_idents_e(a, out);
+            }
+        }
+        Expr::ArrayInit(xs) => {
+            for a in xs {
+                collect_idents_e(a, out);
+            }
+        }
+        Expr::ArrayAccess { array, index } => {
+            collect_idents_e(array, out);
+            collect_idents_e(index, out);
+        }
+        Expr::Binary { lhs, rhs, .. } => {
+            collect_idents_e(lhs, out);
+            collect_idents_e(rhs, out);
+        }
+        Expr::Unary { expr, .. } => collect_idents_e(expr, out),
+        Expr::Assign { lhs, rhs, .. } => {
+            collect_idents_e(lhs, out);
+            collect_idents_e(rhs, out);
+        }
+        Expr::Cond { cond, then, els } => {
+            collect_idents_e(cond, out);
+            collect_idents_e(then, out);
+            collect_idents_e(els, out);
+        }
+        Expr::Cast { expr, .. } => collect_idents_e(expr, out),
+        Expr::InstanceOf { expr, .. } => collect_idents_e(expr, out),
+        Expr::Lambda { params, body } => {
+            collect_idents_e(body, out);
+            out.retain(|n| !params.contains(n));
+        }
+        Expr::LambdaStmt { params, body } => {
+            collect_idents_s(body, out);
+            out.retain(|n| !params.contains(n));
+        }
+        Expr::MethodRef { recv, .. } => collect_idents_e(recv, out),
+        Expr::SwitchExpr(s) => collect_idents_s(s, out),
+        _ => {}
+    }
+}
+
+fn collect_idents_s(s: &Stmt, out: &mut Vec<String>) {
+    match s {
+        Stmt::Block(xs) => {
+            for x in xs {
+                collect_idents_s(x, out);
+            }
+        }
+        Stmt::LocalVar { init, .. } => {
+            if let Some(i) = init {
+                collect_idents_e(i, out);
+            }
+        }
+        Stmt::Expr(e) | Stmt::Throw(e) | Stmt::Yield(e) => collect_idents_e(e, out),
+        Stmt::Return(Some(e)) => collect_idents_e(e, out),
+        Stmt::Return(None) | Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}
+        Stmt::If { cond, then, els } => {
+            collect_idents_e(cond, out);
+            collect_idents_s(then, out);
+            if let Some(e) = els {
+                collect_idents_s(e, out);
+            }
+        }
+        Stmt::While { cond, body } => {
+            collect_idents_e(cond, out);
+            collect_idents_s(body, out);
+        }
+        Stmt::DoWhile { body, cond } => {
+            collect_idents_s(body, out);
+            collect_idents_e(cond, out);
+        }
+        Stmt::For { init, cond, update, body } => {
+            for s in init {
+                collect_idents_s(s, out);
+            }
+            if let Some(c) = cond {
+                collect_idents_e(c, out);
+            }
+            for u in update {
+                collect_idents_e(u, out);
+            }
+            collect_idents_s(body, out);
+        }
+        Stmt::ForEach { iter, body, .. } => {
+            collect_idents_e(iter, out);
+            collect_idents_s(body, out);
+        }
+        Stmt::Labeled { body, .. } => collect_idents_s(body, out),
+        Stmt::Switch { selector, cases } => {
+            collect_idents_e(selector, out);
+            for c in cases {
+                for l in c.labels.iter().flatten() {
+                    collect_idents_e(l, out);
+                }
+                for b in &c.body {
+                    collect_idents_s(b, out);
+                }
+            }
+        }
+        Stmt::Try { body, catches, finally } => {
+            collect_idents_s(body, out);
+            for c in catches {
+                collect_idents_s(&c.body, out);
+            }
+            if let Some(f) = finally {
+                collect_idents_s(f, out);
+            }
+        }
+    }
+}
+
+/// 声明类型 → 它作为功能性接口的内部名（符号表里真实存在的那个键）
+pub(crate) fn lambda_target_of_ty(ty: &Type, ctx: &Ctx) -> Option<super::ctx::LambdaTarget> {
+    let iface = type_name_candidates(ty, ctx).into_iter().find(|c| ctx.iface_sam.contains_key(c))?;
+    let args = match ty {
+        Type::Named { args, .. } => args.clone(),
+        _ => Vec::new(),
+    };
+    Some(super::ctx::LambdaTarget { iface, args })
+}
+
+/// 描述符里的一个参数 → 目标接口（实参位置的目标类型）
+pub(crate) fn lambda_target_of_desc(d: &str, ctx: &Ctx) -> Option<super::ctx::LambdaTarget> {
+    if !d.starts_with('L') {
+        return None;
+    }
+    let name = d.trim_start_matches('L').trim_end_matches(';');
+    if ctx.iface_sam.contains_key(name) {
+        Some(super::ctx::LambdaTarget { iface: name.to_string(), args: Vec::new() })
+    } else {
+        None
+    }
+}
+
+/// 描述符的参数列表 → 类型表
+fn desc_param_types(desc: &str) -> Vec<Type> {
+    desc_params(desc).iter().map(|d| type_from_desc(d)).collect()
+}
+
+/// 把 lambda / 方法引用编成「合成方法 + invokedynamic」。
+///
+/// `params` 是 lambda 的形参（方法引用传空表）；`as_instance` 说合成方法要不要
+/// `this`（体里用到了 `this` / 实例成员时就应当是实例方法）。
+fn emit_lambda(
+    body: Stmt,
+    params: Vec<(String, Type)>,
+    as_instance: bool,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let Some(tgt) = ctx.lambda_target.borrow().clone() else {
+        return err("推断不出 lambda 的目标类型（功能性接口）");
+    };
+    let iface = tgt.iface.clone();
+    let Some((sam_name, sam_desc)) = ctx.iface_sam.get(&iface).cloned() else {
+        return err(format!("`{}` 不是功能性接口，实现不了 lambda", iface.replace('/', ".")));
+    };
+    let sam_params = instantiate_sam(&desc_param_types(&sam_desc), &tgt.args);
+
+    // 捕获：体里出现、且在外层是局部变量的名字（按槽序，保证确定性）
+    let mut names: Vec<String> = Vec::new();
+    collect_idents_s(&body, &mut names);
+    let mut caps: Vec<(String, u8, Type)> = Vec::new();
+    for n in &names {
+        if params.iter().any(|(p, _)| p == n) || n == "<this-class>" {
+            continue;
+        }
+        if let Some(slot) = ctx.locals.get(n) {
+            let ty = ctx.local_ty.get(n).cloned().unwrap_or(Type::Named {
+                path: vec!["java/lang/Object".to_string()],
+                args: Vec::new(),
+            });
+            caps.push((n.clone(), *slot, ty));
+        }
+    }
+    caps.sort_by_key(|(_, s, _)| *s);
+
+    let seq = {
+        let mut g = ctx.lambda_seq.borrow_mut();
+        let v = *g;
+        *g += 1;
+        v
+    };
+    let impl_name = format!("lambda${}${}", sanitize_method_name(&ctx.method_name), seq);
+    let mut impl_desc = String::from("(");
+    for (_, _, t) in &caps {
+        impl_desc.push_str(&descriptor(t));
+    }
+    for t in &sam_params {
+        impl_desc.push_str(&descriptor(t));
+    }
+    impl_desc.push(')');
+    impl_desc.push_str(sam_desc.rsplit(')').next().unwrap_or("V"));
+
+    ctx.synth.borrow_mut().push(super::ctx::SynthMethod {
+        name: impl_name.clone(),
+        desc: impl_desc.clone(),
+        captures: caps.iter().map(|(n, _, t)| (n.clone(), t.clone())).collect(),
+        params,
+        body,
+        is_instance: as_instance,
+    });
+
+    // 调用点：先压 `this`（REF_invokeVirtual 的接收者），再压捕获
+    let mut indy_desc = String::from("(");
+    if as_instance {
+        indy_desc.push('L');
+        indy_desc.push_str(&ctx.class_name);
+        indy_desc.push(';');
+        em.op(0x2A); // aload_0
+        em.push(1);
+    }
+    let mut slots = if as_instance { 1u16 } else { 0 };
+    for (_, slot, t) in &caps {
+        let kind = kind_of(t);
+        em.load_slot(*slot, kind)?;
+        let w = if kind_wide(kind) { 2 } else { 1 };
+        em.push(w);
+        slots += w;
+        indy_desc.push_str(&descriptor(t));
+    }
+    indy_desc.push(')');
+    indy_desc.push('L');
+    indy_desc.push_str(&iface);
+    indy_desc.push(';');
+
+    // 引导方法：LambdaMetafactory.metafactory(Lookup, String, MethodType, MethodType,
+    //                                        MethodHandle, MethodType)
+    let kind = if as_instance { 5u8 } else { 6u8 }; // REF_invokeVirtual / REF_invokeStatic
+    let impl_handle = cp.method_handle(kind, &ctx.class_name, &impl_name, &impl_desc);
+    let sam_mt = cp.method_type(&sam_desc);
+    // instantiatedMethodType：代入类型实参之后的签名（必须是 samMethodType 的特化）
+    let inst_desc = {
+        let mut d = String::from("(");
+        for t in &sam_params {
+            d.push_str(&descriptor(t));
+        }
+        d.push(')');
+        d.push_str(sam_desc.rsplit(')').next().unwrap_or("V"));
+        d
+    };
+    let inst_mt_ty = cp.method_type(&inst_desc);
+    let bsm_ref = cp.method_handle(
+        6, // REF_invokeStatic
+        "java/lang/invoke/LambdaMetafactory",
+        "metafactory",
+        "(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodType;Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;)Ljava/lang/invoke/CallSite;",
+    );
+    let bsm = cp.bootstrap(bsm_ref, vec![sam_mt, impl_handle, inst_mt_ty]);
+    let idx = cp.invoke_dynamic(&sam_name, &indy_desc, bsm);
+    em.op(0xBA); // invokedynamic
+    em.bytes.extend_from_slice(&idx.to_be_bytes());
+    em.bytes.push(0);
+    em.bytes.push(0);
+    em.pop(slots);
+    em.push(1);
+    Ok(())
+}
+
+/// SAM 形参名 + 擦除类型（`params: Vec<String>` 来自 parser，类型从 SAM 描述符取）
+fn sam_params_named(names: &[String], desc: &str, targs: &[Type]) -> Vec<(String, Type)> {
+    let tys = instantiate_sam(&desc_param_types(desc), targs);
+    names
+        .iter()
+        .enumerate()
+        .map(|(i, n)| (n.clone(), tys.get(i).cloned().unwrap_or(Type::Prim("int"))))
+        .collect()
+}
+
+/// 把 SAM 描述符里**擦除成 `Object` 的形参**换成目标类型给的类型实参。
+///
+/// `Consumer<String>` 的 SAM 擦成 `accept(Object)`：不代回去，lambda 体里
+/// `s.isEmpty()` 就按 `Object` 接收者解析（报「未找到实例方法」）。
+/// 返回值**故意不代**：那需要真正的类型推断（还要处理装箱/拆箱），代错了会变成
+/// VerifyError；返回 `Object` 在字节码层面永远合法。
+fn instantiate_sam(params: &[Type], targs: &[Type]) -> Vec<Type> {
+    let mut out = params.to_vec();
+    if targs.is_empty() {
+        return out;
+    }
+    let obj = |t: &Type| match t {
+        Type::Named { path, args } => args.is_empty() && path.len() == 1 && path[0] == "java/lang/Object",
+        _ => false,
+    };
+    let idx: Vec<usize> = params.iter().enumerate().filter(|(_, t)| obj(t)).map(|(i, _)| i).collect();
+    if idx.is_empty() {
+        return out;
+    }
+    if targs.len() == 1 {
+        // `Comparator<T>`：两个 Object 形参共用一个类型实参
+        for i in &idx {
+            out[*i] = targs[0].clone();
+        }
+    } else {
+        // `Function<A,R>` / `BiFunction<A,B,R>`：末尾多出来的那个是返回值，只代形参
+        for (k, i) in idx.iter().enumerate() {
+            if let Some(a) = targs.get(k) {
+                out[*i] = a.clone();
+            }
+        }
+    }
+    out
+}
+
+/// 体里用没用到 `this`（含隐式：实例字段 / 实例方法 / 裸 `this`）。
+///
+/// 判据保守：只要体里出现了不是局部变量、但在本类可见的名字，就认为要 `this`。
+/// 多认得一张实例方法也不必 —— 合成方法用实例形态永远合法（除了静态方法里没有
+/// `this`，那种情况调用点会自然报错）。
+fn body_uses_this(body: &Stmt, ctx: &Ctx) -> bool {
+    if !ctx.has_this {
+        return false;
+    }
+    let mut names: Vec<String> = Vec::new();
+    collect_idents_s(body, &mut names);
+    names.iter().any(|n| {
+        // 只看**实例**成员：静态字段/静态方法不需要 this
+        ctx.locals.get(n).is_none()
+            && (ctx.fields.contains_key(n) || ctx.instance_methods.contains_key(n))
+    })
+}
+
+/// 合成方法名里不能出现 `<` `>`（JVM 规范 4.2.2 限制方法名），构造器叫 `<init>`：
+/// 直接拼进 `lambda$<init>$0` 会得到 `ClassFormatError: Illegal method name`。
+fn sanitize_method_name(n: &str) -> String {
+    match n {
+        "<init>" => "new".to_string(),
+        "<clinit>" => "clinit".to_string(),
+        _ => n.chars().filter(|c| c.is_ascii_alphanumeric() || *c == '_' || *c == '$').collect(),
+    }
 }

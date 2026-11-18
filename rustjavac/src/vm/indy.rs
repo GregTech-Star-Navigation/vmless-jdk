@@ -1815,7 +1815,46 @@ impl Vm {
                     None => Ok(Slot::I(0)),
                 }
             }
-            (_, "findStatic") | (_, "findVirtual") | (_, "findSpecial") | (_, "findConstructor") => {
+            // **`findConstructor` 是 2 个参数**：`(Class, MethodType)`，没有方法名。
+            // 被并进下面那个 3 参分支时 `args.get(2)` 恒为空 → 报「第 3 个参数不是 MethodType」，
+            // 而这条路径是**反射造对象的必经之路**（`Constructor.newInstance` →
+            // `DirectConstructorHandleAccessor` → `findConstructor`）：
+            // `FileChannel.map()` 的 `Util.newMappedByteBuffer` 就炸在这。
+            (_, "findConstructor") => {
+                let c = self.class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
+                    .ok_or_else(|| {
+                        self.bsm_error("Lookup.findConstructor 的第 1 个参数不是 Class".to_string())
+                    })?;
+                let mt = self.mtype_of(args.get(1).copied().unwrap_or(Slot::I(0)).as_i32())
+                    .ok_or_else(|| {
+                        self.bsm_error("Lookup.findConstructor 的第 2 个参数不是 MethodType".to_string())
+                    })?;
+                let n = "<init>".to_string();
+                // 构造器的 MethodType 是 `()V` 形态：参数一致、返回 void；
+                // 句柄自身的类型则是 `(参数)类`
+                let ctor_desc = {
+                    let close = mt.find(')').unwrap_or(1);
+                    format!("{}V", &mt[..close + 1])
+                };
+                let resolved = self.store.resolve_method(&c, &n, &ctor_desc).is_some()
+                    || self.builtin_has_member(&c, &n, &ctor_desc);
+                if !resolved {
+                    return Err(self.java_exception(
+                        "java/lang/NoSuchMethodException",
+                        format!("no such constructor: {}.<init>{}", c.replace('/', "."), ctor_desc),
+                    ));
+                }
+                let mtype = handle_type(8, &c, &ctor_desc);
+                let h = self.mh_obj(
+                    MhKind::Direct { ref_kind: 8, class: c, name: n, desc: ctor_desc },
+                    mtype,
+                );
+                Ok(Slot::I(h))
+            }
+            // `findSpecial(Class, String, MethodType, Class specialCaller)` —— **4 个参数**，
+            // 第 4 个是调用者类。我们的 `invokeSpecial` 不需要它（按引用类直接解析），
+            // 所以只取前三个。
+            (_, "findStatic") | (_, "findVirtual") | (_, "findSpecial") => {
                 let c = self.class_obj_name(args.first().copied().unwrap_or(Slot::I(0)).as_i32())
                     .ok_or_else(|| self.bsm_error(format!("Lookup.{name} 的第一个参数不是 Class")))?;
                 let n = self.value_text(args.get(1).copied().unwrap_or(Slot::I(0)).as_i32())?;

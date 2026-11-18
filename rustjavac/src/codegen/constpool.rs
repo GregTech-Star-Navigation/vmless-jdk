@@ -14,6 +14,10 @@ pub struct CpBuilder {
     method_cache: HashMap<(u16, u16), u16>,
     iface_method_cache: HashMap<(u16, u16), u16>,
     string_cache: HashMap<u16, u16>,
+    method_type_cache: HashMap<u16, u16>,
+    /// `BootstrapMethods` 属性：每项 `(bootstrap method_ref, 静态参数...)`。
+    /// `invokedynamic` 的操作数是这张表的下标，所以它必须在**整份类**里唯一编号。
+    pub(crate) bsm: Vec<(u16, Vec<u16>)>,
 }
 
 impl CpBuilder {
@@ -128,6 +132,50 @@ impl CpBuilder {
 
     pub fn entries(self) -> Vec<Option<CpEntry>> {
         self.entries
+    }
+
+    // ---------------------------------------------------------------- invokedynamic
+
+    /// `CONSTANT_MethodType`（一个方法描述符）。
+    pub fn method_type(&mut self, desc: &str) -> u16 {
+        let u = self.utf8(desc);
+        if let Some(i) = self.method_type_cache.get(&u) {
+            return *i;
+        }
+        let i = self.push(CpEntry::MethodType(u));
+        self.method_type_cache.insert(u, i);
+        i
+    }
+
+    /// `CONSTANT_MethodHandle`。`kind` 用 JVMS 的引用种类
+    /// （5 = invokeVirtual，6 = invokeStatic，7 = invokeSpecial，9 = invokeInterface）。
+    pub fn method_handle(&mut self, kind: u8, owner: &str, name: &str, desc: &str) -> u16 {
+        let r = if kind == 9 {
+            self.interface_method_ref(owner, name, desc)
+        } else {
+            self.method_ref(owner, name, desc)
+        };
+        self.push(CpEntry::MethodHandle(kind, r))
+    }
+
+    /// 注册一条 `BootstrapMethods` 项，返回它的下标。
+    pub fn bootstrap(&mut self, method_ref: u16, args: Vec<u16>) -> u16 {
+        if let Some(i) = self.bsm.iter().position(|(m, a)| *m == method_ref && *a == args) {
+            return i as u16;
+        }
+        self.bsm.push((method_ref, args));
+        (self.bsm.len() - 1) as u16
+    }
+
+    /// `CONSTANT_InvokeDynamic`：`(引导方法下标, 名字+描述符)`。
+    pub fn invoke_dynamic(&mut self, name: &str, desc: &str, bsm_index: u16) -> u16 {
+        let nt = self.name_and_type(name, desc);
+        self.push(CpEntry::InvokeDynamic(bsm_index, nt))
+    }
+
+    /// 取走 `BootstrapMethods`（写属性用），其余照常交出去
+    pub fn take_bootstrap(&mut self) -> Vec<(u16, Vec<u16>)> {
+        std::mem::take(&mut self.bsm)
     }
 
     /// 克隆一份常量池（用于先算索引、后组装）

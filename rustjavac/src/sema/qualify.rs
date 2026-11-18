@@ -283,7 +283,9 @@ impl Qualifier<'_> {
                     self.stmt(f);
                 }
             }
-            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}        }
+            Stmt::Yield(e) => self.expr(e),
+            Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}
+        }
     }
 
     fn expr(&self, e: &mut Expr) {
@@ -345,6 +347,7 @@ impl Qualifier<'_> {
                 self.expr(els);
             }
             Expr::Lambda { body, .. } => self.expr(body),
+            Expr::LambdaStmt { body, .. } => self.stmt(body),
             // 类名当表达式用（静态方法/静态字段的接收者）：按 import 补成内部名
             Expr::Ident(n) => {
                 if let Some(full) = self.imported_class(n) {
@@ -352,7 +355,7 @@ impl Qualifier<'_> {
                 }
             }
             Expr::MethodRef { recv, .. } => self.expr(recv),
-            Expr::SwitchExpr(inner) => self.expr(inner),
+            Expr::SwitchExpr(inner) => self.stmt(inner),
             _ => {}
         }
     }

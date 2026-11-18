@@ -155,6 +155,70 @@ impl Vm {
         r
     }
 
+    /// `invoke_api` 说「这个我没接管」时的兜底：**类里真有这个方法就跑真字节码**。
+    ///
+    /// `is_invoke_api_class` 是「整包接管」的粗筛（`java.lang.invoke.*` 里大量方法是
+    /// VM 原语 —— `invokeBasic` / `linkToVirtual` / 隐藏类 —— 执行它们的字节码不可能
+    /// 跑通）。但那个包里也有**纯 Java 的辅助方法**，典型是
+    /// `MethodHandleImpl.runtimeSetup()`：它只是装 `SharedSecrets.JavaLangInvokeAccess`。
+    /// 把它一并拒掉，`ClassFrameInfo.<clinit>`（`StackWalker` 依赖它）就会
+    /// `BootstrapMethodError`。所以判据是「VM 没接管 **且** 解析得到方法」→ 跑字节码。
+    fn invoke_api_fallback(
+        &mut self,
+        info: &super::call::MethodRefInfo,
+        recv: Option<i32>,
+        args: &[Slot],
+        op_pc: usize,
+    ) -> Result<Slot, VmError> {
+        let target = self
+            .store
+            .resolve_method(&info.class, &info.name, &info.desc)
+            .or_else(|| {
+                // 虚调用：引用类上没有就按接收者的运行时类再找一次
+                recv.and_then(|r| self.obj_class_name(r))
+                    .and_then(|c| self.store.resolve_method(&c, &info.name, &info.desc))
+            });
+        match target {
+            Some((ci, mi)) => {
+                super::stacktrace::set_pc(op_pc);
+                let mut all: Vec<Slot> = Vec::with_capacity(args.len() + 1);
+                if let Some(r) = recv {
+                    all.push(Slot::I(r));
+                }
+                all.extend_from_slice(args);
+                self.depth += 1;
+                let r = self.execute(ci, mi, &info.desc, &all, recv.is_some());
+                self.depth -= 1;
+                r
+            }
+            None => Err(self.java_exception(
+                "java/lang/BootstrapMethodError",
+                format!("VM 没有接管 {}.{}{}", info.class, info.name, info.desc),
+            )),
+        }
+    }
+
+    /// 静态字段的**声明类**：从引用类出发，沿继承链找第一个自己声明了这个静态字段的类。
+    ///
+    /// JVMS 5.4.3.2 的字段解析要求沿父类链找；javac 对**继承来的**静态字段可能仍用
+    /// 子类名做 owner —— JDK 25 的 `StackFrameInfo.declaringClass()` 读的就是
+    /// `StackFrameInfo.JLIA`，而 `JLIA` 声明在父类 `java/lang/ClassFrameInfo` 上。
+    /// 只按引用类建表会读到 0（静态字段表按声明类存）。
+    fn static_owner(&self, class: &str, name: &str) -> String {
+        for c in self.store.chain(class) {
+            if let Some(cf) = self.store.class_file(&c) {
+                let hit = cf.fields.iter().any(|f| {
+                    f.access_flags & 0x0008 != 0
+                        && cf.utf8(f.name_index).map(|b| b == name.as_bytes()).unwrap_or(false)
+                });
+                if hit {
+                    return c;
+                }
+            }
+        }
+        class.to_string()
+    }
+
     fn execute_body(
         &mut self,
         class: usize,
@@ -208,6 +272,9 @@ impl Vm {
         })?;
 
         let mut frame = Frame::new(max_locals);
+        // 帧链：进方法压一帧（只有原子量；Drop 时弹）。native 方法不压 —— 与 HotSpot 一样
+        // 不把 native 帧暴露给 `getStackTrace`/`StackWalker`。
+        let _frame_mark = super::stacktrace::enter(&cf, method);
         native_reg::place_args(&mut frame, desc, args, receiver);
         // 引用位图：这个方法的每个 pc 上「哪些槽是引用」（GC 找根的唯一依据）。
         // 算一次缓存起来，之后每个调用点只是一次读锁 + 一次哈希。
@@ -293,6 +360,8 @@ impl Vm {
                 }
             } else if self.tick >= super::thread::SAFEPOINT_EVERY {
                 self.tick = 0;
+                // 采样点：让别的线程（jstack / 死锁报告 / 帧栈诊断）看到这一帧的当前位置
+                super::stacktrace::set_pc(pc);
                 self.safepoint();
                 self.gc_poll(&mut frame, pc);
             }
@@ -797,6 +866,8 @@ impl Vm {
                 // athrow：沿**本方法**的异常表找 handler；本帧没有就带着异常对象往上抛
                 0xbf => {
                     let op_pc = pc - 1;
+                    // 抛出点：栈轨迹里这一帧的行号 = `throw` 所在行
+                    super::stacktrace::set_pc(op_pc);
                     let h = frame.pop_i()?;
                     match self.find_handler(&cf, &exc_table, op_pc, h)? {
                         Some(target) => {
@@ -1059,13 +1130,33 @@ impl Vm {
                         // 内建常量：`Integer.MAX_VALUE` / `Long.MIN_VALUE`（没有 .class）
                         frame.push(v);
                     } else {
-                        // 首次访问这个类时先跑它的 <clinit>
-                        self.ensure_init(&info.class)?;
-                        let v = lk(&self.sh.statics)
+                        // 静态字段解析要**沿继承链**走（JVMS 5.4.3.2）：javac 对从父类继承来的
+                        // 静态字段可能仍用**子类名**做字段引用的 owner —— JDK 25 的
+                        // `StackFrameInfo.declaringClass()` 读的就是 `StackFrameInfo.JLIA`，
+                        // 而 `JLIA` 声明在父类 `java/lang/ClassFrameInfo` 上。只按
+                        // `info.class` 建表会读到 0，然后拿 null 当接收者去调
+                        // `JavaLangInvokeAccess.getDeclaringClass` → 运行时找不到方法。
+                        //
+                        // 快路径：键在表里就直接读（绝大多数读是已初始化/已镜像过的）。
+                        let direct = lk(&self.sh.statics)
                             .get(&(info.class.clone(), info.name.clone()))
-                            .copied()
-                            .unwrap_or(Slot::I(0));
-                        frame.push(v);
+                            .copied();
+                        match direct {
+                            Some(v) => frame.push(v),
+                            None => {
+                                let owner = self.static_owner(&info.class, &info.name);
+                                self.ensure_init(&owner)?;
+                                let v = lk(&self.sh.statics)
+                                    .get(&(owner.clone(), info.name.clone()))
+                                    .copied()
+                                    .unwrap_or(Slot::I(0));
+                                // 零值静态字段也要留个槽：否则每次读都要走一遍继承链解析
+                                lk(&self.sh.statics)
+                                    .entry((info.class.clone(), info.name.clone()))
+                                    .or_insert(v);
+                                frame.push(v);
+                            }
+                        }
                     }
                 }
                 // putstatic
@@ -1074,8 +1165,13 @@ impl Vm {
                     pc += 2;
                     let info = self.method_ref(&cf, idx)?;
                     let value = frame.pop()?;
-                    self.ensure_init(&info.class)?;
-                    lk(&self.sh.statics).insert((info.class, info.name), value);
+                    // 写也要落到**声明类**上，并给「用子类名引用」的那把键留镜像
+                    let owner = self.static_owner(&info.class, &info.name);
+                    self.ensure_init(&owner)?;
+                    lk(&self.sh.statics).insert((owner.clone(), info.name.clone()), value);
+                    if owner != info.class {
+                        lk(&self.sh.statics).insert((info.class, info.name), value);
+                    }
                 }
                 // invokevirtual / invokeinterface：println 走内建；
                 // 其余按**接收者的运行时类**虚分派（接口与类走同一条路，只是指令编码多两字节）
@@ -1101,10 +1197,7 @@ impl Vm {
                         let r = self.invoke_api(0, &info.class, &info.name, &info.desc, recv, &args);
                         let r = match r {
                             Ok(Some(v)) => Ok(v),
-                            Ok(None) => Err(self.java_exception(
-                                "java/lang/BootstrapMethodError",
-                                format!("VM 没有接管 {}.{}{}", info.class, info.name, info.desc),
-                            )),
+                            Ok(None) => self.invoke_api_fallback(&info, Some(recv), &args, op_pc),
                             Err(e) => Err(e),
                         };
                         match call_or_handle!(r, op_pc) {
@@ -1121,7 +1214,11 @@ impl Vm {
                         }
                         continue;
                     }
-                    if info.name == "println" {
+                    // `println` 只用**内建**实现顶替独立模式（没有 java.base / PrintStream 的替身）。
+                    // 真字节码模式下必须让真 `java.io.PrintStream` 跑：两条不同的输出通道
+                    // （内建 println 进 VM 输出缓冲、`PrintStream.print` 直接写 fd 1）
+                    // 会把顺序打乱 —— `print("x\n"); println("y")` 会先出 y 再出 x。
+                    if info.name == "println" && !self.store.has_class("java/io/PrintStream") {
                         let arg = frame.pop()?;
                         let _recv = frame.pop()?;
                         // `println(Object)` / `println(String)` 要按 java 的语义取文本：
@@ -1259,6 +1356,7 @@ impl Vm {
                                 }
                             }
                         };
+                        super::stacktrace::set_pc(op_pc);
                         self.depth += 1;
                         self.last_caller = class;
                         let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &all, true), op_pc);
@@ -1299,10 +1397,7 @@ impl Vm {
                         let r = self.invoke_api(2, &info.class, &info.name, &info.desc, all[0].as_i32(), &all[1..]);
                         let r = match r {
                             Ok(Some(v)) => Ok(v),
-                            Ok(None) => Err(self.java_exception(
-                                "java/lang/BootstrapMethodError",
-                                format!("VM 没有接管 {}.{}{}", info.class, info.name, info.desc),
-                            )),
+                            Ok(None) => self.invoke_api_fallback(&info, Some(all[0].as_i32()), &all[1..], op_pc),
                             Err(e) => Err(e),
                         };
                         match call_or_handle!(r, op_pc) {
@@ -1323,6 +1418,7 @@ impl Vm {
                     match self.store.resolve_method(&info.class, &info.name, &info.desc) {
                         Some((ci, mi)) => {
                             let op_pc = pc - 3;
+                            super::stacktrace::set_pc(op_pc);
                             self.depth += 1;
                             let r = self.execute(ci, mi, &info.desc, &all, true);
                             self.depth -= 1;
@@ -1379,10 +1475,7 @@ impl Vm {
                         let r = self.invoke_api(1, &info.class, &info.name, &info.desc, 0, &args);
                         let r = match r {
                             Ok(Some(v)) => Ok(v),
-                            Ok(None) => Err(self.java_exception(
-                                "java/lang/BootstrapMethodError",
-                                format!("VM 没有接管 {}.{}{}", info.class, info.name, info.desc),
-                            )),
+                            Ok(None) => self.invoke_api_fallback(&info, None, &args, op_pc),
                             Err(e) => Err(e),
                         };
                         match call_or_handle!(r, op_pc) {
@@ -1443,6 +1536,7 @@ impl Vm {
                         continue;
                     };
                     self.last_caller = class;
+                    super::stacktrace::set_pc(op_pc);
                     self.depth += 1;
                     let r = call_or_handle!(self.execute(target.0, target.1, &info.desc, &args, false), op_pc);
                     self.depth -= 1;
@@ -1482,6 +1576,7 @@ impl Vm {
                 // 参数弹出个数按调用点自己的描述符，不看引导方法。
                 0xba => {
                     let op_pc = pc - 1;
+                    super::stacktrace::set_pc(op_pc);
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 4;
                     let desc = self.indy_desc(class, idx)?;
@@ -1611,6 +1706,11 @@ fn is_override_owner(cf: &crate::ClassFile) -> bool {
             | b"java/lang/reflect/Constructor"
             | b"java/lang/reflect/ReflectAccess"
             | b"java/util/StringJoiner"
+            // `SunGraphics2D`：`drawString` 的接管点（JDK 25 的字体栈全走 FFM，到不了
+            // `DrawGlyphList`；在 `SunGraphics2D` 层拦才能用 GDI 真字体画字）
+            | b"sun/java2d/SunGraphics2D"
+            | b"java/lang/reflect/ReflectAccess"
+            | b"jdk/internal/access/SharedSecrets"
     )
 }
 

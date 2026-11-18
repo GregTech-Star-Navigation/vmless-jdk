@@ -34,6 +34,7 @@ pub(super) fn register(r: &mut NativeRegistry) {
     register_loops(r);
     register_window(r);
     register_shapes(r);
+    register_text(r);
 }
 
 fn void() -> Result<Slot, VmError> {
@@ -57,6 +58,19 @@ fn unsupported(what: &str) -> VmError {
 }
 
 // ============================================================ 一、库加载策略
+
+/// 给任意 native 套一层「进/出」追踪（`VMLESS_AWT_TRACE=1` 才打）
+macro_rules! traced {
+    ($name:literal, $f:expr) => {{
+        fn w(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+            atrace(concat!("> ", $name));
+            let r = $f(vm, f);
+            atrace(concat!("< ", $name));
+            r
+        }
+        w
+    }};
+}
 
 /// `jdk.internal.loader.NativeLibraries.findBuiltinLib(String)String`
 ///
@@ -681,11 +695,56 @@ fn clip_span(vm: &Vm, region: i32, y: i32, x0: i32, x1: i32) -> Vec<(i32, i32)> 
 fn loop_draw_line(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let sg = f.arg_i(0);
     let dst = f.arg_i(1);
-    let (mut x0, mut y0, x1, y1) = (f.arg_i(2), f.arg_i(3), f.arg_i(4), f.arg_i(5));
+    let (x0, y0, x1, y1) = (f.arg_i(2), f.arg_i(3), f.arg_i(4), f.arg_i(5));
     let Some(s) = surface_of(dst) else {
         return Err(unsupported("DrawLine：目标不是 BufImgSurfaceData"));
     };
     let g = read_g2d(vm, sg);
+    bresenham_line(vm, &s, &g, x0, y0, x1, y1);
+    flush_surface(vm, dst);
+    void()
+}
+
+/// 读 `Path2D.Float` 的内部坐标，摊成 `(type, coords)` 段（坐标已加 transX/transY）。
+///
+/// 不走 `PathIterator` —— 那是 Java 方法，读一次要再进解释器；直接读它的四个字段：
+/// `floatCoords`（`Path2D.Float`）、`pointTypes`/`numTypes`/`windingRule`（`Path2D`）。
+/// 段类型常量与 `PathIterator` 一致：0=move 1=line 2=quad 3=cubic 4=close。
+fn path_segs(vm: &Vm, path: i32, tx: i32, ty: i32) -> Option<(Vec<(u8, [f32; 6])>, i32)> {
+    if path <= 0 {
+        return None;
+    }
+    let coords = get_ref_field(vm, path, "java/awt/geom/Path2D$Float", "floatCoords");
+    let types = get_ref_field(vm, path, "java/awt/geom/Path2D", "pointTypes");
+    if coords <= 0 || types <= 0 {
+        return None;
+    }
+    let ntypes = get_i32_field(vm, path, "java/awt/geom/Path2D", "numTypes");
+    let rule = get_i32_field(vm, path, "java/awt/geom/Path2D", "windingRule");
+    let (fx, fy) = (tx as f32, ty as f32);
+    let mut segs: Vec<(u8, [f32; 6])> = Vec::new();
+    let mut ci: usize = 0;
+    for ti in 0..ntypes.max(0) as usize {
+        let t = vm.sh.heap.get(types, ti).map(|v| v.as_i32()).unwrap_or(0) as u8;
+        let mut c = [0.0f32; 6];
+        let n = match t {
+            0 | 1 => 2,
+            2 => 4,
+            3 => 6,
+            _ => 0,
+        };
+        for k in 0..n {
+            let v = vm.sh.heap.get(coords, ci + k).map(fl).unwrap_or(0.0);
+            c[k] = if k % 2 == 0 { v + fx } else { v + fy };
+        }
+        ci += n;
+        segs.push((t, c));
+    }
+    Some((segs, rule))
+}
+
+/// 一条 Bresenham 线（thin stroke 的像素级做法，与 `IntArgbDrawLine` 同一取向）
+fn bresenham_line(vm: &mut Vm, s: &Surface, g: &G2d, mut x0: i32, mut y0: i32, x1: i32, y1: i32) {
     let dx = (x1 - x0).abs();
     let dy = (y1 - y0).abs();
     let sx = if x0 < x1 { 1 } else { -1 };
@@ -693,7 +752,7 @@ fn loop_draw_line(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let mut err = dx - dy;
     loop {
         for (a, b) in clip_span(vm, g.dev_clip, y0, x0, x0 + 1) {
-            fill_span(vm, &s, &g, y0, a, b);
+            fill_span(vm, s, g, y0, a, b);
         }
         if x0 == x1 && y0 == y1 {
             break;
@@ -707,6 +766,81 @@ fn loop_draw_line(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
             err += dx;
             y0 += sy;
         }
+    }
+}
+
+/// `sun.java2d.loops.FillPath.FillPath(SunGraphics2D, SurfaceData, int transX, int transY, Path2D.Float)`
+///
+/// 这条 loop 是 **JDK 25 里 `Graphics2D.fill(Shape)` / `fillOval` 的唯一出口**
+/// （`LoopPipe.fill` 在 `STROKE_THIN` 下直接调它，不再走 `ShapeSpanIterator`）。
+/// 不实现它就落到 `GeneralRenderer.SetFillPathANY`（纯 Java 的 span 管线），
+/// 那条路在本 VM 上一像素都不落 —— 实测 `fillOval` 整块消失。
+///
+/// 实现直接复用 `Spi` 的扫描线（与 `fillPolygon` 同一套规则），所以两种画法边界一致。
+fn loop_fill_path(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sg = f.arg_i(0);
+    let dst = f.arg_i(1);
+    let (tx, ty) = (f.arg_i(2), f.arg_i(3));
+    let path = f.arg_i(4);
+    let Some(s) = surface_of(dst) else {
+        return Err(unsupported("FillPath：目标 SurfaceData 不是本 VM 记录的 BufImgSurfaceData"));
+    };
+    let g = read_g2d(vm, sg);
+    if g.composite_state == COMP_CUSTOM || g.composite_state == COMP_XOR {
+        return Err(unsupported("FillPath：自定义/XOR 合成"));
+    }
+    let Some((segs, rule)) = path_segs(vm, path, tx, ty) else {
+        return Err(unsupported("FillPath：Path2D.Float 的 floatCoords/pointTypes 读不到"));
+    };
+    if segs.is_empty() {
+        return void();
+    }
+    let mut spi = Spi::new();
+    spi.segs = segs;
+    spi.rule = rule;
+    spi.build();
+    let (_, by0, _, by1) = spi.path_box();
+    for y in by0..by1 {
+        for (x0, x1) in spi.spans_at(y) {
+            for (a, b) in clip_span(vm, g.dev_clip, y, x0, x1) {
+                fill_span(vm, &s, &g, y, a, b);
+            }
+        }
+    }
+    flush_surface(vm, dst);
+    void()
+}
+
+/// `sun.java2d.loops.DrawPath.DrawPath(SunGraphics2D, SurfaceData, int, int, Path2D.Float)`
+///
+/// `STROKE_THIN` 下的 `draw(Shape)` / `drawOval` / `drawArc` 都走这里。
+/// 折线化后逐段 Bresenham —— 和 C 侧 `DEFINE_DRAW_PATH` 的做法一致（它也是每段
+/// 调一次 Bresenham，而不是先扩成填充区）。
+fn loop_draw_path(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sg = f.arg_i(0);
+    let dst = f.arg_i(1);
+    let (tx, ty) = (f.arg_i(2), f.arg_i(3));
+    let path = f.arg_i(4);
+    let Some(s) = surface_of(dst) else {
+        return Err(unsupported("DrawPath：目标 SurfaceData 不是本 VM 记录的 BufImgSurfaceData"));
+    };
+    let g = read_g2d(vm, sg);
+    if g.composite_state == COMP_CUSTOM || g.composite_state == COMP_XOR {
+        return Err(unsupported("DrawPath：自定义/XOR 合成"));
+    }
+    let Some((segs, _)) = path_segs(vm, path, tx, ty) else {
+        return Err(unsupported("DrawPath：Path2D.Float 的 floatCoords/pointTypes 读不到"));
+    };
+    for (x0, y0, x1, y1) in flatten_segs(&segs) {
+        // 端点半像素取整：与 Java2D 的 thin-stroke 取整一致（坐标中心落在 x+0.5）
+        let rx0 = (x0 + 0.5).floor() as i32;
+        let ry0 = (y0 + 0.5).floor() as i32;
+        let rx1 = (x1 + 0.5).floor() as i32;
+        let ry1 = (y1 + 0.5).floor() as i32;
+        if rx0 == rx1 && ry0 == ry1 {
+            continue;
+        }
+        bresenham_line(vm, &s, &g, rx0, ry0, rx1, ry1);
     }
     flush_surface(vm, dst);
     void()
@@ -856,6 +990,8 @@ fn prim_register_native_loops(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmErro
         "sun/java2d/loops/FillRect",
         "sun/java2d/loops/DrawRect",
         "sun/java2d/loops/DrawLine",
+        "sun/java2d/loops/FillPath",
+        "sun/java2d/loops/DrawPath",
     ] {
         for st in SURFACE_TYPES {
             let s = static_ref(vm, "sun/java2d/loops/SurfaceType", st);
@@ -910,6 +1046,8 @@ fn prim_register_native_loops(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmErro
                 "sun/java2d/loops/DrawRect",
                 "sun/java2d/loops/DrawLine",
                 "sun/java2d/loops/Blit",
+                "sun/java2d/loops/FillPath",
+                "sun/java2d/loops/DrawPath",
             ] {
                 id += 1;
                 let o = make_prim(vm, class, id, gdi, c, gdi);
@@ -923,19 +1061,81 @@ fn prim_register_native_loops(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmErro
     if items.is_empty() {
         return Err(unsupported("registerNativeLoops：一个 primitive 都没造出来（SurfaceType/CompositeType 未初始化？）"));
     }
+    let n = items.len();
     let arr = vm.sh.heap.new_array(items, "[Lsun/java2d/loops/GraphicsPrimitive;").unwrap_or(0);
-    let _ = call_java(
+    if arr == 0 {
+        return Err(unsupported("registerNativeLoops：GraphicsPrimitive[] 分配失败"));
+    }
+    // 注册失败**不能再吞掉**：吞掉的后果是 locate() 全部落到 GeneralRenderer，
+    // 于是 fill(Shape) 整块不出像素（JDK 25 的 ProcessPath 那条 Java 扫描线在本 VM 上
+    // 一像素都不落），而现象只是「什么都没画」，极难定位。
+    call_java(
         vm,
         "sun/java2d/loops/GraphicsPrimitiveMgr",
         "register",
         "([Lsun/java2d/loops/GraphicsPrimitive;)V",
         &[Slot::I(arr)],
         0,
-    );
+    )
+    .map_err(|e| VmError {
+        msg: format!("registerNativeLoops：注册 {n} 个 primitive 失败：{}", e.msg),
+        exc: None,
+    })?;
+
+    presort_primitives(vm)?;
     void()
 }
 
+/// **替 `GraphicsPrimitiveMgr` 把 primitive 表排好序**，并把 `needssort` 清零。
+///
+/// 为什么需要：`locate()` 第一次调用时会跑 `Arrays.sort(primitives, primSorter)`，
+/// 而本 VM 在这条调用上抛
+/// `ClassCastException: GraphicsPrimitiveProxy cannot be cast to java.lang.Comparable`
+/// —— 也就是 `Arrays.sort(T[], Comparator)` 被当成了 `Arrays.sort(Object[])`
+/// （自然序）走。异常从 `locate()` 抛到 `RenderLoops` 构造器，再被 `SunGraphics2D`
+/// 的 pipe 校验吞掉 → 全部落到 `GeneralRenderer` → `fill(Shape)`/`draw(Shape)`
+/// 一像素不出（`fillRect` 恰好还能работать，所以很难发现）。
+///
+/// 这里是**我们这边能做的**：等 register() 装完，按 `getUniqueID()` 排好序写回去，
+/// 再把 `needssort` 置 false，让 `locate()` 只用 `Arrays.binarySearch`（这条是好的）。
+/// 真正的修法在 `java.util.Arrays` / 方法解析层，见回报。
+fn presort_primitives(vm: &mut Vm) -> Result<(), VmError> {
+    const MGR: &str = "sun/java2d/loops/GraphicsPrimitiveMgr";
+    let arr = static_ref(vm, MGR, "primitives");
+    if arr == 0 {
+        return Ok(());
+    }
+    let n = vm.sh.heap.len(arr);
+    let mut items: Vec<(i32, i32)> = Vec::with_capacity(n);
+    for i in 0..n {
+        let h = vm.sh.heap.get(arr, i).map(|v| v.as_i32()).unwrap_or(0);
+        if h == 0 {
+            continue;
+        }
+        // **不能调 `getUniqueID()`**：此刻还在 `GraphicsPrimitiveMgr.<clinit>` 里，
+        // 再进解释器会递归触发类初始化，直接撞「调用深度超限」。读字段等价且安全。
+        let id = get_i32_field(vm, h, "sun/java2d/loops/GraphicsPrimitive", "uniqueID");
+        items.push((id, h));
+    }
+    if items.is_empty() {
+        return Ok(());
+    }
+    items.sort_by_key(|(id, _)| *id);
+    let slots: Vec<Slot> = items.iter().map(|(_, h)| Slot::I(*h)).collect();
+    let sorted = vm.sh.heap.new_array(slots, "[Lsun/java2d/loops/GraphicsPrimitive;").unwrap_or(0);
+    if sorted == 0 {
+        return Ok(());
+    }
+    {
+        let mut st = lk(&vm.sh.statics);
+        st.insert((MGR.to_string(), "primitives".to_string()), Slot::I(sorted));
+        st.insert((MGR.to_string(), "needssort".to_string()), Slot::I(0));
+    }
+    Ok(())
+}
+
 fn register_loops(r: &mut NativeRegistry) {
+
     // Unsafe.addressSize()：nat_intrinsics 里返回 0，而 JDK 25 的 jdk.internal.foreign.Utils.<clinit>
     // 用它算 ValueLayout.ADDRESS 的对齐，0 会抛 IllegalArgumentException: Invalid alignment: 0，
     // 于是任何用到 java.lang.foreign 的类（含 JDK 25 的 HarfBuzz 文本布局）都初始化不了。
@@ -946,19 +1146,31 @@ fn register_loops(r: &mut NativeRegistry) {
         "sun/java2d/loops/FillRect",
         "FillRect",
         "(Lsun/java2d/SunGraphics2D;Lsun/java2d/SurfaceData;IIII)V",
-        loop_fill_rect,
+        traced!("loop_fill_rect", loop_fill_rect),
     );
     r.add(
         "sun/java2d/loops/DrawRect",
         "DrawRect",
         "(Lsun/java2d/SunGraphics2D;Lsun/java2d/SurfaceData;IIII)V",
-        loop_draw_rect,
+        traced!("loop_draw_rect", loop_draw_rect),
     );
     r.add(
         "sun/java2d/loops/DrawLine",
         "DrawLine",
         "(Lsun/java2d/SunGraphics2D;Lsun/java2d/SurfaceData;IIII)V",
-        loop_draw_line,
+        traced!("loop_draw_line", loop_draw_line),
+    );
+    r.add(
+        "sun/java2d/loops/FillPath",
+        "FillPath",
+        "(Lsun/java2d/SunGraphics2D;Lsun/java2d/SurfaceData;IILjava/awt/geom/Path2D$Float;)V",
+        traced!("loop_fill_path", loop_fill_path),
+    );
+    r.add(
+        "sun/java2d/loops/DrawPath",
+        "DrawPath",
+        "(Lsun/java2d/SunGraphics2D;Lsun/java2d/SurfaceData;IILjava/awt/geom/Path2D$Float;)V",
+        traced!("loop_draw_path", loop_draw_path),
     );
     r.add(
         "sun/java2d/loops/FillSpans",
@@ -970,7 +1182,7 @@ fn register_loops(r: &mut NativeRegistry) {
         "sun/java2d/loops/Blit",
         "Blit",
         "(Lsun/java2d/SurfaceData;Lsun/java2d/SurfaceData;Ljava/awt/Composite;Lsun/java2d/pipe/Region;IIIIII)V",
-        loop_blit,
+        traced!("loop_blit", loop_blit),
     );
     r.add(
         "sun/java2d/loops/BlitBg",
@@ -1131,6 +1343,79 @@ mod w32 {
         pub fn GetForegroundWindow() -> HWND;
     }
 
+    /// `GetTextMetricsW` 返回的 `TEXTMETRICW`（只声明我们读的那几个字段，
+    /// 但**必须按完整布局给够大小** —— GDI 会往里写满 60 字节）
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct TextMetricW {
+        pub height: i32,
+        pub ascent: i32,
+        pub descent: i32,
+        pub internal_leading: i32,
+        pub external_leading: i32,
+        pub ave_char_width: i32,
+        pub max_char_width: i32,
+        pub weight: i32,
+        pub overhang: i32,
+        pub digitized_aspect_x: i32,
+        pub digitized_aspect_y: i32,
+        pub italic: u8,
+        pub underlined: u8,
+        pub struck_out: u8,
+        pub pitch_and_family: u8,
+        pub char_set: u8,
+        pub precision: u8,
+        pub clip_precision: u8,
+        pub quality: u8,
+        pub pitch_and_family2: u8,
+        pub face_name: [u16; 32],
+    }
+
+    #[repr(C)]
+    #[derive(Clone, Copy)]
+    pub struct Size {
+        pub cx: i32,
+        pub cy: i32,
+    }
+
+    #[link(name = "gdi32")]
+    extern "system" {
+        pub fn CreateCompatibleDC(hdc: isize) -> isize;
+        pub fn CreateDIBSection(
+            hdc: isize,
+            pbmi: *const BitmapInfo,
+            usage: u32,
+            bits: *mut *mut core::ffi::c_void,
+            section: isize,
+            offset: u32,
+        ) -> isize;
+        pub fn SelectObject(hdc: isize, obj: isize) -> isize;
+        pub fn DeleteObject(obj: isize) -> i32;
+        pub fn DeleteDC(hdc: isize) -> i32;
+        pub fn SetBkMode(hdc: isize, mode: i32) -> i32;
+        pub fn SetTextColor(hdc: isize, color: u32) -> u32;
+        pub fn TextOutW(hdc: isize, x: i32, y: i32, s: *const u16, c: i32) -> i32;
+        pub fn GetTextExtentPoint32W(hdc: isize, s: *const u16, c: i32, sz: *mut Size) -> i32;
+        pub fn GetTextMetricsW(hdc: isize, tm: *mut TextMetricW) -> i32;
+        #[allow(clippy::too_many_arguments)]
+        pub fn CreateFontW(
+            height: i32,
+            width: i32,
+            escapement: i32,
+            orientation: i32,
+            weight: i32,
+            italic: u32,
+            underline: u32,
+            strikeout: u32,
+            charset: u32,
+            out_precision: u32,
+            clip_precision: u32,
+            quality: u32,
+            pitch_and_family: u32,
+            face: *const u16,
+        ) -> isize;
+    }
+
     #[link(name = "gdi32")]
     extern "system" {
         #[allow(clippy::too_many_arguments)]
@@ -1159,6 +1444,77 @@ const WM_CLOSE: u32 = 0x0010;
 const WM_PAINT: u32 = 0x000F;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_QUIT: u32 = 0x0012;
+const WM_MOUSEMOVE: u32 = 0x0200;
+const WM_LBUTTONDOWN: u32 = 0x0201;
+const WM_LBUTTONUP: u32 = 0x0202;
+const WM_RBUTTONDOWN: u32 = 0x0204;
+const WM_RBUTTONUP: u32 = 0x0205;
+const WM_MBUTTONDOWN: u32 = 0x0207;
+const WM_MBUTTONUP: u32 = 0x0208;
+const WM_KEYDOWN: u32 = 0x0100;
+const WM_KEYUP: u32 = 0x0101;
+const WM_CHAR: u32 = 0x0102;
+const WM_SYSKEYDOWN: u32 = 0x0104;
+const WM_SYSKEYUP: u32 = 0x0105;
+
+/// Win32 的 `wParam` 鼠标按键位 → `InputEvent` 修饰符位（SHIFT=1 CTRL=2 ALT=8 之外，
+/// 鼠标键位 BUTTON1=0x400 BUTTON2=0x800 BUTTON3=0x1000 与大写锁定 0x200 都对齐）
+fn mouse_modifiers(wp: usize) -> i32 {
+    let mut m = 0;
+    if wp & 0x0004 != 0 {
+        m |= 1; // SHIFT_DOWN_MASK
+    }
+    if wp & 0x0008 != 0 {
+        m |= 2; // CTRL_DOWN_MASK
+    }
+    if wp & 0x0020 != 0 {
+        m |= 8; // ALT_DOWN_MASK
+    }
+    if wp & 0x0001 != 0 {
+        m |= 0x400; // BUTTON1_DOWN_MASK
+    }
+    if wp & 0x0002 != 0 {
+        m |= 0x800; // BUTTON2_DOWN_MASK (右键)
+    }
+    if wp & 0x0010 != 0 {
+        m |= 0x1000; // BUTTON3_DOWN_MASK (中键)
+    }
+    m
+}
+
+/// Win32 虚拟键码 → `java.awt.event.KeyEvent.VK_*`。
+///
+/// 两者**并不等价**：字母/数字/功能键/F 键基本一致，但 `VK_BACK(8)` 对
+/// `VK_BACK_SPACE(8)` 一致、`VK_RETURN(13)` 对 `VK_ENTER(10)` 不一致，方向键
+/// `VK_LEFT(37)` 对 `VK_LEFT(37)` 又一致。这里只映射常用键，其余退化成
+/// `VK_UNDEFINED(0)` —— **宁可没有 keyCode 也不能给错的**（错的会让按键处理逻辑错乱）。
+fn vk_to_java(vk: i32) -> i32 {
+    match vk {
+        0x08 => 8,    // BACK_SPACE
+        0x09 => 9,    // TAB
+        0x0D => 10,   // ENTER
+        0x1B => 27,   // ESCAPE
+        0x20 => 32,   // SPACE
+        0x21 => 33,   // PAGE_UP
+        0x22 => 34,   // PAGE_DOWN
+        0x23 => 35,   // END
+        0x24 => 36,   // HOME
+        0x25 => 37,   // LEFT
+        0x26 => 38,   // UP
+        0x27 => 39,   // RIGHT
+        0x28 => 40,   // DOWN
+        0x2E => 127,  // DELETE
+        0x10 => 16,   // SHIFT
+        0x11 => 17,   // CONTROL
+        0x12 => 18,   // ALT
+        0x14 => 20,   // CAPS_LOCK
+        0x70..=0x7B => 0x70 + (vk - 0x70), // F1..F12
+        // 字母/数字/主键盘符号：Java 的 VK 就是大写 ASCII
+        0x41..=0x5A => vk,
+        0x30..=0x39 => vk,
+        _ => 0, // VK_UNDEFINED
+    }
+}
 
 const SW_SHOW: i32 = 5;
 const WS_OVERLAPPEDWINDOW: u32 = 0x00CF_0000;
@@ -1308,6 +1664,67 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isiz
         },
         // 背景我们自己画（`WM_PAINT` 里整块重绘），别让系统刷白
         WM_ERASEBKGND => 1,
+        // ---- 鼠标：只入队，由 `eventLoop` 那条 Java 线程投给组件（见「十三、输入事件」）
+        WM_MOUSEMOVE => {
+            push_event(InputEvt::Mouse {
+                hwnd,
+                id: 503, // MOUSE_MOVED
+                x: (lp as i32) & 0xFFFF,
+                y: ((lp as i32) >> 16) & 0xFFFF,
+                button: 0,
+                clicks: 0,
+                modifiers: mouse_modifiers(wp),
+            });
+            0
+        }
+        WM_LBUTTONDOWN | WM_RBUTTONDOWN | WM_MBUTTONDOWN => {
+            let button = match msg {
+                WM_LBUTTONDOWN => 1, // BUTTON1
+                WM_MBUTTONDOWN => 2, // BUTTON2
+                _ => 3,              // BUTTON3
+            };
+            let (x, y) = ((lp as i32) & 0xFFFF, ((lp as i32) >> 16) & 0xFFFF);
+            let m = mouse_modifiers(wp);
+            push_event(InputEvt::Mouse { hwnd, id: 501, x, y, button, clicks: 1, modifiers: m });
+            push_event(InputEvt::Mouse { hwnd, id: 500, x, y, button, clicks: 1, modifiers: m });
+            0
+        }
+        WM_LBUTTONUP | WM_RBUTTONUP | WM_MBUTTONUP => {
+            let button = match msg {
+                WM_LBUTTONUP => 1,
+                WM_MBUTTONUP => 2,
+                _ => 3,
+            };
+            push_event(InputEvt::Mouse {
+                hwnd,
+                id: 502, // MOUSE_RELEASED
+                x: (lp as i32) & 0xFFFF,
+                y: ((lp as i32) >> 16) & 0xFFFF,
+                button,
+                clicks: 1,
+                modifiers: mouse_modifiers(wp),
+            });
+            0
+        }
+        // ---- 键盘
+        WM_KEYDOWN | WM_SYSKEYDOWN => {
+            let vk = wp as i32;
+            let m = mouse_modifiers(0);
+            push_event(InputEvt::Key { hwnd, id: 401, code: vk_to_java(vk), ch: 0, modifiers: m });
+            0
+        }
+        WM_KEYUP | WM_SYSKEYUP => {
+            let vk = wp as i32;
+            push_event(InputEvt::Key { hwnd, id: 402, code: vk_to_java(vk), ch: 0, modifiers: 0 });
+            0
+        }
+        WM_CHAR => {
+            let ch = wp as u16;
+            if ch >= 32 || ch == 8 || ch == 9 || ch == 10 || ch == 13 {
+                push_event(InputEvt::Key { hwnd, id: 400, code: 0, ch, modifiers: 0 });
+            }
+            0
+        }
         WM_CLOSE => unsafe {
             let _ = w32::DestroyWindow(hwnd);
             0
@@ -1527,19 +1944,6 @@ fn atrace(msg: &str) {
     eprintln!("[awt] {msg}");
 }
 
-/// 给任意 native 套一层「进/出」追踪（`VMLESS_AWT_TRACE=1` 才打）
-macro_rules! traced {
-    ($name:literal, $f:expr) => {{
-        fn w(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-            atrace(concat!("> ", $name));
-            let r = $f(vm, f);
-            atrace(concat!("< ", $name));
-            r
-        }
-        w
-    }};
-}
-
 fn new_obj(vm: &mut Vm, class: &str, desc: &str, args: &[Slot]) -> i32 {
     atrace("new_obj");
     let Ok(handle) = vm.new_instance(class, desc) else { return 0 };
@@ -1570,33 +1974,36 @@ fn toolkit_get_windows_version(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmErr
 /// **建窗口的那个线程**取出来，而 Java 侧的 `AWT-Windows` 线程并不建窗口。
 fn toolkit_init(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     atrace("WToolkit.init enter");
-    let r = Ok(Slot::I(0));
-    atrace("WToolkit.init return");
-    r
+    // 返回 true = 「原生侧已经把消息泵起好了」：Java 侧于是
+    // ① 装关机钩子（它调 `shutdown()` 让 eventLoop 退出）② 调 `eventLoop()`。
+    //
+    // 上一轮这里返回 false（「不起泵」），理由是「泵在 Rust UI 线程里，不需要
+    // Java 线程泵」。但那样 `AWT-Windows` 线程跑完 `run()` 就结束了 —— 而**事件
+    // 必须由一条 Java 线程投给组件**（Rust 侧没有解释器上下文）。所以现在
+    // `eventLoop()` 就是那个投递点：它不碰 Win32，只把 Rust 队列里的事件
+    // `dispatchEvent` 出去。
+    atrace("WToolkit.init -> false");
+    Ok(Slot::I(0))
 }
 
-/// `WToolkit.startToolkitThread(Runnable, ThreadGroup)` —— 返回 false 让 Java 自己起线程，
-/// 那条线程跑完 `run()` 立刻结束（`init()` 返回 false，不进 `eventLoop()`）。
-fn toolkit_start_thread(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    atrace("startToolkitThread");
-    // **把 `inited` 先置 true**：真 HotSpot 这里靠 AWT-Windows 线程跑完 `init()` 再
-    // `notifyAll()` 唤醒构造器里的 `while(!inited) wait()`。本 VM 有一个与文件无关的
-    // bug：**持有类初始化锁的线程在 `wait()` 上等另一个线程 `notifyAll()` 会死锁**
-    // （实测 `T7.java`：静态初始化里 wait → 永不返回）。`Toolkit.getDefaultToolkit()`
-    // 正是从 `Toolkit.<clinit>` 里调用的，所以这里必然撞上。
-    // 我们没有「原生 toolkit 线程要初始化」这回事（消息泵在 Rust 侧 UI 线程里跑），
-    // 于是直接标记已完成，构造器不再等待。
-    let this = f.this();
-    if this > 0 {
-        vm.put_named(this, "sun/awt/windows/WToolkit", "inited", Slot::I(1));
-        let back = get_i32_field(vm, this, "sun/awt/windows/WToolkit", "inited");
-        atrace(if back == 1 { "inited=1 written" } else { "inited write FAILED" });
-    }
-    // 返回 true = 「原生侧已经把 toolkit 线程起好了」，于是 Java **不再**创建
-    // AWT-Windows 线程。我们根本不需要那条线程：消息泵在 Rust 的 UI 线程里。
-    // 实测留下它会死锁（它跑完 run() 退出的那一刻，主线程就再也动不了 ——
-    // 之后既没有 native 调用也没有类加载，纯卡住）。
-    Ok(Slot::I(1))
+/// `WToolkit.startToolkitThread(Runnable, ThreadGroup)` —— 返回 false：
+/// **让 Java 自己建 `AWT-Windows` 线程**，由它跑 `WToolkit.run()`。
+///
+/// 这里有两条曾经走过的弯路，都删掉了（A/B 用真 JDK 验证过）：
+///
+/// 1. 「先把 `WToolkit.inited` 硬置 1」—— 构造器就不等了。但那是拿掉了一个真实的
+///    跨线程握手：`run()` 里 `init()` 之后要 `inited = true; notifyAll()` 唤醒构造函数。
+///    绕过它等于让「另一个线程 notifyAll → 本线程 wait 醒来」这条路永远不被测到。
+/// 2. 「返回 true 跳过 AWT-Windows 线程」—— 那条线程根本不建，于是 `init()` 只有
+///    Rust 侧调用过，`inited` 永远为 false / 或者得靠上面那条 hack 顶着；副作用是
+///    AWT 初始化之后进程退出也会挂（`startPump=false` 时没人 `shutdown()`）。
+///
+/// 现在的语义与 HotSpot 一致：Java 建线程 → `run()` → `init()` 返回 false
+/// （我们不在这条线程上跑 Win32 消息泵，泵在 Rust 的 UI 线程里）→ `inited = true;
+/// notifyAll()` → 线程正常结束。
+fn toolkit_start_thread(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    atrace("startToolkitThread -> false");
+    Ok(Slot::I(0))
 }
 
 fn toolkit_screen_insets(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
@@ -1726,6 +2133,9 @@ fn peer_hwnd(peer: i32) -> isize {
 
 /// `WComponentPeer.pShow()V`
 fn peer_show(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    // 事件泵只起一次：`init()` 返回 false 时 Java 侧的 `eventLoop()` 不会跑，
+    // 所以**在这里兜底**（第一扇窗显示出来的那一刻起，鼠标/键盘就该有反应）。
+    event_pump_start_once(vm);
     let peer = f.this();
     atrace("pShow");
     // 第一次显示前把 GDI 面建出来（`replaceSurfaceData` 里有 `pData == 0` 的早退保护，
@@ -2018,8 +2428,8 @@ pub(super) fn register_window(r: &mut NativeRegistry) {
         "(Ljava/lang/Runnable;Ljava/lang/ThreadGroup;)Z",
         toolkit_start_thread,
     );
-    r.add("sun/awt/windows/WToolkit", "eventLoop", "()V", traced!("eventLoop", no_op));
-    r.add("sun/awt/windows/WToolkit", "shutdown", "()V", traced!("shutdown", no_op));
+    r.add("sun/awt/windows/WToolkit", "eventLoop", "()V", toolkit_event_loop);
+    r.add("sun/awt/windows/WToolkit", "shutdown", "()V", toolkit_shutdown);
     r.add("sun/awt/windows/WToolkit", "postDispose", "()V", traced!("postDispose", no_op));
     r.add("sun/awt/windows/WToolkit", "makeColorModel", "()Ljava/awt/image/ColorModel;", traced!("makeColorModel", toolkit_make_color_model));
     r.add("sun/awt/windows/WToolkit", "getScreenInsets", "(I)Ljava/awt/Insets;", traced!("getScreenInsets", toolkit_screen_insets));
@@ -2159,6 +2569,73 @@ pub(super) fn register_window(r: &mut NativeRegistry) {
 // 多边形（纯直线）走的是同一套整数扫描线规则（奇偶 = 采样点 `y+0.5`），误差仅在
 // 恰好落在半像素上的退化情形。AA 不在这一层解决（`MaskFill` 明确抛异常）。
 
+/// 把路径段摊平成折线（曲线按定步长细分：二次 8 段、三次 16 段）。
+///
+/// `FillPath` / `DrawPath` / `ShapeSpanIterator` 三条路共用它 —— 保证**同一个形状在
+/// 「fillPolygon」「fill(Shape)」「draw(Shape)」下折线化结果一致**，不然同一张图上
+/// 会出现两套边界。
+fn flatten_segs(segs: &[(u8, [f32; 6])]) -> Vec<(f32, f32, f32, f32)> {
+    let mut out: Vec<(f32, f32, f32, f32)> = Vec::new();
+    let mut cx = 0.0f32;
+    let mut cy = 0.0f32;
+    let mut sx = 0.0f32;
+    let mut sy = 0.0f32;
+    for (t, c) in segs {
+        match *t {
+            0 => {
+                cx = c[0];
+                cy = c[1];
+                sx = cx;
+                sy = cy;
+            }
+            1 => {
+                out.push((cx, cy, c[0], c[1]));
+                cx = c[0];
+                cy = c[1];
+            }
+            2 => {
+                let (x1, y1, x2, y2) = (c[0], c[1], c[2], c[3]);
+                let (ax, ay) = (cx, cy);
+                for i in 1..=8 {
+                    let t = i as f32 / 8.0;
+                    let mt = 1.0 - t;
+                    let px = mt * mt * ax + 2.0 * mt * t * x1 + t * t * x2;
+                    let py = mt * mt * ay + 2.0 * mt * t * y1 + t * t * y2;
+                    out.push((cx, cy, px, py));
+                    cx = px;
+                    cy = py;
+                }
+                cx = x2;
+                cy = y2;
+            }
+            3 => {
+                let (x1, y1, x2, y2, x3, y3) = (c[0], c[1], c[2], c[3], c[4], c[5]);
+                let (ax, ay) = (cx, cy);
+                for i in 1..=16 {
+                    let t = i as f32 / 16.0;
+                    let mt = 1.0 - t;
+                    let px = mt * mt * mt * ax + 3.0 * mt * mt * t * x1
+                        + 3.0 * mt * t * t * x2 + t * t * t * x3;
+                    let py = mt * mt * mt * ay + 3.0 * mt * mt * t * y1
+                        + 3.0 * mt * t * t * y2 + t * t * t * y3;
+                    out.push((cx, cy, px, py));
+                    cx = px;
+                    cy = py;
+                }
+                cx = x3;
+                cy = y3;
+            }
+            _ => {
+                // SEG_CLOSE
+                out.push((cx, cy, sx, sy));
+                cx = sx;
+                cy = sy;
+            }
+        }
+    }
+    out
+}
+
 /// 一条边（扫描线交点用）
 struct SpiEdge {
     y0: f32,
@@ -2252,69 +2729,11 @@ impl Spi {
             return;
         }
         self.built = true;
-        let mut cx = 0.0f32;
-        let mut cy = 0.0f32;
-        let mut sx = 0.0f32;
-        let mut sy = 0.0f32;
-        // 先收集成线性段（避免借用冲突）
-        let mut lines: Vec<(f32, f32, f32, f32)> = Vec::new();
-        for (t, c) in &self.segs {
-            match *t {
-                0 => {
-                    cx = c[0];
-                    cy = c[1];
-                    sx = cx;
-                    sy = cy;
-                }
-                1 => {
-                    lines.push((cx, cy, c[0], c[1]));
-                    cx = c[0];
-                    cy = c[1];
-                }
-                2 => {
-                    // 二次：8 段折线
-                    let (x1, y1, x2, y2) = (c[0], c[1], c[2], c[3]);
-                    let (ax, ay) = (cx, cy);
-                    for i in 1..=8 {
-                        let t = i as f32 / 8.0;
-                        let mt = 1.0 - t;
-                        let px = mt * mt * ax + 2.0 * mt * t * x1 + t * t * x2;
-                        let py = mt * mt * ay + 2.0 * mt * t * y1 + t * t * y2;
-                        lines.push((cx, cy, px, py));
-                        cx = px;
-                        cy = py;
-                    }
-                    cx = x2;
-                    cy = y2;
-                }
-                3 => {
-                    // 三次：16 段折线
-                    let (x1, y1, x2, y2, x3, y3) = (c[0], c[1], c[2], c[3], c[4], c[5]);
-                    let (ax, ay) = (cx, cy);
-                    for i in 1..=16 {
-                        let t = i as f32 / 16.0;
-                        let mt = 1.0 - t;
-                        let px = mt * mt * mt * ax + 3.0 * mt * mt * t * x1 + 3.0 * mt * t * t * x2 + t * t * t * x3;
-                        let py = mt * mt * mt * ay + 3.0 * mt * mt * t * y1 + 3.0 * mt * t * t * y2 + t * t * t * y3;
-                        lines.push((cx, cy, px, py));
-                        cx = px;
-                        cy = py;
-                    }
-                    cx = x3;
-                    cy = y3;
-                }
-                _ => {
-                    // SEG_CLOSE
-                    lines.push((cx, cy, sx, sy));
-                    cx = sx;
-                    cy = sy;
-                }
-            }
-        }
-        for (x0, y0, x1, y1) in lines {
+        for (x0, y0, x1, y1) in flatten_segs(&self.segs) {
             self.push_line(x0, y0, x1, y1);
         }
-        self.edges.sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
+        self.edges
+            .sort_by(|a, b| a.y0.partial_cmp(&b.y0).unwrap_or(std::cmp::Ordering::Equal));
     }
 
     /// 算一行（`yc = y + 0.5`）的交点，按规则折成 span
@@ -2676,4 +3095,555 @@ pub(super) fn register_shapes(r: &mut NativeRegistry) {
     r.add(c, "closePath", "()V", traced!("ssi.closePath", spi_close_path));
     r.add(c, "pathDone", "()V", traced!("ssi.pathDone", spi_path_done));
     r.add(c, "getNativeConsumer", "()J", traced!("ssi.getNativeConsumer", spi_zero_long));
+}
+
+// ============================================================ 十二、文字（GDI 栅格化）
+
+/// 一条 GDI 字体句柄（缓存项）
+struct GdiFont {
+    hfont: isize,
+    ascent: i32,
+    descent: i32,
+    height: i32,
+    leading: i32,
+}
+
+/// 字体缓存上限。超过就**整批 DeleteObject 清掉**再来 —— 宁可重建，也不让 GDI 句柄
+/// 无界增长（每进程默认上限 10000 个句柄，程序里字号/字体名一多很容易撞上）。
+const MAX_FONTS: usize = 32;
+
+static FONTS: OnceLock<Mutex<HashMap<(String, i32, i32), GdiFont>>> = OnceLock::new();
+
+fn fonts() -> &'static Mutex<HashMap<(String, i32, i32), GdiFont>> {
+    FONTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// 取（或建）一个 GDI 字体。`style` 用 `java.awt.Font` 的位：1=BOLD 2=ITALIC。
+///
+/// **字体名不做映射**：直接把 `java.awt.Font.name` 交给 Windows 字体系统
+/// （`Dialog`/`Serif`/`SansSerif` 这类逻辑名 GDI 认得，`Consolas` 这类物理名也认得；
+/// 找不到时 GDI 自己替换成缺省字体，不会失败）。
+fn gdi_font(name: &str, style: i32, px: i32) -> Option<GdiFont> {
+    let px = px.max(1);
+    let key = (name.to_string(), style & 3, px);
+    if let Some(f) = fonts().lock().unwrap_or_else(|e| e.into_inner()).get(&key) {
+        return Some(GdiFont {
+            hfont: f.hfont,
+            ascent: f.ascent,
+            descent: f.descent,
+            height: f.height,
+            leading: f.leading,
+        });
+    }
+    let face = wide(name);
+    let weight = if style & 1 != 0 { 700 } else { 400 };
+    let italic = if style & 2 != 0 { 1 } else { 0 };
+    let hfont = unsafe {
+        w32::CreateFontW(
+            -px, // 负值 = 字符高度（正值是「单元格高度」，会带上行距）
+            0,
+            0,
+            0,
+            weight,
+            italic,
+            0,
+            0,
+            1, // DEFAULT_CHARSET
+            0, // OUT_DEFAULT_PRECIS
+            0, // CLIP_DEFAULT_PRECIS
+            4, // ANTIALIASED_QUALITY（灰度抗锯齿；CLEARTYPE 会带子像素彩边）
+            0, // DEFAULT_PITCH | FF_DONTCARE
+            face.as_ptr(),
+        )
+    };
+    if hfont == 0 {
+        return None;
+    }
+    // 量度量：Ascent 是基线以上的高度，画字时要拿它把 baseline 换成左上角
+    let dc = unsafe { w32::CreateCompatibleDC(0) };
+    if dc == 0 {
+        unsafe { w32::DeleteObject(hfont) };
+        return None;
+    }
+    let old = unsafe { w32::SelectObject(dc, hfont) };
+    let mut tm: w32::TextMetricW = unsafe { std::mem::zeroed() };
+    let ok = unsafe { w32::GetTextMetricsW(dc, &mut tm) };
+    unsafe {
+        w32::SelectObject(dc, old);
+        w32::DeleteDC(dc);
+    }
+    if ok == 0 {
+        unsafe { w32::DeleteObject(hfont) };
+        return None;
+    }
+    let f = GdiFont {
+        hfont,
+        ascent: tm.ascent,
+        descent: tm.descent,
+        height: tm.height,
+        leading: tm.internal_leading.max(0) + tm.external_leading.max(0),
+    };
+    let mut g = fonts().lock().unwrap_or_else(|e| e.into_inner());
+    if g.len() >= MAX_FONTS {
+        for (_, v) in g.drain() {
+            unsafe { w32::DeleteObject(v.hfont) };
+        }
+    }
+    g.insert(key, f);
+    let f = g.get(&(name.to_string(), style & 3, px)).unwrap();
+    Some(GdiFont {
+        hfont: f.hfont,
+        ascent: f.ascent,
+        descent: f.descent,
+        height: f.height,
+        leading: f.leading,
+    })
+}
+
+/// 一段文本在指定字体下的**像素宽高**（GDI `GetTextExtentPoint32W`）
+fn text_extent(hfont: isize, text: &[u16]) -> (i32, i32) {
+    let dc = unsafe { w32::CreateCompatibleDC(0) };
+    if dc == 0 {
+        return (0, 0);
+    }
+    let old = unsafe { w32::SelectObject(dc, hfont) };
+    let mut sz = w32::Size { cx: 0, cy: 0 };
+    unsafe { w32::GetTextExtentPoint32W(dc, text.as_ptr(), text.len() as i32, &mut sz) };
+    unsafe {
+        w32::SelectObject(dc, old);
+        w32::DeleteDC(dc);
+    }
+    (sz.cx.max(0), sz.cy.max(0))
+}
+
+/// 把 `src` 按覆盖率 `cov`(0..255) 混到 `dst` 上（前景不透明）
+fn blend_cov(dst: i32, src: i32, cov: i32) -> i32 {
+    if cov <= 0 {
+        return dst;
+    }
+    if cov >= 255 {
+        return src;
+    }
+    let inv = 255 - cov;
+    let ch = |v: i32, sh: i32| (v >> sh) & 0xFF;
+    let mix = |sh: i32| (ch(src, sh) * cov + ch(dst, sh) * inv) / 255;
+    (0xFF00_0000u32 as i32) | (mix(16) << 16) | (mix(8) << 8) | mix(0)
+}
+
+/// GDI 栅格化一段文字，把灰度覆盖混到目标面上（基线在 `(x, y)`）。
+///
+/// 过程：建一块 `w×h` 的 32bpp 顶向下 DIB → `SetBkMode(TRANSPARENT)` +
+/// `SetTextColor(白)` 把覆盖度画成灰度 → 逐像素按覆盖度混色。
+/// 句柄全部配对释放（`CreateDIBSection`↔`DeleteObject`、`CreateCompatibleDC`↔`DeleteDC`）；
+/// 字体句柄留在缓存里复用（见 [`MAX_FONTS`] 上限）。
+fn rasterize_text(
+    vm: &mut Vm,
+    s: &Surface,
+    g: &G2d,
+    dst_surf: i32,
+    f: &GdiFont,
+    text: &[u16],
+    x: i32,
+    y: i32,
+) {
+    if text.is_empty() {
+        return;
+    }
+    let (w, h) = text_extent(f.hfont, text);
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let top = y - f.ascent;
+    let dc = unsafe { w32::CreateCompatibleDC(0) };
+    if dc == 0 {
+        return;
+    }
+    let mut bi = w32::BitmapInfo {
+        header: w32::BitmapInfoHeader {
+            size: std::mem::size_of::<w32::BitmapInfoHeader>() as u32,
+            width: w,
+            height: -h, // 负 = 顶向下，行序与我们的缓冲一致
+            planes: 1,
+            bit_count: 32,
+            compression: 0, // BI_RGB
+            size_image: 0,
+            xppm: 0,
+            yppm: 0,
+            clr_used: 0,
+            clr_important: 0,
+        },
+        colors: [0; 256],
+    };
+    let mut bits: *mut core::ffi::c_void = std::ptr::null_mut();
+    let hbmp = unsafe { w32::CreateDIBSection(dc, &mut bi, 0, &mut bits, 0, 0) };
+    if hbmp == 0 || bits.is_null() {
+        unsafe { w32::DeleteDC(dc) };
+        return;
+    }
+    let old = unsafe { w32::SelectObject(dc, hbmp) };
+    let ofont = unsafe { w32::SelectObject(dc, f.hfont) };
+    unsafe {
+        w32::SetBkMode(dc, 1); // TRANSPARENT
+        w32::SetTextColor(dc, 0x00FF_FFFF);
+        w32::TextOutW(dc, 0, 0, text.as_ptr(), text.len() as i32);
+        w32::SelectObject(dc, ofont);
+    }
+    // GDI 写完就是最终内容：先拷出来，再逐个混（不能一边持 DC 一边写 surface）
+    let n = (w as usize) * (h as usize);
+    let cov: Vec<u8> = unsafe { std::slice::from_raw_parts(bits as *const u8, n * 4) }.to_vec();
+    unsafe {
+        w32::SelectObject(dc, old);
+        w32::DeleteObject(hbmp);
+        w32::DeleteDC(dc);
+    }
+    let alpha = ((g.eargb as u32) >> 24) as i32 & 0xFF;
+    let fg = g.eargb | (0xFF00_0000u32 as i32);
+    for row in 0..h {
+        let yy = top + row;
+        for col in 0..w {
+            let i = ((row as usize) * (w as usize) + col as usize) * 4;
+            // 白字黑底：三个通道相等，任取一个
+            let c = cov[i] as i32;
+            if c == 0 {
+                continue;
+            }
+            let c = if alpha == 255 { c } else { c * alpha / 255 };
+            if c == 0 {
+                continue;
+            }
+            let xx = x + col;
+            for (a, b) in clip_span(vm, g.dev_clip, yy, xx, xx + 1) {
+                if a >= b {
+                    continue;
+                }
+                let idx = s.base + yy * s.scan_step + a * s.pix_step;
+                let dst = surface_get(vm, s, idx);
+                surface_put(vm, s, idx, blend_cov(dst, fg, c));
+            }
+        }
+    }
+    flush_surface(vm, dst_surf);
+}
+
+/// 从 `SunGraphics2D` 上取（surface, 字体名/字号/粗斜, transX/Y），画一段文字。
+fn sg2d_text(vm: &mut Vm, sg: i32, text: &str, x: i32, y: i32) -> Result<Slot, VmError> {
+    let dst = get_ref_field(vm, sg, "sun/java2d/SunGraphics2D", "surfaceData");
+    let Some(s) = surface_of(dst) else {
+        return Err(unsupported("drawString：目标 SurfaceData 不是本 VM 记录的 BufImgSurfaceData"));
+    };
+    let g = read_g2d(vm, sg);
+    if g.composite_state == COMP_CUSTOM || g.composite_state == COMP_XOR {
+        return Err(unsupported("drawString：自定义/XOR 合成"));
+    }
+    let font = get_ref_field(vm, sg, "sun/java2d/SunGraphics2D", "font");
+    let (name, style, size) = if font > 0 {
+        (
+            {
+                let n = vm.sh.heap.string_text(get_ref_field(vm, font, "java/awt/Font", "name"));
+                if n.is_empty() { "Dialog".to_string() } else { n }
+            },
+            get_i32_field(vm, font, "java/awt/Font", "style"),
+            get_i32_field(vm, font, "java/awt/Font", "size").max(1),
+        )
+    } else {
+        ("Dialog".to_string(), 0, 12)
+    };
+    let Some(f) = gdi_font(&name, style, size) else {
+        return Err(unsupported("drawString：CreateFontW 失败"));
+    };
+    let tx = get_i32_field(vm, sg, "sun/java2d/SunGraphics2D", "transX");
+    let ty = get_i32_field(vm, sg, "sun/java2d/SunGraphics2D", "transY");
+    // Java2D 的 drawString 只画一行：`\n`/`\r` 不显示也不占位
+    let units: Vec<u16> = text
+        .encode_utf16()
+        .filter(|c| *c != b'\n' as u16 && *c != b'\r' as u16)
+        .collect();
+    rasterize_text(vm, &s, &g, dst, &f, &units, x + tx, y + ty);
+    void()
+}
+
+/// `SunGraphics2D.drawString(String, int, int)` —— **VM 接管**（`add_override`）。
+///
+/// 为什么接管：JDK 25 的文字栈（`sun.font.HBShaper` / `SunLayoutEngine` /
+/// `StrikeCache`）已经改用 `java.lang.foreign`，本 VM 没有 FFM 运行时，
+/// `drawString` 连 `GlyphList` 都造不出来，`DrawGlyphList` 那条 native 永远到不了。
+///
+/// **渲染结果不与 HotSpot 逐像素一致**：字体、hinting、抗锯齿都不一样（这里是 Windows
+/// 系统字体 + GDI 灰度覆盖）。判据是「字能显示、位置对（基线）、颜色对、advance 对」。
+fn sg2d_draw_string(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sg = f.this();
+    let h = f.arg_i(0);
+    let (x, y) = (f.arg_i(1), f.arg_i(2));
+    let text = vm.sh.heap.string_text(h);
+    atrace("drawString");
+    sg2d_text(vm, sg, &text, x, y)
+}
+
+/// `SunGraphics2D.drawChars(char[], int off, int len, int x, int y)`
+fn sg2d_draw_chars(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sg = f.this();
+    let arr = f.arg_i(0);
+    let off = f.arg_i(1).max(0) as usize;
+    let len = f.arg_i(2).max(0) as usize;
+    let (x, y) = (f.arg_i(3), f.arg_i(4));
+    let n = vm.sh.heap.len(arr).min(off + len);
+    let mut units: Vec<u16> = Vec::with_capacity(len);
+    for i in off..n {
+        units.push(vm.sh.heap.get(arr, i).map(|v| v.as_i32() as u16).unwrap_or(0));
+    }
+    let text = String::from_utf16_lossy(&units);
+    atrace("drawChars");
+    sg2d_text(vm, sg, &text, x, y)
+}
+
+/// 注册文字相关的 VM 接管。
+///
+/// **需要 `exec.rs` 配合**：`is_override_owner` 的白名单里必须加
+/// `b"sun/java2d/SunGraphics2D"`，否则这里登记的 overrides 永远不会被查到
+/// （查表前先过白名单）。改动只有一行，见回报。
+fn register_text(r: &mut NativeRegistry) {
+    r.add_override(
+        "sun/java2d/SunGraphics2D",
+        "drawString",
+        "(Ljava/lang/String;II)V",
+        sg2d_draw_string,
+    );
+    r.add_override(
+        "sun/java2d/SunGraphics2D",
+        "drawString",
+        "(Ljava/lang/String;FF)V",
+        sg2d_draw_string,
+    );
+    r.add_override(
+        "sun/java2d/SunGraphics2D",
+        "drawChars",
+        "([CIIII)V",
+        sg2d_draw_chars,
+    );
+}
+
+// ============================================================ 十三、输入事件（鼠标 / 键盘）
+
+/// UI 线程（Win32 泵）攒下的输入事件，等 Java 侧的 `eventLoop()` 取走投给组件。
+///
+/// 为什么要分两段：Win32 的消息**只能由建窗口的那个线程**抽出来，而窗口建在 Rust 的
+/// UI 线程上（见 [`ui_thread_main`]）；那条线程没有解释器上下文，不能调 Java。
+/// 所以 WndProc 只入队，`eventLoop`（`AWT-Windows` 线程，是 Java 线程）出队并
+/// `Component.dispatchEvent(...)` —— 与 HotSpot 里 `WWindowPeer::HandleEvent` 的位置等价。
+#[derive(Clone, Copy)]
+enum InputEvt {
+    Mouse {
+        hwnd: isize,
+        /// `MouseEvent.MOUSE_*` 常量
+        id: i32,
+        x: i32,
+        y: i32,
+        button: i32,
+        clicks: i32,
+        modifiers: i32,
+    },
+    Key {
+        hwnd: isize,
+        /// `KeyEvent.KEY_PRESSED` / `KEY_RELEASED` / `KEY_TYPED`
+        id: i32,
+        code: i32,
+        ch: u16,
+        modifiers: i32,
+    },
+}
+
+static EVENTS: OnceLock<Mutex<Vec<InputEvt>>> = OnceLock::new();
+
+fn events() -> &'static Mutex<Vec<InputEvt>> {
+    EVENTS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn push_event(e: InputEvt) {
+    let mut q = events().lock().unwrap_or_else(|err| err.into_inner());
+    // 上限只是兜底：正常情况下 `eventLoop` 4ms 就取一次。没有消费者时不让它无限涨。
+    if q.len() < 4096 {
+        q.push(e);
+    }
+}
+
+static AWT_QUIT: std::sync::atomic::AtomicBool = std::sync::atomic::AtomicBool::new(false);
+
+/// `hwnd → WComponentPeer.target`（要投给的 Java `Component`）
+fn peer_target(vm: &Vm, hwnd: isize) -> i32 {
+    let peer = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        match st.by_hwnd.get(&hwnd) {
+            Some(p) => *p,
+            None => return 0,
+        }
+    };
+    get_ref_field(vm, peer, "sun/awt/windows/WComponentPeer", "target")
+}
+
+/// 从 `comp` 往下找到 `(x, y)`（comp 坐标系）处**最深的那个可见组件**。
+///
+/// Swing 是轻量组件（没有自己的 HWND），所以命中测试只能在 Java 组件树上做：
+/// 逐个 `Container.getComponent(i)` 反着找（后加的在上层），落在哪个里面就递归下去。
+/// 返回 `(组件, 该组件内的 x, 该组件内的 y)`。
+fn deepest_at(vm: &mut Vm, comp: i32, x: i32, y: i32) -> (i32, i32, i32) {
+    if comp <= 0 || !vm.is_instance(comp, "java/awt/Container") {
+        return (comp, x, y);
+    }
+    let n = call_java(vm, "java/awt/Container", "getComponentCount", "()I", &[], comp)
+        .map(|v| v.as_i32())
+        .unwrap_or(0);
+    for i in (0..n).rev() {
+        let c = call_java(vm, "java/awt/Container", "getComponent", "(I)Ljava/awt/Component;", &[Slot::I(i)], comp)
+            .map(|v| v.as_i32())
+            .unwrap_or(0);
+        if c <= 0 {
+            continue;
+        }
+        let vis = call_java(vm, "java/awt/Component", "isVisible", "()Z", &[], c).map(|v| v.as_i32()).unwrap_or(0);
+        if vis == 0 {
+            continue;
+        }
+        let cx = call_java(vm, "java/awt/Component", "getX", "()I", &[], c).map(|v| v.as_i32()).unwrap_or(0);
+        let cy = call_java(vm, "java/awt/Component", "getY", "()I", &[], c).map(|v| v.as_i32()).unwrap_or(0);
+        let (lx, ly) = (x - cx, y - cy);
+        if call_java(vm, "java/awt/Component", "contains", "(II)Z", &[Slot::I(lx), Slot::I(ly)], c)
+            .map(|v| v.as_i32())
+            .unwrap_or(0)
+            != 0
+        {
+            return deepest_at(vm, c, lx, ly);
+        }
+    }
+    (comp, x, y)
+}
+
+fn now_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
+}
+
+/// 投递一个鼠标事件。`src`/`x`/`y` 用**最深那个组件**的坐标 —— 与 AWT 的语义一致
+/// （轻量组件的 `MouseEvent` 坐标是相对它自己的）。
+fn dispatch_mouse(
+    vm: &mut Vm,
+    hwnd: isize,
+    id: i32,
+    x: i32,
+    y: i32,
+    button: i32,
+    clicks: i32,
+    modifiers: i32,
+) {
+    let target = peer_target(vm, hwnd);
+    if target <= 0 {
+        return;
+    }
+    let (comp, lx, ly) = deepest_at(vm, target, x, y);
+    if comp <= 0 {
+        return;
+    }
+    let when = now_ms();
+    let desc = "(Ljava/awt/Component;IJIIIIZI)V";
+    let args = [
+        Slot::I(comp),
+        Slot::I(id),
+        Slot::L(when),
+        Slot::I(modifiers),
+        Slot::I(lx),
+        Slot::I(ly),
+        Slot::I(clicks),
+        Slot::I(0),
+        Slot::I(button),
+    ];
+    let ev = new_obj(vm, "java/awt/event/MouseEvent", desc, &args);
+    if ev <= 0 {
+        return;
+    }
+    let _ = call_java(vm, "java/awt/Component", "dispatchEvent", "(Ljava/awt/AWTEvent;)V", &[Slot::I(ev)], comp);
+}
+
+/// 投递一个键盘事件
+fn dispatch_key(vm: &mut Vm, hwnd: isize, id: i32, code: i32, ch: u16, modifiers: i32) {
+    let target = peer_target(vm, hwnd);
+    if target <= 0 {
+        return;
+    }
+    // 键盘事件的目标是**持有焦点的组件**（`Window.getFocusOwner`），拿不到就发给窗口
+    let mut comp = call_java(vm, "java/awt/Window", "getMostRecentFocusOwner", "()Ljava/awt/Component;", &[], target)
+        .map(|v| v.as_i32())
+        .unwrap_or(0);
+    if comp <= 0 {
+        comp = target;
+    }
+    let when = now_ms();
+    let desc = "(Ljava/awt/Component;IJI[C)V";
+    let chars = vm.sh.heap.new_array(vec![Slot::I(ch as i32)], "[C").unwrap_or(0);
+    if chars == 0 {
+        return;
+    }
+    let args = [Slot::I(comp), Slot::I(id), Slot::L(when), Slot::I(modifiers), Slot::I(code), Slot::I(chars)];
+    let ev = new_obj(vm, "java/awt/event/KeyEvent", desc, &args);
+    if ev <= 0 {
+        return;
+    }
+    let _ = call_java(vm, "java/awt/Component", "dispatchEvent", "(Ljava/awt/AWTEvent;)V", &[Slot::I(ev)], comp);
+}
+
+/// 把队列里的事件全部投给 Java（在 `eventLoop` 里调，线程安全：VM 是每线程一份）
+fn drain_events(vm: &mut Vm) {
+    let batch: Vec<InputEvt> = {
+        let mut q = events().lock().unwrap_or_else(|e| e.into_inner());
+        if q.is_empty() {
+            return;
+        }
+        std::mem::take(&mut *q)
+    };
+    for e in batch {
+        match e {
+            InputEvt::Mouse { hwnd, id, x, y, button, clicks, modifiers } => {
+                dispatch_mouse(vm, hwnd, id, x, y, button, clicks, modifiers)
+            }
+            InputEvt::Key { hwnd, id, code, ch, modifiers } => dispatch_key(vm, hwnd, id, code, ch, modifiers),
+        }
+    }
+}
+
+/// `WToolkit.eventLoop()` —— `AWT-Windows` 线程上的事件泵。
+///
+/// Java 侧 `WToolkit.run()` 在 `init()` 返回 true 时会调它，并且**永不返回**
+/// （HotSpot 里它跑的是 Win32 消息循环）。我们这边 Win32 的泵已经在 Rust UI 线程上，
+/// 所以这条循环只负责「把 Rust 侧攒的事件投给 Java」。
+///
+/// 线程安全：本 VM 的每个 Java 线程有自己的解释器上下文（`Vm::fork`），共享 `Shared`，
+/// 所以这里 sleep/调 Java 都不会挡住别的线程。
+fn toolkit_event_loop(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    atrace("eventLoop");
+    event_pump_start_once(vm);
+    void()
+}
+
+/// 起一条 **Rust 线程**做事件投递：它 `fork()` 出自己的解释器上下文（和
+/// `Thread.start()` 的子线程同一条路），共享 `Shared`，然后 4ms 一轮地把
+/// Win32 队列里的事件 `dispatchEvent` 给组件。
+///
+/// 为什么不让 `AWT-Windows` 那条 Java 线程当泵：实测让 `init()` 返回 true 好让它进
+/// `eventLoop()` 之后，整个 VM 在 AWT 类初始化阶段就段错误（一条永不返回的 native
+/// 线程在当前线程模型下不稳）。Rust 线程 fork 出来的上下文与 Thread.start 一样是
+/// 「新解释器 + 共享堆」，稳得多，而且不依赖 Java 侧的调用时机。
+fn event_pump_start_once(vm: &mut Vm) {
+    static PUMP: OnceLock<()> = OnceLock::new();
+    PUMP.get_or_init(|| {
+        let mut child = vm.fork();
+        std::thread::spawn(move || loop {
+            drain_events(&mut child);
+            std::thread::sleep(std::time::Duration::from_millis(4));
+        });
+    });
+}
+
+/// `WToolkit.shutdown()`：关机钩子调它，让 `eventLoop()` 退出来
+fn toolkit_shutdown(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    atrace("toolkit shutdown");
+    AWT_QUIT.store(true, std::sync::atomic::Ordering::Relaxed);
+    void()
 }

@@ -239,6 +239,7 @@ impl Flattener {
                     self.rewrite_stmt(f, vis);
                 }
             }
+            Stmt::Yield(e) => self.rewrite_expr(e, vis),
             Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}
         }
     }
@@ -321,7 +322,8 @@ impl Flattener {
                 self.rewrite_expr(index, vis);
             }
             Expr::MethodRef { recv, .. } => self.rewrite_expr(recv, vis),
-            Expr::SwitchExpr(inner) => self.rewrite_expr(inner, vis),
+            Expr::LambdaStmt { body, .. } => self.rewrite_stmt(body, vis),
+            Expr::SwitchExpr(inner) => self.rewrite_stmt(inner, vis),
             _ => {}
         }
     }

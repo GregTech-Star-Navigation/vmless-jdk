@@ -139,14 +139,65 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
         // `;` / `assert ...`（开关关掉时）/ 块内局部类声明 —— 都降级成空语句
         Stmt::Empty => Ok(false),
         Stmt::Return(None) => compile_return(&None, em, ctx, cp),
-        Stmt::Return(Some(e)) => compile_return(&Some(e.clone()), em, ctx, cp),
+        // `return P && Q && R;`（链上有 instanceof 模式测试）→
+        // `if (P) { if (Q) { return R; } return false; } return false;`
+        Stmt::Return(Some(e)) if is_pattern_and_chain(e) => {
+            let mut parts: Vec<&Expr> = Vec::new();
+            flatten_and(e, &mut parts);
+            let chain = rewrite_and_chain_return(&parts);
+            compile_stmt(&chain, em, ctx, cp)
+        }
+        // `return P ? a : b;`（P 里带模式绑定）→ `if (P) return a; return b;`
+        Stmt::Return(Some(Expr::Cond { cond, then: t, els: e }))
+            if pattern_cond(cond).is_some() || is_pattern_and_chain(cond) =>
+        {
+            let if_stmt = Stmt::If {
+                cond: (**cond).clone(),
+                then: Box::new(Stmt::Return(Some((**t).clone()))),
+                els: Some(Box::new(Stmt::Return(Some((**e).clone())))),
+            };
+            compile_stmt(&if_stmt, em, ctx, cp)
+        }
+        // `return switch (...) { … };`：表达式层没有 `&mut Ctx` 分配不了槽位，
+        // 先把 switch 的值落到临时局部，再按普通 `return 名字` 走
+        Stmt::Return(Some(Expr::SwitchExpr(sw))) => {
+            let (decl, id) = hoist_switch_expr(sw, ctx);
+            compile_stmt(
+                &Stmt::Block(vec![decl, Stmt::Return(Some(id))]),
+                em,
+                ctx,
+                cp,
+            )
+        }
+        Stmt::Return(Some(e)) => {
+            // return 位置的 lambda：目标类型是方法的返回类型
+            let t = ctx.ret_ty.as_ref().and_then(|t| lambda_target_of_ty(t, ctx));
+            let saved = ctx.lambda_target.replace(t);
+            let r = compile_return(&Some(e.clone()), em, ctx, cp);
+            ctx.lambda_target.replace(saved);
+            r
+        }
+        // `f = switch (...) { … };` —— 同上
+        Stmt::Expr(Expr::Assign { op: None, lhs, rhs })
+            if matches!(**rhs, Expr::SwitchExpr(_)) =>
+        {
+            let Expr::SwitchExpr(sw) = &**rhs else { unreachable!() };
+            let (decl, id) = hoist_switch_expr(sw, ctx);
+            let assign = Expr::Assign { op: None, lhs: lhs.clone(), rhs: Box::new(id) };
+            compile_stmt(
+                &Stmt::Block(vec![decl, Stmt::Expr(assign)]),
+                em,
+                ctx,
+                cp,
+            )
+        }
         Stmt::Expr(e) if is_println_call(e) => {
-            compile_expr(e, em, ctx, cp)?;
+            compile_expr_mut(e, em, ctx, cp)?;
             Ok(false)
         }
         Stmt::Expr(e) if !matches!(e, Expr::Assign { .. }) => {
             let kind = expr_kind(e, ctx);
-            compile_expr(e, em, ctx, cp)?;
+            compile_expr_mut(e, em, ctx, cp)?;
             if is_void_call(e, ctx) {
                 return Ok(false); // void 方法调用没有返回值可弹
             }
@@ -159,7 +210,47 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             }
             Ok(false)
         }
+        // `T v = P ? a : b;`（P 里带模式绑定）→ 先声明，再在两条分支里各自赋值
+        Stmt::LocalVar { ty, name, init } if init.as_ref().is_some_and(is_pattern_cond_expr) => {
+            let Some(Expr::Cond { cond, then: t, els: e }) = init.as_ref() else { unreachable!() };
+            let decl = Stmt::LocalVar { ty: ty.clone(), name: name.clone(), init: None };
+            let path = |v: &Expr| {
+                Stmt::Expr(Expr::Assign {
+                    op: None,
+                    lhs: Box::new(Expr::Ident(name.clone())),
+                    rhs: Box::new(v.clone()),
+                })
+            };
+            let if_stmt = Stmt::If {
+                cond: (**cond).clone(),
+                then: Box::new(path(t)),
+                els: Some(Box::new(path(e))),
+            };
+            compile_stmt(&Stmt::Block(vec![decl, if_stmt]), em, ctx, cp)
+        }
+        // `v = P ? a : b;` —— 同上（赋值形态）
+        Stmt::Expr(Expr::Assign { op: None, lhs, rhs }) if is_pattern_cond_expr(rhs) => {
+            let Expr::Cond { cond, then: t, els: e } = &**rhs else { unreachable!() };
+            let path = |v: &Expr| {
+                Stmt::Expr(Expr::Assign { op: None, lhs: lhs.clone(), rhs: Box::new(v.clone()) })
+            };
+            let if_stmt = Stmt::If {
+                cond: (**cond).clone(),
+                then: Box::new(path(t)),
+                els: Some(Box::new(path(e))),
+            };
+            compile_stmt(&if_stmt, em, ctx, cp)
+        }
         Stmt::LocalVar { ty, name, init } => {
+            // `var x = init;`（JLS 10.9）：局部变量的类型由初值推导。不推导的话这个
+            // 局部**没有静态类型** —— 后面 `x.m()` / `x.f` 全报「未找到实例方法」，
+            // 而且 `kind_of(Type::Var)` 是 K_INT，引用值被塞进整数槽（aload 变 iload）。
+            let inferred = if matches!(*ty, Type::Var) {
+                init.as_ref().and_then(|i| expr_type(i, ctx))
+            } else {
+                None
+            };
+            let ty = inferred.as_ref().unwrap_or(ty);
             let slot = ctx.next_slot;
             if slot >= SCRATCH_SLOT {
                 return err(format!(
@@ -186,7 +277,12 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 _ => init.clone(),
             };
             if let Some(e) = &init {
-                compile_expr(e, em, ctx, cp)?;
+                // 目标类型：`Runnable r = () -> { … };` —— lambda 没有自己的类型，
+                // 只能从声明的左侧推
+                let saved = ctx.lambda_target.replace(crate::codegen::expr::lambda_target_of_ty(ty, ctx));
+                let r = compile_expr_mut(e, em, ctx, cp);
+                ctx.lambda_target.replace(saved);
+                r?;
                 // 泛型擦除后 `String s = box.get();` 的右值是 Object：补 checkcast
                 coerce_to(ty, e, ctx, em, cp)?;
             }
@@ -231,7 +327,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                     Expr::Field(_, n) => n.clone(),
                     _ => unreachable!(),
                 };
-                compile_expr(rhs, em, ctx, cp)?;
+                compile_expr_mut(rhs, em, ctx, cp)?;
                 coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                 let f = cp.field_ref(&owner, &fname, &desc);
                 em.op_u2(0xB3, f); // putstatic
@@ -249,7 +345,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 em.op(0x2A); // aload_0
                 em.push(1);
             } else {
-                compile_expr(&recv, em, ctx, cp)?;
+                compile_expr_mut(&recv, em, ctx, cp)?;
             }
             emit_val(rhs, &sr, em, ctx, cp)?;
             let (mut owner, desc) = field_access(&recv, &fname, ctx);
@@ -270,7 +366,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             let Some(slot) = ctx.lookup(&name) else {
                 // 本类的静态字段（`count = count + 1;`）
                 if let Some((owner, desc)) = ctx.static_fields.get(&name).cloned() {
-                    compile_expr(rhs, em, ctx, cp)?;
+                    compile_expr_mut(rhs, em, ctx, cp)?;
                     coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                     let f = cp.field_ref(&owner, &name, &desc);
                     em.op_u2(0xB3, f); // putstatic
@@ -284,7 +380,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 };
                 em.op(0x2A); // aload_0
                 em.push(1);
-                compile_expr(rhs, em, ctx, cp)?;
+                compile_expr_mut(rhs, em, ctx, cp)?;
                 coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                 let f = cp.field_ref(&owner, &name, &desc);
                 em.op_u2(0xB5, f); // putfield
@@ -292,7 +388,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 return Ok(false);
             };
             let kind = *ctx.local_kind.get(&name).unwrap_or(&K_INT);
-            compile_expr(rhs, em, ctx, cp)?;
+            compile_expr_mut(rhs, em, ctx, cp)?;
             if let Some(t) = ctx.local_ty.get(&name).cloned() {
                 coerce_to(&t, rhs, ctx, em, cp)?;
             }
@@ -347,7 +443,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             if em.max_locals < ctx.next_slot as u16 {
                 em.max_locals = ctx.next_slot as u16;
             }
-            compile_expr(&pin(selector, ctx, false), em, ctx, cp)?;
+            compile_expr_mut(&pin(selector, ctx, false), em, ctx, cp)?;
             em.istore(sel_slot)?;
             em.set_local_type(sel_slot as usize, 0); // int
 
@@ -395,7 +491,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                     match label {
                         Some(v) => {
                             em.iload(sel_slot)?;
-                            compile_expr(&pin(v, ctx, true), em, ctx, cp)?;
+                            compile_expr_mut(&pin(v, ctx, true), em, ctx, cp)?;
                             let next = em.new_label();
                             // 不相等就继续比下一个
                             em.branch(0xa0, next); // if_icmpne
@@ -540,6 +636,35 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             if let Some(p) = pattern_cond(cond) {
                 return compile_if_pattern(p, then, els.as_deref(), em, ctx, cp);
             }
+            // `a && P && b`（P 是其中最左边那个 instanceof 模式测试）：模式变量的
+            // 可见性只能在语句层展开，摊平成嵌套 if。`&&` 的语义正好等长：
+            // 任何一段为假都进 else 分支。
+            {
+                let mut parts: Vec<&Expr> = Vec::new();
+                flatten_and(cond, &mut parts);
+                if parts.len() > 1 && parts.iter().any(|p| pattern_cond(p).is_some()) {
+                    let nested = rewrite_and_chain(&parts, then, els.as_deref());
+                    return compile_stmt(&nested, em, ctx, cp);
+                }
+            }
+            // `if (先决条件 && x instanceof T t)`：模式在 `&&` 右边，同样只能先求值
+            // 先决条件、再在「它成立」的分支里测模式
+            // 等价于 `if (A) { if (P) {then} else {els} } else {els}`
+            if let Expr::Binary { op: BinOp::And, lhs: a, rhs: p } = cond {
+                if pattern_cond(p).is_some() && pattern_cond(a).is_none() {
+                    let inner = Stmt::If {
+                        cond: (**p).clone(),
+                        then: then.clone(),
+                        els: els.clone(),
+                    };
+                    let outer = Stmt::If {
+                        cond: (**a).clone(),
+                        then: Box::new(inner),
+                        els: els.clone(),
+                    };
+                    return compile_stmt(&outer, em, ctx, cp);
+                }
+            }
             let l_else = em.new_label();
             let l_end = em.new_label();
             compile_cond_false(cond, em, ctx, cp, l_else)?;
@@ -568,7 +693,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             Ok(false)
         }
         Stmt::Throw(e) => {
-            compile_expr(e, em, ctx, cp)?;
+            compile_expr_mut(e, em, ctx, cp)?;
             em.op(0xBF); // athrow
             em.pop(1);
             Ok(true) // 之后不可达
@@ -731,7 +856,7 @@ fn compile_string_switch(
     if em.max_locals < ctx.next_slot as u16 {
         em.max_locals = ctx.next_slot as u16;
     }
-    compile_expr(selector, em, ctx, cp)?;
+    compile_expr_mut(selector, em, ctx, cp)?;
     let vt = cp.class("java/lang/String");
     em.set_local_type(sel_slot as usize, vt);
     em.astore(sel_slot)?;
@@ -751,7 +876,7 @@ fn compile_string_switch(
         for label in &c.labels {
             let Some(v) = label else { continue };
             em.aload(sel_slot)?;
-            compile_expr(v, em, ctx, cp)?;
+            compile_expr_mut(v, em, ctx, cp)?;
             em.op_u2(0xB6, equals); // invokevirtual String.equals
             em.pop(2);
             em.push(1);
@@ -915,7 +1040,57 @@ fn compile_for_each(
     compile_stmt(&block, em, ctx, cp)
 }
 
-/// `if` 条件里的 instanceof 模式绑定
+/// 这个表达式是不是「条件里带 instanceof 模式绑定」的三元式
+fn is_pattern_cond_expr(e: &Expr) -> bool {
+    matches!(e, Expr::Cond { cond, .. } if pattern_cond(cond).is_some() || is_pattern_and_chain(cond))
+}
+
+/// 把 `P && rest`（P 是 instanceof 模式测试）拆成 (P, rest)。
+///
+/// 模式变量只活在「测试为真」那条路径上，所以这种条件必须**先测再绑**，
+/// 不能在表达式层按 `&&` 的短路语义直接顺序求值。
+fn split_pattern_and(e: &Expr) -> Option<(&Expr, &Expr)> {
+    match e {
+        Expr::Binary { op: BinOp::And, lhs, rhs } if pattern_cond(lhs).is_some() => {
+            Some((lhs.as_ref(), rhs.as_ref()))
+        }
+        _ => None,
+    }
+}
+
+/// `A && B && C` 摊平成 `[A, B, C]`（左结合链）
+fn flatten_and<'a>(e: &'a Expr, out: &mut Vec<&'a Expr>) {
+    match e {
+        Expr::Binary { op: BinOp::And, lhs, rhs } => {
+            flatten_and(lhs, out);
+            flatten_and(rhs, out);
+        }
+        _ => out.push(e),
+    }
+}
+
+/// `cond1 && cond2 && …` 里**任意一段**带模式绑定时，把条件链展开成嵌套 if。
+///
+/// 模式变量的可见性由「测试为真」决定，所以只能在语句层一段一段测：
+/// ```text
+/// if (a && P && b) { T } else { E }
+/// ≡ if (a) { if (P) { if (b) { T } else { E } } else { E } } else { E }
+/// ```
+fn rewrite_and_chain(parts: &[&Expr], then: &Stmt, els: Option<&Stmt>) -> Stmt {
+    match parts.split_first() {
+        None => then.clone(),
+        Some((head, rest)) => {
+            let inner = rewrite_and_chain(rest, then, els);
+            Stmt::If {
+                cond: (*head).clone(),
+                then: Box::new(inner),
+                els: els.map(|e| Box::new(e.clone())),
+            }
+        }
+    }
+}
+
+/// `if (x instanceof T t) …` 条件里的 instanceof 模式绑定
 enum PatCond<'a> {
     /// `if (x instanceof T t)`
     Pos(&'a Expr, &'a Type, &'a str),
@@ -966,7 +1141,7 @@ fn compile_if_pattern(
     };
     let tmp = em.alloc_scratch()?;
     let saved_tmp_ty = em.local_type_of(tmp);
-    compile_expr(expr, em, ctx, cp)?;
+    compile_expr_mut(expr, em, ctx, cp)?;
     em.astore(tmp)?;
     let tmp_vt = match expr_type(expr, ctx) {
         Some(t) if !matches!(t, Type::Prim(_)) => ver_type(cp, &t),
@@ -1078,4 +1253,194 @@ fn compile_if_pattern(
     em.free_scratch(tmp);
     em.set_local_type(tmp as usize, saved_tmp_ty);
     Ok(false)
+}
+
+// ---------------------------------------------------------------------------
+// switch 表达式：整块降成「临时局部 + 语句形态的 switch」
+// ---------------------------------------------------------------------------
+
+/// 同 `compile_expr`，但**允许分配局部变量槽**（switch 表达式要用临时局部收值）。
+/// 语句层一律走这个函数；表达式内部（手里只有 `&Ctx`）仍走 `compile_expr`。
+pub(crate) fn compile_expr_mut(
+    e: &Expr,
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    match e {
+        Expr::SwitchExpr(sw) => compile_switch_expr(sw, em, ctx, cp),
+        _ => compile_expr(e, em, &*ctx, cp),
+    }
+}
+
+/// `switch` 表达式的零值（临时变量的初值）。
+///
+/// Java 要求 switch 表达式穷尽，正常代码里这个初值读不到；给它一个确定的值是为了
+/// **栈图成立** —— 声明了类型的槽位在没赋值的路径上也得有合法值。
+fn default_value(ty: &Type) -> Expr {
+    match ty {
+        Type::Prim("long") => Expr::IntLit("0L".into()),
+        Type::Prim("float") => Expr::FloatLit("0.0f".into()),
+        Type::Prim("double") => Expr::FloatLit("0.0".into()),
+        Type::Prim("boolean") => Expr::BoolLit(false),
+        Type::Prim("char") => Expr::CharLit("a".into()),
+        Type::Prim(_) => Expr::IntLit("0".into()),
+        _ => Expr::Null,
+    }
+}
+
+/// 一条 `yield e;` / 箭头体的裸表达式 → 「写临时变量 + 跳出 switch」
+fn yield_store(tgt: &Expr, label: &str, e: &Expr) -> Stmt {
+    Stmt::Block(vec![
+        Stmt::Expr(Expr::Assign { op: None, lhs: Box::new(tgt.clone()), rhs: Box::new(e.clone()) }),
+        Stmt::Break(Some(label.to_string())),
+    ])
+}
+
+/// 把语句树里的 `yield e;` 改写成「写临时变量 + 跳出 switch」。
+///
+/// 递归进去，但**不**进 `Expr` —— 嵌套的 switch 表达式是 `Expr::SwitchExpr`，
+/// 它有自己的临时变量和标签。
+fn rewrite_yields(s: &Stmt, tgt: &Expr, label: &str) -> Stmt {
+    match s {
+        Stmt::Yield(e) => yield_store(tgt, label, e),
+        Stmt::Block(v) => Stmt::Block(v.iter().map(|x| rewrite_yields(x, tgt, label)).collect()),
+        Stmt::If { cond, then, els } => Stmt::If {
+            cond: cond.clone(),
+            then: Box::new(rewrite_yields(then, tgt, label)),
+            els: els.as_ref().map(|e| Box::new(rewrite_yields(e, tgt, label))),
+        },
+        Stmt::While { cond, body } => {
+            Stmt::While { cond: cond.clone(), body: Box::new(rewrite_yields(body, tgt, label)) }
+        }
+        Stmt::DoWhile { body, cond } => {
+            Stmt::DoWhile { body: Box::new(rewrite_yields(body, tgt, label)), cond: cond.clone() }
+        }
+        Stmt::For { init, cond, update, body } => Stmt::For {
+            init: init.iter().map(|x| rewrite_yields(x, tgt, label)).collect(),
+            cond: cond.clone(),
+            update: update.clone(),
+            body: Box::new(rewrite_yields(body, tgt, label)),
+        },
+        Stmt::ForEach { ty, name, iter, body } => Stmt::ForEach {
+            ty: ty.clone(),
+            name: name.clone(),
+            iter: iter.clone(),
+            body: Box::new(rewrite_yields(body, tgt, label)),
+        },
+        Stmt::Labeled { label: l, body } => {
+            Stmt::Labeled { label: l.clone(), body: Box::new(rewrite_yields(body, tgt, label)) }
+        }
+        Stmt::Switch { selector, cases } => Stmt::Switch {
+            selector: selector.clone(),
+            cases: cases
+                .iter()
+                .map(|c| SwitchCase {
+                    labels: c.labels.clone(),
+                    body: c.body.iter().map(|x| rewrite_yields(x, tgt, label)).collect(),
+                    arrow: c.arrow,
+                })
+                .collect(),
+        },
+        Stmt::Try { body, catches, finally } => Stmt::Try {
+            body: Box::new(rewrite_yields(body, tgt, label)),
+            catches: catches
+                .iter()
+                .map(|c| Catch {
+                    types: c.types.clone(),
+                    name: c.name.clone(),
+                    body: rewrite_yields(&c.body, tgt, label),
+                })
+                .collect(),
+            finally: finally.as_ref().map(|f| Box::new(rewrite_yields(f, tgt, label))),
+        },
+        other => other.clone(),
+    }
+}
+
+/// `switch (...) { … }` 表达式 → 临时局部变量 + 语句形态的 switch
+fn compile_switch_expr(
+    sw: &Stmt,
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    let Stmt::Switch { selector, cases } = sw else {
+        // parser 拿这个变体当「块体 lambda」的占位
+        return err("暂不支持的表达式：块体 lambda（`x -> { … }`）");
+    };
+    let ty = switch_expr_type(sw, ctx)
+        .unwrap_or(Type::Named { path: vec!["Object".into()], args: vec![] });
+    let seq = ctx.next_tmp();
+    let name = format!("$sw{seq}");
+    let label = format!("$swx{seq}");
+    let tgt = Expr::Ident(name.clone());
+    let new_cases: Vec<SwitchCase> = cases
+        .iter()
+        .map(|c| {
+            // 箭头体里直接写值（`case A -> v;`）—— 语句位置上是 Stmt::Expr
+            let value_body = c.arrow && c.body.len() == 1 && matches!(c.body[0], Stmt::Expr(_));
+            let body = if value_body {
+                match &c.body[0] {
+                    Stmt::Expr(e) => vec![yield_store(&tgt, &label, e)],
+                    _ => vec![],
+                }
+            } else {
+                c.body.iter().map(|s| rewrite_yields(s, &tgt, &label)).collect()
+            };
+            SwitchCase { labels: c.labels.clone(), body, arrow: c.arrow }
+        })
+        .collect();
+    // 用标签包住 switch：`yield` 的 break 只跳这一层（不误伤体里的循环）
+    let block = Stmt::Block(vec![
+        Stmt::LocalVar { ty: ty.clone(), name: name.clone(), init: Some(default_value(&ty)) },
+        Stmt::Labeled {
+            label: label.clone(),
+            body: Box::new(Stmt::Switch { selector: selector.clone(), cases: new_cases }),
+        },
+    ]);
+    compile_stmt(&block, em, ctx, cp)?;
+    let Some(slot) = ctx.locals.get(&name).copied() else {
+        return err("switch 表达式内部错误：临时变量没有分到槽位");
+    };
+    let kind = ctx.local_kind.get(&name).copied().unwrap_or(K_REF);
+    em.load_slot(slot, kind)?;
+    Ok(())
+}
+
+/// `switch (...) { … }` 的值落到一个新的临时局部：返回 (声明, 引用它的名字表达式)
+fn hoist_switch_expr(sw: &Stmt, ctx: &mut Ctx) -> (Stmt, Expr) {
+    let seq = ctx.next_tmp();
+    let name = format!("$swv{seq}");
+    let ty = switch_expr_type(sw, ctx)
+        .unwrap_or(Type::Named { path: vec!["Object".into()], args: vec![] });
+    let decl = Stmt::LocalVar {
+        ty,
+        name: name.clone(),
+        init: Some(Expr::SwitchExpr(Box::new(sw.clone()))),
+    };
+    (decl, Expr::Ident(name))
+}
+
+/// 这个表达式是不是「`&&` 链且链上有 instanceof 模式测试」
+fn is_pattern_and_chain(e: &Expr) -> bool {
+    if !matches!(e, Expr::Binary { op: BinOp::And, .. }) {
+        return false;
+    }
+    let mut parts: Vec<&Expr> = Vec::new();
+    flatten_and(e, &mut parts);
+    parts.iter().any(|p| pattern_cond(p).is_some())
+}
+
+/// `return A && B && C;` → 嵌套 if，最后一段是真正的返回值
+fn rewrite_and_chain_return(parts: &[&Expr]) -> Stmt {
+    match parts.split_first() {
+        None => Stmt::Return(Some(Expr::BoolLit(true))),
+        Some((last, [])) => Stmt::Return(Some((**last).clone())),
+        Some((head, rest)) => Stmt::If {
+            cond: (**head).clone(),
+            then: Box::new(rewrite_and_chain_return(rest)),
+            els: Some(Box::new(Stmt::Return(Some(Expr::BoolLit(false))))),
+        },
+    }
 }

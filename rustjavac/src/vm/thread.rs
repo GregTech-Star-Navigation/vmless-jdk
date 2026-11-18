@@ -152,6 +152,10 @@ pub(super) struct ThreadRec {
     /// 而 AQS（`ReentrantLock`/`Condition`/`LinkedBlockingDeque`）全是无限期 park，
     /// 一挂就是整个程序卡死。
     pub permit: bool,
+    /// 这条线程的**帧表**（见 `stacktrace`）：栈轨迹 / 死锁报告 / jstack 都从这里读。
+    /// 放在 `ThreadRec` 里是为了「别的线程也能拿到它」——帧槽本身只由本线程写，
+    /// 读侧走 seqlock。
+    pub frames: Arc<super::stacktrace::FrameStack>,
 }
 
 // ---------------------------------------------------------------- 停靠频率
@@ -168,6 +172,7 @@ impl Vm {
 
     /// 进 VM 的线程登记（main 与 `Thread.start` 都走它）
     pub(super) fn thread_register(&mut self, tid: u64, java: i32, name: &str, daemon: bool) {
+        let frames = Arc::new(super::stacktrace::FrameStack::new_for(tid));
         let rec = ThreadRec {
             tid,
             java,
@@ -179,10 +184,16 @@ impl Vm {
             interrupted: false,
             waiting_on: 0,
             permit: false,
+            frames,
         };
         lk(&self.sh.threads).insert(tid, rec);
         self.sh.nthreads.fetch_add(1, Ordering::AcqRel);
         self.set_state(tid, ST_RUNNABLE);
+        // 主线程是「在自己身上登记」的，这里顺手绑上帧表；子线程要等它自己的 OS 线程
+        // 起来后再绑（`thread_start` 的 spawn 闭包里做）。
+        if cur_tid() == tid {
+            super::stacktrace::bind_current(&self.sh, tid);
+        }
     }
 
     pub(super) fn thread_is_alive(&self, tid: u64) -> bool {
@@ -667,6 +678,8 @@ impl Vm {
         let mut child = self.fork();
         std::thread::spawn(move || {
             set_tid(tid);
+            // 帧表绑到**这个** OS 线程上（登记是在父线程做的，TLS 只能在子线程自己这里设）
+            super::stacktrace::bind_current(&child.sh, tid);
             child.sh.safepoint.register();
             let r = child.invoke_thread_run(thread_obj);
             let exc = child.thread_finish(tid, r);
@@ -849,7 +862,11 @@ impl Vm {
             self.wake(cur_tid());
             return;
         }
-        if let Some(tid) = lk(&self.sh.threads).values().find(|t| t.java == target).map(|t| t.tid) {
+        // 锁纪律：先把 tid 取出来（分号处 guard 就 drop），再调 `wake()` ——
+        // `wake()` 内部还要 take `sh.threads`，写在 `if let` 里会把同一把锁再取一次，
+        // 自己锁自己（不可重入 Mutex，表现为永久挂死、无 panic）。
+        let tid = lk(&self.sh.threads).values().find(|t| t.java == target).map(|t| t.tid);
+        if let Some(tid) = tid {
             self.wake(tid);
         }
     }
@@ -1125,7 +1142,36 @@ impl Vm {
         Some(self.deadlock_text(&cycles))
     }
 
-    /// `jstack -l` 风格的死锁报告（本 VM 没有调用栈模型，帧列表从略，锁图是完整的）
+    /// `jstack` 风格的**全线程**转储（含真实帧栈）。`VMLESS_STACK_DUMP=<秒>` 时由
+    /// 看门狗周期打印；也可以从 `run_main` 的错误路径直接调。
+    pub fn debug_stacks(&self) -> String {
+        let threads = self.debug_threads();
+        let mut out = String::new();
+        for (tid, name, state, daemon, locks, waiting) in &threads {
+            out.push_str(&format!(
+                "\"{}\" tid={} state={:#x}{}{}\n",
+                name,
+                tid,
+                *state,
+                if *daemon { " daemon" } else { "" },
+                if *waiting != 0 { format!(" waiting_on={}", waiting) } else { String::new() }
+            ));
+            if !locks.is_empty() {
+                out.push_str(&format!("  holds: {:?}\n", locks));
+            }
+            for line in super::stacktrace::stack_text(self, *tid, 32) {
+                out.push_str(&line);
+                out.push('\n');
+            }
+            if super::stacktrace::frames_of(self, *tid).is_empty() {
+                out.push_str("\t<empty stack>\n");
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    /// `jstack -l` 风格的死锁报告（进程级诊断输出的拼装在这里）
     fn deadlock_text(&self, cycles: &[Vec<u64>]) -> String {
         let threads = self.debug_threads();
         let name_of = |h: i32| -> String {
@@ -1155,7 +1201,20 @@ impl Vm {
         }
         out.push_str("Java stack information for the threads listed above:\n");
         out.push_str("===================================================\n");
-        out.push_str("（本 VM 没有调用栈模型：栈帧从略，锁图（谁持有 / 谁在等）是完整的）\n\n");
+        // 每一环上的线程给出**真实帧栈**（栈顶若干帧，jstack 风格）：
+        // 「谁在等谁」有了，「为什么走到那里」也有了。
+        for cyc in cycles {
+            for tid in cyc {
+                if let Some(t) = threads.iter().find(|t| t.0 == *tid) {
+                    out.push_str(&format!("\"{}\":\n", t.1));
+                    for line in super::stacktrace::stack_text(self, *tid, 16) {
+                        out.push_str(&line);
+                        out.push('\n');
+                    }
+                    out.push('\n');
+                }
+            }
+        }
         out.push_str(&format!("Found {} deadlock.\n", cycles.len()));
         out
     }
@@ -1189,18 +1248,33 @@ fn spawn_deadlock_watchdog() {
     if STARTED.swap(true, Ordering::SeqCst) {
         return;
     }
-    std::thread::spawn(|| loop {
-        std::thread::sleep(Duration::from_millis(250));
-        // 看门狗是一个独立线程：给它自己的解释器上下文（只需要 `Shared`，不跑字节码）
-        let Some(sh) = shared_reg() else { return };
-        let mut vm = Vm::from_shared(sh);
-        let report = vm.deadlock_watchdog_tick();
-        if std::env::var_os("VMLESS_THREAD_DUMP_MS").is_some() {
-            eprintln!("[dump] threads={:?} cycles={:?}", vm.debug_threads(), vm.debug_deadlocks());
-        }
-        if let Some(text) = report {
-            eprint!("{text}");
-            std::process::exit(1);
+    std::thread::spawn(|| {
+        // `VMLESS_STACK_DUMP=<秒>`：每隔这么久往 stderr 打一份全线程栈（jstack 的替身，
+        // 排查 park/锁挂死用）。`VMLESS_THREAD_DUMP_MS` 只看线程表（老开关，保留）。
+        let stack_iv = std::env::var("VMLESS_STACK_DUMP")
+            .ok()
+            .and_then(|s| s.parse::<f64>().ok())
+            .map(Duration::from_secs_f64);
+        let mut last = Instant::now();
+        loop {
+            std::thread::sleep(Duration::from_millis(250));
+            // 看门狗是一个独立线程：给它自己的解释器上下文（只需要 `Shared`，不跑字节码）
+            let Some(sh) = shared_reg() else { return };
+            let mut vm = Vm::from_shared(sh);
+            let report = vm.deadlock_watchdog_tick();
+            if std::env::var_os("VMLESS_THREAD_DUMP_MS").is_some() {
+                eprintln!("[dump] threads={:?} cycles={:?}", vm.debug_threads(), vm.debug_deadlocks());
+            }
+            if let Some(iv) = stack_iv {
+                if last.elapsed() >= iv {
+                    last = Instant::now();
+                    eprint!("{}", vm.debug_stacks());
+                }
+            }
+            if let Some(text) = report {
+                eprint!("{text}");
+                std::process::exit(1);
+            }
         }
     });
 }

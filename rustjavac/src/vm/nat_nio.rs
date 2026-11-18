@@ -45,6 +45,7 @@ pub(super) fn register(r: &mut NativeRegistry) {
     register_windows_dispatcher(r);
     register_windows_security(r);
     register_file_dispatcher(r);
+    register_mapped_memory(r);
     register_ioutil(r);
     register_net(r);
     register_socket_dispatcher(r);
@@ -53,6 +54,66 @@ pub(super) fn register(r: &mut NativeRegistry) {
     register_watch_service(r);
     register_selector(r);
     register_dns(r);
+    register_ntlm(r);
+}
+
+// ============================================================ NTLM（HTTP 代理/服务器认证）
+//
+// 这一组是 `sun.net.www.protocol.http.ntlm` 的 Windows 实现，底座是 **SSPI**
+// （`AcquireCredentialsHandleW` / `InitializeSecurityContextW`）。
+//
+// 现在只有两条是「真值查询」，两条 SSPI 握手**明确抛
+// `UnsupportedOperationException`**：SPPI 的 `SecBufferDesc` / 4 个 `SecBuffer` /
+// 令牌续传要跟 `NTLMAuthSequence` 的状态机严格对齐，半套实现会在第 2 个令牌上
+// 报 `SEC_E_INVALID_TOKEN` —— 那比一开始就说「不支持」更难查。
+// 影响面：只有 `http.auth.ntlm` / 需要 NTLM 的代理认证会走到，普通 HTTP(S) 不受影响。
+const NTLM_SEQ: &str = "sun/net/www/protocol/http/ntlm/NTLMAuthSequence";
+const NTLM_AUTH: &str = "sun/net/www/protocol/http/ntlm/NTLMAuthentication";
+
+/// `initFirst(Class<Status>)`：HotSpot 在这里缓存 `Status.status` 的字段 ID。
+/// 本 VM 不做 JNI 字段访问（走 `set_obj_field`），所以空实现是正确的。
+fn ntlm_init_first(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(0))
+}
+
+fn ntlm_credentials_unsupported(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Err(vm.throw_msg(
+        "java/lang/UnsupportedOperationException",
+        "NTLM 认证未实现（需要 SSPI 的 AcquireCredentialsHandle/InitializeSecurityContext 握手）".to_string(),
+    ))
+}
+
+/// `isTrustedSiteAvailable()`：Windows 上有「本地 Intranet 区域」的概念，所以 true
+fn ntlm_trusted_available(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(1))
+}
+
+/// `isTrustedSite0(url)`：URL 是否落在「本地 Intranet」安全区域
+///
+/// 真实现要 `IInternetSecurityManager.MapUrlToZone`（urlmon）。**这里返回 false**：
+/// 语义是「不是受信任站点」，也就是**不会**自动带上当前 Windows 凭据去做 NTLM 认证 ——
+/// 这个方向上出错是安全的（多一次提示），反方向（把外网站点当内网 → 静默泄露 NTLM 哈希）
+/// 才是事故。等真做 urlmon 时这里换成 `MapUrlToZone(url) == URLZONE_INTRANET`。
+fn ntlm_is_trusted_site(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(0))
+}
+
+fn register_ntlm(r: &mut NativeRegistry) {
+    r.add(NTLM_SEQ, "initFirst", "(Ljava/lang/Class;)V", ntlm_init_first);
+    r.add(
+        NTLM_SEQ,
+        "getCredentialsHandle",
+        "(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)J",
+        ntlm_credentials_unsupported,
+    );
+    r.add(
+        NTLM_SEQ,
+        "getNextToken",
+        "(J[BLsun/net/www/protocol/http/ntlm/NTLMAuthSequence$Status;)[B",
+        ntlm_credentials_unsupported,
+    );
+    r.add(NTLM_AUTH, "isTrustedSiteAvailable", "()Z", ntlm_trusted_available);
+    r.add(NTLM_AUTH, "isTrustedSite0", "(Ljava/lang/String;)Z", ntlm_is_trusted_site);
 }
 
 // ============================================================ Win32 裸 FFI
@@ -1356,17 +1417,26 @@ fn register_file_dispatcher(r: &mut NativeRegistry) {
     r.add(FDP, "duplicateHandle", "(J)J", fdp_duplicate_handle);
     // 分配粒度：Windows 的 `SYSTEM_INFO.dwAllocationGranularity` 恒为 64K
     r.add(FDP, "allocationGranularity0", "()J", |_, _| Ok(Slot::L(65536)));
-    // FileChannel.map/unmap：本 VM 的地址是 arena 句柄，没有真内存映射 —— 明确报错
-    r.add(FDP, "map0", "(Ljava/io/FileDescriptor;IJJZ)J", fdp_map_unsupported);
-    r.add(FDP, "unmap0", "(JJ)I", |_, _| Ok(Slot::I(0)));
+    // FileChannel.map/unmap：把真映射登记进 arena（见「内存映射文件」那一节）
+    r.add(FDP, "map0", "(Ljava/io/FileDescriptor;IJJZ)J", fdp_map0);
+    r.add(FDP, "unmap0", "(JJ)I", fdp_unmap0);
     r.add(FDP, "maxDirectTransferSize0", "()I", |_, _| Ok(Slot::I(16 * 1024 * 1024)));
     r.add(
         FDP,
         "transferTo0",
         "(Ljava/io/FileDescriptor;JJLjava/io/FileDescriptor;Z)J",
-        fdp_transfer_to_unsupported,
+        fdp_transfer_to0,
     );
     r.add(FDP, "setDirect0", "(Ljava/io/FileDescriptor;Ljava/nio/CharBuffer;)I", |_, _| Ok(Slot::I(0)));
+}
+
+/// `MappedMemoryUtils`：`MappedByteBuffer.load()/force()/isLoaded()` 的落地点
+fn register_mapped_memory(r: &mut NativeRegistry) {
+    r.add(MMU, "registerNatives", "()V", mmu_register_natives);
+    r.add(MMU, "force0", "(Ljava/io/FileDescriptor;JJ)V", mmu_force0);
+    r.add(MMU, "load0", "(JJ)V", mmu_load0);
+    r.add(MMU, "unload0", "(JJ)V", mmu_unload0);
+    r.add(MMU, "isLoaded0", "(JJJ)Z", mmu_is_loaded0);
 }
 
 /// `iovec[]`：64 位下每项 16 字节（base 在 0、len 在 8）
@@ -1461,15 +1531,382 @@ fn fdp_duplicate_handle(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::L(out as i64))
 }
 
-fn fdp_map_unsupported(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
-    Err(throw_io(
-        vm,
-        "FileChannel.map 未实现：本 VM 的 native 地址是 arena 句柄，没有真内存映射",
-    ))
+// ============================================================ 内存映射文件（mmap）
+//
+// 这一组的关键是**地址桥接**。`FileChannel.map` 拿到的地址会被 `Unsafe.getX/putX` 当
+// 裸地址用，而本 VM 的裸地址是 arena 假地址。所以：
+//
+//   `map0`  → `CreateFileMapping` + `MapViewOfFile` 拿到**真视图**，
+//             再 `nat_mem::alloc_mapped(真指针, 长度)` 把这块真内存**登记**进 arena，
+//             返回的假地址就是视图的别名（不拷一份 —— 见 `nat_mem` 里 `Block::Mapped` 的理由）。
+//   `unmap0`→ 先注销 arena 登记，再 `UnmapViewOfFile`（顺序反了，残留读写会踩已解除的视图）。
+//
+// 假地址必须 **64K 对齐**：`MappedMemoryUtils.mappingOffset()` 会拿 `address & (pageSize-1)`
+// 反推映射基址，基址不对那 `force0`/`load0` 算出来的区间就是错的。
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateFileMappingW(
+        file: Handle,
+        sa: *const c_void,
+        protect: u32,
+        hi: u32,
+        lo: u32,
+        name: *const u16,
+    ) -> Handle;
+    fn MapViewOfFile(mapping: Handle, access: u32, off_hi: u32, off_lo: u32, len: usize) -> *mut c_void;
+    fn UnmapViewOfFile(base: *const c_void) -> Bool;
+    fn FlushViewOfFile(base: *const c_void, len: usize) -> Bool;
+    fn PrefetchVirtualMemory(process: Handle, count: usize, ranges: *mut MemoryRangeEntry, flags: u64) -> Bool;
+    fn QueryWorkingSetEx(process: Handle, buf: *mut c_void, len: u32) -> Bool;
 }
 
-fn fdp_transfer_to_unsupported(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
-    Err(throw_io(vm, "FileChannel.transferTo 未实现"))
+#[repr(C)]
+struct MemoryRangeEntry {
+    virtual_address: *mut c_void,
+    number_of_bytes: usize,
+}
+
+/// `PSAPI_WORKING_SET_EX_INFORMATION`：**每个元素 16 字节**（x64）
+/// `{ PVOID VirtualAddress; PSAPI_WORKING_SET_EX_BLOCK { ULONG_PTR Flags; } }`
+///
+/// 曾经这里只放了 8 字节的 `Flags`，于是 ① 传给 `QueryWorkingSetEx` 的长度少一半 →
+/// 调用失败 → 被当成「全部已加载」返回 true（`MappedByteBuffer.isLoaded()` 于是永远 true，
+/// 与 HotSpot 的 false 对不上）。结构体布局必须照 `psapi.h` 来。
+#[repr(C)]
+#[derive(Clone, Copy)]
+struct WorkingSetExInfo {
+    virtual_address: *mut c_void,
+    /// `VirtualAttributes.Flags`，bit0 = Valid
+    flags: u64,
+}
+
+impl Default for WorkingSetExInfo {
+    fn default() -> Self {
+        WorkingSetExInfo { virtual_address: std::ptr::null_mut(), flags: 0 }
+    }
+}
+
+const PAGE_READONLY: u32 = 0x02;
+const PAGE_READWRITE: u32 = 0x04;
+const PAGE_WRITECOPY: u32 = 0x08;
+const FILE_MAP_WRITE: u32 = 0x0002;
+const FILE_MAP_READ: u32 = 0x0004;
+const FILE_MAP_COPY: u32 = 0x0001;
+/// 映射块在 arena 里的对齐要求（`MappedMemoryUtils` 按 4K 页反推基址，64K 一定更安全）
+const MAP_ALIGN: u64 = 0x1_0000;
+const ERROR_NOT_ENOUGH_MEMORY: u32 = 8;
+
+/// 一次活着的映射。`fake` 是 arena 假地址（= `map0` 的返回值），也是登记表的键
+struct MapRec {
+    view: usize,
+    len: usize,
+    /// 建映射时的 `FileDescriptor` 对象句柄（`force0` 走无映射分支时用）
+    fd_obj: i32,
+}
+
+fn mappings() -> &'static std::sync::Mutex<std::collections::HashMap<u64, MapRec>> {
+    static M: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, MapRec>>> =
+        std::sync::OnceLock::new();
+    M.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+/// `addr` 落在哪个映射里 → (假基址, 记录, 块内偏移)
+fn map_containing(addr: u64) -> Option<(u64, usize, usize, usize)> {
+    let g = mappings().lock().unwrap_or_else(|e| e.into_inner());
+    g.iter()
+        .find(|(base, r)| addr >= **base && addr < **base + r.len as u64)
+        .map(|(base, r)| (*base, r.view, r.len, (addr - *base) as usize))
+}
+
+/// `map0(FileDescriptor fd, int prot, long pos, long size, boolean isSync)` → 真视图的 arena 别名
+fn fdp_map0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let fd_obj = f.arg_i(0);
+    let h = fd_handle(vm, fd_obj);
+    // `prot`：MapMode → `FileChannelImpl.MAP_RO=0 / MAP_RW=1 / MAP_PV=2`
+    let prot = f.arg_i(1);
+    let pos = f.arg_l(2).max(0) as u64;
+    let size = f.arg_l(3).max(0) as usize;
+    if h == INVALID_HANDLE_VALUE || h == 0 {
+        return Err(vm.throw_msg("java/nio/channels/ClosedChannelException", "Stream Closed".to_string()));
+    }
+    if size == 0 {
+        return Err(throw_io(vm, "map0: size 必须 > 0"));
+    }
+    // (页保护, 视图访问权)。PRIVATE 走 copy-on-write；文件只读时 copy-on-write 可能被拒，
+    // 那就退回「读写映射」—— PRIVATE 的语义是「改动不外泄」，退回后改动同样不回写。
+    let (page_prot, map_access) = match prot {
+        0 => (PAGE_READONLY, FILE_MAP_READ),
+        1 => (PAGE_READWRITE, FILE_MAP_READ | FILE_MAP_WRITE),
+        2 => (PAGE_WRITECOPY, FILE_MAP_COPY | FILE_MAP_READ),
+        other => return Err(throw_io(vm, format!("map0: 未知的映射保护位 {other}"))),
+    };
+    let mut mapping = unsafe { CreateFileMappingW(h, std::ptr::null(), page_prot, 0, 0, std::ptr::null()) };
+    if mapping == 0 && prot == 2 {
+        let code = last_error();
+        if code == ERROR_ACCESS_DENIED {
+            mapping = unsafe { CreateFileMappingW(h, std::ptr::null(), PAGE_READWRITE, 0, 0, std::ptr::null()) };
+        }
+    }
+    if mapping == 0 {
+        let code = last_error();
+        // 与 HotSpot 一样：内存不足报 OutOfMemoryError（`mapInternal` 会 gc 后重试一次）
+        if code == ERROR_NOT_ENOUGH_MEMORY {
+            return Err(vm.throw_msg(
+                "java/lang/OutOfMemoryError",
+                format!("Map failed: {}", win_msg(code)),
+            ));
+        }
+        return Err(throw_io(vm, format!("CreateFileMapping 失败: {}", win_msg(code))));
+    }
+    let view = unsafe { MapViewOfFile(mapping, map_access, (pos >> 32) as u32, pos as u32, size) };
+    let view_err = if view.is_null() { Some(last_error()) } else { None };
+    // 视图自己让映射活着，句柄可以立刻关（少一个要管的资源）
+    unsafe { CloseHandle(mapping) };
+    if let Some(code) = view_err {
+        if code == ERROR_NOT_ENOUGH_MEMORY {
+            return Err(vm.throw_msg(
+                "java/lang/OutOfMemoryError",
+                format!("Map failed: {}", win_msg(code)),
+            ));
+        }
+        return Err(throw_io(vm, format!("MapViewOfFile 失败: {}", win_msg(code))));
+    }
+    let fake = nat_mem::alloc_mapped_aligned(view as usize, size, MAP_ALIGN);
+    trace(&format!("map0 fd={fd_obj} prot={prot} pos={pos} size={size} view={view:?} fake={fake}"));
+    mappings()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(fake, MapRec { view: view as usize, len: size, fd_obj });
+    Ok(Slot::L(fake as i64))
+}
+
+/// `unmap0(long address, long size)`：注销 arena 登记 + 解除视图。返回 0 成功 / -1 失败
+fn fdp_unmap0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    if addr == 0 {
+        return Ok(Slot::I(0)); // size==0 的映射根本不建视图
+    }
+    let rec = mappings().lock().unwrap_or_else(|e| e.into_inner()).remove(&addr);
+    // 顺序不能反：先让 arena 忘掉这个地址，再解除映射
+    let was_mapped = nat_mem::unmapped(addr);
+    let Some(rec) = rec else {
+        // 没登记过：win32 的语义是「解除一个不存在的视图」= 失败，
+        // 但 Java 侧可能重复 unmap（cleaner 与显式调用都跑），这里按幂等处理并留痕
+        trace(&format!("unmap0 addr={addr} 没登记过（重复 unmap？）"));
+        return Ok(Slot::I(if was_mapped { 0 } else { -1 }));
+    };
+    if unsafe { UnmapViewOfFile(rec.view as *const c_void) } == 0 {
+        return Err(throw_io(vm, format!("UnmapViewOfFile 失败: {}", win_msg(last_error()))));
+    }
+    trace(&format!("unmap0 addr={addr} view={:?} len={}", rec.view, rec.len));
+    Ok(Slot::I(0))
+}
+
+// ---------------------------------------------------------------- MappedMemoryUtils
+//
+// 这 5 条 native 全是**页级提示**，不是数据通路：数据通路是 arena 假地址（映射块）。
+// 但它们是 `MappedByteBuffer.load()/force()/isLoaded()` 的唯一落地点，实现成空操作会让
+// `force()` 变成「什么都没做却报告成功」—— 所以每条都真调 Win32。
+
+const MMU: &str = "java/nio/MappedMemoryUtils";
+
+fn mmu_register_natives(_vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(0))
+}
+
+/// `force0(FileDescriptor fd, long address, long length)`
+fn mmu_force0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let fd_obj = f.arg_i(0);
+    let addr = f.arg_l(1) as u64;
+    let len = f.arg_l(2).max(0) as usize;
+    if let Some((base, view, mlen, off)) = map_containing(addr) {
+        // 只刷这次要求的那段（可能比整个映射短）
+        let n = len.min(mlen - off);
+        let p = (view + off) as *const c_void;
+        if unsafe { FlushViewOfFile(p, n) } == 0 {
+            return Err(throw_io(vm, format!("FlushViewOfFile 失败: {}", win_msg(last_error()))));
+        }
+        trace(&format!("force0 mapped base={base} off={off} len={n}"));
+        return Ok(Slot::I(0));
+    }
+    // 不是映射（`force()` 也可能落在普通 DirectByteBuffer 上）：刷文件缓冲
+    let h = fd_handle(vm, fd_obj);
+    if h == INVALID_HANDLE_VALUE || h == 0 {
+        return Err(vm.throw_msg("java/nio/channels/ClosedChannelException", "Stream Closed".to_string()));
+    }
+    if unsafe { FlushFileBuffers(h) } == 0 {
+        return Err(throw_io(vm, format!("FlushFileBuffers 失败: {}", win_msg(last_error()))));
+    }
+    trace(&format!("force0 file fd={fd_obj} len={len}"));
+    Ok(Slot::I(0))
+}
+
+/// `load0(long address, long length)` —— 把区间预取进物理内存
+fn mmu_load0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let len = f.arg_l(1).max(0) as usize;
+    if addr == 0 || len == 0 {
+        return Ok(Slot::I(0));
+    }
+    let Some((_, view, mlen, off)) = map_containing(addr) else {
+        // 非映射地址：没有「页」可预取，但也不能假装做过 —— 留痕并报错
+        return Err(throw_io(vm, format!("load0: 地址 {addr:#x} 不是映射区")));
+    };
+    let n = len.min(mlen - off);
+    let mut entry = MemoryRangeEntry {
+        virtual_address: (view + off) as *mut c_void,
+        number_of_bytes: n,
+    };
+    let ok = unsafe { PrefetchVirtualMemory(GetCurrentProcess(), 1, &mut entry, 0) };
+    if ok == 0 {
+        return Err(throw_io(vm, format!("PrefetchVirtualMemory 失败: {}", win_msg(last_error()))));
+    }
+    Ok(Slot::I(0))
+}
+
+/// `unload0(long address, long length)` —— 把区间从物理内存挪走
+///
+/// Windows 没有 `madvise(MADV_DONTNEED)`，能做的只有「不再主动保留」。
+/// 明确记一笔而不是假装做过：`unload()` 的契约是提示性的，返回成功是合法的。
+fn mmu_unload0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let len = f.arg_l(1).max(0) as usize;
+    if addr != 0 && len != 0 && map_containing(addr).is_none() {
+        return Err(throw_io(vm, format!("unload0: 地址 {addr:#x} 不是映射区")));
+    }
+    trace(&format!("unload0 addr={addr} len={len}（Windows 无 madvise，提示性操作）"));
+    Ok(Slot::I(0))
+}
+
+/// `isLoaded0(long address, long length, long pageCount)` —— 逐页问内核「在不在工作集里」
+fn mmu_is_loaded0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let len = f.arg_l(1).max(0) as usize;
+    let pages = f.arg_l(2).max(0) as usize;
+    if addr == 0 || len == 0 || pages == 0 {
+        return Ok(Slot::I(1));
+    }
+    let Some((_, view, mlen, off)) = map_containing(addr) else {
+        return Err(throw_io(vm, format!("isLoaded0: 地址 {addr:#x} 不是映射区")));
+    };
+    let n = len.min(mlen - off);
+    let base = (view + off) as *mut c_void;
+    let mut info = vec![WorkingSetExInfo::default(); pages];
+    let bytes = (pages * std::mem::size_of::<WorkingSetExInfo>()) as u32;
+    // 先把每页的虚拟地址填进去（`VirtualAddress` 是入参）
+    for (i, e) in info.iter_mut().enumerate() {
+        e.virtual_address = base as u64 as *mut c_void;
+        if i > 0 {
+            e.virtual_address = (base as usize + i * 4096) as *mut c_void;
+        }
+    }
+    let ok = unsafe { QueryWorkingSetEx(GetCurrentProcess(), info.as_mut_ptr() as *mut c_void, bytes) };
+    let _ = n;
+    // `Flags` bit0 = Valid
+    let all = ok != 0 && info.iter().all(|e| e.flags & 1 != 0);
+    trace(&format!("isLoaded0 pages={pages} query_ok={} all_valid={all}", ok != 0));
+    // **与 HotSpot 对齐：Windows 上一律返回 false。**
+    // 实测对照（同一份 .class、同一个 JDK 镜像）：HotSpot 在 fresh / 写完 / `load()` 之后 /
+    // `force()` 之后**全都是 false**，而我们用 `QueryWorkingSetEx` 能查到「页在工作集里」。两边
+    // 差一个字段就会让 `MappedByteBuffer.isLoaded()` 的走查对不上，所以这里按 HotSpot 的口径回答。
+    // 代价只有一个：`load()` 不会因为「已经在了」而跳过 —— 那是提示性优化，不影响正确性。
+    Ok(Slot::I(0))
+}
+
+// ---------------------------------------------------------------- transferTo0
+
+/// `transferTo0(FileDescriptor src, long position, long count, FileDescriptor dst, boolean append)`
+///
+/// 真实现是「源按位置读 + 目标按当前/末尾写」的循环：文件→文件、文件→socket 两条路都覆盖
+/// （socket 句柄在 Windows 上也是 HANDLE，`WriteFile` 直接可用，不必走 `TransmitFile`
+///  —— 后者只覆盖「文件→socket」且要求 socket 支持重叠 I/O）。
+fn fdp_transfer_to0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let src = fd_handle(vm, f.arg_i(0));
+    let pos = f.arg_l(1).max(0) as u64;
+    let count = f.arg_l(2).max(0) as usize;
+    let dst = fd_handle(vm, f.arg_i(3));
+    let append = f.arg_i(4) != 0;
+    if src == INVALID_HANDLE_VALUE || src == 0 || dst == INVALID_HANDLE_VALUE || dst == 0 {
+        return Err(vm.throw_msg("java/nio/channels/ClosedChannelException", "Stream Closed".to_string()));
+    }
+    if count == 0 {
+        return Ok(Slot::L(0));
+    }
+    // 源按绝对位置读，读完把文件指针还原（transferTo 不能改源通道的位置）
+    let mut saved: i64 = 0;
+    let have_saved = unsafe { SetFilePointerEx(src, 0, &mut saved, FILE_CURRENT) } != 0;
+    if unsafe { SetFilePointerEx(src, pos as i64, std::ptr::null_mut(), FILE_BEGIN) } == 0 {
+        return Err(throw_io(vm, format!("transferTo0: 源定位失败 pos={pos}")));
+    }
+    if append && unsafe { SetFilePointerEx(dst, 0, std::ptr::null_mut(), FILE_END) } == 0 {
+        let _ = have_saved.then(|| unsafe { SetFilePointerEx(src, saved, std::ptr::null_mut(), FILE_BEGIN) });
+        return Err(throw_io(vm, "transferTo0: 目标定位失败（append）"));
+    }
+
+    let chunk = count.min(1 << 16);
+    let mut buf = vec![0u8; chunk];
+    let mut total = 0usize;
+    let mut failure: Option<u32> = None;
+    while total < count {
+        let want = (count - total).min(chunk);
+        let mut got: u32 = 0;
+        let ok = unsafe { ReadFile(src, buf.as_mut_ptr() as *mut c_void, want as u32, &mut got, std::ptr::null_mut()) };
+        if ok == 0 {
+            failure = Some(last_error());
+            break;
+        }
+        if got == 0 {
+            break; // EOF
+        }
+        let mut off = 0usize;
+        while off < got as usize {
+            let mut wrote: u32 = 0;
+            let ok = unsafe {
+                WriteFile(
+                    dst,
+                    buf[off..got as usize].as_ptr() as *const c_void,
+                    (got as usize - off) as u32,
+                    &mut wrote,
+                    std::ptr::null_mut(),
+                )
+            };
+            if ok == 0 {
+                let code = last_error();
+                // 非阻塞 socket 写满：已经送出去的那些仍然算数
+                if code == 997 /* ERROR_IO_PENDING */ || code == 232 /* ERROR_NO_DATA */ || code == 10035 {
+                    trace(&format!("transferTo0 目标暂时不可写 code={code} 已转 {total}"));
+                    failure = None;
+                    total = count.max(total); // 跳出双层循环
+                    break;
+                }
+                failure = Some(code);
+                break;
+            }
+            if wrote == 0 {
+                break;
+            }
+            off += wrote as usize;
+        }
+        total += got as usize;
+        if failure.is_some() {
+            break;
+        }
+    }
+    if have_saved {
+        unsafe { SetFilePointerEx(src, saved, std::ptr::null_mut(), FILE_BEGIN) };
+    }
+    match failure {
+        Some(code) if total == 0 => Err(throw_io(vm, format!("transferTo0 失败: {}", win_msg(code)))),
+        Some(code) => {
+            trace(&format!("transferTo0 半途失败 code={code}（已转 {total} 字节，按已转数返回）"));
+            Ok(Slot::L(total as i64))
+        }
+        None => {
+            trace(&format!("transferTo0 pos={pos} count={count} 转了 {total}"));
+            Ok(Slot::L(total as i64))
+        }
+    }
 }
 
 // ============================================================ IOUtil
@@ -1620,6 +2057,8 @@ extern "system" {
     fn getpeername(s: Socket, name: *mut u8, len: *mut i32) -> i32;
     fn ioctlsocket(s: Socket, cmd: i32, arg: *mut u32) -> i32;
     fn WSAPoll(fds: *mut PollFd, count: u32, timeout: i32) -> i32;
+    fn sendto(s: Socket, buf: *const u8, len: i32, flags: i32, to: *const u8, tolen: i32) -> i32;
+    fn recvfrom(s: Socket, buf: *mut u8, len: i32, flags: i32, from: *mut u8, fromlen: *mut i32) -> i32;
     fn getaddrinfo(
         node: *const u8,
         service: *const u8,
@@ -1732,6 +2171,18 @@ fn set_sock(vm: &Vm, fd_obj: i32, s: Socket) {
 fn new_byte_array(vm: &Vm, bytes: &[u8]) -> i32 {
     let elems: Vec<Slot> = bytes.iter().map(|b| Slot::I(*b as i8 as i32)).collect();
     vm.sh.heap.new_array(elems, "[B").unwrap_or(0)
+}
+
+/// 读 `byte[]` 的一段（元素按 0..=255 归一，与 `baload` 侧一致）
+fn load_bytes(vm: &Vm, arr: i32, off: usize, len: usize) -> Vec<u8> {
+    let total = vm.sh.heap.array_len(arr).unwrap_or(0);
+    let end = off.saturating_add(len).min(total);
+    let mut v = Vec::with_capacity(end.saturating_sub(off));
+    for i in off..end {
+        let b = vm.sh.heap.get(arr, i).map(|s| s.as_i32()).unwrap_or(0);
+        v.push(b as u8);
+    }
+    v
 }
 
 fn run_method(
@@ -3895,10 +4346,26 @@ fn iocp_gqcs(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     }
 
     trace(&format!("GQCS key={key} bytes={bytes} err={err} ov={:?} hit={}", ov, hit));
-    set_obj_field(vm, status, STATUS_CLASS, "error", Slot::I(err as i32));
-    set_obj_field(vm, status, STATUS_CLASS, "bytesTransferred", Slot::I(bytes as i32));
-    set_obj_field(vm, status, STATUS_CLASS, "completionKey", Slot::L(key as i64));
+    // 三个字段一个都不能少：Java 侧正是靠它们决定「唤醒 / 哪个 key / 读多少字节」。
+    // 静默写不进去的后果是 `completionKey` 永远是 0 = WAKEUP_COMPLETION_KEY，主循环
+    // 于是把每个真实事件都当唤醒包吃掉（症状：注册成功、事件永不送达）。
+    set_status_field(vm, status, "error", Slot::I(err as i32))?;
+    set_status_field(vm, status, "bytesTransferred", Slot::I(bytes as i32))?;
+    set_status_field(vm, status, "completionKey", Slot::L(key as i64))?;
+    trace("GQCS filled status");
     Ok(Slot::I(0))
+}
+
+/// 写 `CompletionStatus` 的字段；字段解析不到就抛 —— 不许静默丢。
+fn set_status_field(vm: &mut Vm, obj: i32, name: &str, v: Slot) -> Result<(), VmError> {
+    let Some(i) = vm.store.field_index(STATUS_CLASS, name) else {
+        return Err(vm.throw_msg(
+            "java/lang/InternalError",
+            format!("CompletionStatus.{name} 解析不到字段槽"),
+        ));
+    };
+    vm.sh.heap.set(obj, i, v);
+    Ok(())
 }
 
 fn iocp_cancel(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -4141,6 +4608,637 @@ fn register_selector(r: &mut NativeRegistry) {
     r.add(SEL, "resetWakeupSocket0", "(I)V", sel_reset_wakeup_socket);
     r.add(WND, "FindFirstStream0", "(JLsun/nio/fs/WindowsNativeDispatcher$FirstStream;)V", wnd_FindFirstStream0);
     r.add(WND, "FindNextStream0", "(J)Ljava/lang/String;", wnd_FindNextStream0);
+    register_wepoll(r);
+    register_native_socket_address(r);
+    register_unix_domain(r);
+    register_datagram(r);
+    r.add("sun/nio/ch/FileKey", "init", "(Ljava/io/FileDescriptor;[I)V", filekey_init);
+}
+
+// ============================================================ WEPoll
+//
+// **JDK 25 的 Windows Selector 走的是 wepoll，不是 `WindowsSelectorImpl`**：
+// `Selector.open()` → `WEPollSelectorProvider.openSelector()` → `new WEPollSelectorImpl(..)`
+// → `WEPoll.create()`。只注册 `poll0` 那套老 API 是不够的，`Selector.open()` 会在
+// `<clinit>` 里第一步就 `eventSize()` 抛 `UnsatisfiedLinkError`。
+//
+// wepoll 本体是「把 socket 的 AFD 句柄塞进 IOCP」的高性能实现；这里用 `WSAPoll` 落地：
+// 语义完全一致（水平触发的 epoll），代价是每次 `wait` 是一次 O(n) 的 `WSAPoll`
+// —— 对 VM 里跑到的那点连接数是够的，而且**没有一条捷径**：`WSAPoll` 是真 syscall，
+// 阻塞、超时、错误码都是内核给的，不是模拟出来的。
+//
+// `EPOLLONESHOT` 必须真实现（`WEPollPoller` 把每个 fd 都以 ONESHOT 注册，报过一次就
+// 由 Java 侧重新 ADD）。假实现会让同一个 fd 被反复报告 —— `Poller.polled()` 于是对
+// 一个已经苏醒的 waiter 反复 wake，日志里看不出错，但 CPU 会空转。
+
+const WEPOLL: &str = "sun/nio/ch/WEPoll";
+const EPOLLIN: u32 = 1 << 0;
+const EPOLLPRI: u32 = 1 << 1;
+const EPOLLOUT: u32 = 1 << 2;
+const EPOLLERR: u32 = 1 << 3;
+const EPOLLHUP: u32 = 1 << 4;
+const EPOLLONESHOT: u32 = 1 << 31;
+const EPOLL_CTL_ADD: i32 = 1;
+const EPOLL_CTL_MOD: i32 = 2;
+const EPOLL_CTL_DEL: i32 = 3;
+/// `struct epoll_event { uint32_t events; epoll_data_t data; }`（64 位：events 在 0、data 在 8）
+const EPOLL_EVENT_SIZE: i32 = 16;
+const EPOLL_EVENTS_OFFSET: i32 = 0;
+const EPOLL_DATA_OFFSET: i32 = 8;
+
+struct WePollSet {
+    /// (socket, 关注的事件位)。用 Vec 保持注册顺序，`wait` 的结果更可预测
+    entries: Vec<(Socket, u32)>,
+}
+
+fn wepoll_sets() -> &'static std::sync::Mutex<std::collections::HashMap<u64, WePollSet>> {
+    static W: std::sync::OnceLock<std::sync::Mutex<std::collections::HashMap<u64, WePollSet>>> =
+        std::sync::OnceLock::new();
+    W.get_or_init(|| std::sync::Mutex::new(std::collections::HashMap::new()))
+}
+
+fn wepoll_next_id() -> u64 {
+    static N: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    N.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1
+}
+
+fn wepoll_event_size(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(EPOLL_EVENT_SIZE))
+}
+fn wepoll_events_offset(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(EPOLL_EVENTS_OFFSET))
+}
+fn wepoll_data_offset(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(EPOLL_DATA_OFFSET))
+}
+
+fn wepoll_create(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    let id = wepoll_next_id();
+    wepoll_sets()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .insert(id, WePollSet { entries: Vec::new() });
+    Ok(Slot::L(id as i64))
+}
+
+fn wepoll_ctl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let h = f.arg_l(0) as u64;
+    let op = f.arg_i(1);
+    let s = f.arg_l(2) as Socket;
+    let events = f.arg_i(3) as u32;
+    let mut g = wepoll_sets().lock().unwrap_or_else(|e| e.into_inner());
+    let Some(set) = g.get_mut(&h) else {
+        // 句柄已 close：POSIX epoll 报 EBADF。返回非 0 让 Java 侧抛 IOException
+        return Ok(Slot::I(9));
+    };
+    match op {
+        EPOLL_CTL_ADD | EPOLL_CTL_MOD => {
+            match set.entries.iter_mut().find(|e| e.0 == s) {
+                Some(e) => e.1 = events,
+                None => set.entries.push((s, events)),
+            }
+            Ok(Slot::I(0))
+        }
+        EPOLL_CTL_DEL => {
+            set.entries.retain(|e| e.0 != s);
+            Ok(Slot::I(0))
+        }
+        other => {
+            let _ = other;
+            Err(throw_io(vm, format!("WEPoll.ctl: 未知 opcode {op}")))
+        }
+    }
+}
+
+fn wepoll_wait(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let h = f.arg_l(0) as u64;
+    let out = f.arg_l(1) as u64;
+    let max = f.arg_i(2).max(0) as usize;
+    let timeout = f.arg_i(3);
+    // 快照：**不能持锁等**。注册/注销是别的线程做的（`Poller.implRegister`），
+    // 持锁阻塞会让它们永远进不来。
+    let snapshot: Vec<(Socket, u32)> = {
+        let g = wepoll_sets().lock().unwrap_or_else(|e| e.into_inner());
+        match g.get(&h) {
+            Some(s) => s.entries.clone(),
+            None => return Ok(Slot::I(0)),
+        }
+    };
+    if snapshot.is_empty() {
+        // 没有注册项：照 epoll 的语义睡满超时（timeout<0 = 永久）。不能立刻返回 0，
+        // 否则 Selector.select() 会变成忙等。
+        if timeout > 0 {
+            std::thread::sleep(std::time::Duration::from_millis(timeout as u64));
+        } else if timeout < 0 {
+            // 没有注册项还要求无限等 = 只会被 close 打断；退化为 50ms 一片
+            loop {
+                std::thread::sleep(std::time::Duration::from_millis(50));
+                let alive = wepoll_sets()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .contains_key(&h);
+                let has = wepoll_sets()
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .get(&h)
+                    .map(|s| !s.entries.is_empty())
+                    .unwrap_or(false);
+                if !alive || has {
+                    break;
+                }
+            }
+        }
+        return Ok(Slot::I(0));
+    }
+    let mut pfds: Vec<PollFd> = Vec::with_capacity(snapshot.len());
+    for (s, ev) in &snapshot {
+        let mut e: i16 = 0;
+        if ev & EPOLLIN != 0 {
+            e |= POLLRDNORM;
+        }
+        if ev & EPOLLOUT != 0 {
+            e |= POLLWRNORM;
+        }
+        pfds.push(PollFd { fd: *s, events: e, revents: 0 });
+    }
+    let rc = unsafe { WSAPoll(pfds.as_mut_ptr(), pfds.len() as u32, timeout) };
+    if rc < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "WEPoll.wait/WSAPoll"));
+    }
+    let mut n = 0usize;
+    let mut reported: Vec<Socket> = Vec::new();
+    for (i, p) in pfds.iter().enumerate() {
+        if p.revents == 0 {
+            continue;
+        }
+        if n >= max {
+            break;
+        }
+        let (s, interest) = snapshot[i];
+        let mut ev = 0u32;
+        if p.revents & POLLRDNORM != 0 {
+            ev |= EPOLLIN;
+        }
+        if p.revents & POLLWRNORM != 0 {
+            ev |= EPOLLOUT;
+        }
+        if p.revents & POLLERR != 0 {
+            ev |= EPOLLERR;
+        }
+        if p.revents & POLLHUP != 0 {
+            ev |= EPOLLHUP;
+        }
+        if p.revents & POLLNVAL != 0 {
+            ev |= EPOLLERR; // 无效 fd：epoll 用 EPOLLERR 表达
+        }
+        if ev == 0 {
+            continue;
+        }
+        if interest & EPOLLPRI != 0 {
+            ev |= EPOLLPRI;
+        }
+        let base = out + (n as u64) * EPOLL_EVENT_SIZE as u64;
+        nat_mem::write(base + EPOLL_EVENTS_OFFSET as u64, 4, ev as u64);
+        nat_mem::write(base + EPOLL_DATA_OFFSET as u64, 8, s as u64);
+        n += 1;
+        if interest & EPOLLONESHOT != 0 {
+            reported.push(s);
+        }
+    }
+    if !reported.is_empty() {
+        let mut g = wepoll_sets().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(set) = g.get_mut(&h) {
+            set.entries.retain(|(s, ev)| !(ev & EPOLLONESHOT != 0 && reported.contains(s)));
+        }
+    }
+    trace(&format!("WEPoll.wait h={h} timeout={timeout} 报了 {n} 个事件"));
+    Ok(Slot::I(n as i32))
+}
+
+fn wepoll_close(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let h = f.arg_l(0) as u64;
+    wepoll_sets().lock().unwrap_or_else(|e| e.into_inner()).remove(&h);
+    Ok(Slot::I(0))
+}
+
+fn register_wepoll(r: &mut NativeRegistry) {
+    r.add(WEPOLL, "eventSize", "()I", wepoll_event_size);
+    r.add(WEPOLL, "eventsOffset", "()I", wepoll_events_offset);
+    r.add(WEPOLL, "dataOffset", "()I", wepoll_data_offset);
+    r.add(WEPOLL, "create", "()J", wepoll_create);
+    r.add(WEPOLL, "ctl", "(JIJI)I", wepoll_ctl);
+    r.add(WEPOLL, "wait", "(JJII)I", wepoll_wait);
+    r.add(WEPOLL, "close", "(J)V", wepoll_close);
+}
+
+// ============================================================ NativeSocketAddress 的布局常量
+//
+// 这 12 条只回答「`sockaddr` 各字段在本平台的偏移/大小」。值必须与 `ws2def.h` 一致 ——
+// 它们被用来在 Java 侧手写 `sockaddr_in`/`sockaddr_in6`，错一个字节地址就解错。
+//
+//   struct sockaddr_in  { u16 sin_family; u16 sin_port; u32 sin_addr; i8 pad[8]; }  // 16
+//   struct sockaddr_in6 { u16 sin6_family; u16 sin6_port; u32 sin6_flowinfo;
+//                         u8 sin6_addr[16]; u32 sin6_scope_id; }                     // 28
+const NSA: &str = "sun/nio/ch/NativeSocketAddress";
+
+fn register_native_socket_address(r: &mut NativeRegistry) {
+    r.add(NSA, "AFINET", "()I", |_, _| Ok(Slot::I(AF_INET)));
+    r.add(NSA, "AFINET6", "()I", |_, _| Ok(Slot::I(AF_INET6)));
+    r.add(NSA, "sizeofFamily", "()I", |_, _| Ok(Slot::I(2)));
+    r.add(NSA, "offsetFamily", "()I", |_, _| Ok(Slot::I(0)));
+    r.add(NSA, "sizeofSockAddr4", "()I", |_, _| Ok(Slot::I(16)));
+    r.add(NSA, "offsetSin4Port", "()I", |_, _| Ok(Slot::I(2)));
+    r.add(NSA, "offsetSin4Addr", "()I", |_, _| Ok(Slot::I(4)));
+    r.add(NSA, "sizeofSockAddr6", "()I", |_, _| Ok(Slot::I(28)));
+    r.add(NSA, "offsetSin6Port", "()I", |_, _| Ok(Slot::I(2)));
+    r.add(NSA, "offsetSin6FlowInfo", "()I", |_, _| Ok(Slot::I(4)));
+    r.add(NSA, "offsetSin6Addr", "()I", |_, _| Ok(Slot::I(8)));
+    r.add(NSA, "offsetSin6ScopeId", "()I", |_, _| Ok(Slot::I(24)));
+}
+
+// ============================================================ AF_UNIX（UnixDomainSockets）
+//
+// Windows 10 1803+ 有 AF_UNIX（`AF_UNIX = 1`，`sockaddr_un` 与 Linux 不同：
+// `{ u16 sun_family; char sun_path[108]; }` 共 110 字节，**没有** Linux 那个 2 字节家族占位）。
+//
+// JDK 25 用它做 `Pipe.open()` 的默认实现（`PipeImpl(sp, /*AF_UNIX*/ true, ...)`）——
+// `Selector` 的唤醒管道就是它。`UnixDomainSockets.init()` 返回 false 时 Java 会退回
+// 回环 TCP，所以这里要**真探测**：探测失败必须返回 false，让 Java 走退路，而不是
+// 报成功然后在 `bind0` 里炸。
+const UDS: &str = "sun/nio/ch/UnixDomainSockets";
+const AF_UNIX: i32 = 1;
+/// `sizeof(struct sockaddr_un)`（Windows）＝ 2 + 108，按 2 字节家族算
+const SIZEOF_SOCKADDR_UN: usize = 110;
+
+fn uds_path_bytes(path: &[u8]) -> (Vec<u8>, usize) {
+    // `sun_path` 是 NUL 结尾的字节串；长度要连 NUL 一起算（Windows 要求 len 覆盖它）
+    let mut buf = vec![0u8; SIZEOF_SOCKADDR_UN];
+    let n = path.len().min(SIZEOF_SOCKADDR_UN - 3); // 留家族 2 字节 + 至少 1 个 NUL
+    buf[2..2 + n].copy_from_slice(&path[..n]);
+    // family 是小端 u16
+    buf[0] = (AF_UNIX & 0xFF) as u8;
+    buf[1] = ((AF_UNIX >> 8) & 0xFF) as u8;
+    (buf, 2 + n + 1)
+}
+
+fn uds_init(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    // 真探测：能不能建出一个 AF_UNIX 流套接字
+    let s = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+    if s == INVALID_SOCKET {
+        return Ok(Slot::I(0));
+    }
+    unsafe { closesocket(s) };
+    let af_unix_ok = true;
+
+    // ⚠ 临时闸门（一行开关）：AF_UNIX 本身可用，但**本 VM 的 `SecureRandom` 还不可用**
+    // （`Exception: class configured for SecureRandom (provider: SUN) cannot be found`），
+    // 而 JDK 里 UDS 的唯一使用者 `PipeImpl` 建管道时要用 `generateTempName()` → `SecureRandom`。
+    // 于是 `Selector.open()` 会在 UDS 分支里抛 `RuntimeException`（`PipeImpl` 只 catch
+    // IOException/UnsupportedOperationException 退不回去）→ 整个 Selector 用不了。
+    //
+    // 报 false = 让 JDK 走**它自己设计好的回环 TCP 退路**（`PipeImpl.createListener` 的
+    // else 分支），这是 JDK 认可的能力协商，不是假装不支持。`SecureRandom` 修好后把
+    // 下面这行改成 `return Ok(Slot::I(1));` 即可，探测部分不用动。
+    let secure_random_ok = false;
+    Ok(Slot::I((af_unix_ok && secure_random_ok) as i32))
+}
+
+fn uds_socket0(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = unsafe { socket(AF_UNIX, SOCK_STREAM, 0) };
+    if s == INVALID_SOCKET {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "AF_UNIX socket"));
+    }
+    Ok(Slot::I(s as i32))
+}
+
+fn uds_bind0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let path = load_bytes(vm, f.arg_i(1), 0, usize::MAX);
+    if s == INVALID_SOCKET {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    let (sa, len) = uds_path_bytes(&path);
+    if unsafe { bind(s, sa.as_ptr(), len as i32) } == SOCKET_ERROR {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "AF_UNIX bind"));
+    }
+    Ok(Slot::I(0))
+}
+
+fn uds_connect0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let path = load_bytes(vm, f.arg_i(1), 0, usize::MAX);
+    if s == INVALID_SOCKET {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    let (sa, len) = uds_path_bytes(&path);
+    if unsafe { connect(s, sa.as_ptr(), len as i32) } == SOCKET_ERROR {
+        let code = unsafe { WSAGetLastError() };
+        // 与 OpenJDK 一致：连不上返回错误码（Java 侧据此抛异常），而不是 0
+        return Ok(Slot::I(code));
+    }
+    Ok(Slot::I(0))
+}
+
+fn uds_accept0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let newfd = f.arg_i(1);
+    let array = f.arg_i(2);
+    if s == INVALID_SOCKET {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    let mut name = [0u8; SIZEOF_SOCKADDR_UN];
+    let mut len = SIZEOF_SOCKADDR_UN as i32;
+    let c = unsafe { accept(s, name.as_mut_ptr(), &mut len) };
+    if c == INVALID_SOCKET {
+        let code = unsafe { WSAGetLastError() };
+        return Ok(Slot::I(code));
+    }
+    set_fd_slot(vm, newfd, "fd", c as i64);
+    // array[0] = 对端地址的路径字节（未命名的对端 → null）
+    let plen = (len as usize).saturating_sub(2).min(SIZEOF_SOCKADDR_UN - 2);
+    if plen > 0 && array != 0 {
+        let mut end = plen;
+        while end > 0 && name[2 + end - 1] == 0 {
+            end -= 1;
+        }
+        if end > 0 {
+            let bytes = name[2..2 + end].to_vec();
+            let h = new_byte_array(vm, &bytes);
+            vm.sh.heap.set(array, 0, Slot::I(h));
+        }
+    }
+    Ok(Slot::I(0))
+}
+
+fn uds_local_address0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    if s == INVALID_SOCKET {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    let mut name = [0u8; SIZEOF_SOCKADDR_UN];
+    let mut len = SIZEOF_SOCKADDR_UN as i32;
+    if unsafe { getsockname(s, name.as_mut_ptr(), &mut len) } == SOCKET_ERROR {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "AF_UNIX getsockname"));
+    }
+    let plen = (len as usize).saturating_sub(2).min(SIZEOF_SOCKADDR_UN - 2);
+    let mut end = plen;
+    while end > 0 && name[2 + end - 1] == 0 {
+        end -= 1;
+    }
+    let bytes = name[2..2 + end].to_vec();
+    Ok(Slot::I(new_byte_array(vm, &bytes)))
+}
+
+fn register_unix_domain(r: &mut NativeRegistry) {
+    r.add(UDS, "init", "()Z", uds_init);
+    r.add(UDS, "socket0", "()I", uds_socket0);
+    r.add(UDS, "bind0", "(Ljava/io/FileDescriptor;[B)V", uds_bind0);
+    r.add(UDS, "connect0", "(Ljava/io/FileDescriptor;[B)I", uds_connect0);
+    r.add(
+        UDS,
+        "accept0",
+        "(Ljava/io/FileDescriptor;Ljava/io/FileDescriptor;[Ljava/lang/Object;)I",
+        uds_accept0,
+    );
+    r.add(UDS, "localAddress0", "(Ljava/io/FileDescriptor;)[B", uds_local_address0);
+}
+
+// ============================================================ UDP（DatagramDispatcher / DatagramChannelImpl）
+//
+// 数据报的读必须是**一次读一整个包**：`recv`/`send` 正好是这个语义。
+// `readv0`/`writev0` 的散播/聚集也照做，但要先在真内存里拼成一块再发 —— 分多次
+// `send` 会把一个数据报拆成多个包，接收端看到的是完全不同的东西。
+
+const DGD: &str = "sun/nio/ch/DatagramDispatcher";
+const DGC: &str = "sun/nio/ch/DatagramChannelImpl";
+
+fn dgd_read0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let addr = f.arg_l(1) as u64;
+    let len = f.arg_i(2).max(0) as usize;
+    if s == INVALID_SOCKET || len == 0 {
+        return Ok(Slot::I(0));
+    }
+    let mut buf = vec![0u8; len];
+    let n = unsafe { recv(s, buf.as_mut_ptr(), len as i32, 0) };
+    if n < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "DatagramDispatcher.read"));
+    }
+    nat_mem::write_bytes(addr, &buf[..n as usize]);
+    Ok(Slot::I(n))
+}
+
+fn dgd_write0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let addr = f.arg_l(1) as u64;
+    let len = f.arg_i(2).max(0) as usize;
+    if s == INVALID_SOCKET || len == 0 {
+        return Ok(Slot::I(0));
+    }
+    let data = nat_mem::read_bytes(addr, len);
+    let n = unsafe { send(s, data.as_ptr(), len as i32, 0) };
+    if n < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "DatagramDispatcher.write"));
+    }
+    Ok(Slot::I(n))
+}
+
+/// 散播读：先收一整包，再按 `iovec` 顺序摊到各段
+fn dgd_readv0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let addr = f.arg_l(1) as u64;
+    let cnt = f.arg_i(2).max(0) as usize;
+    if s == INVALID_SOCKET || cnt == 0 {
+        return Ok(Slot::L(0));
+    }
+    let mut total_len = 0usize;
+    for i in 0..cnt {
+        total_len += read_u64(addr, (i * IOVEC + 8) as u64) as usize;
+    }
+    if total_len == 0 {
+        return Ok(Slot::L(0));
+    }
+    let mut buf = vec![0u8; total_len];
+    let n = unsafe { recv(s, buf.as_mut_ptr(), total_len as i32, 0) };
+    if n < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "DatagramDispatcher.readv"));
+    }
+    let mut left = n as usize;
+    let mut off = 0usize;
+    for i in 0..cnt {
+        if left == 0 {
+            break;
+        }
+        let base = read_u64(addr, (i * IOVEC) as u64);
+        let len = read_u64(addr, (i * IOVEC + 8) as u64) as usize;
+        let take = len.min(left);
+        nat_mem::write_bytes(base, &buf[off..off + take]);
+        off += take;
+        left -= take;
+    }
+    Ok(Slot::L(n as i64))
+}
+
+/// 聚集写：先拼成一整块再 `send`（分多次发会把一个数据报拆开）
+fn dgd_writev0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let addr = f.arg_l(1) as u64;
+    let cnt = f.arg_i(2).max(0) as usize;
+    if s == INVALID_SOCKET || cnt == 0 {
+        return Ok(Slot::L(0));
+    }
+    let mut data: Vec<u8> = Vec::new();
+    for i in 0..cnt {
+        let base = read_u64(addr, (i * IOVEC) as u64);
+        let len = read_u64(addr, (i * IOVEC + 8) as u64) as usize;
+        if len > 0 {
+            data.extend_from_slice(&nat_mem::read_bytes(base, len));
+        }
+    }
+    if data.is_empty() {
+        return Ok(Slot::L(0));
+    }
+    let n = unsafe { send(s, data.as_ptr(), data.len() as i32, 0) };
+    if n < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "DatagramDispatcher.writev"));
+    }
+    Ok(Slot::L(n as i64))
+}
+
+/// `send0(fd, address, len, targetAddress, targetAddressLen)`：未连接时的发
+///
+/// `targetAddress` 是 arena 里的 `sockaddr`（由 `NativeSocketAddress` 编好）。
+fn dgc_send0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let addr = f.arg_l(1) as u64;
+    let len = f.arg_i(2).max(0) as usize;
+    let ta = f.arg_l(3) as u64;
+    let tal = f.arg_i(4).max(0) as usize;
+    if s == INVALID_SOCKET {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    let data = nat_mem::read_bytes(addr, len);
+    let target = nat_mem::read_bytes(ta, tal);
+    if target.is_empty() {
+        return Err(throw_io(vm, "send0: 目标地址为空"));
+    }
+    let n = unsafe { sendto(s, data.as_ptr(), len as i32, 0, target.as_ptr(), tal as i32) };
+    if n < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "DatagramChannel.send0"));
+    }
+    Ok(Slot::I(n))
+}
+
+/// `receive0(fd, address, len, senderAddress, connected)`：收 + 带回对端地址
+fn dgc_receive0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let addr = f.arg_l(1) as u64;
+    let len = f.arg_i(2).max(0) as usize;
+    let sender = f.arg_l(3) as u64;
+    let connected = f.arg_i(4) != 0;
+    if s == INVALID_SOCKET {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    let mut buf = vec![0u8; len.max(1)];
+    let n = if connected {
+        unsafe { recv(s, buf.as_mut_ptr(), len as i32, 0) }
+    } else {
+        let mut sa = [0u8; 110];
+        let mut sal = 110i32;
+        let n = unsafe { recvfrom(s, buf.as_mut_ptr(), len as i32, 0, sa.as_mut_ptr(), &mut sal) };
+        if n >= 0 && sender != 0 {
+            nat_mem::write_bytes(sender, &sa[..(sal as usize).min(110)]);
+        }
+        n
+    };
+    if n < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "DatagramChannel.receive0"));
+    }
+    nat_mem::write_bytes(addr, &buf[..n as usize]);
+    Ok(Slot::I(n))
+}
+
+/// `disconnect0(fd, isIPv6)`：解除连接（把对端地址清成 AF_UNSPEC）
+fn dgc_disconnect0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let s = sock_of(vm, f.arg_i(0));
+    let ipv6 = f.arg_i(1) != 0;
+    if s == INVALID_SOCKET {
+        return Err(vm.throw_msg("java/io/IOException", "socket closed".to_string()));
+    }
+    // AF_UNSPEC(0) + 零地址 = 断开。Windows 上这就是 `connect` 到未指定地址。
+    let mut sa = [0u8; 16];
+    let len: i32 = if ipv6 {
+        sa[0] = (AF_INET6 & 0xFF) as u8;
+        sa[1] = ((AF_INET6 >> 8) & 0xFF) as u8;
+        28
+    } else {
+        2
+    };
+    if unsafe { connect(s, sa.as_ptr(), len) } == SOCKET_ERROR {
+        let code = unsafe { WSAGetLastError() };
+        // WSAEAFNOSUPPORT / WSAEINVAL：本来就断开着，等价于成功
+        if code != 10047 && code != 10022 {
+            return Err(sock_error(vm, code, "DatagramChannel.disconnect0"));
+        }
+    }
+    Ok(Slot::I(0))
+}
+
+fn register_datagram(r: &mut NativeRegistry) {
+    r.add(DGD, "read0", "(Ljava/io/FileDescriptor;JI)I", dgd_read0);
+    r.add(DGD, "write0", "(Ljava/io/FileDescriptor;JI)I", dgd_write0);
+    r.add(DGD, "readv0", "(Ljava/io/FileDescriptor;JI)J", dgd_readv0);
+    r.add(DGD, "writev0", "(Ljava/io/FileDescriptor;JI)J", dgd_writev0);
+    r.add(DGC, "send0", "(Ljava/io/FileDescriptor;JIJI)I", dgc_send0);
+    r.add(DGC, "receive0", "(Ljava/io/FileDescriptor;JIJZ)I", dgc_receive0);
+    r.add(DGC, "disconnect0", "(Ljava/io/FileDescriptor;Z)V", dgc_disconnect0);
+}
+
+// ============================================================ FileKey
+//
+// `FileKey.init(FileDescriptor fd, int[] values)`：把卷序列号 + 文件索引填进 `values[0..3]`。
+// `WindowsWatchService`/`Files.isSameFile` 靠它判「同一个文件」。
+
+fn filekey_init(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let h = fd_handle(vm, f.arg_i(0));
+    let arr = f.arg_i(1);
+    if h == INVALID_HANDLE_VALUE || h == 0 {
+        return Err(vm.throw_msg("java/io/IOException", "Stream Closed".to_string()));
+    }
+    let mut info = ByHandleFileInformation::default();
+    if unsafe { GetFileInformationByHandle(h, &mut info) } == 0 {
+        return Err(throw_io(vm, format!("GetFileInformationByHandle 失败: {}", win_msg(last_error()))));
+    }
+    let vals = [info.volume_serial as i32, info.file_index_high as i32, info.file_index_low as i32];
+    for (i, v) in vals.iter().enumerate() {
+        vm.sh.heap.set(arr, i, Slot::I(*v));
+    }
+    Ok(Slot::I(0))
 }
 
 // ============================================================ java.net.InetAddress 的 native
@@ -4291,13 +5389,36 @@ fn impl_host_by_addr(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 /// `isReachable0`：用 ICMP 回显（`IcmpSendEcho`），没有权限就退回「TCP 连接 7 端口」
-fn impl_is_reachable(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    wsa_start();
+///
+/// 两个类的**参数排布不同**（这里曾经共用一个函数，把 Inet6 的描述符也写成 4 参形态，
+/// 于是 `Inet6AddressImpl.isReachable0` 实际一条都没注册上）：
+///
+/// ```text
+/// Inet4AddressImpl.isReachable0(byte[] addr, int timeout, byte[] ifaddr, int ttl)
+/// Inet6AddressImpl.isReachable0(byte[] addr, int scope, int timeout, byte[] ifaddr, int ttl, int ifScope)
+/// ```
+fn impl_is_reachable4(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let addr = f.arg_i(0);
-    let timeout = f.arg_i(f.arg_i(3).max(0) as usize) as u32;
+    let timeout = f.arg_i(1).max(0) as u32;
+    icmp_reachable(vm, addr, timeout)
+}
+
+fn impl_is_reachable6(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_i(0);
+    let timeout = f.arg_i(2).max(0) as u32;
+    // IPv6 的 ICMP 要走 `Icmp6SendEcho2`（目标地址 + 源地址两个 sockaddr），本实现不做 ——
+    // 明确报「不可达」（`isReachable` 的语义就是探测，探测不了就返回 false）
     let bytes = inet_bytes(vm, addr)?;
     if bytes.len() != 4 {
-        // IPv6 的 ICMP 需要 Icmp6SendEcho2，本实现不做 —— 明确报「不可达」而不是假装可达
+        return Ok(Slot::I(0));
+    }
+    icmp_reachable(vm, addr, timeout)
+}
+
+fn icmp_reachable(vm: &mut Vm, addr: i32, timeout: u32) -> Result<Slot, VmError> {
+    wsa_start();
+    let bytes = inet_bytes(vm, addr)?;
+    if bytes.len() != 4 {
         return Ok(Slot::I(0));
     }
     let ip = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
@@ -4343,8 +5464,7 @@ fn impl_is_reachable(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::I((n > 0 && reply.status == 0) as i32))
 }
 
-fn register_dns(r: &mut NativeRegistry) {
-    r.add("java/net/Inet4Address", "init", "()V", inet4_init);
+fn register_dns(r: &mut NativeRegistry) {    r.add("java/net/Inet4Address", "init", "()V", inet4_init);
     r.add("java/net/Inet6Address", "init", "()V", inet4_init);
     r.add(AS_IMPL4, "lookupAllHostAddr", "(Ljava/lang/String;)[Ljava/net/InetAddress;", |vm, f| {
         impl_lookup_all(vm, f, false)
@@ -4356,8 +5476,8 @@ fn register_dns(r: &mut NativeRegistry) {
     r.add(AS_IMPL6, "getHostByAddr", "([B)Ljava/lang/String;", impl_host_by_addr);
     r.add(AS_IMPL4, "getLocalHostName", "()Ljava/lang/String;", impl_local_host_name);
     r.add(AS_IMPL6, "getLocalHostName", "()Ljava/lang/String;", impl_local_host_name);
-    r.add(AS_IMPL4, "isReachable0", "([BI[BI)Z", impl_is_reachable);
-    r.add(AS_IMPL6, "isReachable0", "([BII[BI)Z", impl_is_reachable);
+    r.add(AS_IMPL4, "isReachable0", "([BI[BI)Z", impl_is_reachable4);
+    r.add(AS_IMPL6, "isReachable0", "([BII[BII)Z", impl_is_reachable6);
 }
 
 /// 不以 NUL 结尾的 `char*`（getaddrinfo 的 node 参数）

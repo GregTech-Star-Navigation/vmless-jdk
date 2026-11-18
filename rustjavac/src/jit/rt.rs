@@ -90,14 +90,50 @@ pub fn base_ptr() -> *mut u8 {
 // `class_id`（librustjrt 分配），而 instanceof/checkcast/vcall 的立即数是 tag。
 
 /// class_id → tag（下标是 class_id；注册过才有值）
+///
+/// **读路径无锁**：生成代码里每个 `instanceof`/`checkcast`/`vcall` 都要读一次这张表，
+/// 之前是一把 `Mutex`，实测 16M 次虚调用要 1.7 秒（每次两把锁 + 线性扫全表）。
+/// 现在主表是一块**定长原子数组**（首用才分配），读只有「一次原子加载 + 一次下标」，
+/// 写仍走下面的 `Mutex<Vec>` 当权威 + 越界兜底。
 static TAG_OF_CLASS: Mutex<Vec<u32>> = Mutex::new(Vec::new());
+/// 无锁镜像：`TAG_FAST[id] = tag`，初值 0（未注册 = 按 Object 处理，与旧行为一致）
+static TAG_FAST: std::sync::atomic::AtomicPtr<u32> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+/// 镜像容量（class_id 超过它就退回 mutex 那条路）
+const TAG_FAST_CAP: usize = 1 << 16;
 /// tag → class_id（`u32::MAX` = 还没注册）
 static CLASS_OF_TAG: Mutex<Vec<u32>> = Mutex::new(Vec::new());
 
 const NO_CLASS: u32 = u32::MAX;
 
+/// 取（必要时分配）无锁 tag 镜像
+#[inline]
+fn tag_fast() -> Option<&'static [std::sync::atomic::AtomicU32]> {
+    use std::sync::atomic::AtomicU32;
+    static INIT: Mutex<()> = Mutex::new(());
+    let p = TAG_FAST.load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: 一旦写入就一直有效（只泄漏、不释放），长度恒为 TAG_FAST_CAP
+        return Some(unsafe { std::slice::from_raw_parts(p as *const AtomicU32, TAG_FAST_CAP) });
+    }
+    let _g = INIT.lock().unwrap();
+    let p = TAG_FAST.load(Ordering::Acquire);
+    if !p.is_null() {
+        return Some(unsafe { std::slice::from_raw_parts(p as *const AtomicU32, TAG_FAST_CAP) });
+    }
+    let v: Box<[AtomicU32]> = (0..TAG_FAST_CAP).map(|_| AtomicU32::new(0)).collect();
+    let raw = Box::into_raw(v) as *mut u32;
+    TAG_FAST.store(raw, Ordering::Release);
+    Some(unsafe { std::slice::from_raw_parts(raw as *const AtomicU32, TAG_FAST_CAP) })
+}
+
 #[inline]
 pub fn tag_of_class(class_id: u32) -> u32 {
+    if (class_id as usize) < TAG_FAST_CAP {
+        if let Some(t) = tag_fast() {
+            return t[class_id as usize].load(Ordering::Relaxed);
+        }
+    }
     let g = TAG_OF_CLASS.lock().unwrap();
     match g.get(class_id as usize) {
         Some(&t) => t,
@@ -115,6 +151,12 @@ pub fn class_id_of(tag: u32) -> u32 {
 }
 
 fn record_mapping(tag: u32, class_id: u32) {
+    // 无锁镜像先写（读端只看它）
+    if (class_id as usize) < TAG_FAST_CAP {
+        if let Some(t) = tag_fast() {
+            t[class_id as usize].store(tag, Ordering::Relaxed);
+        }
+    }
     let mut tm = TAG_OF_CLASS.lock().unwrap();
     if tm.len() <= class_id as usize {
         tm.resize(class_id as usize + 1, 0);
@@ -741,6 +783,89 @@ static SIG_IDS: Mutex<Vec<String>> = Mutex::new(Vec::new());
 /// (类型标签, 签名号) → (函数指针, 返回种类)
 static VMETHODS: Mutex<Vec<((u32, u32), (usize, u8))>> = Mutex::new(Vec::new());
 
+/// 虚方法分派的**无锁**哈希表：`(tag, sig) → (函数地址, 返回种类)`。
+///
+/// 之前每次虚调用都是「锁 `VMETHODS` + 线性扫整个 Vec」—— 16M 次虚调用要 1.7 秒。
+/// 现在读路径是「一次原子加载 + 一次开放寻址探测」，写仍然走 mutex（只发生在编译期）。
+/// 表建好后不再变；`VMETHOD_COUNT` 与表里的 `n` 对齐就说明没过期。
+static VFAST: std::sync::atomic::AtomicPtr<VFast> =
+    std::sync::atomic::AtomicPtr::new(std::ptr::null_mut());
+static VMETHOD_COUNT: AtomicUsize = AtomicUsize::new(0);
+
+struct VFast {
+    /// 建表时的条目数（与 `VMETHOD_COUNT` 比对判过期）
+    n: usize,
+    mask: usize,
+    /// `(tag << 32) | sig`；`u64::MAX` = 空槽
+    keys: Vec<u64>,
+    vals: Vec<(usize, u8)>,
+}
+
+impl VFast {
+    #[inline]
+    fn hash(k: u64) -> usize {
+        let mut h = k ^ (k >> 33);
+        h = h.wrapping_mul(0xFF51_AFD7_ED55_8CCD);
+        h ^= h >> 29;
+        h as usize
+    }
+
+    fn build(list: &[((u32, u32), (usize, u8))]) -> VFast {
+        let mut cap = 16usize;
+        while cap < list.len() * 2 {
+            cap *= 2;
+        }
+        let mut keys = vec![u64::MAX; cap];
+        let mut vals = vec![(0usize, 0u8); cap];
+        let mask = cap - 1;
+        for &((tag, sig), v) in list {
+            let k = ((tag as u64) << 32) | sig as u64;
+            let mut i = Self::hash(k) & mask;
+            while keys[i] != u64::MAX && keys[i] != k {
+                i = (i + 1) & mask;
+            }
+            keys[i] = k;
+            vals[i] = v;
+        }
+        VFast { n: list.len(), mask, keys, vals }
+    }
+
+    #[inline]
+    fn get(&self, tag: u32, sig: u32) -> Option<(usize, u8)> {
+        let k = ((tag as u64) << 32) | sig as u64;
+        let mut i = Self::hash(k) & self.mask;
+        loop {
+            let kk = self.keys[i];
+            if kk == k {
+                return Some(self.vals[i]);
+            }
+            if kk == u64::MAX {
+                return None;
+            }
+            i = (i + 1) & self.mask;
+        }
+    }
+}
+
+/// 取（必要时重建）无锁虚方法表。登记只发生在编译期，运行期最多建一次。
+fn vfast() -> &'static VFast {
+    let want = VMETHOD_COUNT.load(Ordering::Acquire);
+    let p = VFAST.load(Ordering::Acquire);
+    if !p.is_null() {
+        // SAFETY: 只要 `n` 对得上就是这份，泄漏的表永远有效
+        let f = unsafe { &*p };
+        if f.n == want {
+            return f;
+        }
+    }
+    let list = VMETHODS.lock().unwrap();
+    let f = Box::into_raw(Box::new(VFast::build(&list)));
+    VMETHOD_COUNT.store(list.len(), Ordering::Release);
+    VFAST.store(f, Ordering::Release);
+    // SAFETY: 刚建的表，长度足够；旧表泄漏（编译期最多几张）
+    unsafe { &*f }
+}
+
 /// 返回值种类
 pub const RET_I32: u8 = 0;
 pub const RET_I64: u8 = 1;
@@ -874,6 +999,9 @@ pub fn register_vmethod(class_tag: u32, sig: u32, ptr: usize, ret: u8) {
     } else {
         g.push(((class_tag, sig), (ptr, ret)));
     }
+    // 条目数变了 → 无锁表过期（`vfast` 靠这个比对重建）
+    let n = g.len();
+    VMETHOD_COUNT.store(n, Ordering::Release);
 }
 
 /// 虚方法分派：`locals[0]` 是接收者，按它的**运行时类型**查表再间接调用。
@@ -890,8 +1018,7 @@ pub extern "C" fn vcall(locals: *mut i64, sig: u32) -> i64 {
         std::process::exit(1);
     }
     let tag = class_tag_at(obj);
-    let entry = VMETHODS.lock().unwrap().iter().find(|(k, _)| *k == (tag, sig)).map(|(_, v)| *v);
-    let Some((ptr, ret)) = entry else {
+    let Some((ptr, ret)) = vfast().get(tag, sig) else {
         eprintln!(
             "NoSuchMethodError: 类 {} 没有虚方法（sig {sig}）",
             class_internal_of(tag)

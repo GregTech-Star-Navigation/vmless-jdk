@@ -272,6 +272,9 @@ impl Parser {
             // 无体的 interface/注解声明
             return Ok(TypeDecl { kind, name, modifiers, type_params, extends, implements, members });
         }
+        // 本类型体里收集到的局部类从这里开始记账（方法体里的类声明会往
+        // `self.local_types` 里追加）
+        let local_mark = self.local_types.len();
         self.expect(&Tok::LBrace)?;
 
         // 枚举常量
@@ -317,6 +320,8 @@ impl Parser {
                 continue;
             }
             members.push(self.parse_member()?);
+            // 多声明符字段（`int a, b;`）的其余部分按源码顺序接在后面
+            members.extend(self.pending_members.drain(..));
         }
         self.expect(&Tok::RBrace)?;
 
@@ -328,6 +333,14 @@ impl Parser {
                 name: p.name,
                 init: None,
             }));
+        }
+
+        // 方法体里声明的局部类挂成这个类型的嵌套类型：`sema::flatten` 会把它们
+        // 拍平成顶层类型 `Outer$Inner`，`rewrite_expr` 再把使用点改名 —— 放在这里
+        // 而不是丢掉，是因为 java.base 里大量 `static Arena global() { class Holder {…}
+        // return Holder.GLOBAL; }` 这种写法（丢了就报「未定义的变量 Holder」）。
+        for lt in self.local_types.split_off(local_mark) {
+            members.push(Member::Type(lt));
         }
 
         Ok(TypeDecl { kind, name, modifiers, type_params, extends, implements, members })
@@ -352,7 +365,14 @@ impl Parser {
     pub(crate) fn parse_member(&mut self) -> Result<Member, ParseError> {
         let modifiers = self.parse_modifiers()?;
 
-        if self.is_kw("class") || self.is_kw("interface") || self.is_kw("enum") || self.is_kw("record")
+        // `record` 是**上下文**关键字（lexer 里是 Ident），必须按 is_ctx 判；
+        // 用 is_kw 的话 `private record H(int a) …` 会被当成字段声明，
+        // 报「期望 Semi，实际 LParen」。
+        if self.is_kw("class")
+            || self.is_kw("interface")
+            || self.is_kw("enum")
+            || (self.is_ctx("record")
+                && matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::Ident(_))))
             || (matches!(self.cur(), Tok::At))
         {
             let mut d = self.parse_type_decl()?;
@@ -460,16 +480,23 @@ impl Parser {
         }
         let first = Member::Field(FieldDecl { modifiers: modifiers.clone(), ty: ty.clone(), name, init });
         if self.eat(&Tok::Comma) {
-            // 简化：其余声明符忽略初始化表达式，但必须消费
+            // 多声明符：`private int majorVersion, minorVersion;` —— 以前只留第一个，
+            // 后面那些名字就完全不存在，用到时全报「未定义的变量」
             loop {
-                let _n = self.expect_ident()?;
+                let n2 = self.expect_ident()?;
+                let mut ty2 = ty.clone();
                 while matches!(self.cur(), Tok::LBracket) {
                     self.advance();
                     self.expect(&Tok::RBracket)?;
+                    ty2 = Type::Array(Box::new(ty2));
                 }
-                if self.eat(&Tok::Assign) {
-                    let _ = self.parse_array_or_expr()?;
-                }
+                let init2 = if self.eat(&Tok::Assign) { Some(self.parse_array_or_expr()?) } else { None };
+                self.pending_members.push(Member::Field(FieldDecl {
+                    modifiers: modifiers.clone(),
+                    ty: ty2,
+                    name: n2,
+                    init: init2,
+                }));
                 if !self.eat(&Tok::Comma) {
                     break;
                 }

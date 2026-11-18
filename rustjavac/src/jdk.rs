@@ -413,6 +413,9 @@ pub fn object_protocol(name: &str, argc: usize) -> Option<String> {
         ("hashCode", 0) => Some("()I".to_string()),
         ("equals", 1) => Some("(Ljava/lang/Object;)Z".to_string()),
         ("getClass", 0) => Some("()Ljava/lang/Class;".to_string()),
+        // 数组的 clone()：JVM 上数组的 clone 走 Object.clone 但返回类型是数组本身，
+        // javac 也把它当 `()Ljava/lang/Object;` 处理（调用点再 checkcast）
+        ("clone", 0) => Some("()Ljava/lang/Object;".to_string()),
         _ => None,
     }
 }

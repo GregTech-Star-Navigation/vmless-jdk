@@ -499,6 +499,69 @@ pub(crate) fn coerce(from: u8, to: u8, em: &mut Emit) -> Result<(), CompileError
 /// 表达式 → 声明类型。能静态推出来的才给（数组元素宽度、anewarray/checkcast 的元素类要用）。
 ///
 /// 推不出来返回 `None`：调用方按「int」这一老行为兜底，不要在这里猜。
+/// `switch` 表达式的结果类型：取第一个「交值点」的静态类型
+/// （箭头体的裸表达式或 `yield e;`）。都推不出来就让调用方按 Object 处理。
+pub(crate) fn switch_expr_type(s: &Stmt, ctx: &Ctx) -> Option<Type> {
+    let Stmt::Switch { cases, .. } = s else { return None };
+    for c in cases {
+        if c.arrow && c.body.len() == 1 {
+            if let Stmt::Expr(e) = &c.body[0] {
+                if let Some(t) = expr_type(e, ctx) {
+                    return Some(t);
+                }
+            }
+        }
+        for st in &c.body {
+            if let Some(t) = first_yield_ty(st, ctx) {
+                return Some(t);
+            }
+        }
+    }
+    None
+}
+
+fn first_yield_ty(s: &Stmt, ctx: &Ctx) -> Option<Type> {
+    match s {
+        Stmt::Yield(e) => expr_type(e, ctx),
+        Stmt::Block(v) => v.iter().find_map(|x| first_yield_ty(x, ctx)),
+        Stmt::If { then, els, .. } => {
+            first_yield_ty(then, ctx).or_else(|| els.as_ref().and_then(|e| first_yield_ty(e, ctx)))
+        }
+        Stmt::While { body, .. }
+        | Stmt::DoWhile { body, .. }
+        | Stmt::Labeled { body, .. }
+        | Stmt::For { body, .. }
+        | Stmt::ForEach { body, .. } => first_yield_ty(body, ctx),
+        Stmt::Switch { cases, .. } => {
+            cases.iter().flat_map(|c| c.body.iter()).find_map(|x| first_yield_ty(x, ctx))
+        }
+        Stmt::Try { body, catches, finally } => first_yield_ty(body, ctx)
+            .or_else(|| catches.iter().find_map(|c| first_yield_ty(&c.body, ctx)))
+            .or_else(|| finally.as_ref().and_then(|f| first_yield_ty(f, ctx))),
+        _ => None,
+    }
+}
+
+/// 报错用的接收者简写：`a.b` / `foo()` / `new X` —— 只为了让人看出是哪一处
+pub(crate) fn recv_brief(e: &Expr) -> String {
+    match e {
+        Expr::Ident(n) => n.clone(),
+        Expr::Field(a, b) => format!("{}.{}", recv_brief(a), b),
+        Expr::Call { name, recv, .. } => match recv {
+            Some(r) => format!("{}.{name}()", recv_brief(r)),
+            None => format!("{name}()"),
+        },
+        Expr::Cast { ty, expr } => format!("({}){}", descriptor(ty), recv_brief(expr)),
+        Expr::New { ty, .. } => "new".to_string() + &descriptor(ty),
+        Expr::StrLit(_) => "\"…\"".into(),
+        Expr::IntLit(s) => s.clone(),
+        Expr::ArrayAccess { array, .. } => format!("{}[…]", recv_brief(array)),
+        Expr::Cond { .. } => "?:".into(),
+        Expr::Binary { op, .. } => format!("{op:?}"),
+        _ => "?".into(),
+    }
+}
+
 pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
     match e {
         Expr::Ident(n) => ctx
@@ -508,16 +571,25 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
             .or_else(|| ctx.static_fields.get(n).map(|(_, d)| type_from_desc(d)))
             // 裸名字也可能是隐式 this 的字段（`new NameIter(data)` 里的 data）：
             // 漏了它，实参/字段的描述符会退化成「String」这种瞎猜
-            .or_else(|| ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).cloned()),
+            .or_else(|| ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).cloned())
+            // 也可能是静态导入进来的常量（`import static …ChronoField.*;` 之后
+            // 的 `YEAR` / `MILLISECONDS`）—— 少了这条它们当接收者时类型是 None
+            .or_else(|| static_import_field(n, ctx).map(|(_, d)| type_from_desc(&d))),
         Expr::Field(r, n) => {
             // 静态字段：`ClassName.f`
             if let Some((_, d)) = static_field_access(e, ctx) {
                 return Some(type_from_desc(&d));
             }
-            // 接收者静态类型已知就按它的字段表查（含继承）
-            if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
-                if let Some(d) = ctx.type_fields.get(&owner).and_then(|f| f.get(n)) {
-                    return Some(type_from_desc(d));
+            // 接收者静态类型已知就按它的字段表查（含继承）；没有 classpath 时
+            // （verify.sh 的独立模式）回落到 jdk.rs 的内建字段表
+            if let Some(t) = expr_type(r, ctx) {
+                for owner in type_name_candidates(&t, ctx) {
+                    if let Some(d) = ctx.type_fields.get(&owner).and_then(|f| f.get(n)) {
+                        return Some(type_from_desc(d));
+                    }
+                    if let Some(d) = crate::jdk::field_desc(&owner, n) {
+                        return Some(type_from_desc(d));
+                    }
                 }
             }
             ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).cloned()
@@ -553,6 +625,8 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
                 Some(type_from_desc(ret))
             }
         }
+        // `switch` 表达式：结果类型就是交值点的类型
+        Expr::SwitchExpr(s) => switch_expr_type(s, ctx),
         // 三元：两侧一致就用它，否则按 `cond_type` 的规则挑一个
         Expr::Cond { then, els, .. } => super::expr::cond_type(then, els, ctx),
         // 字符串拼接的结果类型是 String（描述符/println 重载都靠它）
@@ -571,6 +645,18 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
             path: vec!["java".into(), "lang".into(), "Class".into()],
             args: vec![],
         }),
+        // lambda / 方法引用的静态类型就是它的**目标**功能性接口（多表达式的类型
+        // 完全由上下文决定）。没有目标就返回 None —— 让调用点按「未知引用」处理。
+        Expr::Lambda { .. } | Expr::LambdaStmt { .. } => ctx
+            .lambda_target
+            .borrow()
+            .clone()
+            .map(|t| Type::Named { path: t.iface.split('/').map(|s| s.to_string()).collect(), args: t.args.clone() }),
+        Expr::MethodRef { .. } => ctx
+            .lambda_target
+            .borrow()
+            .clone()
+            .map(|t| Type::Named { path: t.iface.split('/').map(|s| s.to_string()).collect(), args: t.args.clone() }),
         _ => None,
     }
 }
@@ -622,6 +708,7 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
                 .and_then(|i| ctx.field_descs.get(*i))
                 .map(|d| kind_from_desc(d))
                 .or_else(|| ctx.static_fields.get(n).map(|(_, d)| kind_from_desc(d)))
+                .or_else(|| static_import_field(n, ctx).map(|(_, d)| kind_from_desc(&d)))
                 .unwrap_or(K_INT)
         }),
         Expr::Binary { op, lhs, rhs } => match op {
@@ -641,7 +728,11 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
         // class 字面量是 java.lang.Class 的引用
         Expr::ClassLit(_) => K_REF,
         Expr::MethodRef { name, .. } if name == "class" => K_REF,
+        // lambda / 方法引用都是引用（invokedynamic 压进栈的是一个接口实例）
+        Expr::Lambda { .. } | Expr::LambdaStmt { .. } | Expr::MethodRef { .. } => K_REF,
         Expr::InstanceOf { .. } | Expr::BoolLit(_) => K_BOOL,
+        // switch 表达式的种类：交值点的静态类型（推不出来按引用）
+        Expr::SwitchExpr(s) => switch_expr_type(s, ctx).map(|t| kind_of(&t)).unwrap_or(K_REF),
         // 三元：两侧都是 boolean 才保持 boolean，否则按数值提升（引用任一侧即引用）。
         // 包装类不算「引用侧」：`c ? box : 1` 的结果是 int（先拆箱）
         Expr::Cond { then, els, .. } => {
@@ -889,11 +980,19 @@ pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, args: &[Expr], ctx: &Ct
         if let Some(d) = ctx.static_methods.get(name).and_then(|c| pick_desc(c, args, ctx)) {
             return Some(d);
         }
+        // 从父类/外层类继承来的静态方法
+        if let Some(d) = ctx.inherited_statics.get(name).and_then(|(_, ds)| pick_desc(ds, args, ctx)) {
+            return Some(d);
+        }
         // `import static p.C.m;` 之后就是裸名字调用，没有接收者可查
         if let Some((_, d)) = static_import_call(name, args, ctx) {
             return Some(d);
         }
-        return ctx.instance_methods.get(name).and_then(|c| pick_desc(c, args, ctx));
+        // 裸名字的 `getClass()` / `hashCode()` / `toString()`：它们来自 Object
+        if let Some(d) = ctx.instance_methods.get(name).and_then(|c| pick_desc(c, args, ctx)) {
+            return Some(d);
+        }
+        return crate::jdk::object_protocol(name, args.len());
     };
     // super.m()：从**父类**开始解析（否则会调到自己，覆写就成了死循环）
     if matches!(r, Expr::Super) {
@@ -903,33 +1002,137 @@ pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, args: &[Expr], ctx: &Ct
     if let Some((_, d)) = static_call(r, name, args, ctx) {
         return Some(d);
     }
-    if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
-        if let Some(d) = ctx.type_methods.get(&owner).and_then(|m| m.get(name)).and_then(|c| pick_desc(c, args, ctx)) {
-            return Some(d);
-        }
-        if let Some(d) = builtin_method_desc(&owner, name, args, ctx) {
-            return Some(d);
+    // 接收者的静态类型能推出来：按候选内部名逐个试符号表，再试内建表。
+    //
+    // **两个都要试、且要按同一个名字试**：有 classpath 时符号表里有真正的
+    // `java/lang/String`；没有 classpath（verify.sh 的独立模式）时符号表里没有它，
+    // 全靠 `builtin_method_desc` 那张内建表给描述符。任何一侧漏掉都会让
+    // `s.length()` 这种最基本的东西编不过。
+    if let Some(t) = expr_type(r, ctx) {
+        for owner in type_name_candidates(&t, ctx) {
+            if let Some(d) =
+                ctx.type_methods.get(&owner).and_then(|m| m.get(name)).and_then(|c| pick_desc(c, args, ctx))
+            {
+                return Some(d);
+            }
+            if let Some(d) = builtin_method_desc(&owner, name, args, ctx) {
+                return Some(d);
+            }
         }
     }
     // 包装类/字符串的接收者静态类型可能是 `Object`（泛型擦除）：协议方法仍要能编
     ctx.instance_methods.get(name).and_then(|c| pick_desc(c, args, ctx))
 }
 
-/// 简单类名 → 要试的内部名（先裸名，再补**当前包**）。
+/// 简单类名 → 要试的内部名候选（**顺序就是名字解析顺序**）。
 ///
 /// `sema::qualify` 只补 `import` 进来的名字 —— 同包的简单类名故意原样留着（怕和
-/// 同名局部变量混淆）。于是 `AESConstants.AES_BLOCK_SIZE` 这种同包静态访问到这一层
-/// 时 `cls` 还是裸名，查表要按 `pkg/AESConstants` 再试一次。
+/// 同名局部变量混淆），所以这里得按 JLS 6.5.5.1 的顺序补齐：
+/// 本类/外层类的成员类型 → 同包 → `java.lang`。
+///
+/// ⚠️ 别在开头用 `internal_name([cls])`：它会把裸名 `Record` 直接翻成
+/// `java/lang/Record`（java.lang 名字表），于是 `sun/security/ssl/Record` 这种
+/// **同包同名类**永远轮不到（SSL 那一大片 `Record.getInt16(...)` 就是这么挂的）。
 pub(crate) fn class_name_forms(cls: &str, ctx: &Ctx) -> Vec<String> {
-    let base = internal_name(std::slice::from_ref(&cls.to_string()));
-    if base.contains('/') {
-        return vec![base];
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |out: &mut Vec<String>, s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    if cls.contains('/') {
+        push(&mut out, cls.to_string());
+        // 嵌套类型写成 `a/b/Outer/Inner`：把尾部每个大写开头的段用 `$` 拼回去
+        let segs: Vec<&str> = cls.split('/').collect();
+        for split in (1..segs.len()).rev() {
+            if !segs[split..].iter().all(|s| s.chars().next().is_some_and(|c| c.is_ascii_uppercase())) {
+                break;
+            }
+            push(&mut out, format!("{}${}", segs[..split].join("/"), segs[split..].join("$")));
+        }
+        return out;
     }
-    let mut out = vec![base.clone()];
+    // 本类的成员类型（`Holder.INSTANCE` 里的 Holder 常常就是当前类里的嵌套类），
+    // 再一层层往外找外层类
+    let mut cur = ctx.class_name.clone();
+    push(&mut out, format!("{cur}${cls}"));
+    while let Some(i) = cur.rfind('$') {
+        cur.truncate(i);
+        push(&mut out, format!("{cur}${cls}"));
+    }
+    // 同包
     if let Some((pkg, _)) = ctx.class_name.rsplit_once('/') {
-        out.push(format!("{pkg}/{base}"));
+        push(&mut out, format!("{pkg}/{cls}"));
+    }
+    // 裸名本身：默认包（无 package）里的类就叫 `Float2`；`qualify` 已经把
+    // 嵌套类型写成 `Mix2$Kind` 这种内部名形态，那时裸名就是符号表里的键
+    push(&mut out, cls.to_string());
+    // 隐式导入的 `java.lang`（`ModuleLayer.boot()` / `Character.digit(...)`）
+    push(&mut out, format!("java/lang/{cls}"));
+    out
+}
+
+/// 一个类型在符号表（`ctx.type_*`）里可能登记的内部名候选，最可能的在前。
+///
+/// 语义层留下的类型名可能是点分形式（`java.security.Provider.Service`）、裸名
+/// （`Class`）、或嵌套类型（`Map.Entry`），而符号表的键全是内部名
+/// （`java/security/Provider$Service`、`java/lang/Class`、`java/util/Map$Entry`）。
+/// 不列候选就只能按字符串硬匹配，命不中就报「未找到实例方法」。
+pub(crate) fn type_name_candidates(ty: &Type, ctx: &Ctx) -> Vec<String> {
+    let path = match ty {
+        Type::Named { path, .. } => path,
+        Type::Array(_) => return vec![descriptor(ty)],
+        _ => return Vec::new(),
+    };
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |out: &mut Vec<String>, s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    let base = internal_name(path);
+    push(&mut out, base.clone());
+    // 嵌套类型：尾部每段都以大写开头时，把最后一个 `/` 换成 `$`
+    for split in (1..path.len()).rev() {
+        if !path[split..].iter().all(|s| s.chars().next().is_some_and(|c| c.is_ascii_uppercase())) {
+            break;
+        }
+        push(&mut out, format!("{}${}", path[..split].join("/"), path[split..].join("$")));
+    }
+    if path.len() == 1 {
+        let n = path[0].clone();
+        if let Some((pkg, _)) = ctx.class_name.rsplit_once('/') {
+            push(&mut out, format!("{pkg}/{n}"));
+        }
+        // 隐式导入的 `java.lang`
+        push(&mut out, format!("java/lang/{n}"));
+        // 本单元里的嵌套类型：`Holder` → `pkg/Outer$Holder`
+        push(&mut out, format!("{}${n}", ctx.class_name));
     }
     out
+}
+
+/// 类型 → 符号表里真实存在的内部名（先直拼，再试嵌套 `$` / 包前缀 / `java.lang`）
+pub(crate) fn resolve_type_owner(ty: &Type, ctx: &Ctx) -> Option<String> {
+    type_name_candidates(ty, ctx).into_iter().find(|c| {
+        ctx.type_methods.contains_key(c)
+            || ctx.type_fields.contains_key(c)
+            || ctx.type_static_methods.contains_key(c)
+            || ctx.iface_types.contains(c)
+    })
+}
+
+/// `a.b.C` 这种点分链 → 段列表（只认 Ident/Field 组成、不含局部变量的式子）
+fn expr_dotted_path(e: &Expr) -> Option<Vec<String>> {
+    match e {
+        Expr::Ident(n) => Some(vec![n.clone()]),
+        Expr::Field(inner, seg) => {
+            let mut v = expr_dotted_path(inner)?;
+            v.push(seg.clone());
+            Some(v)
+        }
+        _ => None,
+    }
 }
 
 /// 接收者可能是「类名 + 嵌套段」：`Opcode.Kind.ARRAY_LOAD` 里的 `Opcode.Kind` 是嵌套
@@ -946,7 +1149,22 @@ pub(crate) fn class_owner_forms(e: &Expr, ctx: &Ctx) -> Vec<String> {
         }
         // 只有「看起来像类型名」的段才拼 `$`：字段/方法是小写开头，嵌套类型是大写
         Expr::Field(inner, seg) if seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
-            class_owner_forms(inner, ctx).into_iter().map(|o| format!("{o}${seg}")).collect()
+            let mut out: Vec<String> =
+                class_owner_forms(inner, ctx).into_iter().map(|o| format!("{o}${seg}")).collect();
+            // 全限定类名：`jdk.internal.misc.Unsafe.getUnsafe()` 里的 `jdk.internal.misc.Unsafe`
+            // 会被解析成点分 Field 链，而前缀全是包段（小写）—— 那不是嵌套类型，是包名，
+            // 只能按 `/` 拼。少了这条，全限定静态调用一律报「未找到实例方法」。
+            if let Some(path) = expr_dotted_path(e) {
+                if path.len() > 1
+                    && path[..path.len() - 1].iter().all(|s| s.chars().next().is_some_and(|c| c.is_ascii_lowercase()))
+                {
+                    let joined = path.join("/");
+                    if !out.contains(&joined) {
+                        out.push(joined);
+                    }
+                }
+            }
+            out
         }
         _ => Vec::new(),
     }

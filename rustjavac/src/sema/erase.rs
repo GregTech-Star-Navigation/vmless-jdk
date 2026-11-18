@@ -178,6 +178,7 @@ fn erase_stmt(s: &mut Stmt, env: &Env) {
                 erase_stmt(f, env);
             }
         }
+        Stmt::Yield(e) => erase_expr(e, env),
         Stmt::Break(_) | Stmt::Continue(_) | Stmt::Empty => {}
     }
 }
@@ -240,9 +241,10 @@ fn erase_expr(e: &mut Expr, env: &Env) {
             *ty = erase_ty(ty, env);
         }
         Expr::Lambda { body, .. } => erase_expr(body, env),
+        Expr::LambdaStmt { body, .. } => erase_stmt(body, env),
         Expr::MethodRef { recv, .. } => erase_expr(recv, env),
         Expr::ClassLit(t) => *t = erase_ty(t, env),
-        Expr::SwitchExpr(e) => erase_expr(e, env),
+        Expr::SwitchExpr(s) => erase_stmt(s, env),
         Expr::IntLit(_)
         | Expr::FloatLit(_)
         | Expr::StrLit(_)

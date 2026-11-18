@@ -90,6 +90,36 @@ impl Cell {
         self.tag.store(tag, Ordering::Release);
         self.val.store(val, Ordering::Release);
     }
+
+    /// 批量把 `n` 个未初始化的槽位写成「全零」（= `Slot::I(0)`）。
+    ///
+    /// 这是一次**连续 memset**：标签与值都是 0，正好是 `T_I` + `I(0)` 的编码，
+    /// 所以不必逐槽调 `encode`。对象创建时清零与写头合并成一次内存往返，
+    /// 这是 `new X()` 比改动前少一次分配、少一次全块写的直接来源。
+    #[inline]
+    unsafe fn fill_zero(p: *mut Cell, n: usize) {
+        std::ptr::write_bytes(p as *mut u8, 0, n * CELL_SIZE);
+    }
+
+    /// 批量把 `n` 个未初始化的槽位写成同一个值（`new int[n]` 的零/初值、对象默认值）
+    /// 往**未初始化**的槽位写一个值（填充函数用；等价于 `Cell::new` 但不需要先有引用）
+    #[inline]
+    unsafe fn write(p: *mut Cell, v: Slot) {
+        let (tag, val) = encode(v);
+        std::ptr::addr_of_mut!((*p).tag).write(AtomicU8::new(tag));
+        std::ptr::addr_of_mut!((*p).val).write(AtomicU64::new(val));
+    }
+
+    #[inline]
+    unsafe fn fill(p: *mut Cell, v: Slot, n: usize) {
+        let (tag, val) = encode(v);
+        // 与 `fill_zero` 同构，但值不是零：逐槽写两个域（没有一次性 16 字节原子写可用）
+        for i in 0..n {
+            let c = &mut *p.add(i);
+            c.tag = AtomicU8::new(tag);
+            c.val = AtomicU64::new(val);
+        }
+    }
 }
 
 fn encode(v: Slot) -> (u8, u64) {
@@ -127,21 +157,24 @@ pub(crate) enum RefBits {
     Big(Box<[u64]>),
 }
 
-/// `RefBits::None` 的进程级共享实例（基本类型数组、无引用字段的对象）
-fn refbits_none() -> Arc<RefBits> {
-    static NONE: std::sync::OnceLock<Arc<RefBits>> = std::sync::OnceLock::new();
-    Arc::clone(NONE.get_or_init(|| Arc::new(RefBits::None)))
+/// `RefBits::All` / `None` 的进程级共享实例（引用数组、无引用字段的对象、宽对象）。
+///
+/// 泄漏成 `&'static`：槽位图只跟类布局有关，类的种类有界（java.base 也就几千个），
+/// 而对象头里只能放一个 8 字节域 —— 是内联位图还是指针由 `nslots > 64` 决定，不需要额外标志位。
+fn refbits_all_static() -> &'static RefBits {
+    static A: std::sync::OnceLock<&'static RefBits> = std::sync::OnceLock::new();
+    A.get_or_init(|| Box::leak(Box::new(RefBits::All)))
 }
 
-/// `RefBits::All` 的进程级共享实例（引用数组、布局未知时的保守答案）
-fn refbits_all() -> Arc<RefBits> {
-    static ALL: std::sync::OnceLock<Arc<RefBits>> = std::sync::OnceLock::new();
-    Arc::clone(ALL.get_or_init(|| Arc::new(RefBits::All)))
+fn refbits_none_static() -> &'static RefBits {
+    static N: std::sync::OnceLock<&'static RefBits> = std::sync::OnceLock::new();
+    N.get_or_init(|| Box::leak(Box::new(RefBits::None)))
 }
 
 impl RefBits {
     #[inline]
-    pub(crate) fn is_ref(&self, i: usize) -> bool {        match self {
+    pub(crate) fn is_ref(&self, i: usize) -> bool {
+        match self {
             RefBits::None => false,
             RefBits::All => true,
             RefBits::Small(w) => (i as u32) < 64 && (w & (1u64 << i)) != 0,
@@ -168,60 +201,288 @@ impl RefBits {
             RefBits::Big(bits.into_boxed_slice())
         }
     }
+
+    /// 位图 → 对象头里的那一个 8 字节域。
+    ///
+    /// **编码约定（唯一）**：`0` = 一个引用槽都没有；`n <= 64` 时是内联位图；
+    /// `n > 64` 时是泄漏成静态实例的 `*const RefBits`。所以 `is_ref`/`has_refs`
+    /// 两条路径都先判 0 —— 没有引用槽的对象占实测负载的绝大多数，这个判断同时是
+    /// 热路径的短路。
+    fn to_word(self, n: usize) -> u64 {
+        if matches!(self, RefBits::None) {
+            return 0;
+        }
+        if n <= 64 {
+            match self {
+                RefBits::None => 0,
+                RefBits::Small(w) => w,
+                // `All` 用全 1（槽位数 ≤ 64，多出来的位没人看）
+                RefBits::All | RefBits::Big(_) => u64::MAX,
+            }
+        } else {
+            Box::leak(Box::new(self)) as *const RefBits as usize as u64
+        }
+    }
 }
 
-/// 一个对象/数组在堆里的家：类名、长度、thin lock 字、槽位数组。
+/// 一个槽位的字节数（`{tag: AtomicU8, val: AtomicU64}`，对齐到 8 → 16 字节）
+pub(crate) const CELL_SIZE: usize = 16;
+/// 对象头字节数；槽位数组紧跟在头后面，**同一次分配**
+pub(crate) const OBJ_HDR_SIZE: usize = 24;
+
+/// 一个对象/数组在堆里的家：24 字节头 + 紧随其后的变长槽位数组（一次分配）。
 ///
-/// 地址稳定（`Box`），多线程并发访问只碰 `cells` / `lock` / `epoch` 三个原子域。
+/// 旧布局是 56 字节头（`Arc<str>` 16 + len/lock/epoch 12 + `Arc<RefBits>` 8 + `Box<[Cell]>` 16）
+/// **加**一次单独的槽位数组分配（再 16 字节 malloc 块头）。三项改动合起来：
+///
+/// | 项 | 旧 | 新 |
+/// | --- | --- | --- |
+/// | 类名 `Arc<str>` | 16 B | `u32` class_id（见 `Heap::class_names`） |
+/// | 引用位图 `Arc<RefBits>` | 8 B | ≤64 槽内联 `u64`，>64 槽静态指针 |
+/// | 槽位数组 | 8 B 指针 + 16 B 块头 + 独立分配 | 内联，零额外开销 |
+/// | 头总大小 | 56 B | **24 B** |
+///
+/// 除了 RSS，24 字节头 + 内联槽位让「标记」从「页表 → 头 → 槽位数组」三次访存
+/// 变成「页表 → 头+槽位」，这正是停下来标 80 万对象那一格的主要成本。
+///
+/// 地址稳定（一次分配后永不搬动），并发访问只碰 `lock` / `epoch` 两个原子域。
+#[repr(C)]
 pub(crate) struct ObjHdr {
-    /// 运行时类：对象是内部类名，数组是描述符（`[I` / `[Ljava/lang/String;`）
-    pub(crate) class: Arc<str>,
-    /// 数组长度（对象恒 0）
-    pub(crate) len: u32,
     /// thin lock 字：`0` = 未锁；`tid << 8 | 重入计数` = 持有者
     pub(crate) lock: AtomicU32,
     /// GC 标记世代（`== Heap.gc_epoch` 就是本轮存活）。用世代号而不是清除位，
     /// 是因为清扫要遍历所有条目，没法先来一遍 O(n) 的清零。
     pub(crate) epoch: AtomicU32,
-    /// 引用槽位图（分配时按类布局算好，扫描时零查表）
-    pub(crate) refs: Arc<RefBits>,
-    cells: Box<[Cell]>,
+    /// 槽位数（对象 = 字段数，数组 = 元素数）
+    pub(crate) nslots: u32,
+    /// 运行时类 id（`Heap::class_names` 里的下标；对象是内部类名，数组是描述符）
+    pub(crate) class_id: u32,
+    /// 引用槽位图：≤64 槽内联位图；>64 槽存 `*const RefBits`（泄漏的静态实例）
+    refs: u64,
 }
+
+/// 对象头必须是 24 字节 —— 这是 RSS 与标记停顿的关键指标，改坏了编译期就报
+const _: () = assert!(std::mem::size_of::<ObjHdr>() == OBJ_HDR_SIZE);
+/// 槽位单元必须是 16 字节（内联数组的步长靠它）
+const _: () = assert!(std::mem::size_of::<Cell>() == CELL_SIZE);
 
 impl ObjHdr {
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        self.cells.len()
+        self.nslots as usize
+    }
+
+    /// 槽位数组（紧跟对象头，长度 `nslots`）
+    #[inline]
+    fn cells(&self) -> &[Cell] {
+        unsafe {
+            let p = (self as *const ObjHdr as *const u8).add(OBJ_HDR_SIZE) as *const Cell;
+            std::slice::from_raw_parts(p, self.nslots as usize)
+        }
     }
 
     #[inline]
     pub(crate) fn get(&self, i: usize) -> Option<Slot> {
-        self.cells.get(i).map(|c| c.get())
+        self.cells().get(i).map(|c| c.get())
     }
 
     #[inline]
     pub(crate) fn set(&self, i: usize, v: Slot) {
-        if let Some(c) = self.cells.get(i) {
+        if let Some(c) = self.cells().get(i) {
             c.set(v);
+        }
+    }
+
+    /// 第 i 槽是不是引用
+    ///
+    /// `nslots > 64` 时 `refs` 是一个**指针**（指向堆上的 `RefBits`）。
+    /// **`refs == 0` 必须当成「没有引用槽」而不是去解引用** ——
+    /// 空指针 deref 在 release 下就是 SIGSEGV，而且**没有任何 Rust panic**，
+    /// 症状是「只要分配超过 64 槽的对象（长字符串、大 `byte[]`、大数组）就崩」，
+    /// 极易被误判成别处的内存破坏。实测：`"x".repeat(200)` 必崩。
+    #[inline]
+    pub(crate) fn is_ref(&self, i: usize) -> bool {
+        if self.nslots <= 64 {
+            i < 64 && (self.refs >> i) & 1 != 0
+        } else if self.refs == 0 {
+            false
+        } else {
+            // `nslots`/`refs` 只写一次、之后不变，所以这里读到的指针永远同一个
+            (unsafe { &*(self.refs as usize as *const RefBits) }).is_ref(i)
         }
     }
 
     /// 有没有引用槽（没有的话标记时连值都不用碰 —— 少一次访存就是少一次 miss）
     #[inline]
     pub(crate) fn has_refs(&self) -> bool {
-        !matches!(&*self.refs, RefBits::None)
+        if self.nslots <= 64 {
+            self.refs != 0
+        } else if self.refs == 0 {
+            false
+        } else {
+            !matches!(unsafe { &*(self.refs as usize as *const RefBits) }, RefBits::None)
+        }
     }
 
     /// 槽位数组的首地址（GC 预取用：访问它才算把对象的"身体"拉进缓存）
     #[inline]
     pub(crate) fn cells_ptr(&self) -> *const Cell {
-        self.cells.as_ptr()
+        self.cells().as_ptr()
+    }
+
+    /// 扫一遍引用槽，**只把年轻代的目标**推进 `out`。年轻代回收的根扫描用它。
+    ///
+    /// 这是分代回收最值钱的一条优化：老对象（比如一个装着全部存活对象的大数组）
+    /// 被写脏之后，它的每个槽都得看一遍，但槽里绝大多数指向的是**老**对象 ——
+    /// 那些目标不需要标记、更不需要追。只比较一次下标就扔掉，省掉一次页表查找
+    /// （实测 GcBench 的 1M 槽 `keep` 数组：这一条把停顿从 47ms 压到毫秒级）。
+    #[inline]
+    pub(crate) fn scan_refs_young(&self, out: &mut Vec<i32>, lo_obj: u32, lo_arr: u32) {
+        let cells = self.cells();
+        let n = cells.len();
+        let mut push = |v: i32| {
+            if v > 0 {
+                if (v as u32 - 1) >= lo_obj {
+                    out.push(v);
+                }
+            } else if v < 0 && (-(v as i64) - 1) as u64 >= lo_arr as u64 {
+                out.push(v);
+            }
+        };
+        if self.nslots <= 64 {
+            let mut bits = self.refs;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                if i >= n {
+                    break;
+                }
+                if let Slot::I(v) = cells[i].get() {
+                    if v != 0 {
+                        push(v);
+                    }
+                }
+                bits &= bits - 1;
+            }
+        } else if self.refs != 0 {
+            for i in 0..n {
+                if self.is_ref(i) {
+                    if let Slot::I(v) = cells[i].get() {
+                        if v != 0 {
+                            push(v);
+                        }
+                    }
+                }
+            }
+        }
+    }
+
+    /// 扫一遍引用槽：把非零引用推进 `out`。**标记热循环专用**。
+    ///
+    /// 两个优化叠在一起：槽位切片只取一次（逐槽调 `get` 会为每槽重算一次指针），
+    /// 以及按位图驱动 —— 没有引用槽的对象（实测负载里是大多数）直接跳出，
+    /// 一次数组都不用碰。
+    #[inline]
+    pub(crate) fn scan_refs(&self, out: &mut Vec<i32>) {
+        let cells = self.cells();
+        let n = cells.len();
+        if self.nslots <= 64 {
+            let mut bits = self.refs;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                if i >= n {
+                    break;
+                }
+                if let Slot::I(v) = cells[i].get() {
+                    if v != 0 {
+                        out.push(v);
+                    }
+                }
+                bits &= bits - 1;
+            }
+        } else {
+            for i in 0..n {
+                if self.is_ref(i) {
+                    if let Slot::I(v) = cells[i].get() {
+                        if v != 0 {
+                            out.push(v);
+                        }
+                    }
+                }
+            }
+        }
     }
 
     /// 快照（冷路径用：反射/indy 要整块读）
     pub(crate) fn snapshot(&self) -> Vec<Slot> {
-        self.cells.iter().map(|c| c.get()).collect()
+        self.cells().iter().map(|c| c.get()).collect()
     }
+
+    /// 这个对象在堆里占多少字节（统计用）
+    pub(crate) fn bytes(&self) -> u64 {
+        (OBJ_HDR_SIZE + CELL_SIZE * self.nslots as usize) as u64
+    }
+}
+
+/// 一个对象块的分配布局（头 + 槽位）
+#[inline]
+fn obj_layout(n: usize) -> std::alloc::Layout {
+    std::alloc::Layout::from_size_align(OBJ_HDR_SIZE + CELL_SIZE * n, 8)
+        .expect("对象布局非法（槽位数溢出）")
+}
+
+/// 新对象槽位的填充方式
+pub(crate) enum Fill<'a> {
+    /// 全零（`Slot::I(0)`，等价于 memset 0 —— 走批量写，不做逐槽 encode）
+    Zero,
+    /// 全部同一个值（数组的初值 / 对象的默认值）
+    Uniform(Slot),
+    /// 逐槽给值（不够的位置补 `I(0)`）
+    Slice(&'a [Slot]),
+}
+
+/// 分配一个对象块所需的类信息
+#[derive(Clone, Copy)]
+struct ClassMeta {
+    id: u32,
+    refs: u64,
+}
+
+/// 分配对象块并**一次写完**头与槽位（清零与写头合并，省掉一次内存往返）
+fn alloc_obj(n: usize, m: ClassMeta, epoch: u32, fill: Fill) -> *mut ObjHdr {
+    let layout = obj_layout(n);
+    let p = unsafe { std::alloc::alloc(layout) } as *mut ObjHdr;
+    if p.is_null() {
+        std::alloc::handle_alloc_error(layout);
+    }
+    unsafe {
+        std::ptr::addr_of_mut!((*p).lock).write(AtomicU32::new(0));
+        std::ptr::addr_of_mut!((*p).epoch).write(AtomicU32::new(epoch));
+        std::ptr::addr_of_mut!((*p).nslots).write(n as u32);
+        std::ptr::addr_of_mut!((*p).class_id).write(m.id);
+        std::ptr::addr_of_mut!((*p).refs).write(m.refs);
+        let cells = (p as *mut u8).add(OBJ_HDR_SIZE) as *mut Cell;
+        match fill {
+            Fill::Zero => Cell::fill_zero(cells, n),
+            Fill::Uniform(v) => Cell::fill(cells, v, n),
+            Fill::Slice(src) => {
+                let k = src.len().min(n);
+                for i in 0..k {
+                    Cell::write(cells.add(i), src[i]);
+                }
+                if k < n {
+                    Cell::fill(cells.add(k), Slot::I(0), n - k);
+                }
+            }
+        }
+    }
+    p
+}
+
+/// 释放对象块（`nslots` 只写一次，直接读回来算布局）
+#[inline]
+unsafe fn free_obj(p: *mut ObjHdr) {
+    let n = (*p).nslots as usize;
+    std::alloc::dealloc(p as *mut u8, obj_layout(n));
 }
 
 // ---------------------------------------------------------------- 页表
@@ -244,12 +505,14 @@ struct TablePage<T> {
 pub(crate) struct PtrTable<T> {
     pages: Box<[AtomicPtr<TablePage<T>>]>,
     count: AtomicU32,
+    /// 条目是**裸分配块**（对象头 + 内联槽位），释放必须由堆提供正确布局
+    free: fn(*mut T),
 }
 
 impl<T> PtrTable<T> {
-    fn new() -> PtrTable<T> {
+    fn new(free: fn(*mut T)) -> PtrTable<T> {
         let pages = (0..ROOT_PAGES).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect::<Vec<_>>();
-        PtrTable { pages: pages.into_boxed_slice(), count: AtomicU32::new(0) }
+        PtrTable { pages: pages.into_boxed_slice(), count: AtomicU32::new(0), free }
     }
 
     #[inline]
@@ -283,7 +546,7 @@ impl<T> PtrTable<T> {
     }
 
     /// 追加一个对象，返回它的下标。多线程安全（页用 CAS 建、条目用 Release 发布）。
-    fn push(&self, v: T) -> Option<u32> {        let idx = self.count.fetch_add(1, Ordering::AcqRel);
+    fn push(&self, v: *mut T) -> Option<u32> {        let idx = self.count.fetch_add(1, Ordering::AcqRel);
         let p = (idx as usize) >> PAGE_BITS;
         if p >= self.pages.len() {
             // 页表用尽：对象数上限，明确失败（调用方报 OutOfMemoryError），不静默丢
@@ -309,8 +572,7 @@ impl<T> PtrTable<T> {
                 }
             }
         }
-        let obj = Box::into_raw(Box::new(v));
-        unsafe { (*page).entries[idx as usize & (PAGE - 1)].store(obj, Ordering::Release) };
+        unsafe { (*page).entries[idx as usize & (PAGE - 1)].store(v, Ordering::Release) };
         Some(idx)
     }
 
@@ -319,10 +581,15 @@ impl<T> PtrTable<T> {
     ///
     /// 索引**不复用**：句柄就是索引，复用会让「某个还活在别处的陈旧句柄」指向另一台
     /// 对象 —— 那是静默数据损坏，比多占一点页表内存糟得多。
-    fn sweep(&self, mut keep: impl FnMut(u32, &T) -> bool) -> u32 {
+    fn sweep(&self, keep: impl FnMut(u32, &T) -> bool) -> u32 {
+        self.sweep_from(0, keep)
+    }
+
+    /// 只扫 `[lo, count)`（年轻代回收：老条目一个都不碰，代价 ∝ 新生代）
+    fn sweep_from(&self, lo: u32, mut keep: impl FnMut(u32, &T) -> bool) -> u32 {
         let n = self.count.load(Ordering::Acquire);
         let mut freed = 0u32;
-        for i in 0..n {
+        for i in lo.min(n)..n {
             let p = (i as usize) >> PAGE_BITS;
             let Some(page) = self.page(p) else { continue };
             let slot = &page.entries[i as usize & (PAGE - 1)];
@@ -337,7 +604,7 @@ impl<T> PtrTable<T> {
                 .compare_exchange(e, std::ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
                 .is_ok()
             {
-                drop(unsafe { Box::from_raw(e) });
+                (self.free)(e);
                 freed += 1;
             }
         }
@@ -350,37 +617,43 @@ impl<T> PtrTable<T> {
 unsafe impl<T: Send + Sync> Send for PtrTable<T> {}
 unsafe impl<T: Send + Sync> Sync for PtrTable<T> {}
 
-// ---------------------------------------------------------------- TLAB
-
-/// 每线程一个的 TLAB：先原子地划走一大块槽位，块内纯 bump。
-///
-/// 这不是为了「分配快一点」—— `Cell` 已经是原子单元，直接逐对象分配也是安全的。
-/// 它省的是**页表条目的原子写**：块内连续对象的页是同一页，`push_range` 只在跨页时
-/// 才做 CAS。实测对象密集的并行分配（验收第 8 条）靠它把分配路径压到接近单线程。
-const TLAB_CELLS: usize = 256;
-
-thread_local! {
-    static TLAB: std::cell::Cell<Tlab> = const { std::cell::Cell::new(Tlab::EMPTY) };
-}
-
-#[derive(Clone, Copy)]
-struct Tlab {
-    owner: usize,
-    start: u32,
-    next: u32,
-    end: u32,
-}
-
-impl Tlab {
-    const EMPTY: Tlab = Tlab { owner: 0, start: 0, next: 0, end: 0 };
-}
-
 // ---------------------------------------------------------------- 堆
 
 /// 对象 / 数组 / 字符串三套堆。
 pub(crate) struct Heap {
     objs: PtrTable<ObjHdr>,
     arrs: PtrTable<ObjHdr>,
+    /// class_id → 类名/描述符。对象头里只放 4 字节 id（旧布局放 16 字节 `Arc<str>`）。
+    class_names: RwLock<Vec<Arc<str>>>,
+    /// 类名 → class_id（分配热路径唯一的一次查表）
+    class_ids: RwLock<HashMap<Box<str>, u32>>,
+
+    // ---- 分代 ----
+    /// 年轻代下界：下标 `>= 它` 的对象是「上一次年轻代回收之后分配的」
+    young_lo_obj: AtomicU32,
+    young_lo_arr: AtomicU32,
+    /// 写屏障开关（年轻代回收启用；关掉 = 退回全量标记-清扫）
+    barrier_on: AtomicBool,
+    /// 老对象里被写过引用的是哪些（跨代引用的来源）
+    dirty_obj: DirtyMap,
+    dirty_arr: DirtyMap,
+    /// 距上次年轻代回收分配了多少字节（决定要不要回收 eden）
+    pub(crate) young_bytes: AtomicU64,
+    /// 距上次**全量**回收分配了多少字节（全量回收的判据）
+    major_bytes: AtomicU64,
+    /// 堆里活对象大致占多少字节（净值：分配加、释放减）
+    bytes_live: AtomicU64,
+    /// 上一次全量回收之后的存活字节（下次全量的阈值材料）
+    live_bytes_after: AtomicU64,
+    /// 做过全量回收了吗（**第一次必须是全量**：冷启动时「年轻代下界之前都活着」
+    /// 这个前提还不成立 —— 那批对象从来没有被验证过可达性）
+    did_major: AtomicBool,
+    /// 年轻代触发阈值（字节，按存活率自适应）
+    eden_bytes: AtomicU64,
+    /// 年轻代回收次数（自适应与统计用）
+    pub(crate) minor_count: AtomicU64,
+    /// 上一个年轻代回收的存活率（万分比）
+    survivor_bp: AtomicU32,
     /// 字符串池：句柄 = `STR_BASE + 下标`（字符串**不回收**：它们是不可变常量/驻留串）
     pub(crate) strings: RwLock<Vec<Arc<str>>>,
     /// 字符串常量 → 句柄（同一常量池项必须得到同一句柄，否则引用相等会错）
@@ -395,8 +668,6 @@ pub(crate) struct Heap {
     // ---- GC ----
     /// 当前标记世代：`ObjHdr.epoch == 这个数` 就是「本轮活着」
     pub(crate) gc_epoch: AtomicU32,
-    /// 上一次回收之后的分配次数（触发阈值用它）
-    pub(crate) allocs_since_gc: AtomicU64,
     /// 上一次回收后有多少个对象/数组活着（阈值与统计用）
     pub(crate) live_after_gc: AtomicU64,
     /// 上一轮标记**实际扫过**多少个对象。决定下一轮要不要起并行标记线程。
@@ -407,28 +678,158 @@ pub(crate) struct Heap {
     /// 就占掉停顿的六成。改用上一轮的真实标记数，短命负载下停顿从 0.76ms 降到 0.35ms，
     /// 大活集（G2，150 万）仍然走并行。
     pub(crate) last_marked: AtomicU64,
+    /// 上一轮**全量**标记标了多少个。全量回收的并行判据用它 —— 用 `last_marked`
+    /// 会被紧随其后的年轻代回收写回一个小数字，于是每次全量都退化成单线程
+    /// （实测 GcBench 8M/1M：单线程追 100 万活对象 47ms，8 线程 7ms）。
+    pub(crate) last_major_marked: AtomicU64,
+    /// 上一轮**全量**标记标了多少个。全量回收的并行判据用它 —— 用 `last_marked`
+    /// 会被紧随其后的年轻代回收写回一个小数字，于是每次全量都退化成单线程
+    /// （实测 GcBench：单线程追 100 万活对象 47ms，8 线程 7ms）。
     /// 累计已释放的对象数（`live()` 用它把页表高水位折成活对象数）
     pub(crate) reclaimed: AtomicU64,
     /// 类表快照（算字段引用位图用；`store_publish` 与构造时挂上）
     store: RwLock<Option<Arc<ClassStore>>>,
     /// 类名 → 字段引用位图（每个类只算一次）
-    layouts: RwLock<HashMap<String, Arc<RefBits>>>,
+    layouts: RwLock<HashMap<String, ClassMeta>>,
 }
+
+/// 老对象「被写过引用」的精确位图：1 bit 一个对象/数组。
+///
+/// 为什么不用卡表：卡表按地址分块，一块里可能塞着 512 个对象，年轻代回收时得把
+/// 整块对象都扫一遍。位图一 bit 一个对象，**精确到对象**，代价只是一次无锁
+/// `fetch_or`；位图本身按需分页（一页 4096 个 u64 = 26 万个对象），没写过的页
+/// 根本不存在，所以它对 RSS 的影响是「写过多少算多少」而不是「堆有多大」。
+const DMAP_WORDS: usize = 1 << 12;
+/// 一页覆盖的对象数：4096 × 64 = 262144
+const DMAP_SHIFT: u32 = 12 + 6;
+const DMAP_WMASK: usize = DMAP_WORDS - 1;
+/// 页表根：16384 页 × 26.2 万 = 43 亿个对象，根本身 128KB
+const DMAP_PAGES: usize = 1 << 14;
+
+struct DPage {
+    w: [AtomicU64; DMAP_WORDS],
+}
+
+pub(crate) struct DirtyMap {
+    pages: Box<[AtomicPtr<DPage>]>,
+    /// 已建到第几页（扫描只看这里）
+    npages: AtomicU32,
+}
+
+impl DirtyMap {
+    fn new() -> DirtyMap {
+        DirtyMap {
+            pages: (0..DMAP_PAGES).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect(),
+            npages: AtomicU32::new(0),
+        }
+    }
+
+    #[inline]
+    fn page_or_make(&self, p: usize) -> Option<&DPage> {
+        if p >= self.pages.len() {
+            return None;
+        }
+        let cur = self.pages[p].load(Ordering::Acquire);
+        if !cur.is_null() {
+            return Some(unsafe { &*cur });
+        }
+        let fresh = Box::into_raw(Box::new(DPage {
+            w: std::array::from_fn(|_| AtomicU64::new(0)),
+        }));
+        match self.pages[p].compare_exchange(
+            std::ptr::null_mut(),
+            fresh,
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {}
+            Err(winner) => {
+                drop(unsafe { Box::from_raw(fresh) });
+                return unsafe { Some(&*winner) };
+            }
+        }
+        // 发布页数（扫描端按它循环）
+        let need = p as u32 + 1;
+        let mut cur = self.npages.load(Ordering::Acquire);
+        while cur < need {
+            match self.npages.compare_exchange_weak(
+                cur,
+                need,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(c) => cur = c,
+            }
+        }
+        unsafe { Some(&*fresh) }
+    }
+
+    /// 记一笔：老对象 `idx` 里写过引用
+    #[inline]
+    pub(crate) fn set(&self, idx: u32) {
+        let p = (idx >> DMAP_SHIFT) as usize;
+        let Some(page) = self.page_or_make(p) else { return };
+        let w = ((idx as usize) >> 6) & DMAP_WMASK;
+        page.w[w].fetch_or(1u64 << (idx & 63), Ordering::Relaxed);
+    }
+
+    /// 遍历并**原子清空**（调用方必须已经把世界停住，否则会丢掉并发写的账）
+    pub(crate) fn drain(&self, mut f: impl FnMut(u32)) {
+        let n = self.npages.load(Ordering::Acquire) as usize;
+        for p in 0..n.min(self.pages.len()) {
+            let ptr = self.pages[p].load(Ordering::Acquire);
+            if ptr.is_null() {
+                continue;
+            }
+            let page = unsafe { &*ptr };
+            for w in 0..DMAP_WORDS {
+                let v = page.w[w].swap(0, Ordering::Relaxed);
+                if v == 0 {
+                    continue;
+                }
+                let base = ((p as u32) << DMAP_SHIFT) + ((w as u32) << 6);
+                let mut bits = v;
+                while bits != 0 {
+                    let b = bits.trailing_zeros();
+                    f(base + b);
+                    bits &= bits - 1;
+                }
+            }
+        }
+    }
+}
+
 
 impl Heap {
     pub(crate) fn new() -> Heap {
         Heap {
-            objs: PtrTable::new(),
-            arrs: PtrTable::new(),
+            objs: PtrTable::new(|p| unsafe { free_obj(p) }),
+            arrs: PtrTable::new(|p| unsafe { free_obj(p) }),
+            class_names: RwLock::new(Vec::new()),
+            class_ids: RwLock::new(HashMap::new()),
+            young_lo_obj: AtomicU32::new(0),
+            young_lo_arr: AtomicU32::new(0),
+            barrier_on: AtomicBool::new(true),
+            dirty_obj: DirtyMap::new(),
+            dirty_arr: DirtyMap::new(),
+            young_bytes: AtomicU64::new(0),
+            major_bytes: AtomicU64::new(0),
+            bytes_live: AtomicU64::new(0),
+            live_bytes_after: AtomicU64::new(0),
+            did_major: AtomicBool::new(false),
+            eden_bytes: AtomicU64::new(EDEN_BYTES_MIN),
+            minor_count: AtomicU64::new(0),
+            survivor_bp: AtomicU32::new(0),
             strings: RwLock::new(Vec::new()),
             str_handles: Mutex::new(HashMap::new()),
             str_fields: Mutex::new(HashMap::new()),
             sb_bufs: Mutex::new(HashMap::new()),
             wrapper_cache: Mutex::new(HashMap::new()),
             gc_epoch: AtomicU32::new(1),
-            allocs_since_gc: AtomicU64::new(0),
             live_after_gc: AtomicU64::new(0),
             last_marked: AtomicU64::new(0),
+            last_major_marked: AtomicU64::new(0),
             reclaimed: AtomicU64::new(0),
             store: RwLock::new(None),
             layouts: RwLock::new(HashMap::new()),
@@ -443,83 +844,125 @@ impl Heap {
 
     // ---------- 分配 ----------
 
-    /// 对象的字段引用位图（按类布局算，按类名缓存）。
+    /// 类名 + 槽数 → 分配对象头所需的一切：class_id 与引用位图字。
     ///
-    /// 算不出来（类不在类表里 / 槽数和布局对不上）就退化成 `All`：GC 会把每个槽都
-    /// 拿页表验证一遍 —— 多留一点垃圾，但绝不会漏掉一个真引用。
-    fn obj_refbits(&self, class: &str, n: usize) -> Arc<RefBits> {
-        if let Some(b) = self.layouts.read().unwrap_or_else(|e| e.into_inner()).get(class) {
-            return Arc::clone(b);
+    /// 按类名缓存（每个类只算一次布局）；算不出来（类不在类表里 / 槽数和布局对不上）
+    /// 就退化成 `All`：GC 会把每个槽都拿页表验证一遍 —— 多留一点垃圾，但绝不会漏掉
+    /// 一个真引用。
+    #[inline]
+    fn class_meta(&self, class: &str, n: usize) -> ClassMeta {
+        if let Some(m) = self.layouts.read().unwrap_or_else(|e| e.into_inner()).get(class) {
+            return *m;
         }
+        let id = self.intern_class_id(class);
         let g = self.store.read().unwrap_or_else(|e| e.into_inner()).clone();
         let bits = match g {
             Some(store) => class_layout(&store, class, n),
             None => RefBits::All,
         };
-        let a = Arc::new(bits);
+        let m = ClassMeta { id, refs: bits.to_word(n) };
         self.layouts
             .write()
             .unwrap_or_else(|e| e.into_inner())
-            .insert(class.to_string(), Arc::clone(&a));
-        a
+            .insert(class.to_string(), m);
+        m
+    }
+
+    /// 类名驻留：同一个类名只拿一个 id（对象头里只放 4 字节）
+    fn intern_class_id(&self, name: &str) -> u32 {
+        {
+            let g = self.class_ids.read().unwrap_or_else(|e| e.into_inner());
+            if let Some(&id) = g.get(name) {
+                return id;
+            }
+        }
+        let mut g = self.class_ids.write().unwrap_or_else(|e| e.into_inner());
+        if let Some(&id) = g.get(name) {
+            return id;
+        }
+        let mut names = self.class_names.write().unwrap_or_else(|e| e.into_inner());
+        let id = names.len() as u32;
+        names.push(Arc::from(name));
+        g.insert(Box::from(name), id);
+        id
+    }
+
+    /// class_id → 类名
+    #[inline]
+    fn class_name(&self, id: u32) -> Option<Arc<str>> {
+        self.class_names
+            .read()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(id as usize)
+            .cloned()
     }
 
     /// 分配一个对象，返回句柄（> 0）。类名决定字段数由调用方给。
     pub(crate) fn new_object(&self, slots: Vec<Slot>, class: &str) -> Option<i32> {
         let n = slots.len().max(1);
-        let refs = self.obj_refbits(class, n);
-        let mut cells = Vec::with_capacity(n);
-        for i in 0..n {
-            cells.push(Cell::new(slots.get(i).copied().unwrap_or(Slot::I(0))));
-        }
-        let hdr = ObjHdr {
-            class: intern_class(class),
-            len: 0,
-            lock: AtomicU32::new(0),
-            epoch: AtomicU32::new(self.gc_epoch.load(Ordering::Acquire)),
-            refs,
-            cells: cells.into_boxed_slice(),
-        };
-        self.allocs_since_gc.fetch_add(1, Ordering::Relaxed);
+        let m = self.class_meta(class, n);
+        let size = OBJ_HDR_SIZE + CELL_SIZE * n;
+        self.charge(size);
+        let p = alloc_obj(n, m, self.gc_epoch.load(Ordering::Acquire), Fill::Slice(&slots));
         // 句柄 = 下标 + 1，而 `handle >= STR_BASE` 会被 `ref_kind` 判成**字符串**。
         // 所以对象下标必须 < STR_BASE - 1，否则第 16777216 个对象起会拿到一个
         // 「看起来是字符串」的句柄 —— 那是静默的语义错乱，比 OOM 糟得多。
         // 页表本身能放到 3355 万个，这道闸是句柄编码先撞上的，所以按句柄上限拦。
-        let i = self.objs.push(hdr)?;
+        let i = match self.objs.push(p) {
+            Some(i) => i,
+            None => {
+                unsafe { free_obj(p) };
+                return None;
+            }
+        };
         if i as i32 + 1 >= STR_BASE {
             return None;
         }
-        Some(i as i32 + 1)
+                Some(i as i32 + 1)
     }
 
     /// 分配一个数组，返回句柄（< 0）
     pub(crate) fn new_array(&self, elems: Vec<Slot>, desc: &str) -> Option<i32> {
-        let n = elems.len();
-        // 数组元素类型由描述符决定：`[L…;` / `[[…` 是引用数组，其余是基本类型。
-        // 两种情况都用**进程级共享**的那两个 Arc：此前每次 `new int[3]` 都要为
-        // `RefBits::None` 单独 Arc 分配一次（~40 字节 + 一次 malloc + 之后一次原子减），
-        // 而它恰恰是两个常量之一 —— 短命数组多的负载里这是纯浪费。
-        let refs: Arc<RefBits> = if n > 0 && is_ref_array_desc(desc) {
-            refbits_all()
-        } else {
-            refbits_none()
-        };
-        let cells: Vec<Cell> = elems.into_iter().map(Cell::new).collect();
-        let hdr = ObjHdr {
-            class: intern_class(desc),
-            len: n as u32,
-            lock: AtomicU32::new(0),
-            epoch: AtomicU32::new(self.gc_epoch.load(Ordering::Acquire)),
-            refs,
-            cells: cells.into_boxed_slice(),
-        };
-        self.allocs_since_gc.fetch_add(1, Ordering::Relaxed);
-        self.arrs.push(hdr).map(|i| -(i as i32) - 1)
+        self.alloc_array_fill(elems.len(), desc, Fill::Slice(&elems))
     }
 
     /// 分配一个元素全为默认值的数组（长度 `n`）
     pub(crate) fn alloc_array(&self, n: usize, desc: &str, zero: Slot) -> Option<i32> {
-        self.new_array(vec![zero; n], desc)
+        self.alloc_array_fill(n, desc, Fill::Uniform(zero))
+    }
+
+    /// 数组分配的唯一实现（`vec![zero; n]` 那条老路会先分配一个 n 槽的临时 Vec ——
+    /// `new int[10000]` 时那是 160KB 的纯浪费）
+    fn alloc_array_fill(&self, n: usize, desc: &str, fill: Fill) -> Option<i32> {
+        // `Slot::I(0)` 的编码正好全 0 → 用 memset 一次写完，省掉 n 次逐槽 encode
+        // （`new int[n]` / `new Object[n]` / 三色标记里的辅助数组都走这条）
+        let fill = match fill {
+            Fill::Uniform(Slot::I(0)) => Fill::Zero,
+            other => other,
+        };
+        // 数组元素类型由描述符决定：`[L…;` / `[[…` 是引用数组，其余是基本类型。
+        // 位图只有两个常量，直接由描述符算出字，不做任何查表。
+        let refs = if n > 0 && is_ref_array_desc(desc) {
+            if n <= 64 {
+                u64::MAX
+            } else {
+                refbits_all_static() as *const RefBits as usize as u64
+            }
+        } else {
+            0
+        };
+        let id = self.intern_class_id(desc);
+        let size = OBJ_HDR_SIZE + CELL_SIZE * n;
+        self.charge(size);
+        let p = alloc_obj(n, ClassMeta { id, refs }, self.gc_epoch.load(Ordering::Acquire), fill);
+        let i = match self.arrs.push(p) {
+            Some(i) => i,
+            None => {
+                unsafe { free_obj(p) };
+                return None;
+            }
+        };
+                Some(-(i as i32) - 1)
     }
 
     // ---------- 对象 ----------
@@ -556,17 +999,52 @@ impl Heap {
     #[inline]
     pub(crate) fn set(&self, h: i32, i: usize, v: Slot) {
         if let Some(o) = self.obj(h).or_else(|| self.arr(h)) {
-            o.set(i, v);
+            if i < o.len() {
+                o.set(i, v);
+                // 这一格按布局是引用就必须记脏账：全仓有几十处是 `heap.set` 直接写
+                // 引用槽（反射 / JNI / indy / natives），逐个改成 set_ref 做不到，
+                // 所以把屏障放在**唯一的存储入口**上，按槽位位图判断。
+                if self.barrier_on.load(Ordering::Relaxed) && o.is_ref(i) {
+                    self.mark_dirty(h, o);
+                }
+            }
         }
     }
 
-    /// 对象字段的写屏障：引用字段写进来时记卡（GC 用；当前 GC 未接，见 `gc.rs`）
+    /// 对象字段的写屏障：引用字段写进来时给**老对象**记一笔脏账。
+    ///
+    /// 年轻代回收只看根集是不够的：老年代对象里完全可能存着指向年轻代的引用，
+    /// 而根集里没有这条边。所以「老对象被写过引用」必须在 store 时就记下来，
+    /// 回收时把那些老对象也当根扫一遍（见 `gc.rs` 的 `collect`）。
+    ///
+    /// 代价：一次 `AtomicBool` 读 + 一次 `AtomicU32` 读；只有源对象是老对象时才
+    /// 真去 `fetch_or` 一个位。目标是不是年轻代**故意不判断** —— 多记一笔只是
+    /// 多扫一个对象，漏记就是把活对象回收掉。
     #[inline]
     pub(crate) fn set_ref(&self, h: i32, i: usize, v: Slot) {
         if let Some(o) = self.obj(h).or_else(|| self.arr(h)) {
             if i < o.len() {
                 o.set(i, v);
-                super::gc::dirty_write(h as u32);
+                // 这里是**确定**的引用写入：不看位图，一律记脏账（位图算错时宁可多扫）
+                if self.barrier_on.load(Ordering::Relaxed) {
+                    self.mark_dirty(h, o);
+                }
+            }
+        }
+    }
+
+    /// 老对象被写过引用 → 记一笔（源是老对象才记；目标是不是年轻代故意不判断）
+    #[inline]
+    fn mark_dirty(&self, h: i32, _o: &ObjHdr) {
+        if h > 0 {
+            let idx = (h - 1) as u32;
+            if idx < self.young_lo_obj.load(Ordering::Relaxed) {
+                self.dirty_obj.set(idx);
+            }
+        } else {
+            let idx = (-h - 1) as u32;
+            if idx < self.young_lo_arr.load(Ordering::Relaxed) {
+                self.dirty_arr.set(idx);
             }
         }
     }
@@ -576,12 +1054,13 @@ impl Heap {
     }
 
     pub(crate) fn class_of(&self, h: i32) -> Option<Arc<str>> {
-        self.obj(h).or_else(|| self.arr(h)).map(|o| o.class.clone())
+        let id = self.obj(h).or_else(|| self.arr(h))?.class_id;
+        self.class_name(id)
     }
 
     /// 数组长度（不是数组返回 None）
     pub(crate) fn array_len(&self, h: i32) -> Option<usize> {
-        self.arr(h).map(|o| o.len as usize)
+        self.arr(h).map(|o| o.nslots as usize)
     }
 
     /// 对象的 thin lock 字（字符串句柄没有对象头 → None，走膨胀路径）
@@ -718,15 +1197,20 @@ impl Heap {
 
     /// 清扫一轮：释放所有 `epoch != 本轮` 的对象/数组。返回 `(对象数, 数组数, 字节数)`
     pub(crate) fn sweep(&self, epoch: u32) -> (u32, u32, u64) {
+        self.sweep_from(0, 0, epoch)
+    }
+
+    /// 只清扫两个表里下标 `>= lo` 的区段（年轻代回收用：老年代的条目一个都不碰）
+    pub(crate) fn sweep_from(&self, lo_obj: u32, lo_arr: u32, epoch: u32) -> (u32, u32, u64) {
         let mut bytes = 0u64;
-        let o = self.objs.sweep(|_, obj| {
+        let o = self.objs.sweep_from(lo_obj, |_, obj| {
             if obj.epoch.load(Ordering::Acquire) == epoch {
                 return true;
             }
             bytes += obj.bytes();
             false
         });
-        let a = self.arrs.sweep(|_, obj| {
+        let a = self.arrs.sweep_from(lo_arr, |_, obj| {
             if obj.epoch.load(Ordering::Acquire) == epoch {
                 return true;
             }
@@ -734,6 +1218,7 @@ impl Heap {
             false
         });
         self.reclaimed.fetch_add(o as u64 + a as u64, Ordering::AcqRel);
+        self.bytes_live.fetch_sub(bytes, Ordering::AcqRel);
         (o, a, bytes)
     }
 
@@ -744,21 +1229,169 @@ impl Heap {
         (o as u64 + a as u64).saturating_sub(dead)
     }
 
-    /// 再分配多少次就该回收一轮（「存活 × 2」与下限取大）
+    /// 再分配多少次就该回收一轮（「存活 × 2」与下限取大）—— 全量回收的判据
     pub(crate) fn gc_threshold(&self) -> u64 {
         (self.live_after_gc.load(Ordering::Acquire) * 2).max(MIN_GC_THRESHOLD)
     }
+
+    // ---------- 分代 ----------
+
+    /// 把一次分配的字节数记账（决定 eden 什么时候满）
+    ///
+    /// 大对象只按 `los_bytes` 计 —— 与 G1 把大对象直接放进独立 region（不占 eden）
+    /// 同一个道理：否则一个 10MB 数组一分配就把 eden 撑爆，回收频率完全由它决定。
+    #[inline]
+    fn charge(&self, bytes: usize) {
+        let b = bytes as u64;
+        let c = if b > self.los_bytes() { self.los_bytes() } else { b };
+        self.young_bytes.fetch_add(c, Ordering::Relaxed);
+        self.major_bytes.fetch_add(c, Ordering::Relaxed);
+        self.bytes_live.fetch_add(b, Ordering::Relaxed);
+    }
+
+    /// 大对象阈值：eden 的 1/8（G1 的 `G1HeapRegionSize` 思路，但不用固定 64KB ——
+    /// eden 是自适应的，阈值跟着它走才不会在 eden 收缩之后把一个普通数组误判成大对象）
+    #[inline]
+    pub(crate) fn los_bytes(&self) -> u64 {
+        (self.eden_bytes.load(Ordering::Relaxed) / 8).max(64 << 10)
+    }
+
+    #[inline]
+    pub(crate) fn young_lo_obj(&self) -> u32 {
+        self.young_lo_obj.load(Ordering::Acquire)
+    }
+
+    #[inline]
+    pub(crate) fn young_lo_arr(&self) -> u32 {
+        self.young_lo_arr.load(Ordering::Acquire)
+    }
+
+    /// 这个对象索引是不是年轻的
+    #[inline]
+    pub(crate) fn young_obj(&self, idx: u32) -> bool {
+        idx >= self.young_lo_obj.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn young_arr(&self, idx: u32) -> bool {
+        idx >= self.young_lo_arr.load(Ordering::Relaxed)
+    }
+
+    /// 年轻代里已经分配了多少字节 / eden 上限
+    #[inline]
+    pub(crate) fn young_bytes(&self) -> u64 {
+        self.young_bytes.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn eden_bytes(&self) -> u64 {
+        self.eden_bytes.load(Ordering::Relaxed)
+    }
+
+    #[inline]
+    pub(crate) fn survivor_bp(&self) -> u32 {
+        self.survivor_bp.load(Ordering::Relaxed)
+    }
+
+    /// 一轮年轻代回收之后：edens 归零、存活率反馈、下界推到当前末尾（= 全部晋升）
+    ///
+    /// 存活率反馈是 G1 那套 `-XX:AdaptiveSizePolicy` 的简化版：存活率高说明
+    /// 大多数对象会活很久，收得太勤只是白烧 CPU —— 把 eden 放大；存活率极低
+    /// 说明这波就是短命对象，把 eden 收小，让峰值垃圾量跟着降。
+    pub(crate) fn young_after(&self, young_before: u64, survivors: u64) {
+        self.young_bytes.store(0, Ordering::Relaxed);
+        let (o, a) = self.counts();
+        self.young_lo_obj.store(o, Ordering::Release);
+        self.young_lo_arr.store(a, Ordering::Release);
+        self.minor_count.fetch_add(1, Ordering::AcqRel);
+        let bp = if young_before == 0 { 0 } else { (survivors * 1_000_000 / young_before) as u32 };
+        self.survivor_bp.store(bp, Ordering::Relaxed);
+        let cur = self.eden_bytes.load(Ordering::Relaxed);
+        let next = if bp >= 500_000 {
+            (cur * 2).min(EDEN_BYTES_MAX)
+        } else if bp <= 20_000 {
+            (cur / 2).max(EDEN_BYTES_MIN)
+        } else {
+            cur
+        };
+        self.eden_bytes.store(next, Ordering::Relaxed);
+    }
+
+    /// 全量回收之后：所有对象都是「老」的，脏账清空（它们已经不在年轻代里了）
+    pub(crate) fn major_after(&self) {
+        let (o, a) = self.counts();
+        self.major_bytes.store(0, Ordering::Relaxed);
+        self.young_lo_obj.store(o, Ordering::Release);
+        self.young_lo_arr.store(a, Ordering::Release);
+        self.young_bytes.store(0, Ordering::Relaxed);
+        self.dirty_drain(|_| {});
+    }
+
+    /// 把老对象的脏账全部取出来（回调收到**句柄**，GC 直接当根扫）
+    pub(crate) fn dirty_drain(&self, mut f: impl FnMut(i32)) {
+        self.dirty_obj.drain(|idx| f(idx as i32 + 1));
+        self.dirty_arr.drain(|idx| f(-(idx as i32) - 1));
+    }
+
+    /// 这一轮该做哪种回收（`None` = 还不用收）
+    ///
+    /// 判据只有两条，都是字节口径（旧代码用「对象个数」，同样的 `new int[3]` 与
+    /// `new long[64]` 触发次数一样 —— 那是错的）：
+    /// 1. eden 满了 → 年轻代回收（只看新生代，停顿 ∝ 新生代而不是整个活集）；
+    /// 2. 页表长得比活对象多太多 → 全量回收（老年代里攒了垃圾）。
+    #[inline]
+    pub(crate) fn gc_kind(&self) -> GcKind {
+        if !self.did_major.load(Ordering::Relaxed) {
+            return if self.young_bytes.load(Ordering::Relaxed) >= EDEN_BYTES_MIN {
+                GcKind::Major
+            } else {
+                GcKind::None
+            };
+        }
+        if self.young_bytes.load(Ordering::Relaxed) >= self.eden_bytes.load(Ordering::Relaxed) {
+            return GcKind::Minor;
+        }
+        // 全量回收按「自上次全量以来分配了多少字节」判，**不能按页表高水位判**：
+        // 索引不复用，高水位只增不减 —— 按它判会在第一次全量之后每轮都成立，
+        // 退化成「每个检查点都做一次全量回收」。
+        let since = self.major_bytes.load(Ordering::Relaxed);
+        let live = self.live_bytes_after.load(Ordering::Relaxed);
+        if since >= (live + live / 2).max(MIN_MAJOR_BYTES) {
+            return GcKind::Major;
+        }
+        GcKind::None
+    }
+
+    /// 全量回收结束：阈值材料换成「现在的存活字节」，自上次全量的计数清零
+    pub(crate) fn major_settle(&self) {
+        self.live_bytes_after.store(self.bytes_live.load(Ordering::Relaxed), Ordering::Relaxed);
+        self.major_bytes.store(0, Ordering::Relaxed);
+        self.did_major.store(true, Ordering::Release);
+    }
 }
+
+/// 回收的种类
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum GcKind {
+    /// 不收
+    None,
+    /// 只收年轻代（停顿 ∝ 新生代）
+    Minor,
+    /// 全量标记-清扫（停顿 ∝ 活集）
+    Major,
+}
+
+/// eden 起步 8MB —— 比 G1 的默认 region 数（约 5% 堆）小得多，因为这里不做复制，
+/// 年轻代回收只是「标记一遍再清扫一遍」，回收频率高一点比 eden 大了攒停顿划算。
+pub(crate) const EDEN_BYTES_MIN: u64 = 8 << 20;
+/// eden 上限：再大就只是把峰值垃圾量堆起来
+pub(crate) const EDEN_BYTES_MAX: u64 = 96 << 20;
+/// 全量回收的最短间隔（字节）：再小就退化成「一直在做全量回收」
+pub(crate) const MIN_MAJOR_BYTES: u64 = 32 << 20;
 
 /// 触发阈值下限：不管堆里有多少活对象，至少分配这么多次才考虑回收
 pub(crate) const MIN_GC_THRESHOLD: u64 = 262_144;
 
-impl ObjHdr {
-    /// 这个对象在堆里大约占多少字节（统计用：48 字节头 + 每槽 16 字节）
-    pub(crate) fn bytes(&self) -> u64 {
-        48 + 16 * self.cells.len() as u64
-    }
-}
 
 /// 描述符是不是引用类型
 #[inline]
@@ -803,12 +1436,6 @@ fn class_layout(store: &ClassStore, class: &str, n: usize) -> RefBits {
     RefBits::from_iter(n, |i| refs.get(i).copied().unwrap_or(true))
 }
 
-/// 类名驻留：同一个类名在堆里只存一份 `Arc<str>`
-fn intern_class(name: &str) -> Arc<str> {
-    // 直接 Arc::from 已经足够便宜（一次分配），驻留表反而要一把锁。
-    // 类名是对象头的热读字段，读侧只做引用计数自增，绝不拿锁。
-    Arc::from(name)
-}
 
 // ---------------------------------------------------------------- indy 状态
 

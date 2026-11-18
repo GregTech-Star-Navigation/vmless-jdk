@@ -44,6 +44,7 @@ mod reflect;
 mod rt;
 mod shared;
 mod slot;
+pub mod stacktrace;
 mod thread;
 
 pub use bridge::{
@@ -300,12 +301,86 @@ impl Vm {
         // 不先把它跑起来，`initPhase1` 里的 `JavaLangReflectAccess.getRoot` 会以**空接收者**
         // 被调用（"找不到方法 getRoot … 接收者 null"），于是 `System.out/err/in` 一个都装不上 ——
         // 之后任何 `System.err.printf` 直接 NPE。这一步必须在 initPhase1 之前。
-        let _ = self.ensure_init("jdk/internal/reflect/ReflectionFactory");
+        // `SharedSecrets.javaLangReflectAccess` 的安装点在 **`AccessibleObject.<clinit>`**：
+        //   static { SharedSecrets.setJavaLangReflectAccess(new ReflectAccess()); }
+        // 不先跑它，`initPhase1` 里第一次反射访问就会拿到 null 接收者：
+        //   `JavaLangReflectAccess.getExecutableSharedParameterTypes` → NPE
+        // → `setOut0` 根本没跑到 → **`System.out/err/in` 全 null**。
+        // 而 `println` 被 exec 按方法名拦截，所以从 println 完全看不出来，
+        // 只有 `System.out.print/printf` 或把 `System.out` 传出去才 NPE。
+        // **先装 `SharedSecrets.javaLangReflectAccess`，再初始化任何反射类。**
+        //
+        // 顺序陷阱（实测）：
+        //   `AccessibleObject.<clinit>` = `SharedSecrets.setJavaLangReflectAccess(new ReflectAccess())`，
+        //   而 `new ReflectAccess()` 会触发 `ReflectAccess.<clinit>` → 拿到
+        //   `Reflection.getReflectionFactory()` → **构造 `ReflectionFactory` 实例**，
+        //   而它的构造器是 `this.langReflectAccess = SharedSecrets.getJavaLangReflectAccess();`
+        //   —— 此刻 secret 还是 null，于是那个单例**永久缓存 null**，
+        //   之后所有 `getRoot`/`copyMethod` 都以空接收者调用 →
+        //   `System.initPhase1` 中断 → **`setOut0` 没跑到 → `System.out/err/in` 全 null**。
+        //   而 `println` 被 exec 按方法名拦截，所以从 println 完全看不出来；
+        //   只有 `System.out.print/printf` 或把 `System.out` 传出去才 NPE。
+        //
+        // 所以这里在任何 `ensure_init` 之前就直接把 secret 塞进去。
+        // 先确保类已加载 —— `has_class` 为假时下面的安装会被整段跳过（实测就是这个原因：
+        // 那段被跳过 → `AccessibleObject.<clinit>` 才装 secret，但 `ReflectionFactory` 单例
+        // 已经在它之前构造完并缓存了 null）。
+        let _ = self.ensure_class_loaded("java/lang/reflect/ReflectAccess");
+        if self.store.has_class("java/lang/reflect/ReflectAccess") {
+            let key = ("jdk/internal/access/SharedSecrets".to_string(),
+                       "javaLangReflectAccess".to_string());
+            let has = crate::vm::shared::lk(&self.sh.statics)
+                .get(&key).copied().unwrap_or(Slot::I(0)).as_i32() > 0;
+            if !has {
+                let h = self.alloc_vmobj("java/lang/reflect/ReflectAccess");
+                if h > 0 {
+                    crate::vm::shared::lk(&self.sh.statics).insert(key, Slot::I(h));
+                }
+            }
+        }
+        for c in ["java/lang/reflect/AccessibleObject", "jdk/internal/reflect/ReflectionFactory"] {
+            if let Err(e) = self.ensure_init(c) {
+                if std::env::var_os("VMLESS_INIT_TRACE").is_some() {
+                    eprintln!("[init] {c}.<clinit> 失败: {}", e.msg);
+                }
+            }
+        }
+        if std::env::var_os("VMLESS_INIT_TRACE").is_some() {
+            let sec = crate::vm::shared::lk(&self.sh.statics)
+                .get(&("jdk/internal/access/SharedSecrets".to_string(),
+                       "javaLangReflectAccess".to_string()))
+                .copied()
+                .unwrap_or(Slot::I(0))
+                .as_i32();
+            eprintln!("[init] 预初始化后 javaLangReflectAccess={sec}");
+        }
         if self.store.resolve_method("java/lang/System", "initPhase1", "()V").is_some() {
             self.ensure_init("java/lang/System")?;
             if let Some((ci, mi)) = self.store.resolve_method("java/lang/System", "initPhase1", "()V") {
-                // 失败不致命：有些 JDK 版本里它有前置条件。后面真出错会以更具体的错误暴露。
-                let _ = self.execute(ci, mi, "()V", &[], false);
+                // `initPhase1` 里 `setOut0/setErr0/setIn0` 一旦没跑到，`System.out` 就是 null ——
+                // 而 `println` 被 `exec` 按方法名拦截，所以**从 println 看不出来**，
+                // 只有 `System.out.print/printf`、或把 `System.out` 传出去才会 NPE。
+                // 因此这里**不能静默吞掉**错误：设了 `VMLESS_INIT_TRACE=1` 就把原因打出来。
+                if let Err(e) = self.execute(ci, mi, "()V", &[], false) {
+                    if std::env::var_os("VMLESS_INIT_TRACE").is_some() {
+                        // 是 Java 异常就把**异常对象**的文本打出来（只有 e.msg 时看不出是哪一颗）
+                        let detail = match e.exc {
+                            Some(h) => self.exc_text(h),
+                            None => e.msg.clone(),
+                        };
+                        eprintln!("[init] System.initPhase1 失败: {detail}");
+                        // 帧栈已经可用：把出错时的调用链打出来（定位「是谁触发的」比猜快得多）
+                        for (i, fr) in crate::vm::stacktrace::frames_current().iter().take(12).enumerate() {
+                            eprintln!(
+                                "  #{i} {}.{}({}) 行 {}",
+                                fr.class.replace('/', "."),
+                                fr.method,
+                                fr.desc,
+                                fr.line
+                            );
+                        }
+                    }
+                }
             }
         }
         let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);

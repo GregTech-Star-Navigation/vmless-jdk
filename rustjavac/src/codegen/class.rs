@@ -21,6 +21,34 @@ pub const ACC_SUPER: u16 = 0x0020;
 pub const ACC_INTERFACE: u16 = 0x0200;
 pub const ACC_ABSTRACT: u16 = 0x0400;
 
+/// 声明里的修饰符 → access_flags。
+///
+/// 以前字段/方法**一律写成 ACC_PUBLIC**：`javap` 读得出来，但真 JVM 会因为
+/// 语义不对而拒载或行为错乱 —— `private static native int tty();` 被标成
+/// `public abstract`（非抽象类里有 abstract 方法 = ClassFormatError）、
+/// 子类覆写父类 `final` 方法（`overrides final method`）、接口字段不是
+/// `public static final`（JVM 规范 4.5 强制要求）。
+fn modifier_flags(mods: &[String]) -> u16 {
+    let mut f = 0u16;
+    for m in mods {
+        f |= match m.as_str() {
+            "public" => 0x0001,
+            "private" => 0x0002,
+            "protected" => 0x0004,
+            "static" => ACC_STATIC,
+            "final" => 0x0010,
+            "synchronized" => 0x0020,
+            "volatile" => 0x0040,
+            "transient" => 0x0080,
+            "native" => 0x0100,
+            "abstract" => ACC_ABSTRACT,
+            "strictfp" => 0x0800,
+            _ => 0,
+        };
+    }
+    f
+}
+
 
 pub(crate) fn compile_type(
     package: &Option<String>,
@@ -72,6 +100,7 @@ pub(crate) fn compile_type(
     // 接口类型名集合：调用点据此选 invokeinterface（0xB9）而不是 invokevirtual
     let iface_types = w.iface_types;
     let type_ctors = w.type_ctors;
+    let iface_sam = w.iface_sam;
     // 本类（含继承）的静态字段：名字 → (声明类, 描述符)
     let static_fields_map = res.static_fields(&self_name)?;
 
@@ -87,6 +116,21 @@ pub(crate) fn compile_type(
         locals: HashMap::new(),
         next_slot: 0,
         static_methods: static_sigs.clone(),
+        inherited_statics: {
+            // 继承来的静态方法（父类 / 外层类）。本类自己声明的已经在 static_methods 里
+            let mut m: HashMap<String, (String, Vec<String>)> = HashMap::new();
+            if let Ok(all) = res.static_methods(&self_name) {
+                for (name, mut cands) in all {
+                    if static_sigs.contains_key(&name) {
+                        continue;
+                    }
+                    if let Some((desc, owner)) = cands.pop() {
+                        m.insert(name, (owner, cands.into_iter().map(|(d, _)| d).chain(std::iter::once(desc)).collect()));
+                    }
+                }
+            }
+            m
+        },
         instance_methods: inst_methods.clone(),
         fields: field_index.clone(),
         field_descs: field_desc_list.clone(),
@@ -110,6 +154,12 @@ pub(crate) fn compile_type(
         pending_label: None,
         static_imports: res.static_imports().clone(),
         type_ctors: type_ctors.clone(),
+        iface_sam: iface_sam.clone(),
+        synth: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
+        lambda_seq: std::rc::Rc::new(std::cell::RefCell::new(0u32)),
+        method_name: String::new(),
+        lambda_target: std::rc::Rc::new(std::cell::RefCell::new(None)),
+        has_this: false,
     };
 
     let has_ctor = t.members.iter().any(|m| matches!(m, Member::Method(md) if md.ret.is_none() && md.name == t.name));
@@ -123,9 +173,12 @@ pub(crate) fn compile_type(
             let n = cp.utf8(&f.name);
             let d = cp.utf8(&descriptor(&f.ty));
             // 静态字段也要写进字段表：getstatic/putstatic 靠它解析（值本身在 <clinit> 里初始化）
-            let mut flags = if is_static_f { ACC_PUBLIC | ACC_STATIC } else { 0x0000 };
-            if f.modifiers.iter().any(|x| x == "final") || is_iface {
-                flags |= 0x0010; // ACC_FINAL
+            let mut flags = modifier_flags(&f.modifiers);
+            if is_iface {
+                // JVM 规范 4.5：接口字段**必须** ACC_PUBLIC|ACC_STATIC|ACC_FINAL，否则 ClassFormatError
+                flags |= ACC_PUBLIC | ACC_STATIC | 0x0010;
+            } else if is_static_f {
+                flags |= ACC_STATIC;
             }
             fields.push(CfMember {
                 access_flags: flags,
@@ -172,13 +225,18 @@ pub(crate) fn compile_type(
         // 就等于「所有字段都只拿到默认值」）
         {
             let mut cctx = base_ctx.clone();
+            // 实例字段的初始化式跑在构造器里 —— `this` 可用（lambda 体里访问实例字段
+            // 要靠它把合成方法编成实例方法，否则会生成 `static` 方法里 `aload_0` 的坏字节码）
+            cctx.has_this = true;
+            cctx.method_name = "<init>".to_string();
+            cctx.locals.insert("<this-class>".to_string(), 0);
             emit_instance_field_inits(&instance_field_inits, &mut ctor, &mut cctx, &mut cp)?;
         }
         ctor.op(0xB1);
         let ctor_name = cp.utf8("<init>");
         let ctor_desc = cp.utf8("()V");
         methods.push(CfMember {
-            access_flags: ACC_PUBLIC,
+            access_flags: modifier_flags(&t.modifiers) & 0x0007,
             name_index: ctor_name,
             descriptor_index: ctor_desc,
             attributes: vec![ctor.to_attribute(code_name)],
@@ -202,6 +260,8 @@ pub(crate) fn compile_type(
         })
         .collect();
 
+    // 有没有抽象方法（决定了类本身必须带 ACC_ABSTRACT，否则 ClassFormatError）
+    let mut has_abstract = false;
     for m in &t.members {
         let md = match m {
             Member::Method(md) => md,
@@ -217,8 +277,18 @@ pub(crate) fn compile_type(
         if is_abstract_m {
             let name_index = cp.utf8(&md.name);
             let desc_index = cp.utf8(&desc);
+            // `native` 方法也**没有 Code**，但它不是 abstract：把 native 标成
+            // abstract 会让「非抽象类里有抽象方法」成为 ClassFormatError。
+            let mut flags = modifier_flags(&md.modifiers);
+            if is_iface {
+                // 接口里没有方法体的方法必须 ACC_PUBLIC|ACC_ABSTRACT（JVM 规范 4.6）
+                flags = (flags & !0x0002) | ACC_PUBLIC | ACC_ABSTRACT;
+            } else if flags & 0x0100 == 0 {
+                flags |= ACC_ABSTRACT;
+            }
+            has_abstract = has_abstract || flags & ACC_ABSTRACT != 0;
             methods.push(CfMember {
-                access_flags: ACC_PUBLIC | ACC_ABSTRACT,
+                access_flags: flags,
                 name_index,
                 descriptor_index: desc_index,
                 attributes: Vec::new(),
@@ -258,7 +328,11 @@ pub(crate) fn compile_type(
         ctx.next_slot = if is_static { 0 } else { 1 };
         ctx.ret_ty = md.ret.clone();
         ctx.in_ctor = is_ctor_m;
-        ctx.locals.insert("<this-class>".to_string(), 0);
+        ctx.has_this = !is_static;
+        if ctx.has_this {
+            ctx.locals.insert("<this-class>".to_string(), 0);
+        }
+        ctx.method_name = md.name.clone();
         if !is_static {
             let this_cp = cp.class(&self_name);
             em.set_local_type(0, this_cp);
@@ -299,30 +373,7 @@ pub(crate) fn compile_type(
                     // 补一条默认返回。方法体里所有路径都 return 过时这里是死代码，
                     // 但字节码**必须**能通过验证（HotSpot: control flow falls through code end），
                     // 所以按返回类型给一条合法的「常量 + xreturn」，不能只压个常量。
-                    let ret = desc.rsplit(')').next().unwrap_or("V");
-                    match ret.as_bytes().first().copied() {
-                        Some(b'V') => em.op(0xB1),
-                        Some(b'J') => {
-                            em.op(0x09); // lconst_0
-                            em.push(2);
-                            em.op(0xAD); // lreturn
-                        }
-                        Some(b'D') => {
-                            em.op(0x0E); // dconst_0
-                            em.push(2);
-                            em.op(0xAF); // dreturn
-                        }
-                        Some(b'L') | Some(b'[') => {
-                            em.op(0x01); // aconst_null
-                            em.push(1);
-                            em.op(0xB0); // areturn
-                        }
-                        _ => {
-                            em.op(0x03); // iconst_0
-                            em.push(1);
-                            em.op(0xAC); // ireturn
-                        }
-                    }
+                    push_default_return(&mut em, desc.rsplit(')').next().unwrap_or("V"));
                 }
             }
             None => {
@@ -336,7 +387,12 @@ pub(crate) fn compile_type(
         let method_name = if is_ctor { "<init>" } else { md.name.as_str() };
         let name_index = cp.utf8(method_name);
         let desc_index = cp.utf8(&desc);
-        let flags = if is_static { ACC_PUBLIC | ACC_STATIC } else { ACC_PUBLIC };
+        let mut flags = if is_static { ACC_STATIC } else { 0 } | modifier_flags(&md.modifiers);
+        if is_iface && flags & 0x0007 == 0 {
+            // 接口的实例/静态方法必须是 public（Java 9+ 只放开 private）：
+            // 包可见的方法放在接口里是 ClassFormatError
+            flags |= ACC_PUBLIC;
+        }
         methods.push(CfMember {
             access_flags: flags,
             name_index,
@@ -467,10 +523,77 @@ pub(crate) fn compile_type(
         });
     }
 
+    // ---- 合成方法：lambda 体 / 方法引用的转发体 ----
+    //
+    // 它们是在编方法体的过程中「顺手登记」进来的（那时还不知道要编成什么），
+    // 所以在这里统一编。合成方法体里可能又冒出新的 lambda，所以用**下标推进**的
+    // while 循环，让队列自己长大。
+    {
+        let mut i = 0usize;
+        loop {
+            let item = { base_ctx.synth.borrow().get(i).cloned() };
+            let Some(s) = item else { break };
+            i += 1;
+            let ret_desc = s.desc.rsplit(')').next().unwrap_or("V").to_string();
+            let slots: u16 = s.params.iter().map(|(_, t)| kind_width(t)).sum();
+            let cap_slots: u16 = s.captures.iter().map(|(_, t)| kind_width(t)).sum();
+            let mut em = Emit::new(slots + cap_slots + if s.is_instance { 1 } else { 0 });
+            let mut c = base_ctx.clone();
+            c.next_slot = 0;
+            c.ret_ty = Some(type_from_desc(&ret_desc));
+            c.in_ctor = false;
+            c.has_this = s.is_instance;
+            c.method_name = s.name.clone();
+            c.lambda_target.replace(None);
+            c.break_labels.clear();
+            c.cont_labels.clear();
+            if s.is_instance {
+                let this_cp = cp.class(&self_name);
+                em.set_local_type(0, this_cp);
+                c.locals.insert("<this-class>".to_string(), 0);
+                c.next_slot = 1;
+            }
+            for (n, t) in s.captures.iter().chain(s.params.iter()) {
+                let slot = c.next_slot;
+                let wide = kind_width(t) == 2;
+                let vt = ver_type(&mut cp, t);
+                em.set_local_type(slot as usize, vt);
+                if wide {
+                    em.set_local_type(slot as usize + 1, u16::MAX);
+                }
+                c.locals.insert(n.clone(), slot);
+                c.local_kind.insert(n.clone(), kind_of(t));
+                c.local_ty.insert(n.clone(), t.clone());
+                c.next_slot += if wide { 2 } else { 1 };
+            }
+            // 体：`return e;` / 语句块
+            let terminated = compile_stmt(&s.body, &mut em, &mut c, &mut cp)
+                .map_err(|e| CompileError { msg: format!("{}（lambda `{}`）", e.msg, s.name) })?;
+            if !terminated {
+                push_default_return(&mut em, &ret_desc);
+            }
+            em.stack_map_name = stack_map_name;
+            em.resolve()?;
+            let n = cp.utf8(&s.name);
+            let d = cp.utf8(&s.desc);
+            methods.push(CfMember {
+                // ACC_PRIVATE | ACC_SYNTHETIC（+ STATIC）：javac 也把 lambda 体写成
+                // private synthetic，LambdaMetafactory 只在同一个类里找得到它
+                access_flags: 0x0002 | 0x1000 | if s.is_instance { 0 } else { ACC_STATIC },
+                name_index: n,
+                descriptor_index: d,
+                attributes: vec![em.to_attribute(code_name)],
+            });
+        }
+    }
+
     // 接口表：`implements A, B`（接口自己的 `extends A, B` 也算父接口）
     let iface_idxs: Vec<u16> = res.interfaces_of(&self_name).iter().map(|n| cp.class(n)).collect();
 
     // invokestatic 的 owner 用真实类名补齐（此前占位 <SELF>）
+    let bsm = cp.take_bootstrap();
+    // BootstrapMethods 属性要在常量池还没被交出去之前登记它的名字
+    let bsm_attr = bootstrap_attribute(&mut cp, &bsm);
     let cp_entries = fix_self_refs(cp, &self_name);
 
     let cf = ClassFile {
@@ -478,18 +601,92 @@ pub(crate) fn compile_type(
         major_version: 69,
         constant_pool: cp_entries,
         // 接口：public interface abstract，且**不能**带 ACC_SUPER
-        access_flags: if is_iface { ACC_PUBLIC | ACC_INTERFACE | ACC_ABSTRACT } else { ACC_PUBLIC | ACC_SUPER },
+        access_flags: {
+            let m = &t.modifiers;
+            let vis = if m.iter().any(|x| x == "public") { ACC_PUBLIC } else { 0 };
+            if is_iface {
+                vis | ACC_INTERFACE | ACC_ABSTRACT
+            } else {
+                let mut f = vis | ACC_SUPER;
+                if m.iter().any(|x| x == "final") {
+                    f |= 0x0010;
+                }
+                if m.iter().any(|x| x == "abstract") || has_abstract {
+                    f |= ACC_ABSTRACT;
+                }
+                f
+            }
+        },
         this_class,
         super_class,
         interfaces: iface_idxs,
         fields,
         methods,
-        attributes: Vec::new(),
+        attributes: bsm_attr.into_iter().collect(),
     };
     Ok(write(&cf))
 }
 
-/// 把常量池里指向占位类 `<SELF>` 的 MethodRef 改成真实类名索引。
+/// 声明类型的槽宽度（long/double 占 2）
+fn kind_width(t: &Type) -> u16 {
+    if kind_wide(kind_of(t)) {
+        2
+    } else {
+        1
+    }
+}
+
+/// 方法体走完还没 return 时补一条**合法**的默认返回。
+///
+/// 字节码必须能通过验证（HotSpot: control flow falls through code end），
+/// 所以按返回类型给一条「常量 + xreturn」，不能只压个常量、也不能什么都不发。
+fn push_default_return(em: &mut Emit, ret: &str) {
+    match ret.as_bytes().first().copied() {
+        Some(b'V') => em.op(0xB1),
+        Some(b'J') => {
+            em.op(0x09); // lconst_0
+            em.push(2);
+            em.op(0xAD); // lreturn
+        }
+        Some(b'D') => {
+            em.op(0x0E); // dconst_0
+            em.push(2);
+            em.op(0xAF); // dreturn
+        }
+        Some(b'L') | Some(b'[') => {
+            em.op(0x01); // aconst_null
+            em.push(1);
+            em.op(0xB0); // areturn
+        }
+        _ => {
+            em.op(0x03); // iconst_0
+            em.push(1);
+            em.op(0xAC); // ireturn
+        }
+    }
+}
+
+/// 把常量池里的 `BootstrapMethods` 表写成类属性。
+///
+/// `invokedynamic` 的操作数就是这张表的下标，所以属性必须和常量池一起写出来；
+/// 一项 `u2 bootstrap_method_ref; u2 num_args; u2 args[]`。
+fn bootstrap_attribute(cp: &mut CpBuilder, bsm: &[(u16, Vec<u16>)]) -> Option<crate::Attribute> {
+    if bsm.is_empty() {
+        return None;
+    }
+    let name_index = cp.utf8("BootstrapMethods");
+    let mut info = Vec::new();
+    info.extend_from_slice(&(bsm.len() as u16).to_be_bytes());
+    for (m, args) in bsm {
+        info.extend_from_slice(&m.to_be_bytes());
+        info.extend_from_slice(&(args.len() as u16).to_be_bytes());
+        for a in args {
+            info.extend_from_slice(&a.to_be_bytes());
+        }
+    }
+    Some(crate::Attribute { name_index, info })
+}
+
 /// 做法简单：追加一个真实类名 Utf8，并把 MethodRef 的 class_index 指过去。
 pub(crate) fn fix_self_refs(cp: CpBuilder, self_name: &str) -> Vec<Option<CpEntry>> {
     let mut entries = cp.entries();

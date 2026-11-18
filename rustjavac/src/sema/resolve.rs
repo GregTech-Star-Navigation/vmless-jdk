@@ -28,16 +28,70 @@ fn collect_static_imports(cu: &CompilationUnit) -> HashMap<String, Vec<String>> 
         if !imp.is_static || imp.name.is_empty() {
             continue;
         }
-        let (owner, member) = match imp.name.rsplit_once('.') {
-            Some(x) => x,
-            None => continue,
+        // 通配导入（`import static a.b.C.*;`）的 name 是**声明类本身** `a.b.C`
+        // —— 再按最后一个点切一刀会把包名当成类名（`a/b`），于是整条静态导入永远
+        // 查不到（`SEMI_BLKSIZE` 这类裸常量全报「未定义的变量」）。
+        let (owner, member) = if imp.wildcard {
+            (imp.name.as_str(), "*")
+        } else {
+            match imp.name.rsplit_once('.') {
+                Some(x) => x,
+                None => continue,
+            }
         };
         let owner = owner.replace('.', "/");
         let key = if imp.wildcard { "*".to_string() } else { member.to_string() };
         let e = out.entry(key).or_default();
         if !e.contains(&owner) {
-            e.push(owner);
+            e.push(owner.clone());
         }
+        // `import static a.b.Outer.Inner.*;`（静态导入指向**嵌套类**）里的声明类
+        // 在符号表里叫 `a/b/Outer$Inner`，而点分路径换出来的是 `a/b/Outer/Inner`。
+        // 不补 `$` 形态的话这类导入整条失效（`ALLOWED` / `TRACE` 这些裸常量全报
+        // 「未定义的变量」）。
+        for alt in nested_dollar_forms(&owner) {
+            if !e.contains(&alt) {
+                e.push(alt);
+            }
+        }
+    }
+    out
+}
+
+/// `java.lang.Object` 的协议方法（`equals` / `hashCode` / `toString`）。
+///
+/// 接口里**再声明一遍**这仨不算 SAM 的抽象方法（JLS 9.8：功能性接口的抽象方法
+/// 不含「与 Object 的 public 方法签名相同」的那些）。
+fn is_object_protocol(name: &str, desc: &str) -> bool {
+    matches!(
+        (name, desc),
+        ("equals", "(Ljava/lang/Object;)Z")
+            | ("hashCode", "()I")
+            | ("toString", "()Ljava/lang/String;")
+    )
+}
+
+/// 嵌套类被写成 `a/b/Outer/Inner` 时，按 `$` 拼回磁盘上的真名。///
+/// 只对**尾部每段都大写开头**的段生效（包段永远是小写），所以不会把包名拼错。
+fn nested_dollar_forms(class: &str) -> Vec<String> {
+    let segs: Vec<&str> = class.split('/').collect();
+    let mut out: Vec<String> = Vec::new();
+    for split in (1..segs.len()).rev() {
+        if !segs[split..].iter().all(|s| s.chars().next().is_some_and(|c| c.is_ascii_uppercase())) {
+            break;
+        }
+        out.push(format!("{}${}", segs[..split].join("/"), segs[split..].join("$")));
+    }
+    out
+}
+
+/// 嵌套类的**外层类**链：`a/b/Outer$Inner$Deeper` → [`a/b/Outer$Inner`, `a/b/Outer`]
+fn enclosing_chain(class: &str) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut cur = class.to_string();
+    while let Some(i) = cur.rfind('$') {
+        cur.truncate(i);
+        out.push(cur.clone());
     }
     out
 }
@@ -55,6 +109,9 @@ pub struct MethodMeta {
     pub name: String,
     pub desc: String,
     pub is_static: bool,
+    /// 抽象（没有方法体）。lambda / 方法引用要按功能性接口的**唯一抽象方法**取
+    /// SAM 签名，没有这一位就分不清 `compare`（抽象）和 `reversed`（default）。
+    pub is_abstract: bool,
 }
 
 /// 本类**自己声明**的成员；继承来的部分在查询时沿链拼起来
@@ -98,7 +155,7 @@ fn object_meta() -> Own {
         is_iface: false,
         fields: Vec::new(),
         static_fields: Vec::new(),
-        methods: vec![MethodMeta { name: "<init>".into(), desc: "()V".into(), is_static: false }],
+        methods: vec![MethodMeta { name: "<init>".into(), desc: "()V".into(), is_static: false, is_abstract: false }],
     }
 }
 
@@ -161,6 +218,8 @@ impl Resolver {
                             name: if is_ctor { "<init>".to_string() } else { md.name.clone() },
                             desc: method_desc(md),
                             is_static: md.modifiers.iter().any(|x| x == "static"),
+                            // 接口里没有方法体的声明是抽象方法；类里 `abstract` 方法也一样
+                            is_abstract: md.body.is_none(),
                         });
                     }
                     _ => {}
@@ -224,21 +283,17 @@ impl Resolver {
     }
 
     /// 字段布局：父类字段在前、本类字段在后（只含实例字段）
+    ///
+    /// 同名字段（字段隐藏，JLS 8.3）**两份都留**：JVM 的槽位本来就是两份。
+    /// 上层按「名字 → 下标」取用时后写的（子类那份）覆盖前一份，正好就是
+    /// 「子类里 `this.f` 指子类那份、父类里指父类那份」的语义 —— 每个类各按
+    /// 自己的 layout 编，所以不会串。
     pub fn layout(&self, class: &str) -> Result<Vec<FieldMeta>, String> {
         let chain = self.chain(class)?;
         let mut out: Vec<FieldMeta> = Vec::new();
-        let mut seen: HashSet<String> = HashSet::new();
         for c in chain.iter().rev() {
             let own = self.load(c)?;
-            for f in &own.fields {
-                if !seen.insert(f.name.clone()) {
-                    return Err(format!(
-                        "字段 `{}` 在父类与子类中重复声明（本编译器不支持字段隐藏，请改名）",
-                        f.name
-                    ));
-                }
-                out.push(f.clone());
-            }
+            out.extend(own.fields.iter().cloned());
         }
         Ok(out)
     }
@@ -279,8 +334,11 @@ impl Resolver {
     /// 静态字段：名字 → (声明类, 描述符)，含继承
     pub fn static_fields(&self, class: &str) -> Result<HashMap<String, (String, String)>, String> {
         let mut out = HashMap::new();
-        for c in self.chain_with_ifaces(class)? {
-            let own = self.load(&c)?;
+        for c in self.chain_with_enclosing(class) {
+            let own = match self.load(&c) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
             for f in &own.static_fields {
                 out.entry(f.name.clone()).or_insert_with(|| (c.clone(), f.desc.clone()));
             }
@@ -291,6 +349,41 @@ impl Resolver {
     /// 这个类型是不是接口
     pub fn is_interface(&self, class: &str) -> bool {
         self.load(class).map(|o| o.is_iface).unwrap_or(false)
+    }
+
+    /// 功能性接口的**唯一抽象方法**（SAM）：`(方法名, 擦除后的描述符)`。
+    ///
+    /// lambda / 方法引用要靠它拿调用点该实现成什么签名。规则与 JLS 9.8 大致一致：
+    /// 接口里除 `java/lang/Object` 的协议方法（`equals`/`hashCode`/`toString`）和
+    /// `static` 之外的**抽象**实例方法只能有一个。不是接口、或抽象方法不是恰好一个
+    /// （`Comparator` 有 `compare` 一个抽象 + 若干 default，没问题；`Runnable` 一个），
+    /// 就返回 None —— 调用点会报「无法推断 lambda 的目标类型」而不是瞎编。
+    pub fn sam_of(&self, class: &str) -> Option<(String, String)> {
+        let own_iface = self.load(class).ok()?.is_iface;
+        if !own_iface {
+            return None;
+        }
+        let mut found: Option<(String, String)> = None;
+        for c in self.chain_with_ifaces(class).ok()? {
+            let Ok(own) = self.load(&c) else { continue };
+            for m in &own.methods {
+                if m.is_static || m.name == "<init>" || !m.is_abstract {
+                    continue;
+                }
+                // Object 的协议方法不算（接口里再声明一遍也还是 Object 的）
+                if is_object_protocol(&m.name, &m.desc) {
+                    continue;
+                }
+                match &found {
+                    // 同一个签名在父接口里再声明一遍（`interface A { void f(); }
+                    // interface B extends A { void f(); }`）不算两个
+                    Some((_, d)) if *d == m.desc => {}
+                    Some(_) => return None,
+                    None => found = Some((m.name.clone(), m.desc.clone())),
+                }
+            }
+        }
+        found
     }
 
     /// 直接实现的接口
@@ -329,8 +422,11 @@ impl Resolver {
     /// 静态方法：名字 → 描述符（含继承；返回 (描述符, 声明类)）
     pub fn static_methods(&self, class: &str) -> Result<HashMap<String, Vec<(String, String)>>, String> {
         let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
-        for c in self.chain(class)? {
-            let own = self.load(&c)?;
+        for c in self.chain_with_enclosing(class) {
+            let own = match self.load(&c) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
             for m in &own.methods {
                 if !m.is_static || m.name == "<init>" {
                     continue;
@@ -339,6 +435,26 @@ impl Resolver {
             }
         }
         Ok(out)
+    }
+
+    /// 继承链（含接口）+ **外层类**的同样一条链。
+    ///
+    /// 嵌套类可以用外层类的静态成员（JLS 8.5.1），但字节码里没有「继承外层」这回事；
+    /// 不补这条，`Outer$Inner` 里引用外层的 `FS` / `UNSAFE` / `JLA` 这类静态字段
+    /// 全都落空（报「未定义的变量」或「未找到实例方法」）。外层放在后面，
+    /// 本类/父类同名成员优先。
+    fn chain_with_enclosing(&self, class: &str) -> Vec<String> {
+        let mut out = self.chain_with_ifaces(class).unwrap_or_default();
+        for e in enclosing_chain(class) {
+            if let Ok(c) = self.chain_with_ifaces(&e) {
+                for x in c {
+                    if !out.contains(&x) {
+                        out.push(x);
+                    }
+                }
+            }
+        }
+        out
     }
 
     /// 沿继承链找方法（返回**声明它的那个类**）
@@ -542,6 +658,7 @@ impl Resolver {
                 name: String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned(),
                 desc: String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned(),
                 is_static: m.access_flags & 0x0008 != 0,
+                is_abstract: m.access_flags & 0x0400 != 0,
             });
         }
         let ifaces = cf
@@ -576,6 +693,19 @@ impl Resolver {
                 }
             }
         }
+        // 嵌套类型被写成 `a/b/Outer/Inner`（`qualify` 把 import 的点全换成 `/`）：
+        // 磁盘上叫 `Outer$Inner`，按 `$` 拼回去再试一次
+        for cand in nested_dollar_forms(class) {
+            let flat = cand.replace('/', "_");
+            for d in &self.dirs {
+                for f in [format!("{cand}.class"), format!("{flat}.class")] {
+                    let p = d.join(f);
+                    if p.is_file() {
+                        return Some(p);
+                    }
+                }
+            }
+        }
         self.missing.borrow_mut().insert(class.to_string());
         None
     }
@@ -603,6 +733,8 @@ pub struct World {
     pub type_static_fields: HashMap<String, std::sync::Arc<HashMap<String, (String, String)>>>,
     pub type_static_methods: HashMap<String, std::sync::Arc<HashMap<String, Vec<String>>>>,
     pub iface_types: HashSet<String>,
+    /// 功能性接口 → 唯一抽象方法 `(名字, 描述符)`。lambda / 方法引用按它取 SAM 签名。
+    pub iface_sam: HashMap<String, (String, String)>,
 }
 
 impl World {
@@ -627,6 +759,9 @@ impl World {
         }
         if res.is_interface(c) {
             self.iface_types.insert(c.to_string());
+            if let Some(sam) = res.sam_of(c) {
+                self.iface_sam.insert(c.to_string(), sam);
+            }
         }
     }
 }
