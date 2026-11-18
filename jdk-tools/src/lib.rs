@@ -202,17 +202,9 @@ pub fn print_version(tool: &str, jdk: &str) {
     println!("{tool} {VERSION} (vmless, 目标 JDK {jdk})");
 }
 
-/// 工具里表示「这不是我们能实现的那部分」的统一措辞：
-/// 写清**缺什么能力**、**归哪个子系统**、**有没有替代路径**。
-/// 注意：不打印「未实现/TODO」这类字样 —— 用户明确要求说清边界而不是占位。
-pub fn capability_gap(tool: &str, missing: &str, subsystem: &str, alternative: &str) -> ! {
-    println!("{tool}: 本 crate 不提供这项能力");
-    println!("缺少的能力：{missing}");
-    println!("归属子系统：{subsystem}（由该子系统实现，不在 jdk-tools 范围内）");
-    println!("可用替代：{alternative}");
-    println!("退出码 1");
-    std::process::exit(EXIT_FAIL)
-}
+// 这里曾经有 `capability_gap()`：给「本 crate 不实现这个工具」的 17 个桩打印说明然后 exit 1。
+// 那些桩挡住了兄弟 crate 里的真实现（jstack/keytool/jfr/jcmd… 全都能编能跑），已全部删除，
+// 这个函数也一并去掉 —— 留着它就等于给「再退回桩」留了口子。
 
 /// 类路径/模块路径的分段：`;` 或 `:` 分隔，但**盘符**（`D:`）要拼回去。
 /// `D:/a;E:/b` → ["D:/a", "E:/b"]；`/a:/b` → ["/a", "/b"]。

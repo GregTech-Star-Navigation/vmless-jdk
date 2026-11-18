@@ -39,9 +39,12 @@ for t in jps jstack jmap jstat jcmd jinfo jstatd keytool jarsigner ktab kinit kl
 done
 
 # ---------------------------------------------------------------- 活目标：vmsim
-( cd "$W" && "$BIN/vmsim.exe" --main com.example.GcBench --arg -Xmx64m --threads 4 \
-    --objects 2000 --gc-interval 800 > vmsim.log 2>&1 & echo $! > vmsim.pid )
-VM=$(cat "$W/vmsim.pid")
+# 注意：一律「先 cd 再 & 再 $!」，不要写成 `( cd X && cmd & echo $! > pid )` ——
+# 那个 subshell 里 `&` 和 `echo` 是并发跑的两条命令，父 shell 去读 pid 文件会偶发读不到。
+cd "$W" || exit 2
+"$BIN/vmsim.exe" --main com.example.GcBench --arg -Xmx64m --threads 4 \
+    --objects 2000 --gc-interval 800 > vmsim.log 2>&1 &
+VM=$!
 PIDS+=("$VM")
 for _ in $(seq 1 40); do grep -q '^perfdata = ' "$W/vmsim.log" 2>/dev/null && break; sleep 0.25; done
 PID=$(sed -n 's/^vmsim pid=\([0-9]*\).*/\1/p' "$W/vmsim.log")
@@ -74,8 +77,8 @@ if out=$(timeout 20 "$BIN/jinfo.exe" "$PID" 2>&1) && printf '%s' "$out" | grep -
 
 # ---------------------------------------------------------------- 8 jstatd（远程取数）
 PORT=$((19000 + (RANDOM % 2000)))
-( cd "$W" && "$BIN/jstatd.exe" -p "$PORT" > jstatd.log 2>&1 & echo $! > jstatd.pid )
-PIDS+=("$(cat "$W/jstatd.pid")")
+"$BIN/jstatd.exe" -p "$PORT" > jstatd.log 2>&1 &
+PIDS+=("$!")
 sleep 1.5
 if out=$(timeout 20 "$BIN/jstat.exe" -gc "$PID@127.0.0.1:$PORT" 2>&1) && printf '%s' "$out" | grep -q 'YGC'; then
     ok jstatd "jstat pid@127.0.0.1:$PORT → YGC=$(printf '%s' "$out" | tail -1 | awk '{print $13}')"
@@ -117,8 +120,9 @@ else bad ktab "$(printf '%s%s' "${out:-}" "${out2:-}" | head1)"; fi
 
 timeout 30 "$BIN/ktab.exe" -a krbtgt/SMOKE.LOCAL@SMOKE.LOCAL -k smoke.keytab -p krbtgt-pw >/dev/null 2>&1
 KPORT=$((21000 + (RANDOM % 2000)))
-( cd "$W" && "$BIN/kdc.exe" --realm SMOKE.LOCAL --port "$KPORT" --keytab smoke.keytab > kdc.log 2>&1 & echo $! > kdc.pid )
-PIDS+=("$(cat "$W/kdc.pid")")
+"$BIN/kdc.exe" --realm SMOKE.LOCAL --port "$KPORT" --keytab smoke.keytab > kdc.log 2>&1 &
+
+PIDS+=("$!")
 sleep 1.5
 if out=$(timeout 30 "$BIN/kinit.exe" -k -t smoke.keytab smoke@SMOKE.LOCAL -S "127.0.0.1:$KPORT" -c "$W/cc" 2>&1) \
    && out2=$(timeout 30 "$BIN/klist.exe" -c "$W/cc" 2>&1) \
@@ -142,6 +146,12 @@ if out=$(timeout 40 "$BIN/jhsdb.exe" jstack --pid "$PID" 2>&1) && printf '%s' "$
     ok jhsdb "$(printf '%s' "$out" | grep 'at com.example' | head1)"
 else bad jhsdb "$(printf '%s' "$out" | head1)"; fi
 
+# jar 不在「17 个桩」里，但它也进发布包、也由 jdk-tools 提供 —— 进包的东西就得有判据
+if out=$(timeout 40 "$BIN/jar.exe" cf smoke2.jar -C cls a.txt 2>&1) \
+   && out2=$(timeout 40 "$BIN/jar.exe" tf smoke2.jar 2>&1) && printf '%s' "$out2" | grep -q 'a.txt'; then
+    ok jar "$(printf '%s' "$out2" | head1)"
+else bad jar "$(printf '%s%s' "${out:-}" "${out2:-}" | head1)"; fi
+
 # ---------------------------------------------------------------- 17-20 无障碍 / GUI
 if out=$(timeout 20 "$BIN/jabswitch.exe" -q 2>&1) && printf '%s' "$out" | grep -q 'Java Access Bridge'; then
     ok jabswitch "$(printf '%s' "$out" | head1)"; else bad jabswitch "$(printf '%s' "$out" | head1)"; fi
@@ -150,15 +160,16 @@ if out=$(timeout 40 "$BIN/jaccesswalker.exe" 2>&1) && printf '%s' "$out" | grep 
     ok jaccesswalker "$(printf '%s' "$out" | head1)"; else bad jaccesswalker "$(printf '%s' "$out" | head1)"; fi
 
 # jconsole：真连上目标并画出窗口，再用 jaccessinspector 读它的控件树（连"窗口起来了但没数据"都能抓到）
-( cd "$W" && "$BIN/jconsole.exe" -p "$PID" > jconsole.log 2>&1 & echo $! > jc.pid )
-PIDS+=("$(cat "$W/jc.pid")")
+"$BIN/jconsole.exe" -p "$PID" > jconsole.log 2>&1 &
+
+PIDS+=("$!")
 JCWIN=""
 for _ in $(seq 1 40); do
     JCWIN=$(ps -W 2>/dev/null | grep -i '[j]console' | awk '{print $4}' | head -1)
     [ -n "$JCWIN" ] && break
     sleep 0.25
 done
-if [ -n "$JCWIN" ] && out=$(timeout 40 "$BIN/jaccessinspector.exe" -pid "$JCWIN" -o tree -d 3 2>&1) \
+if [ -n "$JCWIN" ] && out=$(timeout 40 "$BIN/jaccessinspector.exe" -title jconsole -o tree -d 3 2>&1) \
    && printf '%s' "$out" | grep -q '已连接'; then
     ok jconsole "$(printf '%s' "$out" | grep '已连接' | head1)"
     ok jaccessinspector "$(printf '%s' "$out" | grep 'role=' | head1)"

@@ -108,7 +108,7 @@ $exes = @(
 # 桩产物）会躺在 target/release 里被悄悄打进包，那种包"能装上、跑起来却是一句退出码 1"，
 # 是最难查的一类事故。
 $ToolMap = @(
-    @{ Crate = 'jdk-tools';  Bins = @('jimage', 'jmod', 'jlink', 'javadoc', 'jdb', 'jshell', 'jrunscript', 'jwebserver', 'jpackage', 'jdeprscan', 'jnativescan', 'serialver', 'rmiregistry', 'javaw', 'jps') },
+    @{ Crate = 'jdk-tools';  Bins = @('jimage', 'jmod', 'jlink', 'javadoc', 'jdb', 'jshell', 'jrunscript', 'jwebserver', 'jpackage', 'jdeprscan', 'jnativescan', 'serialver', 'rmiregistry', 'javaw', 'jps', 'jar') },
     @{ Crate = 'jdk-attach'; Bins = @('jcmd', 'jinfo', 'jmap', 'jstack', 'jstat', 'jstatd') },
     @{ Crate = 'jdk-crypto'; Bins = @('jarsigner', 'keytool', 'ktab') },
     @{ Crate = 'jdk-krb';    Bins = @('kinit', 'klist') },
@@ -116,13 +116,19 @@ $ToolMap = @(
     @{ Crate = 'jdk-gui';    Bins = @('jabswitch', 'jaccessinspector', 'jaccesswalker', 'jconsole') }
 )
 
+# 工具集用**自己的** target 根目录（`<repo>/target-tools/<crate>`），不蹭各 crate 的 `target/`：
+# 那些目录里可能躺着别的活儿留下的旧 exe（删桩之前的桩产物就那样躺着过），而 cargo 不会清理
+# 孤儿产物；更麻烦的是带外文件监视器会锁住刚跑过的 exe，导致 LNK1104 让打包莫名失败。
+# 独立目录 + 每次按 $ToolMap 精确取，两个问题一起消掉。
+$ToolTargetRoot = Join-Path $RepoRoot 'target-tools'
+
 if (-not $SkipBuild) {
     foreach ($c in $ToolMap) {
         Write-Step "cargo build --release（$($c.Crate)：$($c.Bins.Count) 个工具）"
         $prevTarget = $env:CARGO_TARGET_DIR
-        # 每个 crate 用自己的 target：这几个 crate 不是同一个 workspace，共用一个目录
+        # 每个 crate 用自己的子目录：这几个 crate 不是同一个 workspace，共用一个目录
         # 只会让并行构建互相等锁，还容易和别的活儿撞名。
-        $env:CARGO_TARGET_DIR = Join-Path $RepoRoot ("{0}\target" -f $c.Crate)
+        $env:CARGO_TARGET_DIR = Join-Path $ToolTargetRoot $c.Crate
         Push-Location (Join-Path $RepoRoot $c.Crate)
         try {
             & cargo build --release --bins
@@ -137,7 +143,7 @@ if (-not $SkipBuild) {
 
 foreach ($c in $ToolMap) {
     foreach ($b in $c.Bins) {
-        $exes += @{ Name = "$b.exe"; Path = (Join-Path $RepoRoot ("{0}\target\release\{1}.exe" -f $c.Crate, $b)) }
+        $exes += @{ Name = "$b.exe"; Path = (Join-Path $ToolTargetRoot ("{0}\release\{1}.exe" -f $c.Crate, $b)) }
     }
 }
 

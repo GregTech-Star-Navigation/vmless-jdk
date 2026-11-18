@@ -8,6 +8,7 @@
 *.class
 *.zip
 target/
+target-tools/
 build/
 out/
 images/
