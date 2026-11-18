@@ -146,6 +146,14 @@ fn nest_prefix(name: &str) -> &str {
     }
 }
 
+/// 内部名的「包」部分：`java/lang/String` → `java/lang`，默认包 → `""`。
+fn package_of(name: &str) -> &str {
+    match name.rfind('/') {
+        Some(i) => &name[..i],
+        None => "",
+    }
+}
+
 /// 类文件里一个成员的定位（下标 + 元数据）
 #[derive(Clone)]
 pub(super) struct MemAt {
@@ -858,6 +866,13 @@ impl Vm {
             .name_of_index(self.last_caller)
             .unwrap_or_default();
         if !caller.is_empty() && nest_prefix(&caller) == nest_prefix(decl) {
+            return Ok(());
+        }
+        // **同一个包**里的非 private 成员可以访问（JLS 6.6.1）。
+        // 少了这条，包私有成员会被一律当非法 —— `StackWalker` 就是在
+        // `StackFrameInfo` 的包私有构造器上被误拒（`InternalError: IllegalAccessException`）。
+        // 注意 `private` 即使同包也不行。
+        if flags & ACC_PRIVATE == 0 && !caller.is_empty() && package_of(&caller) == package_of(decl) {
             return Ok(());
         }
         Err(self.throw_msg(

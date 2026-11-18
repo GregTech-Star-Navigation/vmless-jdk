@@ -24,6 +24,7 @@
 //! `Unsafe.putLong(long address, long x)` 这些单参数重载在 JDK 里就是
 //! `putLong(null, address, x)` 的包装，所以 `o == null` 必须当作裸内存而不是「越界」。
 
+use crate::vm::shared::lk;
 use super::{Frame, NativeRegistry, RefKind, Slot, Vm, VmError};
 use std::sync::atomic::{fence, Ordering};
 
@@ -519,9 +520,31 @@ fn unsafe_reg(r: &mut NativeRegistry) {
         "(Ljava/lang/Class;Ljava/lang/String;)J",
         super::unsafe_field_offset_by_name,
     );
-    // 静态字段存在 `sh.statics` 里（按 `(类,名)` 索引），没有「基址 + 偏移」这种布局
+    // 静态字段存在 `sh.statics` 里（按 `(类,名)` 索引），没有「基址 + 字节偏移」的布局。
+    // 但 `Unsafe.putInt(base, off, v)` 的 ABI 要求先取 base 再配 off，所以：
+    //   · `staticFieldOffset0` = 0（偏移不用）
+    //   · `staticFieldBase0`   = **该字段专属的哨兵对象**（登记进 `sh.static_bases`）
+    // `unsafe_slot` / `unsafe_put_impl` 见到哨兵就反查 `(类,字段名)` 去读写 `statics`。
+    //
+    // 之前两条恒返回 0/null，于是所有静态字段的 Unsafe 访问都写进裸内存 arena、读回永远 0 ——
+    // `Reference.processPendingReferences` 的 CAS 循环因此永不收敛，
+    // 症状是「建第二个 ThreadLocal 子类时整个程序卡死、有 CPU、无输出」。
     r.add(u, "staticFieldOffset0", "(Ljava/lang/reflect/Field;)J", |_, _| Ok(Slot::L(0)));
-    r.add(u, "staticFieldBase0", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;", |_, _| Ok(Slot::I(0)));
+    r.add(u, "staticFieldBase0", "(Ljava/lang/reflect/Field;)Ljava/lang/Object;", |vm, f| {
+        let (cls, name) = vm.reflect_field_parts(f.arg_i(0));
+        let (Some(c), Some(n)) = (cls, name) else {
+            return Ok(Slot::I(0));
+        };
+        // 同一个 (类,字段) 永远同一个哨兵（`base == base` 必须成立）
+        if let Some((h, _)) = lk(&vm.sh.static_bases).iter().find(|(_, v)| v.0 == c && v.1 == n) {
+            return Ok(Slot::I(*h));
+        }
+        let h = vm.alloc_vmobj("java/lang/Object");
+        if h > 0 {
+            lk(&vm.sh.static_bases).insert(h, (c, n));
+        }
+        Ok(Slot::I(h))
+    });
     r.add(u, "shouldBeInitialized0", "(Ljava/lang/Class;)Z", u_should_be_initialized);
     r.add(u, "ensureClassInitialized0", "(Ljava/lang/Class;)V", super::unsafe_ensure_init);
     r.add(u, "arrayBaseOffset0", "(Ljava/lang/Class;)I", |_, _| Ok(Slot::I(0)));

@@ -924,6 +924,11 @@ pub(crate) struct Shared {
     pub(crate) class_objs: Mutex<HashMap<i32, String>>,
     pub(crate) class_obj_cache: Mutex<HashMap<String, i32>>,
     pub(crate) exc_msgs: Mutex<HashMap<i32, i32>>,
+    /// `Unsafe.staticFieldBase` 的哨兵对象 → `(类, 字段名)`。
+    /// 静态字段在我们这里没有「基址 + 字节偏移」的布局（存在 `statics` 表里），
+    /// 但 `Unsafe.putInt(base, off, v)` 的 ABI 要求先拿 base 再拿 off，
+    /// 所以给每个静态字段发一个哨兵对象，靠它把手上的 `base` 反查回具体的字段。
+    pub(crate) static_bases: Mutex<HashMap<i32, (String, String)>>,
     pub(crate) ann_objs: Mutex<HashMap<i32, AnnInst>>,
     pub(crate) indy: Mutex<IndyState>,
     /// 运行期类加载用的 classpath（`Class.forName`）
@@ -987,6 +992,7 @@ impl Shared {
             class_objs: Mutex::new(HashMap::new()),
             class_obj_cache: Mutex::new(HashMap::new()),
             exc_msgs: Mutex::new(HashMap::new()),
+            static_bases: Mutex::new(HashMap::new()),
             ann_objs: Mutex::new(HashMap::new()),
             indy: Mutex::new(IndyState::default()),
             cp: Mutex::new(None),

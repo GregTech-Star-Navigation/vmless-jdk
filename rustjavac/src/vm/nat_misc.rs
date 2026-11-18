@@ -8,6 +8,8 @@
 //! | --- | --- | --- |
 //! | `java/lang/ClassLoader` | 5/5 真实现 | `defineClass0/1/2`、`findLoadedClass0`、`findBootstrapClass`、`retrieveDirectives` |
 //! | `java/lang/Thread` | `start0` | 交给 `vm/thread.rs::thread_start`（`start()` 已有 override，这条是「有人绕过 start 直接调」的兜底） |
+//! | `java/lang/VirtualThread` | `registerNatives` | 空注册点：`<clinit>` 第一句，不注册 `Thread.ofVirtual()` 连类都初始化不了（实测过） |
+//! | `sun/io/Win32ErrorMode` | `setErrorMode` | 真调 `SetErrorMode`（`ProcessImpl` 初始化会走） |
 //! | `java/lang/Module` | 5/5 | 全是 **no-op**：Java 侧自己维护 reads/exports 表，native 只通知 VM，见下 |
 //! | `java/lang/ref/{Finalizer,PhantomReference}` | 4/4 真实现 | 终结器关闭（与 `--finalization=disabled` 一致）；`clear0`/`refersTo0` 直接读写 `referent` |
 //! | `java/lang/reflect/Executable`/`Field` | 3/3 真实现 | `getParameters0` 从 `MethodParameters` 属性真造 `Parameter[]` |
@@ -109,14 +111,6 @@ fn bytes_of(vm: &Vm, h: i32, off: usize, len: usize) -> Result<Vec<u8>, &'static
         out.push(vm.sh.heap.get(h, off + i).map(|s| s.as_i32() as u8).unwrap_or(0));
     }
     Ok(out)
-}
-
-/// 建一个 `String`（null 用 0 表示 —— 有些 native 要区分「空串」与「没给」）
-fn opt_text(vm: &mut Vm, s: Option<String>) -> i32 {
-    match s {
-        Some(t) => vm.str_new(t),
-        None => 0,
-    }
 }
 
 // ================================================================ java.lang.ClassLoader

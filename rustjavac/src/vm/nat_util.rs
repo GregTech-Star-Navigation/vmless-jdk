@@ -171,7 +171,16 @@ fn group_a_vm_system(r: &mut NativeRegistry) {
     r.add(rf, "clear0", "()V", no_op);
     r.add(rf, "hasReferencePendingList", "()Z", |_, _| zi(0));
     r.add(rf, "getAndClearReferencePendingList", "()Ljava/lang/ref/Reference;", |_, _| Ok(Slot::I(0)));
-    r.add(rf, "waitForReferencePendingList", "()V", no_op);
+    r.add(rf, "waitForReferencePendingList", "()V", |_, _| {
+        // `Reference$ReferenceHandler.run()` 是 `while (true) { processPendingReferences(); }`，
+        // 而这个方法是它的第一句 —— Java 侧期望它阻塞到有 pending Reference 为止。
+        // 我们从不产生 pending Reference（`hasReferencePendingList` 恒 false），于是三种写法：
+        //   · 立刻返回        → handler 线程 **100% CPU 空转** + 疯狂打 safepoint，别的线程被饿死
+        //   · 无限期 park     → 它是在持有监视器时进来的，直接把主线程锁死
+        //   · **睡一小片再返回** ← 取这个：让出 CPU，也不改变任何锁语义
+        std::thread::sleep(std::time::Duration::from_millis(1));
+        Ok(Slot::I(0))
+    });
     // ---- java.lang.VirtualThread ----
     // 本 VM 没有虚拟线程调度器（也就没有 JVMTI 与 continuation），这些全是
     // 「告诉 JVMTI 线程挂载/卸载」的通知口 —— 没有 JVMTI 时注册成空实现是正确语义，

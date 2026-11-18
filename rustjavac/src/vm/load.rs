@@ -425,6 +425,15 @@ impl ClassStore {
         self.metas.get(class).map(|m| m.field_count).unwrap_or(0)
     }
 
+    /// 字段下标 → 字段名（只在这个类**自己**的元数据里找）。
+    ///
+    /// `Unsafe.staticFieldOffset` 给出「字段下标」，而 `staticFieldBase` 给出的是类对象 ——
+    /// 于是 `Unsafe.putInt(base, off)` 落到这里时只剩一个下标，必须能反查名字才能定位静态字段。
+    pub(super) fn field_name_at(&self, class: &str, idx: usize) -> Option<String> {
+        let m = self.metas.get(class)?;
+        m.fields.iter().find(|(_, &i)| i == idx).map(|(n, _)| n.clone())
+    }
+
     /// main 方法
     pub(super) fn main_method(&self) -> Option<usize> {
         let cf = &self.classes[self.main];

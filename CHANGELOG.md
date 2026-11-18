@@ -1386,3 +1386,38 @@ NaN 语义按 `cmpl`/`cmpg` 分别映射到 Cranelift 的 `UnorderedOr*` 条件�
   **null**，是安全的那一侧。
 
 **验证**：`verify.sh` 103/103、`VMLESS_GC_STRESS=1` 下 103/103、`cargo test` 106 passed。
+
+## 0.67.0 — 2026-11-18 · nat_misc 74 条 + 三个跨模块真 bug
+
+### native 覆盖：403 → 591 / 748
+`nat_misc.rs`（1116 行，74 条）补齐：`ClassLoader` 6 条（`defineClass1/0` 真走 `vm.define_class`）、
+`Thread.start0`、`VirtualThread.registerNatives`（修好 `Thread.ofVirtual()`）、`Module` 5 条、
+`StackWalker` 7 条、`Continuation`/FFM 明确不支持、`Perf` 7 条、`reflect` 6 条
+（`getParameters0` **真读 `MethodParameters` 属性**）、`Adler32.updateByteBuffer` 等。
+
+### ① `Unsafe.staticFieldBase/Offset` 恒返回 0 —— 静态字段的原子操作全废
+两条都返回 0/null，于是 `Unsafe.putInt(base, off, v)` 写进裸内存 arena，读回来永远是 0。
+`Reference.processPendingReferences` 的 CAS 循环因此**永不收敛**。
+
+修法：约定 `staticFieldOffset0` = 0、`staticFieldBase0` = **该字段专属的哨兵对象**
+（登记进 `sh.static_bases`），`unsafe_slot`/`unsafe_put_impl` 见哨兵就反查 `(类,字段名)` 读写 `statics`。
+实测：`staticFieldBase` 非 null、`getInt=5`、`weakCompareAndSetInt(5→9)=true`。
+
+### ② 包私有成员被误判为不可访问
+`reflect.rs::check_access` 只判 `public` 与「同 nest」，**漏了「同一个包」**（JLS 6.6.1）。
+于是包私有成员一律抛 `IllegalAccessException` —— `StackWalker` 在 `StackFrameInfo` 的
+包私有构造器上就 `InternalError`。已补 `package_of(caller) == package_of(decl)`（`private` 除外）。
+
+### ③ `ReferenceHandler` 线程 100% CPU 空转
+`waitForReferencePendingList` 原来是 `no_op`，而 `ReferenceHandler.run()` 是
+`while (true) { processPendingReferences(); }` —— 立刻返回就等于死循环 + safepoint 风暴，
+把别的线程饿死。改为睡 1ms 再返回（让出 CPU，不改变任何锁语义）。
+
+**验证**：`verify.sh` 103/103、`cargo test` 106 passed。
+
+### 仍未解（新增已知问题）
+**建第二个 `ThreadLocal` 子类时程序卡住**。已排除两条：不是 `ReferenceHandler` 空转
+（`VMLESS_HANG_DUMP` 显示没有任何线程在跑字节码 16M 次 = 不是 spin，是**阻塞**），
+也不是静态字段原子操作（已修）。要定位需要**线程转储**能力，而本 VM 没有帧栈模型
+（`Vm` 只有 `depth` 计数），`StackWalker`/`getStackTrace` 都只能给空。
+这条是下一步做帧栈的直接动因。

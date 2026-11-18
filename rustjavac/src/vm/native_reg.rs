@@ -947,6 +947,16 @@ fn write_mem(vm: &mut Vm, obj: i32, i: usize, width: usize, v: u64) {
 
 /// `Unsafe.get*` 的 `(Object o, long offset)`：`offset` 在我们的模型里就是**槽下标**
 fn unsafe_slot(vm: &Vm, obj: i32, off: i64) -> Option<Slot> {
+    // `staticFieldBase` 给的是**类对象**：这类访问要落到静态字段表，不是某个实例的槽。
+    if let Some(cn) = vm.class_obj_name(obj) {
+        let fname = vm.store.field_name_at(&cn, off.max(0) as usize)?;
+        return Some(
+            lk(&vm.sh.statics)
+                .get(&(cn, fname))
+                .copied()
+                .unwrap_or(Slot::I(0)),
+        );
+    }
     let i = slot_index(vm, obj, off)?;
     match vm.ref_kind(obj) {
         RefKind::Arr(_) => vm.sh.heap.get(obj, i),
@@ -958,6 +968,13 @@ fn unsafe_slot(vm: &Vm, obj: i32, off: i64) -> Option<Slot> {
 }
 
 fn unsafe_put_impl(vm: &mut Vm, obj: i32, off: i64, v: Slot) {
+    // 同上：`staticFieldBase` 的类对象 → 写静态字段表
+    if let Some(cn) = vm.class_obj_name(obj) {
+        if let Some(fname) = vm.store.field_name_at(&cn, off.max(0) as usize) {
+            lk(&vm.sh.statics).insert((cn, fname), v);
+        }
+        return;
+    }
     let Some(i) = slot_index(vm, obj, off) else { return };
     match vm.ref_kind(obj) {
         RefKind::Arr(_) => vm.sh.heap.set(obj, i, v),
