@@ -12,6 +12,7 @@ use super::call::{
 };
 use super::divmod;
 use super::exc::{class_uses_exceptions, ExcHelpers};
+use super::gcfree;
 use super::insn::{insn_len, insn_len_at};
 use super::layout::{
     class_const_tag, elem_addr, emit_ref_addr, field_off, field_ref_of, field_slot_idx,
@@ -126,6 +127,9 @@ impl Jit {
         // 内联体让操作数栈也可能变深：根区大小是 max_locals + max_stack，
         // 两边都得跟着涨（内联体本身没有 GC 点，但把余量算足不给以后埋雷）
         let max_stack = max_stack0 + stack_extra;
+        // 本方法自己会不会触发 GC：不会的话，整帧根区的那对 push/pop 也可以省掉
+        // （没有 GC 点就没有对象被搬动，也就没有「回来要刷新」这回事）
+        let self_may_gc = gcfree::body_may_gc(&body, !exc_table.is_empty());
 
         // 方法签名：(locals_ptr: i64) -> 返回值
         // 返回值必须按描述符给出真类型：long → i64、double → f64。
@@ -523,6 +527,8 @@ impl Jit {
         // 操作数栈上的引用在 GC 点前也写进来。整块登记进 Heap 的根表，GC 搬完对象就地
         // 改写它，本帧再从根区把新偏移读回去。
         let root_slots = if has_refs { (max_locals + max_stack).max(1) as i32 } else { 0 };
+        // 真正要「登记进堆根表」的条数：本方法不会 GC 时整帧都不用登记
+        let reg = if self_may_gc { root_slots } else { 0 };
         let root_area = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
             cranelift_codegen::ir::StackSlotKind::ExplicitSlot,
             (root_slots * 4) as u32,
@@ -559,7 +565,7 @@ impl Jit {
             }
         }
         if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
 
         // ---- 局部变量驻留寄存器 ----
@@ -1026,7 +1032,7 @@ impl Jit {
                     let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
                     let v = convert_to(&mut fb, v, ret_ty);
                     if has_refs {
-                        self.emit_frame_exit(&mut fb, root_ptr, root_slots)?;
+                        self.emit_frame_exit(&mut fb, root_ptr, reg)?;
                     }
                     fb.ins().return_(&[v]);
                     returns += 1;
@@ -1041,7 +1047,7 @@ impl Jit {
                 0xb1 => {
                     let zero = zero_of(&mut fb, ret_ty);
                     if has_refs {
-                        self.emit_frame_exit(&mut fb, root_ptr, root_slots)?;
+                        self.emit_frame_exit(&mut fb, root_ptr, reg)?;
                     }
                     fb.ins().return_(&[zero]);
                     returns += 1;
@@ -1069,7 +1075,7 @@ impl Jit {
                             op_pc,
                             ret_ty,
                             root_ptr,
-                            root_slots,
+                            reg,
                         )?;
                     terminated = true;
                     open.pop();
@@ -1094,7 +1100,7 @@ impl Jit {
                         let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                         spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                         if has_refs {
-                            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                            self.emit_roots(&mut fb, root_ptr, reg, true)?;
                         }
                         let raw = if bcls == "java/lang/System" && bname == "arraycopy" {
                             // 五参数：单独一个入口
@@ -1121,7 +1127,7 @@ impl Jit {
                             fb.inst_results(c)[0]
                         };
                         if has_refs {
-                            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                            self.emit_roots(&mut fb, root_ptr, reg, false)?;
                         }
                         reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                         let ret = bdesc.rsplit(')').next().unwrap_or("V").to_string();
@@ -1156,13 +1162,13 @@ impl Jit {
                         let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                         spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                         if has_refs {
-                            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                            self.emit_roots(&mut fb, root_ptr, reg, true)?;
                         }
                         let iid = fb.ins().iconst(types::I32, *mid as i64);
                         let fref = self.module.declare_func_in_func(interp_call_id, fb.func);
                         let c = fb.ins().call(fref, &[iid, ptr]);
                         if has_refs {
-                            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                            self.emit_roots(&mut fb, root_ptr, reg, false)?;
                         }
                         reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                         let ret = mdesc.rsplit(')').next().unwrap_or("V").to_string();
@@ -1180,16 +1186,16 @@ impl Jit {
                     let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     // 首次调用这个类的静态方法时先跑它的 <clinit>
                     let callee_owner = method_ref_of(&cf, idx)?.0;
                     self.emit_clinit_call(&mut fb, &callee_owner)?;
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     // 参数出栈（逆序），写进为被调方法准备的栈槽
                     let mut args = Vec::new();
@@ -1220,7 +1226,7 @@ impl Jit {
                         Some(fb.inst_results(call)[0])
                     };
                     // 被调方可能分配过对象：撤根区，把（可能被搬过的）新偏移读回操作数栈
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     if let Some(v) = rv {
                         stack.push(v);
@@ -1245,7 +1251,7 @@ impl Jit {
                             op_pc,
                             ret_ty,
                             root_ptr,
-                            root_slots,
+                            reg,
                         )?;
                         fb.switch_to_block(cont);
                     }
@@ -1302,7 +1308,7 @@ impl Jit {
                     let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     let mut args = Vec::new();
                     for _ in 0..argc {
@@ -1331,7 +1337,7 @@ impl Jit {
                     } else {
                         Some(fb.inst_results(c)[0])
                     };
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     if let Some(v) = rv {
                         stack.push(v);
@@ -1696,12 +1702,12 @@ impl Jit {
                             let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                             spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                             if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                             let fref = self.module.declare_func_in_func(sb_to_str_id, fb.func);
                             let c = fb.ins().call(fref, &[obj]);
                             if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+            self.emit_roots(&mut fb, root_ptr, reg, false)?;
         }
                             reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                             stack.push(fb.inst_results(c)[0]);
@@ -1767,7 +1773,7 @@ impl Jit {
                         let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                         spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                         if has_refs {
-                            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                            self.emit_roots(&mut fb, root_ptr, reg, true)?;
                         }
                         let recv64 = convert_to(&mut fb, recv, types::I64);
                         let a64 = match args.first() {
@@ -1783,7 +1789,7 @@ impl Jit {
                         let c = fb.ins().call(fref, &[recv64, oi, a64, b64]);
                         let raw = fb.inst_results(c)[0];
                         if has_refs {
-                            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                            self.emit_roots(&mut fb, root_ptr, reg, false)?;
                         }
                         reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                         let ret = desc.rsplit(')').next().unwrap_or("V").to_string();
@@ -1821,7 +1827,7 @@ impl Jit {
                         let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                         spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                         if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                         let ptr = fb.ins().stack_addr(types::I64, slot, 0);
                         let key = fb.ins().iconst(types::I32, sig as i64);
@@ -1832,7 +1838,7 @@ impl Jit {
                         } else {
                             Some(fb.inst_results(c)[0])
                         };
-                        self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                        self.emit_roots(&mut fb, root_ptr, reg, false)?;
                         reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                         if let Some(raw) = rv {
                             // vcall 统一按 i64 回来，按真实返回类型转一次
@@ -1867,7 +1873,7 @@ impl Jit {
                             op_pc,
                             ret_ty,
                             root_ptr,
-                            root_slots,
+                            reg,
                         )?;
                             fb.switch_to_block(cont);
                         }
@@ -1888,12 +1894,12 @@ impl Jit {
                         let refs_pc = refs.at.get(&(pc - 3)).cloned().unwrap_or_default();
                         spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                         if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                         let fref = self.module.declare_func_in_func(sb_new_id, fb.func);
                         let c = fb.ins().call(fref, &[]);
                         if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+            self.emit_roots(&mut fb, root_ptr, reg, false)?;
         }
                         reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                         stack.push(fb.inst_results(c)[0]);
@@ -1907,20 +1913,20 @@ impl Jit {
                     // <clinit> 里也可能分配对象 → 先登记根区再调
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     self.emit_clinit_call(&mut fb, &cls)?;
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     // 分配本身也是 GC 点
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     let cid = fb.ins().iconst(types::I32, class_id as i64);
                     let fref = self.module.declare_func_in_func(new_obj_id, fb.func);
                     let c = fb.ins().call(fref, &[cid]);
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     let p = fb.inst_results(c)[0];
                     stack.push(p);
@@ -1994,10 +2000,10 @@ impl Jit {
                     let refs_pc = refs.at.get(&(pc - 2)).cloned().unwrap_or_default();
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     let v = push_new_array(&mut self.module, &mut fb, new_arr_id, desc, n);
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     stack.push(v);
                     let _ = esize;
@@ -2045,11 +2051,11 @@ impl Jit {
                     let refs_pc = refs.at.get(&(pc - 4)).cloned().unwrap_or_default();
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     let fref = self.module.declare_func_in_func(new_multi_id, fb.func);
                     let c = fb.ins().call(fref, &[ptr, nd, sp]);
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     stack.push(fb.inst_results(c)[0]);
                 }
@@ -2073,10 +2079,10 @@ impl Jit {
                     let refs_pc = refs.at.get(&(pc - 3)).cloned().unwrap_or_default();
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     if has_refs {
-            self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+            self.emit_roots(&mut fb, root_ptr, reg, true)?;
         }
                     let v = push_new_array(&mut self.module, &mut fb, new_arr_id, &desc, n);
-                    self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                    self.emit_roots(&mut fb, root_ptr, reg, false)?;
                     reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                     stack.push(v);
                 }
@@ -2248,13 +2254,13 @@ impl Jit {
                             let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                             spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                             if has_refs {
-                                self.emit_roots(&mut fb, root_ptr, root_slots, true)?;
+                                self.emit_roots(&mut fb, root_ptr, reg, true)?;
                             }
                             let pi = fb.ins().iconst(types::I32, plan as i64);
                             let fref = self.module.declare_func_in_func(concat_id, fb.func);
                             let c = fb.ins().call(fref, &[pi, ptr]);
                             if has_refs {
-                                self.emit_roots(&mut fb, root_ptr, root_slots, false)?;
+                                self.emit_roots(&mut fb, root_ptr, reg, false)?;
                             }
                             reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                             stack.push(fb.inst_results(c)[0]);
@@ -2269,7 +2275,7 @@ impl Jit {
             fb.switch_to_block(b);
             let z = zero_of(&mut fb, ret_ty);
             if has_refs {
-                self.emit_frame_exit(&mut fb, root_ptr, root_slots)?;
+                self.emit_frame_exit(&mut fb, root_ptr, reg)?;
             }
             fb.ins().return_(&[z]);
         }

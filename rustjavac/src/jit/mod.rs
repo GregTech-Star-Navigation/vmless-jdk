@@ -21,6 +21,7 @@ mod indy;
 mod inline;
 mod insn;
 mod pure;
+mod gcfree;
 mod layout;
 mod natives;
 mod refmap;
@@ -51,6 +52,8 @@ pub struct Jit {
     n_compiled: usize,
     /// 内联掉的调用点个数（`jit::inline` 的账）
     n_inlined: usize,
+    /// 方法 → 「会不会触发 GC」（`jit::gcfree` 的判据，见那儿的长注释）
+    may_gc: std::collections::HashMap<(String, String, String), bool>,
 }
 
 #[derive(Debug)]
@@ -136,6 +139,7 @@ impl Jit {
             interpreted: std::collections::HashMap::new(),
             n_compiled: 0,
             n_inlined: 0,
+            may_gc: std::collections::HashMap::new(),
         }
     }
 
@@ -219,6 +223,30 @@ impl Jit {
     /// 成功编译的方法个数
     pub fn compiled_count(&self) -> usize {
         self.n_compiled
+    }
+
+    /// 被调方法会不会触发 GC（`jit::gcfree` 的保守判据）。
+    ///
+    /// 解析不出来就按「会 GC」处理 —— 判反了只会多登记一次根区，
+    /// 绝不会漏登记。
+    pub(super) fn method_may_gc(&mut self, owner: &str, name: &str, desc: &str) -> bool {
+        let key = (owner.to_string(), name.to_string(), desc.to_string());
+        if let Some(v) = self.may_gc.get(&key) {
+            return *v;
+        }
+        let v = (|| {
+            let cf = self.classes.get(owner)?;
+            let m = cf.methods.iter().find(|m| {
+                let n = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default());
+                let d = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default());
+                n == name && d == desc
+            })?;
+            let (_, _, body, table) = call::code_of(&cf, m).ok()?;
+            Some(gcfree::body_may_gc(&body, !table.is_empty()))
+        })()
+        .unwrap_or(true);
+        self.may_gc.insert(key, v);
+        v
     }
 
     /// **逐方法**试一遍：把类表里每个有字节码的方法都编译一次。
