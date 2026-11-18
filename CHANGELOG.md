@@ -1561,3 +1561,49 @@ AWT 一个闭包几百个类就是几十秒，`Class.forName` 看起来像卡死
 并补 `getRoot` 的 override（我们没有 root 机制，原样返回实参）。
 
 **验证**：`verify.sh` 103/103、`cargo test` 106 passed。
+
+## 0.71.0 — 2026-11-18 · AQS 通了；`wide` 字节码；字段遮蔽按 JVMS 解析
+
+### ① `LockSupport.park` 永远不返回 —— AQS 全挂
+`thread_park` 原来只有一条出路：**被中断**。`unpark` 呢？`ThreadRec` 里根本没有「许可」这个概念，
+`wake()` 只是 unpark 一下 condvar，而 `thread_park(None)` 的循环**从不检查许可**。
+
+于是 `ReentrantLock.await` / `CountDownLatch.await` / `LinkedBlockingDeque.take` 这类
+「先阻塞等事件」的形态全部**永久挂死**（`WatchService.take()`、`Socket.accept()` 同理）。
+
+修法：给每个线程一个 `permit`（JDK 语义：`unpark` 在目标没 park 时记一个许可，
+下一次 `park` 立刻返回并清掉；连续多次 `unpark` 只算一次），
+`thread_park` 进出都检查它，`wake()` 先置许可再 unpark。
+
+实测：
+```
+ReentrantLock 1000 次争用   lock=1000        ✓
+CountDownLatch.await        latch ok         ✓
+Semaphore.acquire/release   sem ok           ✓
+```
+（改前这三个全部挂死）
+
+### ② `wide`（0xc4）字节码没实现
+javac 在「局部变量槽 ≥ 256」或「`iinc` 增量超出 `i8`」时才发它 —— 一个方法里局部变量多就会撞上。
+症状是**同一方法里所有路径都挂**，与具体逻辑无关（`fillOval`/`fill(Shape)` 就是这么被挡的，pc=662）。
+已实现 `*load` / `*store` / `iinc` 三种后续指令，其它明确报错。
+
+### ③ 字段遮蔽：解析必须按 JVMS 从**声明类**出发
+`metas[..].fields` 是按名字合并过的（父类先插、`or_insert` 保留父类那份），
+所以**子类遮蔽父类同名字段时永远指不到子类那一份**。
+JDK 里真有：`WindowsWatchService$WindowsWatchKey.events`（`Set`）遮蔽
+`AbstractWatchKey.events`（`List`）—— 于是 `signalEvent()` 拿到父类那个 List 槽，
+`List.get(int)` 打到 HashSet 上，报「内建方法 get 未实现」。
+
+修法：新增 `ClassStore::own_fields`（每个类**自己声明**的字段表），
+`field_index` 沿继承链逐层查它；`field_offset` 改成**声明类优先**（原来运行时类优先，遮蔽就反了）。
+
+### ④ `ClassStore::add_class` 从 O(类总数) 改成增量
+每次加载类都整体重建 methods/metas，实测 **~85ms/类**。AWT 一个闭包几百类就是几十秒，
+`Class.forName` 看起来像卡死。
+
+**验证**：`verify.sh` 103/103、`cargo test` 106 passed。
+
+### 仍未解
+`Condition.await/signal` 仍挂（`ReentrantLock`/`CountDownLatch`/`Semaphore` 已通，同一个 AQS 家族）。
+下一步按 `ConditionObject` 的 `fullyRelease` + `park` + 重入恢复顺序查。

@@ -500,6 +500,41 @@ impl Vm {
                     let v = frame.load(slot).as_i32().wrapping_add(delta);
                     frame.store(slot, Slot::I(v));
                 }
+                // wide：把后面那条指令的下标扩成 u16（`iinc` 的增量也扩成 i16）。
+                // javac 在「局部变量槽 ≥ 256」或「iinc 增量超出 i8」时才发它；
+                // 一个方法里局部变量很多（大 `switch`、巨型方法体）就会撞上。
+                // 不实现的话报「未实现的字节码 0xc4」，症状是**同一个方法里所有路径都挂**，
+                // 看起来跟具体逻辑无关（`fillOval`/`fill(Shape)` 就是这么被挡的）。
+                0xc4 => {
+                    let op2 = body[pc];
+                    let idx = u16::from_be_bytes([body[pc + 1], body[pc + 2]]) as usize;
+                    match op2 {
+                        // *load
+                        0x15..=0x19 => {
+                            pc += 3;
+                            frame.push(frame.load(idx));
+                        }
+                        // *store
+                        0x36..=0x3a => {
+                            pc += 3;
+                            let v = frame.pop()?;
+                            frame.store(idx, v);
+                        }
+                        // iinc（u16 下标 + i16 增量）
+                        0x84 => {
+                            let delta = i16::from_be_bytes([body[pc + 3], body[pc + 4]]) as i32;
+                            pc += 5;
+                            let v = frame.load(idx).as_i32().wrapping_add(delta);
+                            frame.store(idx, Slot::I(v));
+                        }
+                        // ret：旧版 finally 的产物，本编译器不生成；明确报出来而不是静默跳过
+                        other => {
+                            return super::err(format!(
+                                "wide 后的字节码 {other:#04x} 不支持（pc={pc}）"
+                            ))
+                        }
+                    }
+                }
                 // int 算术
                 0x60 | 0x64 | 0x68 | 0x6c | 0x70 => {
                     let b = frame.pop_i()?;
@@ -1515,8 +1550,13 @@ impl Vm {
 
     /// 字段偏移：先按引用类的继承链找，找不到再按对象的**运行时类**找
     pub(super) fn field_offset(&self, obj: i32, owner: &str, name: &str) -> Result<usize, VmError> {
-        self.field_index_of_object(obj, name)
-            .or_else(|| self.store.field_index(owner, name))
+        // JVMS：字段按常量池里的**声明类**（`owner`）解析。
+        // 原来「先按运行时类查」会让 `getfield AbstractWatchKey.events` 也落到子类那个槽上，
+        // 遮蔽就反了 —— `WindowsWatchKey.events`(Set) 遮蔽 `AbstractWatchKey.events`(List) 时，
+        // `signalEvent()` 会拿到父类那个 List 槽，`List.get(int)` 打到 HashSet 上。
+        self.store
+            .field_index(owner, name)
+            .or_else(|| self.field_index_of_object(obj, name))
             .ok_or_else(|| VmError { msg: format!("未知字段 {owner}.{name}"), exc: None })
     }
 

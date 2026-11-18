@@ -145,6 +145,13 @@ pub(super) struct ThreadRec {
     pub interrupted: bool,
     /// 正在等哪个监视器（诊断 / 死锁报告用）
     pub waiting_on: i32,
+    /// `LockSupport.unpark` 留下的**许可**。
+    ///
+    /// JDK 语义：`unpark` 在目标线程没 park 时记一个许可，下一次 `park` **立刻返回并清掉**；
+    /// 连续多次 `unpark` 只算一次。少了它，`park()` 只能靠中断才返回 ——
+    /// 而 AQS（`ReentrantLock`/`Condition`/`LinkedBlockingDeque`）全是无限期 park，
+    /// 一挂就是整个程序卡死。
+    pub permit: bool,
 }
 
 // ---------------------------------------------------------------- 停靠频率
@@ -171,6 +178,7 @@ impl Vm {
             parker: Parker::new(),
             interrupted: false,
             waiting_on: 0,
+            permit: false,
         };
         lk(&self.sh.threads).insert(tid, rec);
         self.sh.nthreads.fetch_add(1, Ordering::AcqRel);
@@ -243,15 +251,20 @@ impl Vm {
         };
         match timeout {
             Some(d) => parker.park_timeout(d),
-            None => {
-                parker.park();
-                true
-            }
+            // **不能无限期 `park()`**：`LockSupport.park` 的契约本来就允许**伪唤醒**，
+            // 而我们的 `unpark` 要靠「Thread 对象句柄 → tid」反查，那条链一旦断掉
+            // （对象还没登记、或 tid 表在 GC 期间换过），`park()` 就永远醒不来。
+            // AQS（`ReentrantLock`/`Condition`/`LinkedBlockingDeque`）全是无限期 park，
+            // 一挂就是整个程序卡死。用 50ms 一片轮转：伪唤醒 → AQS 重查条件 → 该走的就走。
+            None => parker.park_timeout(Duration::from_millis(50)),
         }
     }
 
     pub(super) fn wake(&self, tid: u64) {
-        if let Some(r) = lk(&self.sh.threads).get(&tid) {
+        if let Some(r) = lk(&self.sh.threads).get_mut(&tid) {
+            // 先记许可再 unpark：`LockSupport.unpark` 在目标还没 park 时也要「记住这一次」，
+            // 否则 AQS 的 signal 早于 await 就会丢（典型症状：先 signal 后 await 永不醒）。
+            r.permit = true;
             r.parker.unpark();
         }
     }
@@ -788,6 +801,10 @@ impl Vm {
     pub(super) fn thread_park(&mut self, timeout: Option<Duration>) -> Result<(), VmError> {
         let me = cur_tid();
         const CAP: Duration = Duration::from_millis(100);
+        // 许可：`unpark` 在没 park 时留下的那一个。有许可就**立刻返回并清掉**。
+        if self.take_permit(me) {
+            return Ok(());
+        }
         let deadline = timeout.map(|d| Instant::now() + d);
         loop {
             if lk(&self.sh.threads).get(&me).map(|r| r.interrupted).unwrap_or(false) {
@@ -806,6 +823,23 @@ impl Vm {
             self.set_state(me, if timeout.is_some() { ST_TIMED_WAITING } else { ST_WAITING });
             self.park_block(Some(slice));
             self.set_state(me, ST_RUNNABLE);
+            // unpark 到达（或分片超时的伪唤醒）→ 返回。`LockSupport.park` 允许伪唤醒，
+            // 调用方（AQS）会重查条件再决定要不要继续 park。
+            if self.take_permit(me) || timeout.is_none() {
+                return Ok(());
+            }
+        }
+    }
+
+    /// 取走一个 park 许可（有则清掉并返回 true）
+    fn take_permit(&self, tid: u64) -> bool {
+        let mut t = lk(&self.sh.threads);
+        match t.get_mut(&tid) {
+            Some(r) if r.permit => {
+                r.permit = false;
+                true
+            }
+            _ => false,
         }
     }
 

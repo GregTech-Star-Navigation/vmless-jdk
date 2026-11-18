@@ -30,6 +30,15 @@ pub(crate) struct ClassStore {
     /// 内部类名 → 类下标
     pub(super) by_name: HashMap<String, usize>,
     pub(super) metas: HashMap<String, ClassMeta>,
+    /// 类 → 「**本类自己声明**的实例字段」名→下标。
+    ///
+    /// `metas[..].fields` 是按名字合并过的（父类先插、`or_insert` 保留父类那份），
+    /// 所以**子类遮蔽父类同名字段时，`fields` 永远指不到子类那一份**。
+    /// JDK 里真有这种：`WindowsWatchService$WindowsWatchKey.events`（`Set`）遮蔽
+    /// `AbstractWatchKey.events`（`List`）—— 于是 `signalEvent()` 读到父类那个 List 槽，
+    /// `List.get(int)` 打到 HashSet 上，报「内建方法 get 未实现」。
+    /// 字段解析按 JVMS 要「从引用类出发、逐层查本类自己的表」，所以这张表是必需的。
+    pub(super) own_fields: HashMap<String, HashMap<String, usize>>,
     /// (声明类, 方法名, 描述符) → (类下标, 方法下标)
     pub(super) methods: HashMap<(String, String, String), (usize, usize)>,
     /// main 方法所在的类下标
@@ -176,6 +185,7 @@ impl ClassStore {
     fn build_meta_one(&mut self, name: &str) {
         let chain = self.chain(name);
         let mut fields = HashMap::new();
+        let mut own = HashMap::new();
         let mut count = 0usize;
         for c in chain.iter().rev() {
             let Some(&ci) = self.by_name.get(c) else { continue };
@@ -185,10 +195,15 @@ impl ClassStore {
                     continue; // 静态字段不在对象里
                 }
                 let n = String::from_utf8_lossy(cf.utf8(f.name_index).unwrap_or_default()).into_owned();
-                fields.entry(n).or_insert(count);
+                fields.entry(n.clone()).or_insert(count);
+                // 只记「本类自己声明」的那一份 —— 遮蔽时它才是正确的槽
+                if c.as_str() == name {
+                    own.insert(n, count);
+                }
                 count += 1;
             }
         }
+        self.own_fields.insert(name.to_string(), own);
         self.metas.insert(name.to_string(), ClassMeta { fields, field_count: count });
     }
 
@@ -237,6 +252,7 @@ impl ClassStore {
             classes,
             by_name,
             metas: HashMap::new(),
+            own_fields: HashMap::new(),
             methods,
             main,
         };
@@ -293,9 +309,11 @@ impl ClassStore {
 
     fn build_metas(&mut self) {
         let names: Vec<String> = self.by_name.keys().cloned().collect();
+        self.own_fields.clear();
         for name in names {
             let chain = self.chain(&name);
             let mut fields = HashMap::new();
+            let mut own = HashMap::new();
             let mut count = 0usize;
             for c in chain.iter().rev() {
                 let Some(&ci) = self.by_name.get(c) else { continue };
@@ -305,10 +323,14 @@ impl ClassStore {
                         continue; // 静态字段不在对象里
                     }
                     let n = String::from_utf8_lossy(cf.utf8(f.name_index).unwrap_or_default()).into_owned();
-                    fields.entry(n).or_insert(count);
+                    fields.entry(n.clone()).or_insert(count);
+                    if c.as_str() == name.as_str() {
+                        own.insert(n, count);
+                    }
                     count += 1;
                 }
             }
+            self.own_fields.insert(name.clone(), own);
             self.metas.insert(name.clone(), ClassMeta { fields, field_count: count });
         }
     }
@@ -442,15 +464,20 @@ impl ClassStore {
     }
 
     /// 从 `from` 开始的继承链上，字段名 → 下标
+    /// 字段解析（JVMS 5.4.3.2）：从 `from` 出发沿继承链**逐层查该层自己声明的表**。
+    ///
+    /// 不能查合并过的 `metas[..].fields` —— 那张表用 `or_insert` 保留的是**父类**那份，
+    /// 子类遮蔽父类同名字段时永远指不到子类的槽。
     pub(super) fn field_index(&self, from: &str, name: &str) -> Option<usize> {
         for c in self.chain(from) {
-            if let Some(m) = self.metas.get(&c) {
-                if let Some(i) = m.fields.get(name) {
+            if let Some(m) = self.own_fields.get(&c) {
+                if let Some(i) = m.get(name) {
                     return Some(*i);
                 }
             }
         }
-        None
+        // 兜底：链上某个类没进 `own_fields`（内置元数据 / 未加载的父类）时用合并表
+        self.metas.get(from).and_then(|m| m.fields.get(name)).copied()
     }
 
     pub(super) fn field_count(&self, class: &str) -> usize {

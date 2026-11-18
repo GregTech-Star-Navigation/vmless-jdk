@@ -49,6 +49,9 @@ pub(super) fn register(r: &mut NativeRegistry) {
     register_net(r);
     register_socket_dispatcher(r);
     register_inet_address(r);
+    register_network_interface(r);
+    register_watch_service(r);
+    register_selector(r);
     register_dns(r);
 }
 
@@ -2187,11 +2190,32 @@ fn net_join_or_drop4(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::I(0))
 }
 
-fn net_block_or_unblock4(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
-    Err(vm.throw_msg(
-        "java/io/IOException",
-        "IPv4 组播源过滤（blockOrUnblock4）未实现".to_string(),
-    ))
+/// `blockOrUnblock4(boolean block, fd, int group, int interf, int source)`：
+/// 源过滤（`IP_BLOCK_SOURCE` / `IP_UNBLOCK_SOURCE`）。三个参数都是
+/// `Inet4Address.address` 那种「网络序被当成 int」的值，所以 `to_be_bytes` 才是线上字节。
+fn net_block_or_unblock4(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    const IP_BLOCK_SOURCE: i32 = 17;
+    const IP_UNBLOCK_SOURCE: i32 = 18;
+    let block = f.arg_i(0) != 0;
+    let s = sock_of(vm, f.arg_i(1));
+    let group = f.arg_i(2) as u32;
+    let interf = f.arg_i(3) as u32;
+    let source = f.arg_i(4) as u32;
+    #[repr(C)]
+    struct IpMreqSource {
+        multiaddr: u32,
+        sourceaddr: u32,
+        interface: u32,
+    }
+    let mreq = IpMreqSource { multiaddr: group, sourceaddr: source, interface: interf };
+    let opt = if block { IP_BLOCK_SOURCE } else { IP_UNBLOCK_SOURCE };
+    if unsafe {
+        setsockopt(s, IPPROTO_IP, opt, &mreq as *const IpMreqSource as *const u8, 12)
+    } == SOCKET_ERROR
+    {
+        return Err(sock_error(vm, unsafe { WSAGetLastError() }, "源过滤配置失败"));
+    }
+    Ok(Slot::I(0))
 }
 
 fn net_join_or_drop6(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -2226,11 +2250,45 @@ fn net_join_or_drop6(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     Ok(Slot::I(0))
 }
 
-fn net_block_or_unblock6(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
-    Err(vm.throw_msg(
-        "java/io/IOException",
-        "IPv6 组播源过滤（blockOrUnblock6）未实现".to_string(),
-    ))
+/// `blockOrUnblock6(block, fd, byte[] group, int index, byte[] source)`：
+/// IPv6 的源过滤走 `group_source_req`（组接口下标 + 两个 `sockaddr_storage`）。
+fn net_block_or_unblock6(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    const MCAST_BLOCK_SOURCE: i32 = 43;
+    const MCAST_UNBLOCK_SOURCE: i32 = 44;
+    let block = f.arg_i(0) != 0;
+    let s = sock_of(vm, f.arg_i(1));
+    let group = read_array_bytes(vm, f.arg_i(2), 16);
+    let index = f.arg_i(3) as u32;
+    let source = read_array_bytes(vm, f.arg_i(4), 16);
+    if group.len() != 16 || source.len() != 16 {
+        return Err(vm.throw_msg("java/io/IOException", "组播组/源地址长度非法".to_string()));
+    }
+    let req = group_source_req(index, &group, &source);
+    let opt = if block { MCAST_BLOCK_SOURCE } else { MCAST_UNBLOCK_SOURCE };
+    if unsafe {
+        setsockopt(s, IPPROTO_IPV6, opt, req.as_ptr() as *const u8, req.len() as i32)
+    } == SOCKET_ERROR
+    {
+        return Err(sock_error(vm, unsafe { WSAGetLastError() }, "源过滤配置失败"));
+    }
+    Ok(Slot::I(0))
+}
+
+/// `GROUP_SOURCE_REQ`：两个 `GROUP_REQ`（各 = `ULONG gr_interface`(4) + 4 填充 +
+/// `SOCKADDR_STORAGE`(128)），共 272 字节。
+fn group_source_req(index: u32, group: &[u8], source: &[u8]) -> Vec<u8> {
+    // sockaddr_in6：family(u16@0) port(u16@2) flowinfo(u32@4) addr@8 scope_id@24
+    fn put_sockaddr(buf: &mut [u8], at: usize, addr: &[u8], index: u32) {
+        buf[at..at + 2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
+        buf[at + 8..at + 24].copy_from_slice(&addr[..16]);
+        buf[at + 24..at + 28].copy_from_slice(&index.to_ne_bytes());
+    }
+    let mut req = vec![0u8; 272];
+    req[0..4].copy_from_slice(&index.to_ne_bytes());
+    put_sockaddr(&mut req, 8, group, index);
+    req[136..140].copy_from_slice(&index.to_ne_bytes());
+    put_sockaddr(&mut req, 144, source, index);
+    req
 }
 
 fn net_set_interface4(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -3119,6 +3177,970 @@ fn register_windows_security(r: &mut NativeRegistry) {
     r.add(WND, "AdjustTokenPrivileges", "(JJI)V", wnd_AdjustTokenPrivileges);
     r.add(WND, "LookupPrivilegeValue0", "(J)J", wnd_LookupPrivilegeValue0);
     r.add(WND, "AccessCheck", "(JJIIIII)Z", wnd_AccessCheck);
+}
+
+// ============================================================ java.net.NetworkInterface
+//
+// 与 HotSpot 的 `windows/native/libnet/NetworkInterface.c` **同一条 API 路线**：
+// `GetIfTable2` 拿接口行、`GetUnicastIpAddressTable`/`GetAnycastIpAddressTable` 拿地址表、
+// `ConvertInterfaceLuidToNameW` 拿名字。这不是随便挑的：
+//
+// - 名字必须是 `ConvertInterfaceLuidToNameW` 的结果（`ethernet_0` / `loopback_0` / `tunnel_32512`），
+//   不是 `GetAdaptersAddresses` 的 FriendlyName（"以太网"）也不是 AdapterName（`{GUID}`）。
+//   名字对不上，`getByName(ni.getName())` 立刻返回 null。
+// - 顺序必须是 `GetIfTable2` 的行顺序（NDIS 的枚举序，既不是 IfIndex 序也不是字典序）。
+// - `isUp` 是 `AdminStatus==UP && OperStatus==Up`，`isLoopback` 是 `Type==IF_TYPE_SOFTWARE_LOOPBACK`，
+//   `isP2P` 是 `AccessType==NET_IF_ACCESS_POINT_TO_POINT`，MTU 是行里的 `Mtu`。
+// - 地址表里只有 DadState ∈ {Deprecated, Preferred} 的要（其它是 tentative/duplicate）。
+// - HotSpot 收集地址时是**头插链表**，所以数组顺序与地址表顺序**相反**，别顺手改正过来。
+//
+// 结构体布局按 Windows SDK（netioapi.h）逐字节对齐，下面有 const 断言钉住偏移 ——
+// 偏移错一个不会报错，只会读到别的字段（MTU 变成 GUID 的低 4 字节之类）。
+
+const NI: &str = "java/net/NetworkInterface";
+const IFA: &str = "java/net/InterfaceAddress";
+
+const IF_MAX_STRING_SIZE: usize = 256;
+const MIB_IF_ROW2_SIZE: usize = 1352;
+const MIB_UNICAST_ROW_SIZE: usize = 80;
+const MIB_ANYCAST_ROW_SIZE: usize = 48;
+const ERROR_INVALID_NAME: u32 = 123;
+const ERROR_OPERATION_ABORTED: u32 = 995;
+/// `NO_PREFIX`（NetworkInterface.c）：anycast 地址没有前缀长度
+const NO_PREFIX: u8 = 255;
+/// `NL_DAD_STATE`：`NldsDeprecated = 3`、`NldsPreferred = 4`
+const DAD_DEPRECATED: u32 = 3;
+const DAD_PREFERRED: u32 = 4;
+/// `IF_TYPE_SOFTWARE_LOOPBACK`
+const IF_TYPE_SOFTWARE_LOOPBACK: u32 = 24;
+/// `NET_IF_ACCESS_POINT_TO_POINT`
+const NET_IF_ACCESS_POINT_TO_POINT: u32 = 3;
+/// `NET_IF_ADMIN_STATUS_UP` / `IfOperStatusUp`
+const NET_IF_ADMIN_STATUS_UP: u32 = 1;
+const IF_OPER_STATUS_UP: u32 = 1;
+
+#[repr(C)]
+struct MibIfRow2 {
+    interface_luid: u64,
+    interface_index: u32,
+    interface_guid: [u8; 16],
+    alias: [u16; IF_MAX_STRING_SIZE + 1],
+    description: [u16; IF_MAX_STRING_SIZE + 1],
+    physical_address_length: u32,
+    physical_address: [u8; 32],
+    permanent_physical_address: [u8; 32],
+    mtu: u32,
+    if_type: u32,
+    tunnel_type: u32,
+    media_type: u32,
+    physical_medium_type: u32,
+    access_type: u32,
+    direction_type: u32,
+    status_flags: u8,
+    oper_status: u32,
+    admin_status: u32,
+    media_connect_state: u32,
+    network_guid: [u8; 16],
+    connection_type: u32,
+    transmit_link_speed: u64,
+    receive_link_speed: u64,
+    counters: [u64; 18],
+}
+
+/// `MIB_UNICASTIPADDRESS_ROW`
+#[repr(C)]
+struct MibUnicastRow {
+    address: [u8; 28],
+    interface_luid: u64,
+    interface_index: u32,
+    prefix_origin: u32,
+    suffix_origin: u32,
+    valid_lifetime: u32,
+    preferred_lifetime: u32,
+    on_link_prefix_length: u8,
+    skip_as_source: u8,
+    _pad: u16,
+    dad_state: u32,
+    scope_id: u32,
+    creation_timestamp: i64,
+}
+
+/// `MIB_ANYCASTIPADDRESS_ROW`
+#[repr(C)]
+struct MibAnycastRow {
+    address: [u8; 28],
+    interface_luid: u64,
+    interface_index: u32,
+    scope_id: u32,
+}
+
+const _: () = {
+    assert!(std::mem::size_of::<MibIfRow2>() == MIB_IF_ROW2_SIZE);
+    assert!(std::mem::offset_of!(MibIfRow2, alias) == 28);
+    assert!(std::mem::offset_of!(MibIfRow2, description) == 542);
+    assert!(std::mem::offset_of!(MibIfRow2, physical_address_length) == 1056);
+    assert!(std::mem::offset_of!(MibIfRow2, physical_address) == 1060);
+    assert!(std::mem::offset_of!(MibIfRow2, mtu) == 1124);
+    assert!(std::mem::offset_of!(MibIfRow2, if_type) == 1128);
+    assert!(std::mem::offset_of!(MibIfRow2, access_type) == 1144);
+    assert!(std::mem::offset_of!(MibIfRow2, oper_status) == 1156);
+    assert!(std::mem::offset_of!(MibIfRow2, admin_status) == 1160);
+    assert!(std::mem::size_of::<MibUnicastRow>() == MIB_UNICAST_ROW_SIZE);
+    assert!(std::mem::offset_of!(MibUnicastRow, interface_luid) == 32);
+    assert!(std::mem::offset_of!(MibUnicastRow, dad_state) == 64);
+    assert!(std::mem::size_of::<MibAnycastRow>() == MIB_ANYCAST_ROW_SIZE);
+    assert!(std::mem::offset_of!(MibAnycastRow, interface_luid) == 32);
+};
+
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn GetIfTable2(table: *mut *mut c_void) -> u32;
+    fn GetIfEntry2(row: *mut c_void) -> u32;
+    fn GetUnicastIpAddressTable(family: u16, table: *mut *mut c_void) -> u32;
+    fn GetAnycastIpAddressTable(family: u16, table: *mut *mut c_void) -> u32;
+    fn FreeMibTable(mem: *const c_void);
+    fn ConvertInterfaceLuidToNameW(luid: *const u64, name: *mut u16, len: usize) -> u32;
+    fn ConvertInterfaceNameToLuidW(name: *const u16, luid: *mut u64) -> u32;
+}
+
+/// 一张 `MIB_*_TABLE`（首字段 `NumEntries`，行紧跟其后；行是 8 字节对齐的，所以
+/// 表头实际占 8 字节而不是 4 —— `MIB_IF_ROW2` 里有 `ULONG64`）。
+struct MibTable {
+    ptr: *const u8,
+    count: usize,
+    stride: usize,
+}
+
+impl MibTable {
+    fn new(ptr: *const c_void, stride: usize) -> Option<MibTable> {
+        if ptr.is_null() {
+            return None;
+        }
+        let count = unsafe { *(ptr as *const u32) } as usize;
+        Some(MibTable { ptr: ptr as *const u8, count, stride })
+    }
+    fn row(&self, i: usize) -> *const u8 {
+        unsafe { self.ptr.add(8 + i * self.stride) }
+    }
+    fn ifrow(&self, i: usize) -> &MibIfRow2 {
+        unsafe { &*(self.row(i) as *const MibIfRow2) }
+    }
+    fn unicast(&self, i: usize) -> &MibUnicastRow {
+        unsafe { &*(self.row(i) as *const MibUnicastRow) }
+    }
+    fn anycast(&self, i: usize) -> &MibAnycastRow {
+        unsafe { &*(self.row(i) as *const MibAnycastRow) }
+    }
+}
+
+impl Drop for MibTable {
+    fn drop(&mut self) {
+        unsafe { FreeMibTable(self.ptr as *const c_void) };
+    }
+}
+
+fn sock_socket_error(vm: &mut Vm, code: u32, what: &str) -> VmError {
+    vm.throw_msg("java/net/SocketException", format!("{what}: {}", win_msg(code)))
+}
+
+/// `ipv6_available()` → 有就 AF_UNSPEC(0)，没有就 AF_INET。本实现永远按有 IPv6 处理。
+fn mib_if_table(vm: &mut Vm) -> Result<MibTable, VmError> {
+    let mut p: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { GetIfTable2(&mut p) };
+    if rc != 0 {
+        return Err(sock_socket_error(vm, rc, "GetIfTable2"));
+    }
+    MibTable::new(p, MIB_IF_ROW2_SIZE)
+        .ok_or_else(|| vm.throw_msg("java/net/SocketException", "GetIfTable2 返回空表".to_string()))
+}
+
+fn mib_uni_table(vm: &mut Vm) -> Result<MibTable, VmError> {
+    let mut p: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { GetUnicastIpAddressTable(0 /* AF_UNSPEC */, &mut p) };
+    if rc != 0 {
+        return Err(sock_socket_error(vm, rc, "GetUnicastIpAddressTable"));
+    }
+    MibTable::new(p, MIB_UNICAST_ROW_SIZE).ok_or_else(|| {
+        vm.throw_msg("java/net/SocketException", "GetUnicastIpAddressTable 返回空表".to_string())
+    })
+}
+
+fn mib_any_table(vm: &mut Vm) -> Result<MibTable, VmError> {
+    let mut p: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { GetAnycastIpAddressTable(0, &mut p) };
+    if rc != 0 {
+        return Err(sock_socket_error(vm, rc, "GetAnycastIpAddressTable"));
+    }
+    MibTable::new(p, MIB_ANYCAST_ROW_SIZE).ok_or_else(|| {
+        vm.throw_msg("java/net/SocketException", "GetAnycastIpAddressTable 返回空表".to_string())
+    })
+}
+
+fn wz_len(buf: &[u16]) -> usize {
+    buf.iter().position(|&c| c == 0).unwrap_or(buf.len())
+}
+
+fn luid_name(luid: u64) -> Option<String> {
+    let mut buf = [0u16; IF_MAX_STRING_SIZE + 1];
+    let rc = unsafe { ConvertInterfaceLuidToNameW(&luid, buf.as_mut_ptr(), buf.len()) };
+    if rc != 0 {
+        return None;
+    }
+    let n = wz_len(&buf);
+    Some(String::from_utf16_lossy(&buf[..n]))
+}
+
+/// `SOCKADDR_INET` → (地址字节, scope_id)。v4 取 4 字节、v6 取 16 字节（`sin6_addr` 在偏移 8）
+fn sockaddr_split(sa: &[u8; 28]) -> Option<(Vec<u8>, u32)> {
+    let fam = u16::from_ne_bytes([sa[0], sa[1]]) as i32;
+    if fam == AF_INET {
+        Some((sa[4..8].to_vec(), 0))
+    } else if fam == AF_INET6 {
+        let scope = u32::from_ne_bytes([sa[24], sa[25], sa[26], sa[27]]);
+        Some((sa[8..24].to_vec(), scope))
+    } else {
+        None
+    }
+}
+
+/// 广播地址：`addr | ~mask(prefix)`（`ConvertLengthToIpv4Mask` 给出的掩码是网络序，
+/// 这里直接按字节算，与它同一个结果）
+fn broadcast_of(addr: &[u8], prefix: u8) -> [u8; 4] {
+    let mut out = [0u8; 4];
+    for k in 0..4 {
+        let bits = (prefix as i32 - (k as i32) * 8).clamp(0, 8) as u32;
+        let mask: u8 = if bits == 0 { 0 } else { (0xFFu16 << (8 - bits)) as u8 };
+        out[k] = addr[k] | !mask;
+    }
+    out
+}
+
+/// 给 IPv6 地址补 `holder6.scope_ifname`（`getHostAddress()` 打印的 `%ethernet_0` 就靠它）。
+/// `scope_ifname` 是 `NetworkInterface` 类型，`scope_ifname_set` 置 true 后不再看数字 scope。
+fn inet6_set_scope_ifname(vm: &mut Vm, ia: i32, ni: i32) {
+    const H6: &str = "java/net/Inet6Address$Inet6AddressHolder";
+    let Some(fi) = vm.store.field_index("java/net/Inet6Address", "holder6") else { return };
+    let h = vm.sh.heap.get(ia, fi).map(|s| s.as_i32()).unwrap_or(0);
+    if h <= 0 {
+        return;
+    }
+    if let Some(i) = vm.store.field_index(H6, "scope_ifname") {
+        let _ = vm.sh.heap.set(h, i, Slot::I(ni));
+    }
+    if let Some(i) = vm.store.field_index(H6, "scope_ifname_set") {
+        let _ = vm.sh.heap.set(h, i, Slot::I(1));
+    }
+}
+
+fn new_inet4(vm: &mut Vm, addr_be: i32) -> Result<i32, VmError> {
+    vm.new_instance_args(
+        "java/net/Inet4Address",
+        "(Ljava/lang/String;I)V",
+        &[Slot::I(0), Slot::I(addr_be)],
+    )
+}
+
+fn new_inet6(vm: &mut Vm, bytes: &[u8], scope: u32, ni: i32) -> Result<i32, VmError> {
+    let arr = new_byte_array(vm, bytes);
+    let a = vm.new_instance_args(
+        "java/net/Inet6Address",
+        "(Ljava/lang/String;[BI)V",
+        &[Slot::I(0), Slot::I(arr), Slot::I(if scope == 0 { -1 } else { scope as i32 })],
+    )?;
+    if scope != 0 {
+        inet6_set_scope_ifname(vm, a, ni);
+    }
+    Ok(a)
+}
+
+/// 按一行 `MIB_IF_ROW2` + 两张地址表造一个 `NetworkInterface`（字段直接填，与 HotSpot 一致）
+fn ni_from_row(
+    vm: &mut Vm,
+    row: &MibIfRow2,
+    uni: &MibTable,
+    any: &MibTable,
+) -> Result<i32, VmError> {
+    let obj = vm.alloc_vmobj(NI);
+    if obj == 0 {
+        return Err(vm.throw_msg("java/lang/OutOfMemoryError", "NetworkInterface 分配失败".to_string()));
+    }
+    let name = luid_name(row.interface_luid).unwrap_or_default();
+    let nh = vm.sh.heap.new_string(name);
+    set_obj_field(vm, obj, NI, "name", Slot::I(nh));
+    let dn = String::from_utf16_lossy(&row.description[..wz_len(&row.description)]);
+    let dnh = vm.sh.heap.new_string(dn);
+    set_obj_field(vm, obj, NI, "displayName", Slot::I(dnh));
+    set_obj_field(vm, obj, NI, "index", Slot::I(row.interface_index as i32));
+    set_obj_field(vm, obj, NI, "virtual", Slot::I(0));
+
+    // 收集地址（unicast 先、anycast 后，与 HotSpot 的两次循环同序）
+    let mut list: Vec<(Vec<u8>, u8, u32)> = Vec::new();
+    for i in 0..uni.count {
+        let r = uni.unicast(i);
+        if r.interface_luid != row.interface_luid {
+            continue;
+        }
+        if r.dad_state != DAD_PREFERRED && r.dad_state != DAD_DEPRECATED {
+            continue;
+        }
+        if let Some((bytes, scope)) = sockaddr_split(&r.address) {
+            list.push((bytes, r.on_link_prefix_length, scope));
+        }
+    }
+    for i in 0..any.count {
+        let r = any.anycast(i);
+        if r.interface_luid != row.interface_luid {
+            continue;
+        }
+        if let Some((bytes, scope)) = sockaddr_split(&r.address) {
+            list.push((bytes, NO_PREFIX, scope));
+        }
+    }
+    list.reverse(); // HotSpot 是头插链表
+
+    let mut addr_items: Vec<Slot> = Vec::with_capacity(list.len());
+    let mut bind_items: Vec<Slot> = Vec::with_capacity(list.len());
+    for (bytes, prefix, scope) in list {
+        let ia = if bytes.len() == 4 {
+            let v = i32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+            new_inet4(vm, v)?
+        } else {
+            new_inet6(vm, &bytes, scope, obj)?
+        };
+        let bind = vm.new_instance_args(IFA, "()V", &[])?;
+        set_obj_field(vm, bind, IFA, "address", Slot::I(ia));
+        if prefix != NO_PREFIX {
+            set_obj_field(vm, bind, IFA, "maskLength", Slot::I(prefix as i32));
+            if bytes.len() == 4 {
+                let bc = broadcast_of(&bytes, prefix);
+                let bcv = i32::from_be_bytes([bc[0], bc[1], bc[2], bc[3]]);
+                let b = new_inet4(vm, bcv)?;
+                set_obj_field(vm, bind, IFA, "broadcast", Slot::I(b));
+            }
+        }
+        addr_items.push(Slot::I(ia));
+        bind_items.push(Slot::I(bind));
+    }
+
+    let addrs = vm.sh.heap.new_array(addr_items, "[Ljava/net/InetAddress;").unwrap_or(0);
+    set_obj_field(vm, obj, NI, "addrs", Slot::I(addrs));
+    let binds = vm.sh.heap.new_array(bind_items, "[Ljava/net/InterfaceAddress;").unwrap_or(0);
+    set_obj_field(vm, obj, NI, "bindings", Slot::I(binds));
+    let childs = vm.sh.heap.new_array(Vec::new(), "[Ljava/net/NetworkInterface;").unwrap_or(0);
+    set_obj_field(vm, obj, NI, "childs", Slot::I(childs));
+    Ok(obj)
+}
+
+fn ni_get_all(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    let ift = mib_if_table(vm)?;
+    let uni = mib_uni_table(vm)?;
+    let any = mib_any_table(vm)?;
+    let mut items: Vec<Slot> = Vec::with_capacity(ift.count);
+    for i in 0..ift.count {
+        let obj = ni_from_row(vm, ift.ifrow(i), &uni, &any)?;
+        items.push(Slot::I(obj));
+    }
+    let arr = vm.sh.heap.new_array(items, "[Ljava/net/NetworkInterface;").unwrap_or(0);
+    Ok(Slot::I(arr))
+}
+
+/// `GetIfEntry2` 填一行。`luid`/`index` 二选一（另一个传 0）
+fn ni_row_of(vm: &mut Vm, luid: u64, index: u32) -> Result<Option<MibIfRow2>, VmError> {
+    let mut row: MibIfRow2 = unsafe { std::mem::zeroed() };
+    row.interface_luid = luid;
+    row.interface_index = index;
+    let rc = unsafe { GetIfEntry2(&mut row as *mut MibIfRow2 as *mut c_void) };
+    if rc == 0 {
+        return Ok(Some(row));
+    }
+    if rc == ERROR_FILE_NOT_FOUND {
+        return Ok(None); // 与 HotSpot 一样：找不到就返回 null，不抛异常
+    }
+    Err(sock_socket_error(vm, rc, "GetIfEntry2"))
+}
+
+fn ni_for_row(vm: &mut Vm, row: MibIfRow2) -> Result<i32, VmError> {
+    let uni = mib_uni_table(vm)?;
+    let any = mib_any_table(vm)?;
+    ni_from_row(vm, &row, &uni, &any)
+}
+
+fn ni_get_by_name(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let name = vm.text_of(f.arg_i(0));
+    let mut w: Vec<u16> = name.encode_utf16().collect();
+    w.push(0);
+    let mut luid: u64 = 0;
+    let rc = unsafe { ConvertInterfaceNameToLuidW(w.as_ptr(), &mut luid) };
+    if rc != 0 {
+        if rc == ERROR_INVALID_NAME || rc == ERROR_FILE_NOT_FOUND {
+            return Ok(Slot::I(0));
+        }
+        return Err(sock_socket_error(vm, rc, "ConvertInterfaceNameToLuidW"));
+    }
+    match ni_row_of(vm, luid, 0)? {
+        Some(row) => Ok(Slot::I(ni_for_row(vm, row)?)),
+        None => Ok(Slot::I(0)),
+    }
+}
+
+fn ni_get_by_index(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let index = f.arg_i(0);
+    // 0 不是合法下标（GetIfEntry2 会当成「没设置 key」）
+    if index == 0 {
+        return Ok(Slot::I(0));
+    }
+    match ni_row_of(vm, 0, index.max(0) as u32)? {
+        Some(row) => Ok(Slot::I(ni_for_row(vm, row)?)),
+        None => Ok(Slot::I(0)),
+    }
+}
+
+/// 在 unicast / anycast 表里找与 `InetAddress` 相同的地址，返回它的 LUID
+fn ni_luid_of_inet(vm: &mut Vm, inet: i32, uni: &MibTable, any: &MibTable) -> Option<u64> {
+    let want = inet_bytes(vm, inet).unwrap_or_default();
+    let hit = |sa: &[u8; 28]| -> bool {
+        match sockaddr_split(sa) {
+            Some((bytes, _)) => bytes == want,
+            None => false,
+        }
+    };
+    for i in 0..uni.count {
+        let r = uni.unicast(i);
+        if hit(&r.address) && (r.dad_state == DAD_PREFERRED || r.dad_state == DAD_DEPRECATED) {
+            return Some(r.interface_luid);
+        }
+    }
+    for i in 0..any.count {
+        let r = any.anycast(i);
+        if hit(&r.address) {
+            return Some(r.interface_luid);
+        }
+    }
+    None
+}
+
+fn ni_get_by_inet(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let inet = f.arg_i(0);
+    let uni = mib_uni_table(vm)?;
+    let any = mib_any_table(vm)?;
+    let Some(luid) = ni_luid_of_inet(vm, inet, &uni, &any) else { return Ok(Slot::I(0)) };
+    match ni_row_of(vm, luid, 0)? {
+        Some(row) => Ok(Slot::I(ni_from_row(vm, &row, &uni, &any)?)),
+        None => Ok(Slot::I(0)),
+    }
+}
+
+fn ni_bound_inet(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let inet = f.arg_i(0);
+    let uni = mib_uni_table(vm)?;
+    let any = mib_any_table(vm)?;
+    Ok(Slot::I(ni_luid_of_inet(vm, inet, &uni, &any).is_some() as i32))
+}
+
+fn ni_is_up(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let row = ni_row_of(vm, 0, f.arg_i(1).max(0) as u32)?;
+    let up = row
+        .map(|r| r.admin_status == NET_IF_ADMIN_STATUS_UP && r.oper_status == IF_OPER_STATUS_UP)
+        .unwrap_or(false);
+    Ok(Slot::I(up as i32))
+}
+
+fn ni_is_loopback(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let row = ni_row_of(vm, 0, f.arg_i(1).max(0) as u32)?;
+    let lo = row.map(|r| r.if_type == IF_TYPE_SOFTWARE_LOOPBACK).unwrap_or(false);
+    Ok(Slot::I(lo as i32))
+}
+
+fn ni_is_p2p(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let row = ni_row_of(vm, 0, f.arg_i(1).max(0) as u32)?;
+    let p2p = row.map(|r| r.access_type == NET_IF_ACCESS_POINT_TO_POINT).unwrap_or(false);
+    Ok(Slot::I(p2p as i32))
+}
+
+fn ni_get_mtu(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let row = ni_row_of(vm, 0, f.arg_i(1).max(0) as u32)?;
+    Ok(Slot::I(row.map(|r| r.mtu as i32).unwrap_or(-1)))
+}
+
+fn ni_get_mac(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let row = ni_row_of(vm, 0, f.arg_i(2).max(0) as u32)?;
+    let Some(r) = row else { return Ok(Slot::I(0)) };
+    let n = (r.physical_address_length as usize).min(32);
+    if n == 0 {
+        return Ok(Slot::I(0));
+    }
+    let arr = new_byte_array(vm, &r.physical_address[..n]);
+    Ok(Slot::I(arr))
+}
+
+fn register_network_interface(r: &mut NativeRegistry) {
+    r.add(NI, "init", "()V", |_, _| Ok(Slot::I(0)));
+    r.add(NI, "getAll", "()[Ljava/net/NetworkInterface;", ni_get_all);
+    r.add(NI, "getByName0", "(Ljava/lang/String;)Ljava/net/NetworkInterface;", ni_get_by_name);
+    r.add(NI, "getByIndex0", "(I)Ljava/net/NetworkInterface;", ni_get_by_index);
+    r.add(NI, "getByInetAddress0", "(Ljava/net/InetAddress;)Ljava/net/NetworkInterface;", ni_get_by_inet);
+    r.add(NI, "boundInetAddress0", "(Ljava/net/InetAddress;)Z", ni_bound_inet);
+    r.add(NI, "isUp0", "(Ljava/lang/String;I)Z", ni_is_up);
+    r.add(NI, "isLoopback0", "(Ljava/lang/String;I)Z", ni_is_loopback);
+    r.add(NI, "supportsMulticast0", "(Ljava/lang/String;I)Z", |_, _| Ok(Slot::I(1)));
+    r.add(NI, "isP2P0", "(Ljava/lang/String;I)Z", ni_is_p2p);
+    r.add(NI, "getMacAddr0", "([BLjava/lang/String;I)[B", ni_get_mac);
+    r.add(NI, "getMTU0", "(Ljava/lang/String;I)I", ni_get_mtu);
+}
+
+// ============================================================ IO 完成端口 + 异步目录监视
+//
+// `sun.nio.fs.WindowsWatchService` 的全部 native 都在这一组。它与前面那些「同步 Win32」
+// 有一个本质区别：**`ReadDirectoryChangesW` 是异步的** —— 内核在调用返回之后的任意时刻
+// 往缓冲区里写 `FILE_NOTIFY_INFORMATION`，写完才往完成端口投一个包。
+//
+// 这就把「arena 假地址 → 真内存」的桥接推到了两个调用之间：
+//
+//   ReadDirectoryChangesW：arena 缓冲区/OVERLAPPED → 各分配一份**真内存**交给内核，
+//                          并登记 `arena OVERLAPPED 地址 → 真内存指针`；
+//   GetQueuedCompletionStatus0：拿到完成包后用真内存指针反查登记项，把字节**拷回 arena**
+//                          —— Java 侧的 `processEvents` 读的就是 arena 里的那份。
+//
+// **不能**在 ReadDirectoryChangesW 里「调完就拷回」：那一刻缓冲区还是空的，
+// 拷回去等于把上一次的内容留在 Java 眼里（症状是「第一批事件正常、之后再也收不到」）。
+//
+// 另外：`GetQueuedCompletionStatus` 是**阻塞**调用（INFINITE）。本 VM 的 Java 线程是真
+// OS 线程，所以这里阻塞是正确的；但绝不能持锁去等 —— 否则注册线程进不来。
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn CreateIoCompletionPort(
+        file: Handle,
+        existing: Handle,
+        key: usize,
+        threads: u32,
+    ) -> Handle;
+    fn GetQueuedCompletionStatus(
+        port: Handle,
+        bytes: *mut u32,
+        key: *mut usize,
+        ov: *mut *mut c_void,
+        ms: u32,
+    ) -> Bool;
+    fn PostQueuedCompletionStatus(port: Handle, bytes: u32, key: usize, ov: *mut c_void) -> Bool;
+    fn ReadDirectoryChangesW(
+        h: Handle,
+        buf: *mut c_void,
+        len: u32,
+        subtree: Bool,
+        filter: u32,
+        ret: *mut u32,
+        ov: *mut c_void,
+        routine: *mut c_void,
+    ) -> Bool;
+    fn CancelIo(h: Handle) -> Bool;
+    fn GetOverlappedResult(h: Handle, ov: *mut c_void, bytes: *mut u32, wait: Bool) -> Bool;
+}
+
+const STATUS_CLASS: &str = "sun/nio/fs/WindowsNativeDispatcher$CompletionStatus";
+const OVERLAPPED_SIZE: usize = 32;
+const INFINITE: u32 = 0xFFFF_FFFF;
+
+/// 一次在飞的异步目录读：真内存的两块（数据缓冲 + OVERLAPPED），与 arena 侧一一对应
+struct AsyncRead {
+    arena_ov: u64,
+    arena_buf: u64,
+    len: usize,
+    real_buf: Box<[u8]>,
+    real_ov: Box<[u8; OVERLAPPED_SIZE]>,
+}
+
+impl AsyncRead {
+    fn new(arena_ov: u64, arena_buf: u64, len: usize) -> AsyncRead {
+        AsyncRead {
+            arena_ov,
+            arena_buf,
+            len,
+            real_buf: vec![0u8; len].into_boxed_slice(),
+            real_ov: Box::new([0u8; OVERLAPPED_SIZE]),
+        }
+    }
+    fn ov_ptr(&self) -> *mut c_void {
+        self.real_ov.as_ptr() as *mut c_void
+    }
+}
+
+fn async_reads() -> &'static std::sync::Mutex<Vec<AsyncRead>> {
+    static A: std::sync::OnceLock<std::sync::Mutex<Vec<AsyncRead>>> = std::sync::OnceLock::new();
+    A.get_or_init(|| std::sync::Mutex::new(Vec::new()))
+}
+
+fn iocp_create(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let file = f.arg_l(0) as Handle;
+    let existing = f.arg_l(1) as Handle;
+    let key = f.arg_l(2) as usize;
+    let h = unsafe { CreateIoCompletionPort(file, existing, key, 0) };
+    if h == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::L(h as i64))
+}
+
+fn iocp_post(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let port = f.arg_l(0) as Handle;
+    let key = f.arg_l(1) as usize;
+    if unsafe { PostQueuedCompletionStatus(port, 0, key, std::ptr::null_mut()) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+/// `ReadDirectoryChangesW(hDirectory, bufferAddress, bufferLength, watchSubTree, filter,
+///                        bytesReturnedAddress, pOverlapped)`
+fn iocp_read_changes(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let handle = f.arg_l(0) as Handle;
+    let arena_buf = f.arg_l(1) as u64;
+    let len = f.arg_i(2).max(0) as usize;
+    let subtree = (f.arg_i(3) != 0) as Bool;
+    let filter = f.arg_i(4) as u32;
+    let ov_addr = f.arg_l(6) as u64;
+
+    // 同步分支（本 JDK 的 WatchService 不走这里，但 API 存在，照实现）
+    if ov_addr == 0 {
+        let mut real = vec![0u8; len];
+        let mut got: u32 = 0;
+        let ok = unsafe {
+            ReadDirectoryChangesW(
+                handle,
+                real.as_mut_ptr() as *mut c_void,
+                len as u32,
+                subtree,
+                filter,
+                &mut got,
+                std::ptr::null_mut(),
+                std::ptr::null_mut(),
+            )
+        };
+        if ok == 0 {
+            return Err(throw_windows(vm, last_error()));
+        }
+        nat_mem::write_bytes(arena_buf, &real[..(got as usize).min(len)]);
+        let cnt = f.arg_l(5) as u64;
+        if cnt != 0 {
+            nat_mem::write(cnt, 4, got as u64);
+        }
+        return Ok(Slot::I(0));
+    }
+
+    // 异步分支：真内存缓冲 + 真 OVERLAPPED，登记在案
+    let (buf_ptr, ov_ptr) = {
+        let mut g = async_reads().lock().unwrap_or_else(|e| e.into_inner());
+        let idx = match g.iter().position(|e| e.arena_ov == ov_addr) {
+            Some(i) if g[i].len == len && g[i].arena_buf == arena_buf => i,
+            Some(i) => {
+                g.remove(i);
+                g.push(AsyncRead::new(ov_addr, arena_buf, len));
+                g.len() - 1
+            }
+            None => {
+                g.push(AsyncRead::new(ov_addr, arena_buf, len));
+                g.len() - 1
+            }
+        };
+        // OVERLAPPED 里的 hEvent 是 Java 侧刚写进 arena 的，每次调用都要同步过去
+        let ov_bytes = nat_mem::read_bytes(ov_addr, OVERLAPPED_SIZE);
+        if ov_bytes.len() == OVERLAPPED_SIZE {
+            g[idx].real_ov.copy_from_slice(&ov_bytes);
+        }
+        (g[idx].real_buf.as_mut_ptr() as *mut c_void, g[idx].ov_ptr())
+    }; // 锁在这里就放掉：内核要持有这块内存在 I/O 期间
+
+    trace(&format!("ReadDirectoryChangesW h={handle} buf={arena_buf} len={len} ov={ov_addr} tree={subtree}"));
+    let ok = unsafe {
+        ReadDirectoryChangesW(
+            handle,
+            buf_ptr,
+            len as u32,
+            subtree,
+            filter,
+            std::ptr::null_mut(),
+            ov_ptr,
+            std::ptr::null_mut(),
+        )
+    };
+    if ok == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+/// `GetQueuedCompletionStatus0(port, CompletionStatus)`：阻塞等一个完成包，
+/// 把数据拷回 arena，并把 error / bytesTransferred / completionKey 填进 Java 对象
+fn iocp_gqcs(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let port = f.arg_l(0) as Handle;
+    let status = f.arg_i(1);
+    let mut bytes: u32 = 0;
+    let mut key: usize = 0;
+    let mut ov: *mut c_void = std::ptr::null_mut();
+    let ok = unsafe { GetQueuedCompletionStatus(port, &mut bytes, &mut key, &mut ov, INFINITE) };
+    let err = if ok == 0 { last_error() } else { 0 };
+
+    let mut hit = false;
+    if !ov.is_null() {
+        let pending = {
+            let g = async_reads().lock().unwrap_or_else(|e| e.into_inner());
+            g.iter()
+                .position(|e| e.ov_ptr() == ov)
+                .map(|i| (g[i].arena_buf, (bytes as usize).min(g[i].len), g[i].real_buf[..(bytes as usize).min(g[i].len)].to_vec()))
+        };
+        if let Some((arena_buf, _n, data)) = pending {
+            hit = true;
+            nat_mem::write_bytes(arena_buf, &data);
+        }
+    }
+
+    trace(&format!("GQCS key={key} bytes={bytes} err={err} ov={:?} hit={}", ov, hit));
+    set_obj_field(vm, status, STATUS_CLASS, "error", Slot::I(err as i32));
+    set_obj_field(vm, status, STATUS_CLASS, "bytesTransferred", Slot::I(bytes as i32));
+    set_obj_field(vm, status, STATUS_CLASS, "completionKey", Slot::L(key as i64));
+    Ok(Slot::I(0))
+}
+
+fn iocp_cancel(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let handle = f.arg_l(0) as Handle;
+    if unsafe { CancelIo(handle) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+/// `GetOverlappedResult(hFile, lpOverlapped)`：Java 传的是 **arena** 里的 OVERLAPPED 地址，
+/// 要换成真内存那份再问内核；返回已传字节数
+fn iocp_overlapped_result(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let handle = f.arg_l(0) as Handle;
+    let arena_ov = f.arg_l(1) as u64;
+    let target = {
+        let g = async_reads().lock().unwrap_or_else(|e| e.into_inner());
+        g.iter().find(|e| e.arena_ov == arena_ov).map(|e| (e.ov_ptr(), e.arena_buf))
+    };
+    let Some((ov_ptr, arena_buf)) = target else {
+        // 没登记过（同步 I/O 或已经取过结果）：照 Win32 的语义报错
+        return Err(throw_windows(vm, ERROR_INVALID_PARAMETER));
+    };
+    let mut bytes: u32 = 0;
+    let ok = unsafe { GetOverlappedResult(handle, ov_ptr, &mut bytes, 1) };
+    if ok == 0 {
+        let code = last_error();
+        // 被 CancelIo 取消是这个流程的**正常收尾**，字节数先拷回再说
+        if code != ERROR_OPERATION_ABORTED {
+            return Err(throw_windows(vm, code));
+        }
+    }
+    {
+        let g = async_reads().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(e) = g.iter().find(|e| e.arena_ov == arena_ov) {
+            let n = (bytes as usize).min(e.len);
+            let data = e.real_buf[..n].to_vec();
+            nat_mem::write_bytes(arena_buf, &data);
+        }
+    }
+    // 这一次重叠 I/O 到此结束：注销登记（arena 那块马上会被释放/复用）
+    async_reads()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .retain(|e| e.arena_ov != arena_ov);
+    Ok(Slot::I(bytes as i32))
+}
+
+fn register_watch_service(r: &mut NativeRegistry) {
+    r.add(WND, "CreateIoCompletionPort", "(JJJ)J", iocp_create);
+    r.add(
+        WND,
+        "GetQueuedCompletionStatus0",
+        "(JLsun/nio/fs/WindowsNativeDispatcher$CompletionStatus;)V",
+        iocp_gqcs,
+    );
+    r.add(WND, "PostQueuedCompletionStatus", "(JJ)V", iocp_post);
+    r.add(WND, "ReadDirectoryChangesW", "(JJIZIJJ)V", iocp_read_changes);
+    r.add(WND, "CancelIo", "(J)V", iocp_cancel);
+    r.add(WND, "GetOverlappedResult", "(JJ)I", iocp_overlapped_result);
+}
+
+// ============================================================ 选择器的唤醒口 + 流枚举
+//
+// `sun.nio.ch.WindowsSelectorImpl` 在 Windows 上只有三条 native：
+// `poll0`（子选择器等待）、`setWakeupSocket0`/`resetWakeupSocket0`（`Selector.wakeup()`
+// 靠往唤醒管道写一个字节、再读掉）。**不是** init/updateRegistrations/drainfd ——
+// 那些是 Java 侧的方法，没有 native。
+//
+// `poll0` 的事件位直接就是 `Net.pollinValue()` 那一套（本文件已经注册成 WSAPoll 常量），
+// 所以这里用 `WSAPoll` 而不是 `select()`：语义一致，还没有 `FD_SETSIZE` 的 64 上限。
+// Java 侧只消费 `readFds/writeFds/exceptFds` 三个 int 数组（`[0]` 是条数），
+// 所以「按 WSAPoll 的 revents 填这三个数组」就够了。
+
+const SEL: &str = "sun/nio/ch/WindowsSelectorImpl";
+const SUB_SEL: &str = "sun/nio/ch/WindowsSelectorImpl$SubSelector";
+
+/// `struct pollfd { int fd; short events; short revents; }`（`PollArrayWrapper` 里的 8 字节）
+const SIZEOF_POLLFD: u64 = 8;
+
+fn sel_wakeup_socket(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let s = (f.arg_i(0) as u32) as Socket;
+    let byte = [1u8; 1];
+    // HotSpot 也不看返回值：唤醒失败最多是「唤醒丢了」，不能因此抛异常
+    unsafe { send(s, byte.as_ptr(), 1, 0) };
+    Ok(Slot::I(0))
+}
+
+fn sel_reset_wakeup_socket(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let s = (f.arg_i(0) as u32) as Socket;
+    let mut buf = [0u8; 4096];
+    unsafe { recv(s, buf.as_mut_ptr(), buf.len() as i32, 0) };
+    Ok(Slot::I(0))
+}
+
+/// 把一个 Java `int[]` 的 `[0]` 写成条数、从 `[1]` 开始写就绪的 fd
+fn fill_fd_array(vm: &Vm, arr: i32, fds: &[i32]) {
+    if arr <= 0 || fds.is_empty() {
+        return;
+    }
+    let cap = vm.sh.heap.array_len(arr).unwrap_or(0);
+    let n = fds.len().min(cap.saturating_sub(1));
+    for (i, fd) in fds.iter().take(n).enumerate() {
+        let _ = vm.sh.heap.set(arr, i + 1, Slot::I(*fd));
+    }
+    let _ = vm.sh.heap.set(arr, 0, Slot::I(n as i32));
+}
+
+fn sel_poll0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let poll_addr = f.arg_l(0) as u64;
+    let n = f.arg_i(1).max(0) as usize;
+    let read_arr = f.arg_i(2);
+    let write_arr = f.arg_i(3);
+    let except_arr = f.arg_i(4);
+    let timeout = f.arg_l(5);
+    let ms = timeout.clamp(-1, i32::MAX as i64) as i32;
+
+    // pollfd 数组在 arena 里：读出来自己排成 WSAPoll 要的形状
+    let mut pfds: Vec<PollFd> = Vec::with_capacity(n);
+    let mut order: Vec<i32> = Vec::with_capacity(n);
+    for i in 0..n {
+        let base = poll_addr + (i as u64) * SIZEOF_POLLFD;
+        if capacity_at(base) < SIZEOF_POLLFD as usize {
+            break;
+        }
+        let fd = nat_mem::read(base, 4) as u32 as i32;
+        if fd <= 0 {
+            continue; // 空槽（Java 侧删键后不会立刻压缩数组）
+        }
+        let events = nat_mem::read(base + 4, 2) as u16 as i16;
+        pfds.push(PollFd { fd: fd as usize, events, revents: 0 });
+        order.push(fd);
+    }
+    if pfds.is_empty() {
+        return Ok(Slot::I(0));
+    }
+    let rc = unsafe { WSAPoll(pfds.as_mut_ptr(), pfds.len() as u32, ms) };
+    if rc < 0 {
+        let code = unsafe { WSAGetLastError() };
+        return Err(sock_error(vm, code, "WSAPoll"));
+    }
+    let mut reads: Vec<i32> = Vec::new();
+    let mut writes: Vec<i32> = Vec::new();
+    let mut excepts: Vec<i32> = Vec::new();
+    for (i, p) in pfds.iter().enumerate() {
+        let rev = p.revents;
+        if rev == 0 {
+            continue;
+        }
+        // POLLNVAL（非 socket 句柄）不能当成「就绪」报给 Java —— 那会让选择器空转
+        if rev & POLLNVAL != 0 {
+            continue;
+        }
+        if rev & (POLLRDNORM | POLLHUP | POLLERR) != 0 {
+            reads.push(order[i]);
+        }
+        if rev & POLLWRNORM != 0 {
+            writes.push(order[i]);
+        }
+        // `POLLERR`/`POLLHUP` 在 select 里只出现在 except 集，这里同样补一份
+        if rev & (POLLERR | POLLHUP) != 0 {
+            excepts.push(order[i]);
+        }
+    }
+    let total = (reads.len() + writes.len() + excepts.len()) as i32;
+    fill_fd_array(vm, read_arr, &reads);
+    fill_fd_array(vm, write_arr, &writes);
+    fill_fd_array(vm, except_arr, &excepts);
+    Ok(Slot::I(total))
+}
+
+// ---- 备用数据流（`FindFirstStreamW` / `FindNextStreamW`）----
+//
+// `WIN32_FIND_STREAM_DATA { LARGE_INTEGER StreamSize; WCHAR cStreamName[MAX_PATH + 36]; }`
+// 名字在偏移 8，`::$DATA` 是默认流。
+
+const FIRST_STREAM: &str = "sun/nio/fs/WindowsNativeDispatcher$FirstStream";
+const FIND_STREAM_DATA_SIZE: usize = 8 + (260 + 36) * 2;
+
+fn wnd_FindFirstStream0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let path = read_wstr_z(f.arg_l(0) as u64);
+    let obj = f.arg_i(1);
+    let mut data = vec![0u8; FIND_STREAM_DATA_SIZE];
+    let h = unsafe {
+        FindFirstStreamW(path.as_ptr(), 0 /* FindStreamInfoStandard */, data.as_mut_ptr() as *mut c_void, 0)
+    };
+    if h != INVALID_HANDLE_VALUE {
+        let name = stream_name_of(&data);
+        let nh = vm.sh.heap.new_string(name);
+        set_obj_field(vm, obj, FIRST_STREAM, "handle", Slot::L(h as i64));
+        set_obj_field(vm, obj, FIRST_STREAM, "name", Slot::I(nh));
+        return Ok(Slot::I(0));
+    }
+    let code = last_error();
+    // 目录/卷这类没有流的对象用 ERROR_HANDLE_EOF 结束 —— 与 HotSpot 一样当成「没有流」
+    if code == ERROR_HANDLE_EOF || code == ERROR_FILE_NOT_FOUND {
+        let empty = vm.sh.heap.new_string(String::new());
+        set_obj_field(vm, obj, FIRST_STREAM, "handle", Slot::L(-1));
+        set_obj_field(vm, obj, FIRST_STREAM, "name", Slot::I(empty));
+        return Ok(Slot::I(0));
+    }
+    Err(throw_windows(vm, code))
+}
+
+fn wnd_FindNextStream0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let h = f.arg_l(0) as Handle;
+    let mut data = vec![0u8; FIND_STREAM_DATA_SIZE];
+    if unsafe { FindNextStreamW(h, data.as_mut_ptr() as *mut c_void) } == 0 {
+        let code = last_error();
+        if code == ERROR_HANDLE_EOF {
+            return Ok(Slot::I(0)); // null = 遍历结束
+        }
+        return Err(throw_windows(vm, code));
+    }
+    Ok(Slot::I(vm.sh.heap.new_string(stream_name_of(&data))))
+}
+
+fn stream_name_of(data: &[u8]) -> String {
+    let raw = &data[8..];
+    let mut units: Vec<u16> = Vec::with_capacity(raw.len() / 2);
+    for ch in raw.chunks_exact(2) {
+        let w = u16::from_ne_bytes([ch[0], ch[1]]);
+        if w == 0 {
+            break;
+        }
+        units.push(w);
+    }
+    String::from_utf16_lossy(&units)
+}
+
+#[link(name = "kernel32")]
+extern "system" {
+    fn FindFirstStreamW(path: *const u16, level: u32, data: *mut c_void, flags: u32) -> Handle;
+    fn FindNextStreamW(h: Handle, data: *mut c_void) -> Bool;
+}
+
+fn register_selector(r: &mut NativeRegistry) {
+    r.add(SUB_SEL, "poll0", "(JI[I[I[IJJ)I", sel_poll0);
+    r.add(SEL, "setWakeupSocket0", "(I)V", sel_wakeup_socket);
+    r.add(SEL, "resetWakeupSocket0", "(I)V", sel_reset_wakeup_socket);
+    r.add(WND, "FindFirstStream0", "(JLsun/nio/fs/WindowsNativeDispatcher$FirstStream;)V", wnd_FindFirstStream0);
+    r.add(WND, "FindNextStream0", "(J)Ljava/lang/String;", wnd_FindNextStream0);
 }
 
 // ============================================================ java.net.InetAddress 的 native
