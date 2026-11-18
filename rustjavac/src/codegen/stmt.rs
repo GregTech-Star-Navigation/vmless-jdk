@@ -202,11 +202,9 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 return Ok(false); // void 方法调用没有返回值可弹
             }
             if kind_wide(kind) {
-                em.op(0x58); // pop2
-                em.pop(2);
+                em.insn(0x58, 2, 0); // pop2
             } else {
-                em.op(0x57); // pop
-                em.pop(1);
+                em.insn(0x57, 1, 0); // pop
             }
             Ok(false)
         }
@@ -342,8 +340,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             // rhs 会分叉时先算进脏槽：接收者压上栈之后，跳转点就不空了
             let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
             if is_super {
-                em.op(0x2A); // aload_0
-                em.push(1);
+                em.insn(0x2A, 0, 1); // aload_0
             } else {
                 compile_expr_mut(&recv, em, ctx, cp)?;
             }
@@ -378,8 +375,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 let Some(_) = ctx.fields.get(&name) else {
                     return err(format!("未定义的变量 `{name}`"));
                 };
-                em.op(0x2A); // aload_0
-                em.push(1);
+                em.insn(0x2A, 0, 1); // aload_0
                 compile_expr_mut(rhs, em, ctx, cp)?;
                 coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                 let f = cp.field_ref(&owner, &name, &desc);
@@ -694,8 +690,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
         }
         Stmt::Throw(e) => {
             compile_expr_mut(e, em, ctx, cp)?;
-            em.op(0xBF); // athrow
-            em.pop(1);
+            em.insn(0xBF, 1, 0); // athrow
             Ok(true) // 之后不可达
         }
         // `synchronized (lock) { body }` —— 照 javac 的形态发：
@@ -738,8 +733,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             em.place(body_end);
             if !terminated {
                 em.load_slot(lk, K_REF)?;
-                em.op(0xC3); // monitorexit
-                em.pop(1);
+                em.insn(0xC3, 1, 0); // monitorexit
                 em.goto(end);
             }
             // 异常路径：接住任何异常 → 解锁 → 原样抛出
@@ -748,8 +742,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             em.set_local_type(ex as usize, cp.class("java/lang/Throwable"));
             em.store_slot(ex, K_REF)?; // astore
             em.load_slot(lk, K_REF)?;
-            em.op(0xC3); // monitorexit
-            em.pop(1);
+            em.insn(0xC3, 1, 0); // monitorexit
             em.load_slot(ex, K_REF)?;
             em.op(0xBF); // athrow
             em.pop(1); // athrow 弹掉异常对象：不记账会让 end 之后的代码从 +1 槽开始算
@@ -880,8 +873,7 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 let fin2_terminated = compile_stmt(f, em, ctx, cp)?;
                 if !fin2_terminated {
                     em.load_slot(xslot, K_REF)?;
-                    em.op(0xBF); // athrow
-                    em.pop(1);
+                    em.insn(0xBF, 1, 0); // athrow
                 }
             }
             // 有没有路径能落到 end？全都有终结（return/throw）时这里就没后续代码了：

@@ -184,8 +184,7 @@ pub(crate) fn emit_array_init(
     };
     let wide = matches!(elem, Type::Prim("long") | Type::Prim("double"));
     for (i, item) in items.iter().enumerate() {
-        em.op(0x59); // dup（数组引用）
-        em.push(1);
+        em.insn(0x59, 0, 1); // dup（数组引用）
         em.const_int(i as i32);
         emit_val(item, &sps[i], em, ctx, cp)?;
         coerce_to(elem, item, ctx, em, cp)?;
@@ -509,8 +508,7 @@ fn pack_tail(
     em.pop(1);
     em.push(1);
     for (i, a) in tail.iter().enumerate() {
-        em.op(0x59); // dup
-        em.push(1);
+        em.insn(0x59, 0, 1); // dup
         em.const_int(i as i32);
         emit_val(a, &sp[i], em, ctx, cp)?;
         em.op(store);
@@ -747,14 +745,43 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             Ok(())
         }
         Expr::This => {
-            em.op(0x2A); // aload_0
-            em.push(1);
+            em.insn(0x2A, 0, 1); // aload_0
             Ok(())
         }
         Expr::Super => err("super 只能用在 super(...)、super.m()、super.x 里"),
         Expr::Field(recv, name) if name == "length" && !ctx.fields.contains_key(name) => {
+            // `x.length` 只在 x 是**数组**时合法。这里只拦**确定不是数组**的那一种：
+            // 接收者静态类型是 `java/lang/String`。以前这里无脑发 `arraylength`，
+            // 于是 `s.length`（String 少写括号）编出 `arraylength` 作用在 String 上 ——
+            // 合法 class 文件，JVM 一装载就 `VerifyError: Bad type on operand stack`。
+            //
+            // **不要**放宽成「静态类型不是数组就报错」：本编译器对数组字段的类型记录
+            // 不完整（`String[] eras` 会推成 `java/lang/String`、`char[] skipBuffer`
+            // 推成 `?`），放宽会误杀 13 个本来能编的文件。宁可只抓确定的那一类。
+            if let Some(t) = expr_type(recv, ctx) {
+                // 字段/局部的**描述符**是权威的：本编译器的 `field_tys` 会把
+                // `String[] eras` 记成 `String`，只看推断类型会误杀（DateFormatSymbols
+                // 就是这么被挡的）。描述符说它是数组就放行。
+                let desc_array = match &**recv {
+                    Expr::Ident(n) => ctx
+                        .fields
+                        .get(n)
+                        .and_then(|i| ctx.field_descs.get(*i))
+                        .map(|d| d.starts_with('['))
+                        .or_else(|| ctx.local_ty.get(n).map(|t| descriptor(t).starts_with('['))),
+                    _ => None,
+                };
+                if desc_array != Some(true)
+                    && crate::codegen::types::type_internal(&t).as_deref() == Some("java/lang/String")
+                {
+                    return err(format!(
+                        "`{}.length` 不是数组：接收者静态类型是 java/lang/String（String 要写 `length()`）",
+                        recv_brief(recv)
+                    ));
+                }
+            }
             compile_expr(recv, em, ctx, cp)?;
-            em.op(0xBE); // arraylength
+            em.insn(0xBE, 1, 1); // arraylength
             Ok(())
         }
         Expr::Field(recv, name) => {
@@ -768,8 +795,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             // super.x → 读父类字段，接收者还是 this
             let is_super = matches!(**recv, Expr::Super);
             if is_super {
-                em.op(0x2A); // aload_0
-                em.push(1);
+                em.insn(0x2A, 0, 1); // aload_0
             } else {
                 compile_expr(recv, em, ctx, cp)?;
             }
@@ -855,8 +881,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             let sp = hoist_args(args, em, ctx, cp)?;
             em.op_u2(0xBB, cls); // new
             em.push(1);
-            em.op(0x59); // dup
-            em.push(1);
+            em.insn(0x59, 0, 1); // dup
             emit_call_args(args, &ctor_desc, &sp, em, ctx, cp)?;
             let init = cp.method_ref(&owner, "<init>", &ctor_desc);
             em.op_u2(0xB7, init); // invokespecial
@@ -910,8 +935,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             Ok(())
         }
         Expr::Null => {
-            em.op(0x01); // aconst_null
-            em.push(1);
+            em.insn(0x01, 0, 1); // aconst_null
             Ok(())
         }
         Expr::BoolLit(b) => {
@@ -957,8 +981,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             // 隐式 this 字段
             if let Some(idx) = ctx.fields.get(name).copied() {
-                em.op(0x2A); // aload_0
-                em.push(1);
+                em.insn(0x2A, 0, 1); // aload_0
                 let desc = ctx.field_descs[idx].clone();
                 let owner = ctx.class_name.clone();
                 let f = cp.field_ref(&owner, name, &desc);
@@ -1047,8 +1070,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             let desc = pick_ctor(&ctx.class_name, args, ctx)
                 .unwrap_or_else(|| format!("({})V", args_desc(args, ctx)));
             let sp = hoist_args(args, em, ctx, cp)?;
-            em.op(0x2A); // aload_0
-            em.push(1);
+            em.insn(0x2A, 0, 1); // aload_0
             emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let idx = cp.method_ref(&ctx.class_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
@@ -1063,8 +1085,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             let desc = pick_ctor(&ctx.super_name, args, ctx)
                 .unwrap_or_else(|| format!("({})V", args_desc(args, ctx)));
             let sp = hoist_args(args, em, ctx, cp)?;
-            em.op(0x2A); // aload_0
-            em.push(1);
+            em.insn(0x2A, 0, 1); // aload_0
             emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let idx = cp.method_ref(&ctx.super_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
@@ -1076,8 +1097,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             let desc = call_desc(Some(r), name, args, ctx)
                 .ok_or_else(|| CompileError { msg: format!("父类里未找到方法 `{name}`") })?;
             let sp = hoist_args(args, em, ctx, cp)?;
-            em.op(0x2A); // aload_0
-            em.push(1);
+            em.insn(0x2A, 0, 1); // aload_0
             emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let idx = cp.method_ref(&ctx.super_name, name, &desc);
             em.op_u2(0xB7, idx); // invokespecial
@@ -1219,8 +1239,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 .and_then(|c| pick_desc(c, args, ctx))
                 .ok_or_else(|| CompileError { msg: format!("未找到方法 `{name}`") })?;
             let sp = hoist_args(args, em, ctx, cp)?;
-            em.op(0x2A); // aload_0
-            em.push(1);
+            em.insn(0x2A, 0, 1); // aload_0
             emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             // invokeinterface 的 count 是**描述符里的参数槽数**（long/double 各 2 槽）
             // + 1 个接收者，不是源码里的实参个数 —— 写成实参个数会得到
@@ -1347,13 +1366,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 let idx = cp.long(-1);
                 em.op_u2(0x14, idx);
                 em.push(2);
-                em.op(0x83); // lxor
-                em.pop(3);
+                em.insn(0x83, 4, 2); // lxor：弹两个 long（4 槽）压一个 long（2 槽）
             } else {
-                em.op(0x02); // iconst_m1
-                em.push(1);
-                em.op(0x82); // ixor
-                em.pop(2);
+                em.insn(0x02, 0, 1); // iconst_m1
+                em.insn(0x82, 2, 1); // ixor：弹两个 int 压一个 int
             }
             Ok(())
         }
@@ -2069,8 +2085,7 @@ fn emit_concat(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result
 
     em.op_u2(0xBB, sb_cls); // new
     em.push(1);
-    em.op(0x59); // dup
-    em.push(1);
+    em.insn(0x59, 0, 1); // dup
     let init = cp.method_ref("java/lang/StringBuilder", "<init>", "()V");
     em.op_u2(0xB7, init); // invokespecial
     em.pop(1);
@@ -2088,8 +2103,7 @@ fn emit_concat(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result
         em.op_u2(0xB6, idx); // invokevirtual
         em.pop(desc_slots(desc) + 1); // 接收者 + 实参
         em.push(1); // append 返回 this
-        em.op(0x57); // pop
-        em.pop(1);
+        em.insn(0x57, 1, 0); // pop
     }
     em.load_slot(slot, K_REF)?;
     let to_s = cp.method_ref("java/lang/StringBuilder", "toString", "()Ljava/lang/String;");
@@ -2136,11 +2150,9 @@ fn inc_dec_this_field(
     let fref = cp.field_ref(&ctx.class_name, name, &desc);
     let w = if wide { 2 } else { 1 };
     // [this]
-    em.op(0x2A);
-    em.push(1);
+    em.insn(0x2A, 0, 1);
     // [this] → [this][this] → getfield → [this][old]
-    em.op(0x2A);
-    em.push(1);
+    em.insn(0x2A, 0, 1);
     em.op_u2(0xB4, fref);
     em.pop(1);
     em.push(w);
@@ -2187,8 +2199,7 @@ fn assign_expr_this_field(
         kind = kind_from_desc(&desc);
         w = if kind_wide(kind) { 2 } else { 1 };
         let fref = cp.field_ref(&ctx.class_name, name, &desc);
-        em.op(0x2A); // aload_0
-        em.push(1);
+        em.insn(0x2A, 0, 1); // aload_0
         compile_expr(rhs, em, ctx, cp)?;
         coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
         em.op(if w == 2 { 0x5D } else { 0x5A }); // dup2_x1 / dup_x1
@@ -2586,8 +2597,7 @@ fn emit_lambda(
         indy_desc.push('L');
         indy_desc.push_str(&ctx.class_name);
         indy_desc.push(';');
-        em.op(0x2A); // aload_0
-        em.push(1);
+        em.insn(0x2A, 0, 1); // aload_0
     }
     let mut slots = if as_instance { 1u16 } else { 0 };
     for (_, slot, t) in &caps {

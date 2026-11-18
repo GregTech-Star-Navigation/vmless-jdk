@@ -137,11 +137,9 @@ pub(crate) fn compile_return(
                     let k = expr_kind(x, ctx);
                     compile_expr(x, em, ctx, cp)?;
                     if kind_wide(k) {
-                        em.op(0x58); // pop2
-                        em.pop(2);
+                        em.insn(0x58, 2, 0); // pop2
                     } else {
-                        em.op(0x57); // pop
-                        em.pop(1);
+                        em.insn(0x57, 1, 0); // pop
                     }
                     em.op(0xB1); // return
                     return Ok(true);

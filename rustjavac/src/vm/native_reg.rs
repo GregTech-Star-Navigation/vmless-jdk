@@ -370,6 +370,26 @@ fn synth_loader(vm: &mut Vm) -> i32 {
     let nm = vm.str_new("app".to_string());
     let _ = vm.put_named(h, "java/lang/ClassLoader", "name", Slot::I(nm));
     // `parent` 为 null（我们的加载器没有父链）
+    //
+    // **`unnamedModule` 必须非 null**：`ClassLoader.getUnnamedModule()` 直接返回这个字段，
+    // 而 `ResourceBundle.getBundleImpl` 把它当 `CacheKey` 的实参做 `requireNonNull`
+    // （`getBundleImpl(baseName, locale, caller, loader, control)` 里 `loader == null`
+    // 时走 `BootLoader.getUnnamedModule()`，非 null 时走 `loader.getUnnamedModule()`）。
+    // 少了它：任何走 `ResourceBundle` 的路径（Swing 的 `UIDefaults.getUI` 是第一个）
+    // 都在 `CacheKey.<init>` 抛 NPE。这里造一个「未命名模块」替身：`name` 为 null
+    // ⇒ `isNamed()` 为 false，与真实语义一致。
+    if vm.store.has_class("java/lang/Module") {
+        let m = vm.alloc_vmobj("java/lang/Module");
+        if m > 0 {
+            let _ = vm.put_named(m, "java/lang/Module", "loader", Slot::I(h));
+            let _ = vm.put_named(h, "java/lang/ClassLoader", "unnamedModule", Slot::I(m));
+            // 引导加载器的未命名模块（`BootLoader.getUnnamedModule()`；`loader == null`
+            // 那条路径用它）。HotSpot 由 `BootLoader.<clinit>` 经 `defineUnnamedModule` 挂上，
+            // 我们没跑那段引导，只能在这里补。
+            lk(&vm.sh.statics)
+                .insert(("jdk/internal/loader/BootLoader".to_string(), "UNNAMED_MODULE".to_string()), Slot::I(m));
+        }
+    }
     lk(&vm.sh.statics).insert(key, Slot::I(h));
     h
 }

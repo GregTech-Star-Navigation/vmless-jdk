@@ -332,8 +332,7 @@ pub(crate) fn compile_type(
                         super_name.replace('/', ".")
                     ));
                 }
-                em.op(0x2A); // aload_0
-                em.push(1);
+                em.insn(0x2A, 0, 1); // aload_0
                 em.op_u2(0xB7, super_init);
                 em.pop(1);
             }
@@ -383,6 +382,10 @@ pub(crate) fn compile_type(
                 } else {
                     compile_stmt(body, &mut em, &mut ctx, &mut cp).map_err(in_method)?
                 };
+                // 收尾自检：JVMS 要求在 return 处栈为空。记账一旦漂移（发指令忘了 pop），
+                // 表现只是 max_stack 偏小、或后面某个跳转点报「栈非空」—— 都是**别处**的错。
+                // 打开 VMLESS_STRICT_STACK=1 就在漂移的那一层当场报出来。
+                em.check_depth_zero(md.name.as_str())?;
                 if !terminated {
                     // 补一条默认返回。方法体里所有路径都 return 过时这里是死代码，
                     // 但字节码**必须**能通过验证（HotSpot: control flow falls through code end），
@@ -462,8 +465,7 @@ pub(crate) fn compile_type(
             let pdescs = desc_params(&bdesc);
             let mut slots: u16 = 1; // 0 是 this
             let mut em = Emit::new(1 + pdescs.iter().map(|p| if p.starts_with('J') || p.starts_with('D') { 2 } else { 1 }).sum::<u16>());
-            em.op(0x2A); // aload_0
-            em.push(1);
+            em.insn(0x2A, 0, 1); // aload_0
             for p in &pdescs {
                 let k = kind_from_desc(p);
                 em.load_slot(slots as u8, k)?;
@@ -664,8 +666,7 @@ fn push_default_return(em: &mut Emit, ret: &str) {
     match ret.as_bytes().first().copied() {
         Some(b'V') => em.op(0xB1),
         Some(b'J') => {
-            em.op(0x09); // lconst_0
-            em.push(2);
+            em.insn(0x09, 0, 2); // lconst_0
             em.op(0xAD); // lreturn
         }
         Some(b'D') => {
@@ -674,13 +675,11 @@ fn push_default_return(em: &mut Emit, ret: &str) {
             em.op(0xAF); // dreturn
         }
         Some(b'L') | Some(b'[') => {
-            em.op(0x01); // aconst_null
-            em.push(1);
+            em.insn(0x01, 0, 1); // aconst_null
             em.op(0xB0); // areturn
         }
         _ => {
-            em.op(0x03); // iconst_0
-            em.push(1);
+            em.insn(0x03, 0, 1); // iconst_0
             em.op(0xAC); // ireturn
         }
     }
@@ -769,8 +768,7 @@ fn emit_instance_field_inits(
     for (name, desc, init) in inits {
         let ty = type_from_desc(desc);
         let em_dir = if needs_scratch(init) { Some(spill(init, em, ctx, cp)?) } else { None };
-        em.op(0x2A); // aload_0
-        em.push(1);
+        em.insn(0x2A, 0, 1); // aload_0
         match em_dir {
             Some(sp) => unspill(&sp, em)?,
             None => emit_init(&ty, init, em, ctx, cp)?,
@@ -836,8 +834,7 @@ fn compile_ctor_body(
     // 字段初始化
     for (name, desc, init) in inits {
         let sp = if needs_scratch(init) { Some(spill(init, em, ctx, cp)?) } else { None };
-        em.op(0x2A); // aload_0
-        em.push(1);
+        em.insn(0x2A, 0, 1); // aload_0
         emit_val(init, &sp, em, ctx, cp)?;
         coerce_to(&type_from_desc(desc), init, ctx, em, cp)?;
         let f = cp.field_ref(&ctx.class_name, name, desc);

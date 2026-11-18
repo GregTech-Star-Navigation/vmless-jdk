@@ -932,6 +932,17 @@ impl Vm {
                         0x2f => Slot::L(v.as_i64()),   // laload
                         0x31 => Slot::F(v.as_f64()),   // daload
                         0x30 => Slot::Fl(v.as_f32()),  // faload
+                        // **窄类型读出来必须按 JVMS 归一**：`baload` 符号扩展、
+                        // `caload` 零扩展、`saload` 符号扩展。
+                        // 少了这三条，`ba[i] < 0` 永远为假 —— 后果很隐蔽：
+                        // `StringCoding.countPositives`（用它判断「整段是不是纯 ASCII」）
+                        // 恒返回 `len`，于是 `Files.readString` / `String.newStringNoRepl`
+                        // 把 UTF-8 字节**逐个当成 Latin-1 字符**（实测
+                        // `Files.readString(p, UTF_8)` 打出 30 个字符、首字符 0xE4，
+                        // 真 JDK 是 16 个字符、首字符 0x4E2D）。
+                        0x33 => Slot::I((v.as_i32() as u8) as i8 as i32), // baload
+                        0x34 => Slot::I(v.as_i32() as u16 as i32),        // caload
+                        0x35 => Slot::I((v.as_i32() as u16) as i16 as i32), // saload
                         _ => Slot::I(v.as_i32()),      // iaload / aaload
                     });
                 }
@@ -945,6 +956,13 @@ impl Vm {
                             0x50 => Slot::L(v.as_i64()),  // lastore
                             0x52 => Slot::F(v.as_f64()),  // dastore
                             0x51 => Slot::Fl(v.as_f32()), // fastore
+                            // 窄类型写进去要**截断**（JVMS 6.5）：`bastore` 只留低 8 位，
+                            // `castore`/`sastore` 只留低 16 位。不截断的话，写一个
+                            // 超过范围的值会让同一格读回来的结果和 HotSpot 不一致
+                            // （与 `baload`/`caload`/`saload` 的归一是一对）。
+                            0x54 => Slot::I((v.as_i32() as u8) as i8 as i32),      // bastore
+                            0x55 => Slot::I(v.as_i32() as u16 as i32),             // castore
+                            0x56 => Slot::I((v.as_i32() as u16) as i16 as i32),    // sastore
                             _ => Slot::I(v.as_i32()),     // iastore / aastore
                         };
                         // 引用元素写卡表（GC 用），基本类型直接写
@@ -1813,6 +1831,11 @@ fn is_override_owner(cf: &crate::ClassFile) -> bool {
             // `SunGraphics2D`：`drawString` 的接管点（JDK 25 的字体栈全走 FFM，到不了
             // `DrawGlyphList`；在 `SunGraphics2D` 层拦才能用 GDI 真字体画字）
             | b"sun/java2d/SunGraphics2D"
+            // `Throwable.getOurStackTrace` 由 VM 接管：JDK 自己的实现会对每个
+            // `StackTraceElement` 调 `computeFormat()`，而公开 7 参构造器造出来的
+            // 元素 `declaringClassObject` 是 null → 每打一次异常栈就 NPE
+            // （真正的异常会被这个 NPE 盖掉）。接管后直接返回我们造好的 backtrace。
+            | b"java/lang/Throwable"
             | b"java/lang/reflect/ReflectAccess"
             | b"jdk/internal/access/SharedSecrets"
     )

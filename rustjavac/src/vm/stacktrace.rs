@@ -606,9 +606,43 @@ pub(crate) fn to_stack_trace_elements(vm: &mut Vm, tid: u64, skip: usize) -> i32
 
 // ================================================================ native：Throwable
 
+/// `Throwable.getOurStackTrace()Ljava/lang/StackTraceElement[];`
+///
+/// JDK 自己的实现会把 `backtrace` 再过一遍 `StackTraceElement.of(...)`，而 `of()`
+/// 会对**每个元素**调 `computeFormat()` —— 那里面第一行是
+/// `declaringClassObject.getClassLoader0()`。我们造的元素来自公开的 7 参构造器
+/// （按 JDK 语义 `declaringClassObject` 就是 null），于是**每打一次异常栈就 NPE**，
+/// 而且这个 NPE 会把真正的异常整个盖掉（`D2` 就是这样：`new JFrame` 的真错看不到）。
+///
+/// 我们的 `backtrace` 本来就是造好的 `StackTraceElement[]`（`throwable_fill_in`
+/// 按精确帧算出来的），直接返回即可 —— 不需要那趟再加工，也绕开了 `Module` 那套。
+fn throwable_get_our_stack_trace(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let this = f.this();
+    let bt = vm.get_named(this, "java/lang/Throwable", "backtrace").as_i32();
+    if bt != 0 {
+        return Ok(Slot::I(bt));
+    }
+    // 没有 backtrace（VM 直接造的异常，没走过 `fillInStackTrace`）→ 空数组，
+    // 绝不返回 null：JDK 的 `getStackTrace()` 直接用这个返回值，null 会炸在别人那
+    let empty = vm
+        .sh
+        .heap
+        .new_array(Vec::new(), "[Ljava/lang/StackTraceElement;")
+        .unwrap_or(0);
+    Ok(Slot::I(empty))
+}
+
 /// Throwable 自己的这几帧不能出现在栈轨迹里（HotSpot 的 `fill_in_stack_trace` 同样跳过）。
+///
+/// `fillInStackTrace` 这一条**不看类名**：JDK 里每个异常类都覆写了它
+/// （`NullPointerException.fillInStackTrace(NullPointerException.java:90)` 那种），
+/// 它们全在「这个异常自己的构造链」上 —— 只看 `java/lang/Throwable` 会漏掉一整串，
+/// 栈顶就变成了 `NullPointerException.fillInStackTrace` 而不是真正的抛出点。
 fn is_throwable_internal(f: &FrameInfo) -> bool {
-    f.class == "java/lang/Throwable" && (f.method == "<init>" || f.method == "fillInStackTrace")
+    if f.method == "fillInStackTrace" {
+        return true;
+    }
+    f.class == "java/lang/Throwable" && f.method == "<init>"
 }
 
 /// `Throwable.fillInStackTrace(I)Ljava/lang/Throwable;`
@@ -971,6 +1005,14 @@ pub(crate) fn register(r: &mut NativeRegistry) {
 
     // 2) 真实现
     r.add("java/lang/Throwable", "fillInStackTrace", "(I)Ljava/lang/Throwable;", throwable_fill_in);
+    // 直接返回我们造好的 `backtrace`：JDK 自带的实现会再走一遍 `computeFormat()`，
+    // 那一步在公开构造器造出来的元素上必 NPE（见 `throwable_get_our_stack_trace`）
+    r.add_override(
+        "java/lang/Throwable",
+        "getOurStackTrace",
+        "()[Ljava/lang/StackTraceElement;",
+        throwable_get_our_stack_trace,
+    );
     r.add("java/lang/StackTraceElement", "initStackTraceElements",
         "([Ljava/lang/StackTraceElement;Ljava/lang/Object;I)V", ste_init_elements);
     r.add("java/lang/StackTraceElement", "initStackTraceElement",

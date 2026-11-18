@@ -1466,3 +1466,16 @@ pub(super) fn ensure_deadlock_watchdog() {
     spawn_deadlock_watchdog();
 }
 
+
+/// 让一条**不是** `Thread.start()` 起的 Rust 线程获得 Java 线程身份。
+///
+/// 事件泵（`nat_desktop::event_pump_start_once`）就是这样一条线程：它需要调进 Java 派发
+/// 鼠标/重画事件，但没有 tid 时 `cur_tid()==0`，任何 `monitorexit` 都会判成
+/// 「current thread is not owner」→ `IllegalMonitorStateException`（实测：泵线程调
+/// `Component.dispatchEvent` 必挂）。登记名册走 `thread_register`，本函数只负责补
+/// **本 OS 线程**的那份 TLS。
+///
+/// 调用顺序：父线程先 `thread_register(tid, …)`，子线程入口再调本函数。
+pub(super) fn adopt_current_thread(tid: u64) {
+    set_tid(tid);
+}

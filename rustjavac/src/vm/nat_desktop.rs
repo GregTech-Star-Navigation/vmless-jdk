@@ -1348,6 +1348,8 @@ mod w32 {
         pub fn BeginPaint(hwnd: HWND, ps: *mut PaintStruct) -> isize;
         pub fn EndPaint(hwnd: HWND, ps: *const PaintStruct) -> i32;
         pub fn GetDC(hwnd: HWND) -> isize;
+        pub fn GetPixel(dc: isize, x: i32, y: i32) -> u32;
+        pub fn PatBlt(dc: isize, x: i32, y: i32, w: i32, h: i32, rop: u32) -> i32;
         pub fn ReleaseDC(hwnd: HWND, dc: isize) -> i32;
         pub fn SetFocus(hwnd: HWND) -> HWND;
         pub fn GetForegroundWindow() -> HWND;
@@ -1452,6 +1454,8 @@ use std::sync::mpsc::{channel, Sender};
 const WM_DESTROY: u32 = 0x0002;
 const WM_CLOSE: u32 = 0x0010;
 const WM_PAINT: u32 = 0x000F;
+const WM_PRINTCLIENT: u32 = 0x0318;
+const WM_PRINT: u32 = 0x0317;
 const WM_ERASEBKGND: u32 = 0x0014;
 const WM_QUIT: u32 = 0x0012;
 const WM_MOUSEMOVE: u32 = 0x0200;
@@ -1546,6 +1550,8 @@ struct WinInfo {
     /// 这个窗口当前的 `GDIWindowSurfaceData` 句柄（0 = 还没建面）
     gdi: i32,
     visible: bool,
+    /// Java 面里的像素变过了、还没 BitBlt 上去（由事件泵每 tick 收敛，见 `flush_dirty`）
+    dirty: bool,
 }
 
 #[derive(Default)]
@@ -1565,6 +1571,16 @@ fn wstate() -> &'static Mutex<WinState> {
 }
 
 enum UiJob {
+    /// 建一个 **WS_CHILD** 子窗口（heavyweight 子组件，如 Panel/Canvas）。
+    CreateChild {
+        parent: isize,
+        x: i32,
+        y: i32,
+        w: i32,
+        h: i32,
+        peer: i32,
+        tx: Sender<isize>,
+    },
     Create {
         frame: bool,
         title: String,
@@ -1607,17 +1623,28 @@ fn ui_send(job: UiJob) {
 fn wide(s: &str) -> Vec<u16> {
     s.encode_utf16().chain(std::iter::once(0)).collect()
 }
-
-/// 把 `px` 画到窗口客户区（`StretchDIBits`，32bpp 自顶向下 DIB）
-fn blit_px(hwnd: isize, px: &[u32], w: i32, h: i32) {
-    if w <= 0 || h <= 0 || px.len() < (w as usize) * (h as usize) {
-        return;
+fn blit_to_dc(dc: isize, px: &[u32], w: i32, h: i32) -> i32 {
+    if dc == 0 || w <= 0 || h <= 0 || px.len() < (w as usize) * (h as usize) {
+        return -1;
+    }
+    // **24bpp 而不是 32bpp**：我们内部的像素是 `0x00RRGGBB`（高字节 0）。在 32bpp 的
+    // 重定向面上，DWM 会把高字节当 **alpha** —— alpha=0 就是「完全透明」，于是
+    // `GetPixel` 读得到颜色、屏幕上却只看到窗口后面的东西（实测：同一块 DC，
+    // `GetPixel(50,50)=0xff0000`，而 PrintWindow / 屏幕抓图全是背景）。24bpp 没有 alpha 通道，
+    // 从根上避开这件事。行按 4 字节对齐。
+    let stride = ((w as usize) * 3 + 3) & !3;
+    let mut buf = vec![0u8; stride * (h as usize)];
+    for y in 0..h as usize {
+        let src = y * (w as usize);
+        let dst = y * stride;
+        for x in 0..w as usize {
+            let v = px[src + x];
+            buf[dst + x * 3] = (v & 0xFF) as u8;
+            buf[dst + x * 3 + 1] = ((v >> 8) & 0xFF) as u8;
+            buf[dst + x * 3 + 2] = ((v >> 16) & 0xFF) as u8;
+        }
     }
     unsafe {
-        let dc = w32::GetDC(hwnd);
-        if dc == 0 {
-            return;
-        }
         let bmi = w32::BitmapInfo {
             header: w32::BitmapInfoHeader {
                 size: std::mem::size_of::<w32::BitmapInfoHeader>() as u32,
@@ -1625,7 +1652,7 @@ fn blit_px(hwnd: isize, px: &[u32], w: i32, h: i32) {
                 // 负高度 = 自顶向下（`px[0]` 是左上角）
                 height: -h,
                 planes: 1,
-                bit_count: 32,
+                bit_count: 24,
                 compression: 0, // BI_RGB
                 size_image: 0,
                 xppm: 0,
@@ -1635,7 +1662,7 @@ fn blit_px(hwnd: isize, px: &[u32], w: i32, h: i32) {
             },
             colors: [0; 256],
         };
-        w32::StretchDIBits(
+        let ret = w32::StretchDIBits(
             dc,
             0,
             0,
@@ -1645,40 +1672,110 @@ fn blit_px(hwnd: isize, px: &[u32], w: i32, h: i32) {
             0,
             w,
             h,
-            px.as_ptr() as *const _,
+            buf.as_ptr() as *const _,
             &bmi,
             0, // DIB_RGB_COLORS
             SRCCOPY,
         );
+        atrace(&format!("blit_to_dc {w}x{h} ret={ret} GetPixel(50,50)={:#08x}", w32::GetPixel(dc, 50, 50)));
+        ret
+    }
+}
+
+fn blit_px(hwnd: isize, px: &[u32], w: i32, h: i32) -> i32 {
+    if w <= 0 || h <= 0 || px.len() < (w as usize) * (h as usize) {
+        return -1;
+    }
+    unsafe {
+        let dc = w32::GetDC(hwnd);
+        if dc == 0 {
+            return -1;
+        }
+        let ret = blit_to_dc(dc, px, w, h);
         w32::ReleaseDC(hwnd, dc);
+        ret
     }
 }
 
 extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isize {
+    if msg == WM_PAINT {
+        atrace(&format!("wnd_proc WM_PAINT hwnd={hwnd}"));
+    }
     match msg {
-        WM_PAINT => unsafe {
-            let mut ps: w32::PaintStruct = std::mem::zeroed();
-            let _ = w32::BeginPaint(hwnd, &mut ps);
-            // 只读一次状态：`try_lock` 防止和创建/上屏路径互锁（拿不到就交给系统重画）
+        // `WM_PRINT` / `WM_PRINTCLIENT`：系统（或 `PrintWindow`）递进来一个 HDC
+        // 让我们把客户区画上去。不实现它，`PrintWindow` 只能拿到空白 —— 抓证据图时吃过
+        // 这个亏：窗口 DC 里 `GetPixel(30,30)=0x884422` 明明是蓝的，`PrintWindow` 拍出来全白
+        // （窗口被全屏窗口盖着时，`GetWindowDC` + BitBlt 也读不到被遮挡的客户区）。
+        WM_PRINT | WM_PRINTCLIENT => {
+            atrace(&format!("wnd_proc WM_PRINT msg={msg:#06x} hdc={wp}"));
             if let Ok(st) = wstate().try_lock() {
                 if let Some(peer) = st.by_hwnd.get(&hwnd) {
                     if let Some(w) = st.by_peer.get(peer) {
                         if w.visible {
-                            blit_px(hwnd, &w.px, w.w, w.h);
+                            unsafe {
+                                blit_to_dc(wp as isize, &w.px, w.w, w.h);
+                            }
+                        }
+                    }
+                }
+            }
+            0
+        }
+        WM_PAINT => unsafe {
+            let mut ps: w32::PaintStruct = std::mem::zeroed();
+            let _ = w32::BeginPaint(hwnd, &mut ps);
+            // 只读一次状态：`try_lock` 防止和创建/上屏路径互锁
+            let mut known = None;
+            if let Ok(st) = wstate().try_lock() {
+                if let Some(peer) = st.by_hwnd.get(&hwnd) {
+                    if let Some(w) = st.by_peer.get(peer) {
+                        if w.visible {
+                            // 先把上一帧已经画好的 `px` 贴上去（覆盖/最小化恢复时全靠这一下）。
+                            // **必须用 `BeginPaint` 给的 HDC**，不能用 `GetDC(hwnd)`：DWM 下
+                            // 窗口的重定向面只认「画在 WM_PAINT 里、并且是 ps.hdc」的那部分，
+                            // 用 GetDC 得到的 DC 上画完 GetPixel 读得到、屏幕上却永远是底色（实测）。
+                            unsafe {
+                                if std::env::var_os("VMLESS_AWT_BLACK").is_some() {
+                                    // 实验：同样在 WM_PAINT 的 ps.hdc 上，改用纯 GDI 的 PatBlt 填黑
+                                    w32::PatBlt(ps.hdc, 0, 0, w.w, w.h, 0x0000_0042 /* BLACKNESS */);
+                                } else {
+                                    blit_to_dc(ps.hdc, &w.px, w.w, w.h);
+                                }
+                            }
+                            known = Some((w.w, w.h));
                         }
                     }
                 }
             }
             let _ = w32::EndPaint(hwnd, &ps);
-            // 这里只把已经画好的 `px` 再 BitBlt 一次，**不**去触发 Java 的 `paint()`。
-            // 重画链本身还没接通，断了三处（2026-11-18 实测，见交付说明）：
-            //   ① `WM_PAINT` → `WComponentPeer.handlePaint` 只是把 `PaintEvent` 投进
-            //      EventQueue，消费它的是 `AWT-EventQueue-0` 上的 `Runnable.run()` ——
-            //      VM 对**匿名类**的接口方法解析是坏的（`new Runnable(){…}` 直接报
-            //      「找不到方法 java/lang/Runnable.run()V」；命名类与静态嵌套类都正常）；
-            //   ② 事件泵那条 Rust 线程调 `peer.getGraphics()` 会**静默挂死**；
-            //   ③ `SunGraphics2D.<clinit>` 抛 `ExceptionInInitializerError`（字体子系统）。
-            // 所以客户区现在是我们自己那张底色 `px`。
+            unsafe {
+                let dc2 = w32::GetDC(hwnd);
+                atrace(&format!("after EndPaint GetPixel(50,50)={:#08x}", w32::GetPixel(dc2, 50, 50)));
+                w32::ReleaseDC(hwnd, dc2);
+            }
+            // 锁被占**不能**当成「不用重画」：实测 `ShowWindow → UpdateWindow` 那一发
+            // WM_PAINT 正好撞上主线程在 `flush_surface` 里拷像素，`try_lock` 必失败，
+            // 然后**再没有第三发** WM_PAINT（我们从不置脏区），窗口就永远停在底色。
+            // 所以尺寸退化成从客户区取，与 WinState 无关。
+            let (w, h) = match known {
+                Some(v) => v,
+                None => {
+                    let mut rc: w32::Rect = std::mem::zeroed();
+                    let _ = w32::GetClientRect(hwnd, &mut rc);
+                    (rc.right - rc.left, rc.bottom - rc.top)
+                }
+            };
+            // 转给 Java 侧重画：真 HotSpot 在这里调 `WComponentPeer.handlePaint`，
+            // 它只把 `PaintEvent` 投进 EventQueue，真正跑 `paint()` 的是 EDT。
+            // 这条线程没有解释器上下文，所以只入队，由事件泵投递（见 `dispatch_paint`）。
+            if w > 0 && h > 0 {
+                atrace(&format!("WM_PAINT hwnd={hwnd} {w}x{h}（状态{})", if known.is_some() { "命中" } else { "未取到，用客户区" }));
+                // 不入队：泵线程调 `WComponentPeer.handlePaint` 会卡住（它内部的
+                // `SunToolkit.postEvent` 在这条线程上不返回），一卡泵就死了、鼠标也跟着废。
+                // 重画改由 Java 侧自己驱动：`repaint()` → EDT → `paint()`，
+                // GDIRenderer 的 native 会 `mark_surface_dirty`，泵的 `flush_dirty` 搬上屏。
+                let _ = (hwnd, w, h);
+            }
             0
         },
         // 背景我们自己画（`WM_PAINT` 里整块重绘），别让系统刷白
@@ -1777,7 +1874,7 @@ fn ui_thread_main(rx: std::sync::mpsc::Receiver<UiJob>) {
             instance: inst,
             icon: 0,
             cursor: cur,
-            background: 5isize + 1, // COLOR_WINDOW + 1
+            background: 5isize + 1, // COLOR_WINDOW + 1（白）
             menu_name: std::ptr::null(),
             class_name: cls.as_ptr(),
             icon_small: 0,
@@ -1790,6 +1887,10 @@ fn ui_thread_main(rx: std::sync::mpsc::Receiver<UiJob>) {
         loop {
             match rx.try_recv() {
                 Ok(job) => match job {
+                    UiJob::CreateChild { parent, x, y, w, h, peer, tx } => {
+                        let hwnd = create_child_hwnd(parent, x, y, w, h, peer);
+                        let _ = tx.send(hwnd);
+                    }
                     UiJob::Create { frame, title, x, y, w, h, peer, tx } => {
                         let hwnd = create_hwnd(frame, &title, x, y, w, h, peer);
                         let _ = tx.send(hwnd);
@@ -1845,6 +1946,31 @@ fn ui_thread_main(rx: std::sync::mpsc::Receiver<UiJob>) {
             }
         }
         std::thread::sleep(std::time::Duration::from_millis(4));
+    }
+}
+
+fn create_child_hwnd(parent: isize, x: i32, y: i32, w: i32, h: i32, peer: i32) -> isize {
+    if parent == 0 {
+        return 0;
+    }
+    let cls = wide("VmlessAwtWindow");
+    // 子窗口用 `WS_CHILD | WS_VISIBLE`，**不加** 边框，尺寸就是客户区尺寸（子窗口没有非客户区）
+    let style = 0x4000_0000 /* WS_CHILD */ | WS_VISIBLE | 0x0200_0000 /* WS_CLIPSIBLINGS */;
+    unsafe {
+        w32::CreateWindowExW(
+            0,
+            cls.as_ptr(),
+            wide("").as_ptr(),
+            style,
+            x,
+            y,
+            w.max(1),
+            h.max(1),
+            parent,
+            0,
+            0,
+            peer as usize as *mut _,
+        )
     }
 }
 
@@ -1939,11 +2065,16 @@ fn flush_surface(vm: &mut Vm, surf: i32) {
     let mut st = wstate().lock().unwrap_or_else(|e| e.into_inner());
     let Some(info) = st.by_peer.get_mut(&peer) else { return };
     if !info.visible || info.hwnd == 0 {
+        atrace(&format!("flush_surface surf={surf} 跳过：visible={} hwnd={}", info.visible, info.hwnd));
         return;
     }
     let w = info.w;
     let h = info.h;
     if s.width != w || s.height != h {
+        atrace(&format!(
+            "flush_surface surf={surf} 跳过：面 {0}x{1} ≠ 窗口 {w}x{h}",
+            s.width, s.height
+        ));
         return;
     }
     for y in 0..h {
@@ -1955,8 +2086,24 @@ fn flush_surface(vm: &mut Vm, surf: i32) {
         }
     }
     let (hwnd, px, pw, ph) = (info.hwnd, info.px.clone(), info.w, info.h);
+    // 抽查左上/中央/矩形里的各一个像素，确认「面里的值」是不是真的到了 `px`
+    atrace(&format!(
+        "flush_surface surf={surf} hwnd={hwnd} {pw}x{ph} px[0..3]={:08x},{:08x},{:08x} center={:08x}",
+        px.first().copied().unwrap_or(0),
+        px.get(1).copied().unwrap_or(0),
+        px.get(2).copied().unwrap_or(0),
+        px.get(30 * (pw as usize) + 30).copied().unwrap_or(0)
+    ));
     drop(st);
-    blit_px(hwnd, &px, pw, ph);
+    // **让窗口所在的线程去 BitBlt**（`InvalidateRect` → `WM_PAINT`），而不是在这里直接画。
+    //
+    // 实测：从事件泵线程 `StretchDIBits` 到窗口 DC 返回 200（"成功"），`px` 里也确实是
+    // `00224488`，但屏幕上始终是白的 —— 跨线程写窗口 DC 在这套窗口上不生效（GDI 的
+    // 重定向面归窗口所属线程管）。改成置脏区让 UI 线程画，与 AWT 自己的模型也一致。
+    unsafe {
+        let _ = w32::InvalidateRect(hwnd, std::ptr::null(), 0);
+    }
+    atrace("flush_surface -> InvalidateRect（由 UI 线程 WM_PAINT 上屏）");
 }
 
 // ============================================================ 十、AWT 窗口树
@@ -2168,6 +2315,46 @@ fn frame_title(vm: &Vm, target: i32) -> String {
     }
 }
 
+/// `WCanvasPeer.create(WComponentPeer parent)` —— heavyweight 子组件（`Panel` / `Canvas`）。
+///
+/// 真实现里建一个 `WS_CHILD` 子窗口挂在父 peer 的 hwnd 里。我们照做：子窗口自己有一块
+/// `px`/Java `int[]` 缓冲（`initOps` → `bind_surface` 会绑），`WM_PAINT` 落到子窗口的客户区。
+/// 位置交给随后的 `reshape`（`MoveWindow` 对子窗口是相对父客户区的坐标）。
+fn peer_create_child(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let peer = f.this();
+    let parent_peer = f.arg_i(0);
+    atrace("WCanvasPeer.create");
+    let target = get_ref_field(vm, peer, "sun/awt/windows/WComponentPeer", "target");
+    let (w, h) = component_size(vm, target);
+    let parent = peer_hwnd(parent_peer);
+    if parent == 0 {
+        return Err(unsupported("WCanvasPeer.create：父 peer 还没有窗口"));
+    }
+    let x = get_i32_field(vm, target, "java/awt/Component", "x");
+    let y = get_i32_field(vm, target, "java/awt/Component", "y");
+    let (tx, rx) = channel::<isize>();
+    ui_send(UiJob::CreateChild { parent, x, y, w, h, peer, tx });
+    let hwnd = match rx.recv_timeout(std::time::Duration::from_secs(5)) {
+        Ok(v) => v,
+        Err(_) => 0,
+    };
+    if hwnd == 0 {
+        return Err(unsupported("WCanvasPeer.create：Win32 建子窗口失败"));
+    }
+    set_i64_field(vm, peer, "sun/awt/windows/WComponentPeer", "hwnd", hwnd as i64);
+    set_i64_field(vm, peer, "sun/awt/windows/WObjectPeer", "pData", 1);
+    let jbuf = new_int_array(vm, (w as usize) * (h as usize), 0x00FF_FFFF);
+    {
+        let mut st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        st.by_hwnd.insert(hwnd, peer);
+        st.by_peer.insert(
+            peer,
+            WinInfo { hwnd, w, h, jbuf, px: vec![0x00FF_FFFFu32; (w as usize) * (h as usize)], gdi: 0, visible: false, dirty: false },
+        );
+    }
+    void()
+}
+
 fn peer_create(vm: &mut Vm, f: &mut Frame, frame: bool) -> Result<Slot, VmError> {
     let peer = f.this();
     atrace(if frame { "createAwtFrame" } else { "createAwtWindow" });
@@ -2210,7 +2397,7 @@ fn peer_create(vm: &mut Vm, f: &mut Frame, frame: bool) -> Result<Slot, VmError>
         st.by_hwnd.insert(hwnd, peer);
         st.by_peer.insert(
             peer,
-            WinInfo { hwnd, w, h, jbuf, px: vec![0x00FF_FFFFu32; (w as usize) * (h as usize)], gdi: 0, visible: false },
+            WinInfo { hwnd, w, h, jbuf, px: vec![0x00FF_FFFFu32; (w as usize) * (h as usize)], gdi: 0, visible: false, dirty: false },
         );
     }
     void()
@@ -2247,6 +2434,62 @@ fn peer_show(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     };
     if gdi != 0 {
         flush_surface(vm, gdi);
+    }
+    // ---- 要第一帧 ----
+    //
+    // 真 HotSpot 靠 `WM_PAINT → WComponentPeer.handlePaint → PaintEvent → EDT` 出第一帧。
+    // 我们这条路现在通不了，卡在**跨界调用**上（2026-11-18 实测，逐条记下来）：
+    //   · `WM_PAINT` 确实到了 Rust（wnd_proc 有日志，2 次）；
+    //   · 转给事件泵后，泵线程调 `handlePaint` **不返回**（日志停在
+    //     `dispatch_paint -> handlePaint peer=…`，之后 `drain_events` 再也没有 tick）。
+    //     同一个泵线程调 `peer.getGraphics()` 也是这个症状 —— 推测是 fork 出来的解释器
+    //     上下文没有被当成「已注册的 Java 线程」，凡是要 `Object.wait` 等别的线程的地方就死。
+    //     这条不是 nat_desktop 能修的（要改 thread/exec），所以这里绕开它。
+    //   · 于是在 **`pShow` 这条（主）线程**上把 `handlePaint` 要一次 —— 主线程是注册过的
+    //     Java 线程，`flushPendingEvents()` 能正常等到 EDT 把 `paint()` 跑完。
+    let (w, h) = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        st.by_peer.get(&peer).map(|i| (i.w, i.h)).unwrap_or((0, 0))
+    };
+    if w > 0 && h > 0 {
+        // ⚠ 写 `paint()` 的时候**不要**把 `Graphics` / `Color` / `Font` 拼进字符串做诊断，
+        //   实测 `System.out.println("PAINT " + g)` 会走
+        //   `Graphics.toString()` → `Font.toString()` → `FontManagerFactory.getInstance()`
+        //   → `StrikeCache.<clinit>` → `jdk.internal.foreign.LayoutPath.<clinit>`
+        //   → `NoSuchMethodException: java.lang.foreign.MemorySegment.asSlice(JJ)/invokeVirtual`
+        //   → `ExceptionInInitializerError`，**paint 在第一句就被打掉**，一个像素都画不出来，
+        //   而日志上只会看到 "PAINT 没打印"，很容易误判成「重画链没接通」。
+        //   `g.getClipBounds()`、`clicks` 这类是安全的；`drawString` 本身也没问题。
+        let r = call_java(
+            vm,
+            "sun/awt/windows/WComponentPeer",
+            "handlePaint",
+            "(IIII)V",
+            &[Slot::I(0), Slot::I(0), Slot::I(w), Slot::I(h)],
+            peer,
+        );
+        match &r {
+            Ok(_) => atrace("pShow: handlePaint ok"),
+            Err(e) => {
+                let detail = match e.exc {
+                    Some(hh) => vm.exc_text(hh),
+                    None => e.msg.clone(),
+                };
+                atrace(&format!("pShow: handlePaint 失败: {detail}"));
+            }
+        }
+        if r.is_ok() {
+            // 等 EDT 把 `paint()` 真跑完，再把面里的像素搬上屏
+            let _ = call_java(vm, "sun/awt/SunToolkit", "flushPendingEvents", "()V", &[], 0);
+            atrace("pShow: flushPendingEvents 返回");
+            let gdi = {
+                let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+                st.by_peer.get(&peer).map(|w| w.gdi).unwrap_or(0)
+            };
+            if gdi != 0 {
+                flush_surface(vm, gdi);
+            }
+        }
     }
     void()
 }
@@ -2306,9 +2549,63 @@ fn peer_title(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     void()
 }
 
+/// 把某个窗口的帧缓冲 `px` 写成 32bpp BMP（`VMLESS_AWT_DUMP=<路径>`）。
+///
+/// 自下而上写（BMP 的常规方向），每像素 `B,G,R,0`。
+fn dump_window_bmp(peer: i32) {
+    let Some(path) = std::env::var_os("VMLESS_AWT_DUMP") else { return };
+    let (w, h, px) = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        match st.by_peer.get(&peer) {
+            Some(win) if win.w > 0 && win.h > 0 => (win.w, win.h, win.px.clone()),
+            _ => return,
+        }
+    };
+    let stride = (w as usize) * 4;
+    let body = px.len() * 4;
+    let mut out: Vec<u8> = Vec::with_capacity(54 + body);
+    let file_size = (54 + body) as u32;
+    out.extend_from_slice(b"BM");
+    out.extend_from_slice(&file_size.to_le_bytes());
+    out.extend_from_slice(&0u16.to_le_bytes()); // 保留
+    out.extend_from_slice(&0u16.to_le_bytes()); // 保留
+    out.extend_from_slice(&54u32.to_le_bytes()); // 像素数据偏移
+    out.extend_from_slice(&40u32.to_le_bytes()); // BITMAPINFOHEADER 大小
+    out.extend_from_slice(&w.to_le_bytes());
+    out.extend_from_slice(&h.to_le_bytes()); // 正数 = 自下而上
+    out.extend_from_slice(&1u16.to_le_bytes()); // planes
+    out.extend_from_slice(&32u16.to_le_bytes()); // bpp
+    out.extend_from_slice(&0u32.to_le_bytes()); // BI_RGB
+    out.extend_from_slice(&(body as u32).to_le_bytes());
+    out.extend_from_slice(&2835u32.to_le_bytes()); // xppm (72dpi)
+    out.extend_from_slice(&2835u32.to_le_bytes()); // yppm
+    out.extend_from_slice(&0u32.to_le_bytes()); // clr_used
+    out.extend_from_slice(&0u32.to_le_bytes()); // clr_important
+    for y in (0..h as usize).rev() {
+        for x in 0..w as usize {
+            let v = px.get(y * (w as usize) + x).copied().unwrap_or(0);
+            out.push((v & 0xFF) as u8); // B
+            out.push(((v >> 8) & 0xFF) as u8); // G
+            out.push(((v >> 16) & 0xFF) as u8); // R
+            out.push(0);
+        }
+    }
+    let _ = stride;
+    match std::fs::write(&path, &out) {
+        Ok(_) => atrace(&format!("dump_window_bmp -> {} ({w}x{h})", path.to_string_lossy())),
+        Err(e) => atrace(&format!("dump_window_bmp 写失败: {e}")),
+    }
+}
+
 fn peer_dispose(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let peer = f.this();
     atrace("_dispose");
+    // 证据导出：`VMLESS_AWT_DUMP=<路径.bmp>` 时把这块窗口的帧缓冲写成 32bpp BMP。
+    // 为什么要它：窗口被别的窗口盖住时 `GetWindowDC` + BitBlt 读不到被遮挡的客户区，
+    // `PrintWindow` 在 DWM 下也不会给我们发 `WM_PRINT`（实测 20 次 WM_PAINT、0 次 WM_PRINT），
+    // 于是所有「按屏幕抓图」的路子都只能拿到白图 —— 而像素其实是好的
+    // （窗口 DC 里 `GetPixel(30,30)=0x884422`）。
+    dump_window_bmp(peer);
     let (hwnd, gdi) = {
         let mut st = wstate().lock().unwrap_or_else(|e| e.into_inner());
         let hwnd = match st.by_peer.remove(&peer) {
@@ -2405,6 +2702,206 @@ fn gdi_init_ops(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         return Err(unsupported("GDIWindowSurfaceData.initOps：只支持 32/24bpp"));
     }
     bind_surface(vm, sd, peer);
+    void()
+}
+
+// ---------------------------------------------------------------- GDIRenderer
+
+/// 标记「这个窗口面的像素变过了」。
+///
+/// 为什么不在这里直接 `flush_surface`：这些 native 跑在 **EDT** 上，一次 `paint()` 里会被
+/// 调几十次，每次都拷一遍全窗口太浪费；而且 `flush_surface` 要 `wstate()` 锁，和 UI 线程
+/// 的 `WM_PAINT` 抢锁。让事件泵每 4ms 收敛一次（纯 Rust 路径，不跨到 Java，不会挂）更稳。
+fn mark_surface_dirty(sd: i32) {
+    let peer = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        st.by_surf.get(&sd).copied()
+    };
+    if let Some(peer) = peer {
+        let mut st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        if let Some(w) = st.by_peer.get_mut(&peer) {
+            w.dirty = true;
+        }
+    }
+}
+
+/// 事件泵每 tick 调一次：把标脏的窗口面搬到 `px` 并 BitBlt 上屏。
+fn flush_dirty(vm: &mut Vm) {
+    let targets: Vec<(i32, i32)> = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        st.by_peer
+            .iter()
+            .filter(|(_, w)| w.dirty && w.visible && w.gdi != 0)
+            .map(|(p, w)| (*p, w.gdi))
+            .collect()
+    };
+    atrace(&format!("flush_dirty n={}", targets.len()));
+    for (peer, gdi) in targets {
+        {
+            let mut st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(w) = st.by_peer.get_mut(&peer) {
+                w.dirty = false;
+            }
+        }
+        flush_surface(vm, gdi);
+    }
+}
+
+/// 往面上填一段水平像素 `[x0,x1)`（行 `y`），颜色 `0x00RRGGBB`。
+fn gdi_fill_run(vm: &mut Vm, s: &Surface, y: i32, x0: i32, x1: i32, color: i32) {
+    if y < 0 || y >= s.height {
+        return;
+    }
+    let x0 = x0.max(0);
+    let x1 = x1.min(s.width);
+    if x0 >= x1 {
+        return;
+    }
+    let base = s.base + y * s.scan_step + x0 * s.pix_step;
+    for i in 0..(x1 - x0) {
+        surface_put(vm, s, base + i * s.pix_step, color & 0x00FF_FFFF);
+    }
+}
+
+/// 矩形 `[x,x+w)×[y,y+h)` 填色，按 `Region` 裁剪（`clip<=0` 表示不裁）。
+fn gdi_fill_box(vm: &mut Vm, s: &Surface, clip: i32, x: i32, y: i32, w: i32, h: i32, color: i32) {
+    if w <= 0 || h <= 0 {
+        return;
+    }
+    let (x1, y1) = (x + w, y + h);
+    match region_spans(vm, clip) {
+        Some(spans) if !spans.is_empty() => {
+            for (cy, cx0, cx1) in spans {
+                if cy < y || cy >= y1 {
+                    continue;
+                }
+                let a = cx0.max(x);
+                let b = cx1.min(x1);
+                if a < b {
+                    gdi_fill_run(vm, s, cy, a, b, color);
+                }
+            }
+        }
+        _ => {
+            for yy in y..y1 {
+                gdi_fill_run(vm, s, yy, x, x1, color);
+            }
+        }
+    }
+}
+
+/// `GDIRenderer.doFillRect(sd, clip, comp, color, x, y, w, h)`
+fn gdi_do_fill_rect(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_i(0);
+    let clip = f.arg_i(1);
+    let color = f.arg_i(3) & 0x00FF_FFFF;
+    let (x, y, w, h) = (f.arg_i(4), f.arg_i(5), f.arg_i(6), f.arg_i(7));
+    let Some(s) = surface_of(sd) else {
+        return Err(unsupported("GDIRenderer.doFillRect：窗口面没绑定（initOps 没跑？）"));
+    };
+    atrace(&format!("doFillRect sd={sd} color={color:#08x} rect={x},{y} {w}x{h} clip={clip}"));
+    gdi_fill_box(vm, &s, clip, x, y, w, h, color);
+    mark_surface_dirty(sd);
+    void()
+}
+
+/// `GDIRenderer.doDrawRect(...)`：只画四条边（GDI 里是空心矩形）
+fn gdi_do_draw_rect(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_i(0);
+    let clip = f.arg_i(1);
+    let color = f.arg_i(3) & 0x00FF_FFFF;
+    let (x, y, w, h) = (f.arg_i(4), f.arg_i(5), f.arg_i(6), f.arg_i(7));
+    let Some(s) = surface_of(sd) else {
+        return Err(unsupported("GDIRenderer.doDrawRect：窗口面没绑定"));
+    };
+    if w <= 0 || h <= 0 {
+        return void();
+    }
+    let (x1, y1) = (x + w, y + h);
+    gdi_fill_box(vm, &s, clip, x, y, w, 1, color); // 上
+    gdi_fill_box(vm, &s, clip, x, y1 - 1, w, 1, color); // 下
+    gdi_fill_box(vm, &s, clip, x, y, 1, h, color); // 左
+    gdi_fill_box(vm, &s, clip, x1 - 1, y, 1, h, color); // 右
+    mark_surface_dirty(sd);
+    void()
+}
+
+/// `GDIRenderer.doDrawLine(sd, clip, comp, color, x1, y1, x2, y2)`（Bresenham）
+fn gdi_do_draw_line(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_i(0);
+    let clip = f.arg_i(1);
+    let color = f.arg_i(3) & 0x00FF_FFFF;
+    let (mut x1, mut y1, x2, y2) = (f.arg_i(4), f.arg_i(5), f.arg_i(6), f.arg_i(7));
+    let Some(s) = surface_of(sd) else {
+        return Err(unsupported("GDIRenderer.doDrawLine：窗口面没绑定"));
+    };
+    let spans = region_spans(vm, clip);
+    let inside = |x: i32, y: i32| -> bool {
+        match &spans {
+            Some(v) if !v.is_empty() => v.iter().any(|&(cy, a, b)| cy == y && x >= a && x < b),
+            _ => true,
+        }
+    };
+    let dx = (x2 - x1).abs();
+    let dy = -(y2 - y1).abs();
+    let sx = if x1 < x2 { 1 } else { -1 };
+    let sy = if y1 < y2 { 1 } else { -1 };
+    let mut err = dx + dy;
+    let mut guard = 0;
+    loop {
+        guard += 1;
+        if guard > 100_000 {
+            break;
+        }
+        if inside(x1, y1) {
+            gdi_fill_run(vm, &s, y1, x1, x1 + 1, color);
+        }
+        if x1 == x2 && y1 == y2 {
+            break;
+        }
+        let e2 = 2 * err;
+        if e2 >= dy {
+            err += dy;
+            x1 += sx;
+        }
+        if e2 <= dx {
+            err += dx;
+            y1 += sy;
+        }
+    }
+    mark_surface_dirty(sd);
+    void()
+}
+
+/// `GDIRenderer.devCopyArea(sd, x, y, w, h, dx, dy)`：面内整块平移（滚动）。
+fn gdi_dev_copy_area(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_i(0);
+    let (x, y, w, h) = (f.arg_i(1), f.arg_i(2), f.arg_i(3), f.arg_i(4));
+    let (dx, dy) = (f.arg_i(5), f.arg_i(6));
+    let Some(s) = surface_of(sd) else { return void() };
+    if w <= 0 || h <= 0 {
+        return void();
+    }
+    // 先整块读出来再写回去（源/目的重叠）
+    let mut tmp = Vec::with_capacity((w * h) as usize);
+    for yy in 0..h {
+        for xx in 0..w {
+            let idx = s.base + (y + yy) * s.scan_step + (x + xx) * s.pix_step;
+            tmp.push(surface_get(vm, &s, idx));
+        }
+    }
+    for yy in 0..h {
+        for xx in 0..w {
+            let tx = x + xx + dx;
+            let ty = y + yy + dy;
+            if tx < 0 || tx >= s.width || ty < 0 || ty >= s.height {
+                continue;
+            }
+            let idx = s.base + ty * s.scan_step + tx * s.pix_step;
+            surface_put(vm, &s, idx, tmp[(yy * w + xx) as usize]);
+        }
+    }
+    mark_surface_dirty(sd);
     void()
 }
 
@@ -2506,6 +3003,13 @@ pub(super) fn register_window(r: &mut NativeRegistry) {
     // 我们的绘制是自己 blit 到窗口像素缓冲，没有 WM_ERASEBKGND 这条路径，no-op 即可；
     // 不注册的话 `WCanvasPeer.initialize()` 里直接 UnsatisfiedLinkError，建 peer 就断。
     r.add("sun/awt/windows/WCanvasPeer", "setNativeBackgroundErase", "(ZZ)V", no_op_taking);
+    // heavyweight 子组件（Panel/Canvas）的窗口创建 —— 见 `peer_create_child`
+    r.add(
+        "sun/awt/windows/WCanvasPeer",
+        "create",
+        "(Lsun/awt/windows/WComponentPeer;)V",
+        traced!("WCanvasPeer.create", peer_create_child),
+    );
     // `SunToolkit.closeSplashScreen()`：第一个窗口 show 的时候调，用来关掉启动画面。
     // 我们没有启动画面 → no-op（**static**，所以用 no_op 不是 no_op_taking）。
     r.add("sun/awt/SunToolkit", "closeSplashScreen", "()V", no_op);
@@ -2712,6 +3216,30 @@ pub(super) fn register_window(r: &mut NativeRegistry) {
     r.add("sun/java2d/windows/GDIWindowSurfaceData", "initIDs", "(Ljava/lang/Class;)V", traced!("initIDs", no_op_taking));
     r.add("sun/java2d/windows/GDIWindowSurfaceData", "initOps", "(Lsun/awt/windows/WComponentPeer;IIIII)V", traced!("initOps", gdi_init_ops));
     r.add("sun/java2d/windows/GDIWindowSurfaceData", "invalidateSD", "()V", traced!("invalidateSD", no_op));
+
+    // ---- GDIRenderer：窗口面的**默认**绘制管道
+    //
+    // `GDIWindowSurfaceData.validatePipe()` 在不透明 + 无抗锯齿时直接把
+    // `drawpipe/fillpipe` 换成 `GDIRenderer`，所以 `g.fillRect()` 根本不走
+    // `sun.java2d.loops.FillRect`（那套软件循环只在离屏 BufferedImage 上用）。
+    // 不实现这三个，`Component.paint()` 一画就 `UnsatisfiedLinkError: doFillRect`。
+    // 我们把它落到同一条「Java int[] 缓冲」上（`gdi_init_ops` 绑的那块），
+    // 于是窗口和离屏图共用同一套像素。
+    r.add("sun/java2d/windows/GDIRenderer", "doFillRect", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIII)V", traced!("doFillRect", gdi_do_fill_rect));
+    r.add("sun/java2d/windows/GDIRenderer", "doDrawRect", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIII)V", traced!("doDrawRect", gdi_do_draw_rect));
+    r.add("sun/java2d/windows/GDIRenderer", "doDrawLine", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIII)V", traced!("doDrawLine", gdi_do_draw_line));
+    // 下面这些暂时只吞掉调用（画出来是空白，不崩）：圆角矩形/椭圆/弧/多边形/Path2D。
+    // 要补的时候照 `doFillRect` 的写法往那块缓冲里填就行。
+    r.add("sun/java2d/windows/GDIRenderer", "doDrawRoundRect", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIIIII)V", traced!("doDrawRoundRect", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doDrawOval", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIII)V", traced!("doDrawOval", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doDrawArc", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIIIII)V", traced!("doDrawArc", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doDrawPoly", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;II[I[IIZ)V", traced!("doDrawPoly", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doFillRoundRect", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIIIII)V", traced!("doFillRoundRect", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doFillOval", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIII)V", traced!("doFillOval", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doFillArc", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIIIII)V", traced!("doFillArc", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doFillPoly", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;II[I[III)V", traced!("doFillPoly", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "doShape", "(Lsun/java2d/windows/GDIWindowSurfaceData;Lsun/java2d/pipe/Region;Ljava/awt/Composite;IIIILjava/awt/geom/Path2D$Float;Z)V", traced!("doShape", no_op_taking));
+    r.add("sun/java2d/windows/GDIRenderer", "devCopyArea", "(Lsun/java2d/windows/GDIWindowSurfaceData;IIIIII)V", traced!("devCopyArea", gdi_dev_copy_area));
 
     // ---- 图形环境 / 设备 / 配置
     r.add("sun/awt/Win32GraphicsDevice", "initDevice", "(I)V", traced!("initDevice", no_op_taking));
@@ -3626,9 +4154,22 @@ enum InputEvt {
         ch: u16,
         modifiers: i32,
     },
+    /// `WM_PAINT`：让 Java 侧重画。
+    ///
+    /// 真 HotSpot 是在 `AwtComponent::WmPaint` 里调 Java 的 `WComponentPeer.handlePaint`
+    /// （它只把 `PaintEvent` 投进 EventQueue，真正画的是 EDT 上那一跳）。
+    /// 我们的 `WM_PAINT` 在 Rust UI 线程上，那条线程没有解释器上下文，所以只入队。
+    Paint {
+        hwnd: isize,
+        w: i32,
+        h: i32,
+    },
 }
 
 static EVENTS: OnceLock<Mutex<Vec<InputEvt>>> = OnceLock::new();
+
+/// `handlePaint` 之后等 EDT 把 `paint()` 跑完的时间（毫秒），见 `dispatch_paint`。
+const PAINT_SETTLE_MS: u64 = 40;
 
 fn events() -> &'static Mutex<Vec<InputEvt>> {
     EVENTS.get_or_init(|| Mutex::new(Vec::new()))
@@ -3710,7 +4251,7 @@ fn dispatch_mouse(
     clicks: i32,
     modifiers: i32,
 ) {
-    atrace(&format!("dispatch_mouse hwnd={hwnd} id={id} at {x},{y}"));
+    atrace(&format!("dispatch_mouse hwnd={hwnd} id={id} at {x},{y} tid={}", crate::vm::thread::cur_tid()));
     let target = peer_target(vm, hwnd);
     if target <= 0 {
         return;
@@ -3735,9 +4276,33 @@ fn dispatch_mouse(
     ];
     let ev = new_obj(vm, "java/awt/event/MouseEvent", desc, &args);
     if ev <= 0 {
+        atrace("dispatch_mouse: MouseEvent 造不出来");
         return;
     }
-    let _ = call_java(vm, "java/awt/Component", "dispatchEvent", "(Ljava/awt/AWTEvent;)V", &[Slot::I(ev)], comp);
+    // **直接调 `Component.processMouseEvent`，不走 `dispatchEvent`。**
+    //
+    // 实测两条都不通：
+    //  · `Component.dispatchEvent` 在这条泵线程上抛
+    //    `IllegalMonitorStateException: current thread is not owner` —— 即使泵线程已经
+    //    `thread_register`（tid=0x7FFF0001 实测正确）且补了 TLS；`dispatchEventImpl` 里那串
+    //    `synchronized` 在「非 `Thread.start()` 起的线程」上还不成立；
+    //  · `SunToolkit.postEvent` 会卡住泵线程（投出去后没有下文）。
+    //
+    // `processMouseEvent(event)` 就是「把它交给本组件的 MouseListener」，内部只是
+    // `if (mouseListener != null) …`，没有监视器、也不依赖 EDT。代价：少了
+    // `enableEvents`/`eventEnabled` 判定与 `MOUSE_CLICKED` 的合成 —— 演练样张够用。
+    let mname = if id == 503 { "processMouseMotionEvent" } else { "processMouseEvent" };
+    match call_java(vm, "java/awt/Component", mname, "(Ljava/awt/event/MouseEvent;)V", &[Slot::I(ev)], comp)
+    {
+        Ok(_) => atrace(&format!("dispatch_mouse: {mname} ok id={id}")),
+        Err(e) => {
+            let detail = match e.exc {
+                Some(h) => vm.exc_text(h),
+                None => e.msg.clone(),
+            };
+            atrace(&format!("dispatch_mouse: {mname} 失败 id={id}: {detail}"));
+        }
+    }
 }
 
 /// 投递一个键盘事件
@@ -3776,14 +4341,62 @@ fn drain_events(vm: &mut Vm) {
         }
         std::mem::take(&mut *q)
     };
+    atrace(&format!("drain_events n={}", batch.len()));
     for e in batch {
         match e {
             InputEvt::Mouse { hwnd, id, x, y, button, clicks, modifiers } => {
                 dispatch_mouse(vm, hwnd, id, x, y, button, clicks, modifiers)
             }
             InputEvt::Key { hwnd, id, code, ch, modifiers } => dispatch_key(vm, hwnd, id, code, ch, modifiers),
+            InputEvt::Paint { hwnd, w, h } => dispatch_paint(vm, hwnd, w, h),
         }
     }
+}
+
+/// 把一次 `WM_PAINT` 交给 Java：`WComponentPeer.handlePaint(x,y,w,h)`。
+///
+/// 这一步只是 `postPaintIfNecessary` —— 它 `new PaintEvent(target, PAINT, rect)` 再
+/// `SunToolkit.postEvent(...)` 就返回。真正的 `Component.paint(g)` 在 `AWT-EventQueue-0`
+/// （EDT）上跑。所以这里**调完要等它一下**再把 Java 面里的像素搬上屏：
+/// * 不等 → `flush_surface` 拿到的还是上一帧（第一次就是空白底色）；
+/// * `SunToolkit.flushPendingEvents()` 能等，但它在事件泵线程上等，EDT 一旦卡住泵就死了。
+///   折中：`handlePaint` 之后睡 `PAINT_SETTLE_MS` 再 flush。窗口小时这点延迟看不出来。
+fn dispatch_paint(vm: &mut Vm, hwnd: isize, w: i32, h: i32) {
+    let peer = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        match st.by_hwnd.get(&hwnd) {
+            Some(p) => *p,
+            None => {
+                atrace(&format!("dispatch_paint: hwnd={hwnd} 没有对应 peer"));
+                return;
+            }
+        }
+    };
+    if peer <= 0 {
+        return;
+    }
+    atrace(&format!("dispatch_paint -> handlePaint peer={peer} {w}x{h}"));
+    let r = call_java(
+        vm,
+        "sun/awt/windows/WComponentPeer",
+        "handlePaint",
+        "(IIII)V",
+        &[Slot::I(0), Slot::I(0), Slot::I(w), Slot::I(h)],
+        peer,
+    );
+    match &r {
+        Ok(_) => atrace(&format!("dispatch_paint peer={peer} handlePaint ok {w}x{h}")),
+        Err(e) => {
+            let detail = match e.exc {
+                Some(h) => vm.exc_text(h),
+                None => e.msg.clone(),
+            };
+            atrace(&format!("dispatch_paint peer={peer} handlePaint 失败: {detail}"));
+            return;
+        }
+    }
+    // 像素由 EDT 自己画进 Java 面；GDIRenderer 那几个 native 会 `mark_surface_dirty`，
+    // 事件泵下一 tick 的 `flush_dirty` 负责搬上屏 —— 这里不用再 flush。
 }
 
 /// `WToolkit.eventLoop()` —— `AWT-Windows` 线程上的事件泵。
@@ -3811,10 +4424,25 @@ fn toolkit_event_loop(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
 fn event_pump_start_once(vm: &mut Vm) {
     static PUMP: OnceLock<()> = OnceLock::new();
     PUMP.get_or_init(|| {
+        atrace("event_pump_start_once: fork + spawn");
+        // 这条线程要**调进 Java**（派发鼠标 / 重画），所以必须是一个「已登记」的 Java 线程。
+        // 不登记时 `cur_tid()==0`，`monitorexit` 一律判成 "current thread is not owner"
+        // → `Component.dispatchEvent` 抛 `IllegalMonitorStateException`（实测）。
+        // tid 取一个远离 `Thread.start()` 自增区间的值，避免撞号。
+        const PUMP_TID: u64 = 0x7FFF_0001;
+        vm.thread_register(PUMP_TID, 0, "vmless-pump", true);
+        atrace("pump: thread_register done");
         let mut child = vm.fork();
-        std::thread::spawn(move || loop {
-            drain_events(&mut child);
-            std::thread::sleep(std::time::Duration::from_millis(4));
+        std::thread::spawn(move || {
+            crate::vm::thread::adopt_current_thread(PUMP_TID);
+            child.sh.safepoint.register();
+            atrace(&format!("pump: 线程就绪 tid={}", crate::vm::thread::cur_tid()));
+            loop {
+                drain_events(&mut child);
+                // 纯 Rust 的收敛路径：EDT 画进 Java 面的像素在这里 BitBlt 上屏。
+                flush_dirty(&mut child);
+                std::thread::sleep(std::time::Duration::from_millis(4));
+            }
         });
     });
 }

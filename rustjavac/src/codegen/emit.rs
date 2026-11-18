@@ -113,6 +113,39 @@ impl Emit {
         self.bytes.push(b);
     }
 
+    /// 发一条**改变栈深**的指令：发字节码与记账在同一个调用里完成。
+    ///
+    /// 为什么强制走这里：`monitorenter`/`monitorexit`/`athrow` 都弹 1 槽，
+    /// 我第一版分两处写、漏了记账 —— 表现是**该指令之后**的代码每处比较/`&&`/`||`
+    /// 都报「栈非空」，44 个文件当场变红。这类错误只影响它之后的代码，
+    /// 因果在空间上被拉开，靠事后核对是核不出来的，只能让它们在物理上分不开。
+    ///
+    /// `pops`/`pushes` 是**槽数**（long/double 各算 2）。不改变栈深的指令
+    /// （goto/nop/monitor 之外的控制流）继续用 `op()`。
+    /// 方法收尾自检：栈深必须回到 0（`VMLESS_STRICT_STACK=1` 才启用）。
+    ///
+    /// 记账漂移的两种表现：`max_stack` 偏小（HotSpot: Operand stack overflow），
+    /// 或者**之后**某处比较/`&&`报「栈非空」。两种都离真凶很远，所以在这里兜一下。
+    pub(crate) fn check_depth_zero(&self, what: &str) -> Result<(), CompileError> {
+        if self.depth != 0 && std::env::var_os("VMLESS_STRICT_STACK").is_some() {
+            return err(format!(
+                "内部错误：`{what}` 退出时栈记账还剩 {} 槽（发指令漏了记账，max_stack 会偏小）",
+                self.depth
+            ));
+        }
+        Ok(())
+    }
+
+    pub(crate) fn insn(&mut self, opcode: u8, pops: u16, pushes: u16) {
+        self.op(opcode);
+        if pops > 0 {
+            self.pop(pops);
+        }
+        if pushes > 0 {
+            self.push(pushes);
+        }
+    }
+
     pub(crate) fn op_u2(&mut self, b: u8, idx: u16) {
         self.bytes.push(b);
         self.bytes.extend_from_slice(&idx.to_be_bytes());
