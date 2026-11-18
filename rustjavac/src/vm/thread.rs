@@ -48,6 +48,78 @@ use super::{Vm, VmError};
 /// 只在这个环境变量开着时才会被初始化；正常跑一个字节码都不多碰。
 static MON_OCC: Mutex<Option<HashMap<i32, u64>>> = Mutex::new(None);
 
+// ================================================================ Rust 栈预算
+//
+// 解释器的每层 Java 调用都是**真的**一层 Rust 栈帧（`execute` → `execute_body`
+// → 递归 `execute`），所以「能递归多深」由线程栈大小决定，不是随便拍一个数字。
+// 判据直接看**实际栈指针**：`stack_top() - 当前 sp > 预算` 就是快溢出了。
+// 这比数深度准 —— 有的帧宽（局部变量多）、有的窄，深度相同的两次调用栈占用不同。
+
+/// 栈顶哨兵：本 OS 线程在入口处记下的 sp（0 = 还没绑定）
+thread_local! {
+    static STACK_TOP: Cell<usize> = const { Cell::new(0) };
+}
+
+/// Java 线程（含主线程）的 Rust 栈大小，`VMLESS_STACK_MB` 可覆盖（默认 24 MB）。
+///
+/// 为什么要显式给：解释器一层调用比 JIT 重得多（`execute_body` 那个大 match 的
+/// 栈帧不小），默认 1 MB 的线程栈只够几十层。HotSpot 默认 `-Xss512k` 能跑到
+/// 一万层上下，因为它的解释器帧不是真实 C 栈帧。
+///
+/// 24 MB 是**实测**定的：`VMLESS_SOE_TRACE=1` 量到每层 ≈ **2128 B**（`R5` 的
+/// `deep(0)` 递归），按 3/4 预算 → 约 8800 层可用，落在「8000 层」这个目标上。
+/// 这是**虚拟**保留：Windows 按需提交，没递归到那么深就几乎不占物理内存。
+pub(crate) fn java_stack_bytes() -> usize {
+    static B: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var("VMLESS_STACK_MB")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .map(|mb| mb.clamp(1, 512))
+            .unwrap_or(24)
+            << 20
+    })
+}
+
+/// 在**本线程的入口**调一次，记下栈顶。
+///
+/// 必须在真入口（`thread_start` 的 spawn 闭包 / `run_main` 的大栈线程）调：
+/// 绑定得越晚，`top` 越低，算出来的可用空间越保守 —— 保守是安全方向，但会
+/// 少掉一大截可用深度。
+pub(super) fn bind_stack_top() {
+    let anchor = 0u8;
+    let sp = std::hint::black_box(&anchor) as *const u8 as usize;
+    STACK_TOP.with(|t| t.set(sp));
+}
+
+#[inline]
+pub(super) fn stack_top() -> usize {
+    STACK_TOP.with(|t| t.get())
+}
+
+/// 本线程已经用掉多少栈（诊断 / 定 `VMLESS_STACK_MB` 用）
+pub(super) fn stack_used() -> usize {
+    let anchor = 0u8;
+    let sp = std::hint::black_box(&anchor) as *const u8 as usize;
+    stack_top().saturating_sub(sp)
+}
+
+/// 溢出判据：这一层再压下去还剩多少栈。
+#[inline]
+pub(super) fn stack_exhausted() -> bool {
+    let anchor = 0u8;
+    let sp = std::hint::black_box(&anchor) as *const u8 as usize;
+    let top = stack_top();
+    if top == 0 {
+        // 没绑定（不是我们起的线程）→ 按最保守的 1 MB 算，宁可早报错也不要段错误
+        return false;
+    }
+    // 留 1/4 余量：抛 `StackOverflowError` 自己还要走几层（分配异常对象、
+    // 抓帧快照、`exc_text` 拼串），临界点上再吃满栈就是真 SIGSEGV，没有 panic。
+    top.saturating_sub(sp) > java_stack_bytes() / 4 * 3
+}
+
+
 /// 开关**只在第一次问的时候查环境**。
 ///
 /// 这是 `monitorenter` / `monitorexit` 的热路径：每次锁都做一次 `var_os` 就是每次
@@ -752,18 +824,32 @@ impl Vm {
         ensure_deadlock_watchdog();
         // 子线程入口：**自己的解释器上下文**（共享 `Shared`，执行状态全新）
         let mut child = self.fork();
-        std::thread::spawn(move || {
-            set_tid(tid);
-            // 帧表绑到**这个** OS 线程上（登记是在父线程做的，TLS 只能在子线程自己这里设）
-            super::stacktrace::bind_current(&child.sh, tid);
-            child.sh.safepoint.register();
-            let r = child.invoke_thread_run(thread_obj);
-            let exc = child.thread_finish(tid, r);
-            child.sh.safepoint.unregister();
-            if let Some(text) = exc {
-                eprintln!("{text}");
-            }
-        });
+        // 解释器每层 Java 调用是一层真实 Rust 栈帧：默认 1~2 MB 的线程栈只够跑几十层，
+        // 任何正常递归（快排 / 树遍历 / 解析器）都会撞上限。这里按 `VMLESS_STACK_MB`
+        // 给足（默认 8 MB），并在闭包第一行记下栈顶供 `stack_exhausted()` 用。
+        let spawned = std::thread::Builder::new()
+            .name(format!("java-{tid}"))
+            .stack_size(java_stack_bytes())
+            .spawn(move || {
+                bind_stack_top();
+                set_tid(tid);
+                // 帧表绑到**这个** OS 线程上（登记是在父线程做的，TLS 只能在子线程自己这里设）
+                super::stacktrace::bind_current(&child.sh, tid);
+                child.sh.safepoint.register();
+                let r = child.invoke_thread_run(thread_obj);
+                let exc = child.thread_finish(tid, r);
+                child.sh.safepoint.unregister();
+                if let Some(text) = exc {
+                    eprintln!("{text}");
+                }
+            });
+        if spawned.is_err() {
+            // 起不来线程：按 JVM 语义，`Thread.start()` 失败 → OutOfMemoryError
+            return Err(self.java_exception(
+                "java/lang/OutOfMemoryError",
+                "unable to create native thread",
+            ));
+        }
         Ok(())
     }
 

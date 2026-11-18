@@ -61,10 +61,18 @@ pub(crate) fn compile_type(
     };
     let is_iface = t.kind == TypeKind::Interface;
     // 父类：AST 里写了 extends 就用它，否则就是 Object（接口的 extends 是父接口，见 interfaces）
-    let super_name = match res.super_of(&self_name)? {
+    let mut super_name = match res.super_of(&self_name)? {
         Some(s) => s,
         None => "java/lang/Object".to_string(),
     };
+    // **匿名类实现的是接口**：`new Runnable(){ … }` 的 AST 里基类型写在 `extends` 上，
+    // 但 JVMS 4.1 要求 `super_class` 必须是类。这里把它挪到 `interfaces[]`，
+    // 父类退回 Object —— javac 生成的匿名类也是这个形态（`Object` + 接口表）。
+    let mut extra_ifaces: Vec<String> = Vec::new();
+    if !is_iface && super_name != "java/lang/Object" && res.is_interface(&super_name) {
+        extra_ifaces.push(super_name.clone());
+        super_name = "java/lang/Object".to_string();
+    }
 
     // 第一遍：收集静态方法签名（供 invokestatic 使用）。同名重载全留，调用点按实参挑
     let mut static_sigs: HashMap<String, Vec<String>> = HashMap::new();
@@ -594,7 +602,13 @@ pub(crate) fn compile_type(
     }
 
     // 接口表：`implements A, B`（接口自己的 `extends A, B` 也算父接口）
-    let iface_idxs: Vec<u16> = res.interfaces_of(&self_name).iter().map(|n| cp.class(n)).collect();
+    let mut iface_all = res.interfaces_of(&self_name);
+    for i in &extra_ifaces {
+        if !iface_all.contains(i) {
+            iface_all.push(i.clone());
+        }
+    }
+    let iface_idxs: Vec<u16> = iface_all.iter().map(|n| cp.class(n)).collect();
 
     // invokestatic 的 owner 用真实类名补齐（此前占位 <SELF>）
     let bsm = cp.take_bootstrap();

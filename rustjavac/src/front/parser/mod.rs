@@ -42,6 +42,8 @@ pub struct Parser {
     /// 帧与代码于是对不上（HotSpot: `Bad local variable type`）。这里把它们排成队，
     /// `parse_statement` 每次先取一条，效果与源码里写成两条语句完全一样。
     pending_stmts: Vec<Stmt>,
+    /// 匿名类的编号（`Outer$Anon0` 的 0）。每次 `new X(){...}` 自增。
+    anon_seq: usize,
 }
 
 impl Parser {
@@ -57,6 +59,7 @@ impl Parser {
             local_types: Vec::new(),
             pending_members: Vec::new(),
             pending_stmts: Vec::new(),
+            anon_seq: 0,
         })
     }
 

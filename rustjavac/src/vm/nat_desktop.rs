@@ -1660,24 +1660,25 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isiz
             let mut ps: w32::PaintStruct = std::mem::zeroed();
             let _ = w32::BeginPaint(hwnd, &mut ps);
             // 只读一次状态：`try_lock` 防止和创建/上屏路径互锁（拿不到就交给系统重画）
-            let mut ask_java = None;
             if let Ok(st) = wstate().try_lock() {
                 if let Some(peer) = st.by_hwnd.get(&hwnd) {
                     if let Some(w) = st.by_peer.get(peer) {
                         if w.visible {
                             blit_px(hwnd, &w.px, w.w, w.h);
-                            ask_java = Some((w.w, w.h));
                         }
                     }
                 }
             }
             let _ = w32::EndPaint(hwnd, &ps);
-            // 系统只是提醒「这块要重画」。像素得由 Java 侧 `Component.paint()` 产出来，
-            // 所以把重画请求转给事件泵：`handlePaint` → `PaintEvent` → `paint()`。
-            // 不转这一步窗口就永远是我们自己那张空白 `px`（实测：客户区全白）。
-            if let Some((w, h)) = ask_java {
-                push_event(InputEvt::Paint { hwnd, w, h });
-            }
+            // 这里只把已经画好的 `px` 再 BitBlt 一次，**不**去触发 Java 的 `paint()`。
+            // 重画链本身还没接通，断了三处（2026-11-18 实测，见交付说明）：
+            //   ① `WM_PAINT` → `WComponentPeer.handlePaint` 只是把 `PaintEvent` 投进
+            //      EventQueue，消费它的是 `AWT-EventQueue-0` 上的 `Runnable.run()` ——
+            //      VM 对**匿名类**的接口方法解析是坏的（`new Runnable(){…}` 直接报
+            //      「找不到方法 java/lang/Runnable.run()V」；命名类与静态嵌套类都正常）；
+            //   ② 事件泵那条 Rust 线程调 `peer.getGraphics()` 会**静默挂死**；
+            //   ③ `SunGraphics2D.<clinit>` 抛 `ExceptionInInitializerError`（字体子系统）。
+            // 所以客户区现在是我们自己那张底色 `px`。
             0
         },
         // 背景我们自己画（`WM_PAINT` 里整块重绘），别让系统刷白
@@ -2247,16 +2248,6 @@ fn peer_show(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     if gdi != 0 {
         flush_surface(vm, gdi);
     }
-    // 第一次上屏后主动要一帧 Java 的 `paint()`：`ShowWindow` 带来的 `WM_PAINT` 不保证
-    // 落在这之后（实测它可能在 `pShow` 之前就被系统合并掉了），缺这一下客户区会一直是我们
-    // 自己那张空白 `px`。
-    if hwnd != 0 {
-        let (w, h) = {
-            let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
-            st.by_peer.get(&peer).map(|i| (i.w, i.h)).unwrap_or((0, 0))
-        };
-        push_event(InputEvt::Paint { hwnd, w, h });
-    }
     void()
 }
 
@@ -2535,6 +2526,14 @@ pub(super) fn register_window(r: &mut NativeRegistry) {
     r.add("sun/awt/windows/WWindowPeer", "initIDs", "()V", no_op_taking);
     r.add("sun/font/FreetypeFontScaler", "initIDs", "(Ljava/lang/Class;)V", no_op_taking);
     r.add("sun/font/SunFontManager", "initIDs", "()V", no_op_taking);
+    // 画字要用 `STrike`/`StrikeCache`，它们进 `StrikeCache.<clinit>` 时会摸这几个 native。
+    // 我们没有 native 字形缓存（走 GDI 那条路，见文件末尾「字体」），统一答「没有」：
+    // `getInvisibleGlyphPtr` 返回 0 → 不可见字形（空格之类）没有像素，正是想要的效果。
+    r.add("sun/font/StrikeCache", "getInvisibleGlyphPtr", "()J", traced!("getInvisibleGlyphPtr", |_, _| Ok(Slot::L(0))));
+    r.add("sun/font/StrikeCache", "freeIntPointer", "(I)V", traced!("freeIntPointer", no_op_taking));
+    r.add("sun/font/StrikeCache", "freeLongPointer", "(J)V", traced!("freeLongPointer", no_op_taking));
+    r.add("sun/font/StrikeCache", "freeIntMemory", "([IJ)V", traced!("freeIntMemory", no_op_taking));
+    r.add("sun/font/StrikeCache", "freeLongMemory", "([JJ)V", traced!("freeLongMemory", no_op_taking));
     r.add("sun/java2d/Disposer", "initIDs", "()V", no_op_taking);
     r.add("sun/java2d/SurfaceData", "initIDs", "()V", no_op_taking);
     r.add("sun/java2d/loops/GraphicsPrimitiveMgr", "initIDs", "(Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;Ljava/lang/Class;)V", no_op_taking);
@@ -3627,15 +3626,6 @@ enum InputEvt {
         ch: u16,
         modifiers: i32,
     },
-    /// `WM_PAINT`：让 Java 侧 `Component.paint()` 重新产出像素。
-    ///
-    /// 不带上「脏矩形」——`handlePaint(0,0,w,h)` 就是整窗重画，够用且省得同步 `BeginPaint`
-    /// 的矩形。窗口还不大的时候整画比裁剪便宜。
-    Paint {
-        hwnd: isize,
-        w: i32,
-        h: i32,
-    },
 }
 
 static EVENTS: OnceLock<Mutex<Vec<InputEvt>>> = OnceLock::new();
@@ -3720,11 +3710,13 @@ fn dispatch_mouse(
     clicks: i32,
     modifiers: i32,
 ) {
+    atrace(&format!("dispatch_mouse hwnd={hwnd} id={id} at {x},{y}"));
     let target = peer_target(vm, hwnd);
     if target <= 0 {
         return;
     }
     let (comp, lx, ly) = deepest_at(vm, target, x, y);
+    atrace(&format!("dispatch_mouse target={target} comp={comp} local={lx},{ly}"));
     if comp <= 0 {
         return;
     }
@@ -3790,78 +3782,7 @@ fn drain_events(vm: &mut Vm) {
                 dispatch_mouse(vm, hwnd, id, x, y, button, clicks, modifiers)
             }
             InputEvt::Key { hwnd, id, code, ch, modifiers } => dispatch_key(vm, hwnd, id, code, ch, modifiers),
-            InputEvt::Paint { hwnd, w, h } => dispatch_paint(vm, hwnd, w, h),
         }
-    }
-}
-
-/// 把一次 `WM_PAINT` 转成 Java 的「该重画了」。
-///
-/// 三步必须按这个顺序，缺一步就是黑窗口：
-/// 1. `WComponentPeer.handlePaint(x,y,w,h)` —— 只是 `postPaintIfNecessary`，
-///    把 `PaintEvent` 投进 EventQueue 就返回（**同步画完的是下面那步**）；
-/// 2. `SunToolkit.flushPendingEvents()` —— 等 EventQueue 真的把 `paint()` 跑完。
-///    不等就会拿旧的 `px` 去 BitBlt，屏幕上还是上一帧；
-/// 3. `flush_surface` —— 把 Java 面里的像素搬到 `px` 并 `BitBlt` 上屏。
-fn dispatch_paint(vm: &mut Vm, hwnd: isize, w: i32, h: i32) {
-    let peer = {
-        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
-        match st.by_hwnd.get(&hwnd) {
-            Some(p) => *p,
-            None => return,
-        }
-    };
-    if peer <= 0 {
-        return;
-    }
-    atrace("dispatch_paint");
-    // **不走 `WComponentPeer.handlePaint`**：它只是把 `PaintEvent` 投进 `EventQueue`，
-    // 真正跑 `paint()` 的是 `AWT-EventQueue-0`，而那条线程要执行 `Runnable.run()` ——
-    // VM 对**匿名类**的接口方法解析目前是坏的（`new Runnable(){…}` 在 EDT 上直接报
-    // 「找不到方法 java/lang/Runnable.run()V」，见样张 E1；命名类 E2 与静态嵌套类 E3 都正常）。
-    // 于是事件投出去没人消费，客户区就永远是我们自己那张空白 `px`（实测）。
-    // 改法：在这条泵线程上**同步**画一次，无异步依赖。
-    let target = get_ref_field(vm, peer, "sun/awt/windows/WComponentPeer", "target");
-    atrace(&format!("dispatch_paint peer={peer} target={target}"));
-    if target > 0 {
-        let g = call_java(
-            vm,
-            "sun/awt/windows/WComponentPeer",
-            "getGraphics",
-            "()Ljava/awt/Graphics;",
-            &[],
-            peer,
-        )
-        .map(|v| v.as_i32())
-        .unwrap_or(0);
-        if g > 0 {
-            // 必须调 **peer** 的 `paint(Graphics)`：它体内是
-            // `target.paint(g)` 的 `invokevirtual`，虚分派由字节码自己做，
-            // 所以 `PaintFrame` 的覆盖方法一定会跑到。（若直接调
-            // `Component.paint`，解析到的是基类那个空实现 —— 实测画不出来。）
-            let r = call_java(
-                vm,
-                "sun/awt/windows/WComponentPeer",
-                "paint",
-                "(Ljava/awt/Graphics;)V",
-                &[Slot::I(g)],
-                peer,
-            );
-            if let Err(e) = &r {
-                atrace(&format!("peer.paint 失败: {}", e.msg));
-            }
-            // Graphics 必须还回去：`SunGraphics2D` 里挂着 SurfaceData 的引用
-            let _ = call_java(vm, "java/awt/Graphics", "dispose", "()V", &[], g);
-        } else {
-            atrace("getGraphics 返回 null");
-        }
-    }
-    let gdi = {
-        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
-        st.by_peer.get(&peer).map(|i| i.gdi).unwrap_or(0)
-    };
-    if gdi != 0 {
-        flush_surface(vm, gdi);
     }
 }
 

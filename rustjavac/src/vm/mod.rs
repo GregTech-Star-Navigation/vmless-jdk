@@ -285,17 +285,63 @@ impl Vm {
     }
 
     /// 跑 main([Ljava/lang/String;)V
+    ///
+    /// **真的跑在一个大栈 OS 线程上**：解释器每层 Java 调用都是一层真实 Rust 栈帧，
+    /// 而调用方给的线程栈是平台默认（Windows 1 MB）—— 那个大小只够几十层递归，
+    /// 任何正常递归都会撞 `StackOverflowError`。这是唯一能给主线程换栈的办法
+    /// （OS 线程的栈大小只能在创建时定）。
+    ///
+    /// 状态搬家用 `fork()` + `swap`：`Vm` 里有 `depth` / `held` / 输出缓冲这些
+    /// 执行状态，跑完必须原样回到调用方手里，所以是「换出去 → 在新线程里跑 →
+    /// 换回来」，而不是简单地把 `self` 借给闭包（`&mut self` 跨线程做不到）。
     pub fn run_main(&mut self) -> Result<ExecResult, VmError> {
+        // 已经是我们的线程（自己绑过栈顶）或者显式要求就地跑，就不折腾了
+        if thread::stack_top() != 0 || std::env::var_os("VMLESS_NO_BIG_STACK").is_some() {
+            thread::bind_stack_top();
+            return self.run_main_inner();
+        }
+        let mut tmp = self.fork();
+        std::mem::swap(self, &mut tmp);
+        let spawned = std::thread::Builder::new()
+            .name("main-big-stack".into())
+            .stack_size(thread::java_stack_bytes())
+            .spawn(move || {
+                thread::bind_stack_top();
+                let r = tmp.run_main_inner();
+                (tmp, r)
+            });
+        let Ok(handle) = spawned else {
+            // 起不来线程：退回就地跑（栈小，但至少不静默失败）
+            thread::bind_stack_top();
+            return self.run_main_inner();
+        };
+        let (mut tmp, r) = match handle.join() {
+            Ok(v) => v,
+            Err(_) => {
+                return Err(VmError { msg: "main 线程 panic".into(), exc: None });
+            }
+        };
+        // 执行状态搬回 `self`：输出缓冲 / 类表版本 / 持有的锁全都在这里
+        std::mem::swap(self, &mut tmp);
+        r
+    }
+
+    fn run_main_inner(&mut self) -> Result<ExecResult, VmError> {
         let mi = self.store
             .main_method()
             .ok_or_else(|| VmError { msg: "找不到 main([Ljava/lang/String;)V".into(), exc: None })?;
         let main_class = self.store.main;
-        // JVM 在调 main 之前会先初始化入口类
-        let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
-        self.ensure_init(&main_name)?;
+        // **先登记线程，再初始化入口类**。顺序反了会出事：`<clinit>` 里完全可能
+        // `synchronized`（AWT 的 `Frame` / `Panel` 全都是），而监视器的 owner 是
+        // 线程 id —— 线程没登记时 `cur_tid()` 还是 0，`monitorenter` 拿到一个
+        // 「owner=0 之外没人认识」的锁，紧接着 `monitorexit` 就报
+        // `IllegalMonitorStateException: current thread is not owner`，
+        // 于是**任何 main 类继承 AWT（或任何 `<clinit>` 里加锁的类）都挂在类初始化**。
         thread::set_main_tid();
         self.sh.safepoint.register();
         self.thread_register(1, 0, "main", false);
+        // 入口类的 `<clinit>` 放到系统引导之后（见下面 `execute(main)` 之前那一处）：
+        // HotSpot 的 `initPhase1` 是 VM 启动阶段做完的，早于任何用户类初始化。
         // 真字节码模式下，JVM 在跑 main 之前会先执行 `System.initPhase1()`：
         // 它填 `System.props`（`java.home`/`java.class.path` 等）、装 `SharedSecrets`
         // （`JavaLangAccess` / `JavaLangReflectAccess`）、设置 `System.out/err/in`。
@@ -404,6 +450,16 @@ impl Vm {
         // 全部打在 null 接收者上 —— 要么被内建兜底静默吞成 null（`Boolean.getBoolean`
         // 恒 false → `ResourceBundle.<clinit>` 走错分支），要么在 AWT 里变成
         // 「内建方法 remove 未实现（接收者 null）」这种看不出所以然的 VM 错误。
+        // 入口类的 `<clinit>` 必须放在**系统引导之后**：HotSpot 里
+        // `System.initPhase1` 是 VM 启动阶段就跑完的，等 `main` 的类初始化时
+        // `System.props` / `System.out` 早已就位。反过来（先初始化 main 类）时，
+        // 只要 main 的继承链上有任何类在 `<clinit>` 里读系统属性就会 NPE ——
+        // 典型是 `class Q1 extends java.awt.Frame`：AWT 的静态初始化会
+        // `System.getProperty("...")`，此刻 props 还是 null。
+        {
+            let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
+            self.ensure_init(&main_name)?;
+        }
         let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);
         // `VMLESS_WDN_TRACE=1`：把 main 的结局**先**打出来。`wait_non_daemon()` 可能挂死
         // （非 daemon 线程退出不了），而 main 的异常文本原本要等它返回之后才由调用方打印 ——

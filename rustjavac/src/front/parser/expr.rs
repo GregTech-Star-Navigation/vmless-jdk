@@ -488,9 +488,72 @@ impl Parser {
                     return Ok(Expr::ArrayNew { elem, dims });
                 }
                 let args = if matches!(self.cur(), Tok::LParen) { self.parse_args()? } else { vec![] };
-                // 匿名类体
+                // `new T(args) { … }` —— **匿名类**。
+                //
+                // 以前这里 `skip_to_matching` 把类体整个吃掉：`new Callable<Long>(){ … }`
+                // 于是编成 `new Callable()`（接口！）—— 产物是合法 class，运行时
+                // `InstantiationError`。java.base 里有 205 个源文件用匿名类，
+                // 它们全都「编过」但产物是错的，属于静默丢语义，必须真做出来。
+                //
+                // 做法：合成一个嵌套类型 `Outer$AnonN`（走既有的局部类扁平化通道），
+                // 类体就是它的成员，构造器委托给父类（接口则委托 `Object.<init>()`，
+                // 由 codegen 按「父类型其实是接口」改写 super_class）。
                 if self.eat(&Tok::LBrace) {
-                    self.skip_to_matching(Tok::RBrace)?;
+                    let n = self.anon_seq;
+                    self.anon_seq += 1;
+                    let cls = format!("Anon{n}");
+                    let mut members: Vec<Member> = Vec::new();
+                    while !matches!(self.cur(), Tok::RBrace | Tok::Eof) {
+                        if self.eat(&Tok::Semi) {
+                            continue;
+                        }
+                        members.push(self.parse_member()?);
+                        members.extend(self.pending_members.drain(..));
+                    }
+                    self.expect(&Tok::RBrace)?;
+                    // 已知**不支持**：匿名类体引用外层方法的局部变量（捕获）。
+                    // 现在这种写法会在 codegen 报「未定义的变量 `x`（方法 `Outer$Anon0.m()`）」——
+                    // 错误里带着合成类名，能看出是匿名类这一路；捕获要自由变量分析 +
+                    // 合成 final 字段 + 构造器多传实参，是独立的一块。
+                    // 这里不做事前拦截：纯语法层面分不清「外层局部变量」和「漏声明的成员」，
+                    // 猜错会把本来能编的代码挡掉。
+                    // 构造器：形参按实参的**语法形态**定类型（字面量 / cast 能定，
+                    // 其余落 Object）；体里把同名形参原样交给 super。
+                    let params: Vec<Param> = args
+                        .iter()
+                        .enumerate()
+                        .map(|(i, a)| Param { ty: syntactic_type(a), name: format!("$a{i}"), varargs: false })
+                        .collect();
+                    let super_args: Vec<Expr> =
+                        (0..args.len()).map(|i| Expr::Ident(format!("$a{i}"))).collect();
+                    let ctor_body = Stmt::Expr(Expr::Call {
+                        recv: Some(Box::new(Expr::Super)),
+                        name: "super".into(),
+                        args: super_args,
+                        type_args: Vec::new(),
+                    });
+                    members.push(Member::Method(MethodDecl {
+                        modifiers: Vec::new(),
+                        type_params: Vec::new(),
+                        ret: None,
+                        name: cls.clone(),
+                        params,
+                        throws: Vec::new(),
+                        body: Some(ctor_body),
+                    }));
+                    self.local_types.push(TypeDecl {
+                        kind: TypeKind::Class,
+                        name: cls.clone(),
+                        modifiers: vec!["final".into()],
+                        type_params: Vec::new(),
+                        extends: vec![ty.clone()],
+                        implements: Vec::new(),
+                        members,
+                    });
+                    return Ok(Expr::New {
+                        ty: Type::Named { path: vec![cls], args: Vec::new() },
+                        args,
+                    });
                 }
                 Ok(Expr::New { ty, args })
             }
@@ -556,5 +619,27 @@ impl Parser {
             }
             other => Err(self.err(format!("无法解析的表达式，实际 {other}"))),
         }
+    }
+}
+
+/// 匿名类构造器形参的类型：只按**语法形态**猜，猜不出就用 `Object`。
+///
+/// 解析阶段拿不到真正的类型信息（那要等 classpath 上的解析），而构造器必须有一个
+/// 具体形参表才能生成字节码。字面量与 cast 能定得很准（`new Base(1){}` 的形参就是
+/// `int`），其余落 `Object` —— 实参会被自动装箱，`super` 那一步再按父类描述符适配。
+fn syntactic_type(e: &Expr) -> Type {
+    match e {
+        Expr::IntLit(s) if s.ends_with(['L', 'l']) => Type::Prim("long"),
+        Expr::IntLit(_) => Type::Prim("int"),
+        Expr::FloatLit(s) if s.ends_with(['f', 'F']) => Type::Prim("float"),
+        Expr::FloatLit(_) => Type::Prim("double"),
+        Expr::CharLit(_) => Type::Prim("char"),
+        Expr::BoolLit(_) => Type::Prim("boolean"),
+        Expr::StrLit(_) | Expr::TextBlock(_) => {
+            Type::Named { path: vec!["String".into()], args: Vec::new() }
+        }
+        Expr::Cast { ty, .. } => ty.clone(),
+        Expr::New { ty, .. } => ty.clone(),
+        _ => Type::Named { path: vec!["Object".into()], args: Vec::new() },
     }
 }

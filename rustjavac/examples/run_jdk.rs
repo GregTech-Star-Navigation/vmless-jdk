@@ -51,7 +51,7 @@ fn main() {
                 println!("{line}");
             }
             if let Some(exc) = &r.exception {
-                println!("未捕获异常: {exc}");
+                eprintln!("{exc}");
             }
             println!("退出值 = {}", r.return_value);
         }

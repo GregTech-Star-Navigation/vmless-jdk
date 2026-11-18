@@ -226,6 +226,8 @@ impl Vm {
         let msg = msg.into();
         let n = self.store.field_count(class).max(1);
         let h = self.sh.heap.new_object(vec![Slot::I(0); n], &class.to_string()).unwrap_or(0);
+        // 未捕获时 `Thread-0` 那行下面要打的栈：当场抓（此刻还没开始展开）
+        super::exception::note_frames(h, super::stacktrace::frames_current());
         let m = self.str_new(msg.clone());
         lk(&self.sh.exc_msgs).insert(h, m);
         // `getMessage()` 读的是 `Throwable.detailMessage` 字段 —— 只记在 `exc_msgs` 里的话，

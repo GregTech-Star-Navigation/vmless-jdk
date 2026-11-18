@@ -42,8 +42,13 @@ use super::slot::Slot;
 use super::{Vm, VmError};
 use crate::ClassFile;
 
-/// 每线程帧表容量。递归深度上限是 `execute_body` 的 64（`Vm::depth`），256 足够富余。
-pub(crate) const CAP: usize = 256;
+/// 每线程帧表容量。
+///
+/// 递归能有多深由**线程栈**决定（见 `thread::stack_exhausted`，默认 24 MB 栈 →
+/// 约 8000 层），所以这张表要装得下「一次真实的深递归」，否则栈轨迹会在深处被截断。
+/// 1024 是 HotSpot 的默认口径（`MaxJavaStackTraceDepth`），也够覆盖任何一次异常栈；
+/// 更深的递归由 [`FrameStack::push`] 的溢出计数兜住（见那里的注释）。
+pub(crate) const CAP: usize = 1024;
 
 // ================================================================ 帧元数据（intern）
 
@@ -326,6 +331,13 @@ pub(crate) struct FrameStack {
     /// seqlock：奇数 = 写者正在改
     seq: AtomicU64,
     depth: AtomicU32,
+    /// 因为表满而被丢掉的帧数。
+    ///
+    /// 必须有它：`push` 在表满时会丢弃最里面的帧，但对应的 `pop` 照样会来 ——
+    /// 只减 `depth` 而不记这笔账，表的深度就会和真实调用深度**永久错位**，
+    /// 之后所有栈轨迹整体偏一截（这在 64 层上限的年代看不出来，深度放开到
+    /// 8000 之后任何深递归都会踩到）。
+    skipped: AtomicU32,
     slots: Box<[FrameSlot]>,
 }
 
@@ -336,6 +348,7 @@ impl FrameStack {
             tid,
             seq: AtomicU64::new(0),
             depth: AtomicU32::new(0),
+            skipped: AtomicU32::new(0),
             slots: (0..CAP)
                 .map(|_| FrameSlot { meta: AtomicUsize::new(0), pc: AtomicUsize::new(0) })
                 .collect(),
@@ -349,7 +362,10 @@ impl FrameStack {
     fn push(&self, meta: &'static FrameMeta, pc: usize) {
         let d = self.depth.load(Ordering::Relaxed) as usize;
         if d >= self.slots.len() {
-            return; // 溢出就丢最里面的帧：栈轨迹少几帧，好过越界
+            // 表满：丢最里面的帧（栈轨迹少几帧，好过越界），但要记下这笔账 ——
+            // 对应的 `pop` 还会来，不清账就会把 `depth` 减穿，之后所有栈轨迹错位。
+            self.skipped.fetch_add(1, Ordering::Relaxed);
+            return;
         }
         self.seq.fetch_add(1, Ordering::Acquire);
         self.slots[d].meta.store(meta as *const FrameMeta as usize, Ordering::Relaxed);
@@ -359,6 +375,11 @@ impl FrameStack {
     }
 
     fn pop(&self) {
+        // 先还「被丢掉的那些帧」的账：它们没进 `slots`，只能抵掉计数
+        if self.skipped.load(Ordering::Relaxed) > 0 {
+            self.skipped.fetch_sub(1, Ordering::Relaxed);
+            return;
+        }
         let d = self.depth.load(Ordering::Relaxed) as usize;
         if d == 0 {
             return;
@@ -622,6 +643,9 @@ fn throwable_fill_in(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         }
     }
     frames.drain(..skip);
+    // 未捕获异常要打的栈就在这里定下来：此刻正是 `fillInStackTrace` 的时机
+    // （= HotSpot 取栈轨迹的同一时刻），再晚帧就弹空了。
+    super::exception::note_frames(this, frames.clone());
     let arr = elements_for(vm, &frames);
     vm.put_named(this, "java/lang/Throwable", "backtrace", Slot::I(arr));
     vm.put_named(this, "java/lang/Throwable", "depth", Slot::I(frames.len() as i32));

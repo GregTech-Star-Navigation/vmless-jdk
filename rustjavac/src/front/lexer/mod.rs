@@ -297,9 +297,65 @@ impl Lexer {
             match self.peek() {
                 None => return Err(LexError { line: self.line, msg: "字面量未闭合".into() }),
                 Some('\\') => {
-                    s.push(self.bump().unwrap());
-                    if let Some(c) = self.bump() {
-                        s.push(c);
+                    self.bump(); // 反斜杠
+                    // **必须在这里解码**：留着原文 `\` + `n` 会让 `"\n"` 变成一个
+                    // 反斜杠加 n 两个字符、`'\n'` 变成 `\`（ASCII 92）。
+                    // 产物是合法 class，所以 javap 看不出问题 —— 数据静默写坏。
+                    // （实测：`sb.append('\n')` 写出的文件里全是 0x5C 而不是 0x0A。）
+                    let Some(e) = self.bump() else {
+                        return Err(LexError { line: self.line, msg: "字面量未闭合".into() });
+                    };
+                    match e {
+                        'n' => s.push('\n'),
+                        't' => s.push('\t'),
+                        'r' => s.push('\r'),
+                        'b' => s.push('\u{8}'),
+                        'f' => s.push('\u{c}'),
+                        's' => s.push(' '), // text block 的 \s（字符串里也接受）
+                        '\n' => {}          // 续行：反斜杠 + 换行 = 什么都不加
+                        '\r' => {
+                            if self.peek() == Some('\n') {
+                                self.bump();
+                            }
+                        }
+                        '0'..='7' => {
+                            // 八进制转义：最多三位
+                            let mut v = e as u32 - '0' as u32;
+                            for _ in 0..2 {
+                                match self.peek() {
+                                    Some(c @ '0'..='7') => {
+                                        v = v * 8 + (c as u32 - '0' as u32);
+                                        self.bump();
+                                    }
+                                    _ => break,
+                                }
+                            }
+                            s.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                        }
+                        'u' => {
+                            // `\uXXXX`：吃若干个 u 再 4 位十六进制
+                            while self.peek() == Some('u') {
+                                self.bump();
+                            }
+                            let mut v = 0u32;
+                            let mut ok = false;
+                            for _ in 0..4 {
+                                let Some(c) = self.peek() else { break };
+                                if let Some(d) = c.to_digit(16) {
+                                    v = v * 16 + d;
+                                    self.bump();
+                                    ok = true;
+                                } else {
+                                    break;
+                                }
+                            }
+                            if ok {
+                                s.push(char::from_u32(v).unwrap_or('\u{fffd}'));
+                            }
+                        }
+                        // `\\` `\'` `\"` 以及未知转义：按原字符收（javac 对未知转义报错，
+                        // 但这里宽松处理，至少不会把 `\d` 弄成两个字符）
+                        other => s.push(other),
                     }
                 }
                 Some(c) if c == quote => {

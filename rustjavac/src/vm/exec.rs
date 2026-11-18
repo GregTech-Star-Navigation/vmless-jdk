@@ -23,6 +23,12 @@ pub(super) const ACC_NATIVE: u16 = 0x0100;
 /// 方法访问标志：`synchronized`（进入/退出时自动加解对象监视器）
 pub(super) const ACC_SYNCHRONIZED: u16 = 0x0020;
 
+/// 深度硬上限：**只兜底**，正常溢出判据是 `thread::stack_exhausted()`（看真实栈指针）。
+///
+/// 栈指针判据失效时（线程没有绑定栈顶，比如从别的宿主线程钻进 VM）才靠这条。
+/// 取 5 万是为了比 8 MB 栈实际能跑的层数（约 8 千~1 万）明显高，不提前误杀。
+const MAX_DEPTH_HARD: usize = 50_000;
+
 /// 字段描述符是不是引用类型（写引用字段要过卡表写屏障）
 fn is_ref_desc(d: &str) -> bool {
     d.starts_with('L') || d.starts_with('[')
@@ -234,8 +240,34 @@ impl Vm {
         args: &[Slot],
         receiver: bool,
     ) -> Result<Slot, VmError> {
-        if self.depth > 64 {
-            return err("调用深度超限（可能递归过深）");
+        // 递归深度上限：**按真实栈余量判**，不是拍一个深度数字。
+        //
+        // 历史上这里是 `if self.depth > 64 { err(..) }` —— 后果是任何正常递归
+        // （快排、树遍历、解析器，甚至 `R5` 那种 `deep(0)` 到 5000 的样张）直接
+        // 硬失败。现在判据是「本线程栈还能不能再压一层」：解释器每层 Java 调用
+        // 都是真的 Rust 栈帧，所以栈指针才是唯一正确的口径。
+        //
+        // 撞上限时抛的是**真 Java 异常**（`StackOverflowError`），Java 代码
+        // `catch (Throwable e)` 接得住；以前那个 `err(...)` 是 `exc: None`，
+        // 用户的 `catch` 形同虚设、程序直接死。
+        if super::thread::stack_exhausted() || self.depth > MAX_DEPTH_HARD {
+            // `VMLESS_SOE_TRACE=1`：把「这一层用到了多少栈 / 每层平均多少字节」
+            // 打出来 —— 定 `VMLESS_STACK_MB` 和判据是否过早触发全靠这个数。
+            if std::env::var_os("VMLESS_SOE_TRACE").is_some() {
+                let used = super::thread::stack_used();
+                let per = if self.depth > 0 { used / self.depth } else { 0 };
+                eprintln!(
+                    "[soe] depth={} used={}KB 每层≈{}B 栈上限={}MB 判据=真实栈指针",
+                    self.depth,
+                    used / 1024,
+                    per,
+                    super::thread::java_stack_bytes() >> 20
+                );
+            }
+            return Err(self.java_exception(
+                "java/lang/StackOverflowError",
+                "stack overflow（解释器栈耗尽；`VMLESS_STACK_MB` 可调大线程栈）",
+            ));
         }
         // 每次调用先把「当前类」钉住：常量池、Code 属性都按它取（继承后方法来自不同类）
         let cf = self.store.classes[class].clone();
@@ -1040,6 +1072,7 @@ impl Vm {
                         // 句柄已经失效（`hdr` 查不到）时 `type_name` 只会说 "null" ——
                         // 那是**悬空句柄**（活对象被回收），不是真的 null。带上调用链和
                         // 原始句柄值，两者一眼可分。
+                        super::stacktrace::set_pc(pc - 3); // 行号要停在 checkcast 这一条
                         let mut where_ = String::new();
                         if self.sh.heap.hdr(v).is_none() {
                             where_.push_str(&format!("（悬空句柄 h={v}，对象已被回收）"));
@@ -1344,26 +1377,19 @@ impl Vm {
                         // 只在引用类**真有字节码**时抛：独立模式下 `System.out` 之类就是
                         // 句柄 0 的占位对象，那条老路（内建表）必须留着。
                         if recv.as_i32() == 0 && self.store.has_class(&info.class) {
-                            // 消息里带**当前帧栈**（栈顶在前）：这条错误以前会被内建兜底吃掉，
-                            // 现在只剩「哪个字段是 null」，栈就是唯一定位依据。
-                            let mut where_ = String::new();
-                            for fr in super::stacktrace::frames_current().iter().take(8) {
-                                where_.push_str(&format!(
-                                    "\n\tat {}.{}({}:{})",
-                                    fr.class.replace('/', "."),
-                                    fr.method,
-                                    fr.source.clone().unwrap_or_else(|| "?".into()),
-                                    fr.line
-                                ));
-                            }
+                            // 行号要在**抛出点**上：帧槽里的 pc 是上次调用点同步的，
+                            // 这里不补就会指到「上一条 invoke」（离真相差好几行）。
+                            super::stacktrace::set_pc(op_pc);
+                            // 消息里**不再**嵌帧：未捕获异常的栈现在由 `exc_text` 统一
+                            // 按 HotSpot 的格式打（嵌进 message 会重复一层，而且
+                            // `getMessage()` 也不该带栈）。
                             let e = self.java_exception(
                                 "java/lang/NullPointerException",
                                 format!(
-                                    "Cannot invoke \"{}.{}{}\" because the receiver is null{}",
+                                    "Cannot invoke \"{}.{}{}\" because the receiver is null",
                                     info.class.replace('/', "."),
                                     info.name,
-                                    info.desc,
-                                    where_
+                                    info.desc
                                 ),
                             );
                             match call_or_handle!(Err(e), op_pc) {

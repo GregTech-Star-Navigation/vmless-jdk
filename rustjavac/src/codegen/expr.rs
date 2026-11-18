@@ -2047,7 +2047,15 @@ fn append_desc(e: &Expr, kind: u8, ctx: &Ctx) -> &'static str {
                 "(Ljava/lang/Object;)Ljava/lang/StringBuilder;"
             }
         }
-        _ => "(I)Ljava/lang/StringBuilder;",
+        // char 和 int 在字节码层面同一个种类，但 append 的重载语义不同：
+        // 打成 `append(int)` 会输出码点（`first=a` 变成 `first=97`）。
+        _ => {
+            if matches!(expr_type(e, ctx), Some(Type::Prim("char"))) {
+                "(C)Ljava/lang/StringBuilder;"
+            } else {
+                "(I)Ljava/lang/StringBuilder;"
+            }
+        }
     }
 }
 
