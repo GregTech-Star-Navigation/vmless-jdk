@@ -38,6 +38,12 @@ pub(crate) mod nat_intrinsics;
 pub(crate) mod nat_os;
 #[path = "nat_util.rs"]
 pub(crate) mod nat_util;
+#[path = "nat_nio.rs"]
+pub(crate) mod nat_nio;
+#[path = "nat_misc.rs"]
+pub(crate) mod nat_misc;
+#[path = "nat_desktop.rs"]
+pub(crate) mod nat_desktop;
 
 /// native 方法的 Rust 实现。参数在 `frame.locals` 里按 JVM 槽位落位
 /// （实例方法 `this` 在槽 0），返回值由 `Result<Slot, VmError>` 给出（`void` 返回 `Slot::I(0)`）。
@@ -307,6 +313,9 @@ fn register_all(r: &mut NativeRegistry) {
     nat_intrinsics::register(r);
     nat_os::register(r);
     nat_util::register(r);
+    nat_nio::register(r);
+    nat_misc::register(r);
+    nat_desktop::register(r);
 
     register_classloaders(r);
 }
