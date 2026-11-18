@@ -227,7 +227,10 @@ impl Parser {
             Tok::Plus | Tok::Minus | Tok::Star | Tok::Slash | Tok::Percent | Tok::Semi
             | Tok::RParen | Tok::Comma | Tok::Dot | Tok::LBracket | Tok::EqEq | Tok::AndAnd
             | Tok::OrOr | Tok::Question | Tok::Shl | Tok::Shr | Tok::Ushr
-            | Tok::Star | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Bar | Tok::Caret => {
+            | Tok::Star | Tok::Slash | Tok::Percent | Tok::Amp | Tok::Bar | Tok::Caret
+            // 比较运算符也说明这不是 cast：`(a & m) != 0` 的 `(a & m)` 会被
+            // 当成「交集类型 cast」吃下去，然后卡在 `!=` 上
+            | Tok::Ne | Tok::Le | Tok::Ge | Tok::Lt | Tok::Gt => {
                 self.pos = save_pos;
                 self.pending = save_pending;
                 return Ok(None);
@@ -302,6 +305,13 @@ impl Parser {
                     if matches!(self.toks.get(self.pos + 1).map(|t| &t.tok), Some(Tok::RBracket)) {
                         self.advance();
                         self.advance();
+                        // `File[]::new`：数组构造器引用（`e` 是元素类型名）
+                        if matches!(self.cur(), Tok::ColonColon) {
+                            self.advance();
+                            self.expect_kw("new")?;
+                            let name = "%array-new".to_string();
+                            e = Expr::MethodRef { recv: Box::new(e), name };
+                        }
                         continue;
                     }
                     self.advance();
@@ -533,6 +543,10 @@ impl Parser {
                 }
                 if matches!(self.cur(), Tok::ColonColon) {
                     self.advance();
+                    // `File[]::new`：数组构造器引用，`::` 后面是 `new` 而不是方法名
+                    if self.eat_kw("new") {
+                        return Ok(Expr::MethodRef { recv: Box::new(Expr::Ident(name)), name: "%array-new".into() });
+                    }
                     let n = self.expect_ident()?;
                     return Ok(Expr::MethodRef { recv: Box::new(Expr::Ident(name)), name: n });
                 }

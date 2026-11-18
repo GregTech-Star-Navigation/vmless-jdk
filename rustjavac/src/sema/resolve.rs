@@ -17,6 +17,31 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 
+/// 静态导入表：成员名 → 声明类内部名。通配的记在 `"*"` 下。
+///
+/// `import static java.util.Objects.requireNonNull;` 之后代码里就写 `requireNonNull(x)` ——
+/// 没有接收者，光看调用点分不出它是本类方法还是别人的静态方法。java.base 里这种写法
+/// 非常多（`requireNonNull`、`checkIndex`、`StandardCharsets.UTF_8` 这类常量）。
+fn collect_static_imports(cu: &CompilationUnit) -> HashMap<String, Vec<String>> {
+    let mut out: HashMap<String, Vec<String>> = HashMap::new();
+    for imp in &cu.imports {
+        if !imp.is_static || imp.name.is_empty() {
+            continue;
+        }
+        let (owner, member) = match imp.name.rsplit_once('.') {
+            Some(x) => x,
+            None => continue,
+        };
+        let owner = owner.replace('.', "/");
+        let key = if imp.wildcard { "*".to_string() } else { member.to_string() };
+        let e = out.entry(key).or_default();
+        if !e.contains(&owner) {
+            e.push(owner);
+        }
+    }
+    out
+}
+
 /// 一个实例字段的元数据
 #[derive(Clone, Debug, PartialEq)]
 pub struct FieldMeta {
@@ -54,6 +79,15 @@ pub struct Resolver {
     dirs: Vec<PathBuf>,
     /// 已经尝试过、但没找到的类名，避免重复扫目录
     missing: RefCell<HashSet<String>>,
+    /// classpath 上反解好的元数据。**共享**而不是逐编译单元克隆：java.base 有 7350 个
+    /// `.class`，每个编译单元复制一份等于每次编译多搬 7350 个 `Own`（实测占了
+    /// 批量编译 99% 的时间）。这里只存一个 `Rc`。
+    plat: RefCell<Option<std::sync::Arc<HashMap<String, Own>>>>,
+    /// `own` 里的 `java/lang/Object` 是不是那张只有 `<init>()V` 的占位表
+    object_is_placeholder: bool,
+    /// 静态导入：成员名 → 声明类的内部名（`import static java.util.Objects.requireNonNull;`）。
+    /// 通配的 `import static p.C.*;` 记在 `"*"` 这个键下，解析时一起试。
+    static_imports: HashMap<String, Vec<String>>,
 }
 
 /// `java/lang/Object` 的元数据：只有无参构造器（隐式 `super()` 的目标）
@@ -73,7 +107,14 @@ impl Resolver {
     pub fn new(cu: &CompilationUnit, dirs: &[PathBuf]) -> Self {
         let mut own = HashMap::new();
         own.insert("java/lang/Object".to_string(), object_meta());
+        // 本单元自己编 `java/lang/Object.java` 时上面那份占位会被覆盖；没覆盖就说明
+        // 它是占位 —— 此时 classpath 上真有 `Object.class` 的话必须换掉它（占位少了
+        // `clone`/`getClass`/`notifyAll`，而这三个是每个类都能调的）
+        let mut declares_object = false;
         for t in flat_types(&cu.types) {
+            if internal_type_name(cu.package.as_deref(), &t.name) == "java/lang/Object" {
+                declares_object = true;
+            }
             let name = internal_type_name(cu.package.as_deref(), &t.name);
             // 接口的 `extends A, B` 是**父接口**（不是父类）：两处合并进 ifaces
             let (super_name, ifaces) = if t.kind == TypeKind::Interface {
@@ -87,7 +128,15 @@ impl Resolver {
                 )
             } else {
                 (
-                    t.extends.first().map(|ty| qualify(cu.package.as_deref(), ty)),
+                    // 没写 extends 的类**继承 java/lang/Object**：不显式补上的话，
+                    // 本单元里的类查 instance_methods 就少了 getClass/clone/toString/hashCode，
+                    // 于是 `x.clone()`、`this.getClass().getName()` 全都报「未找到实例方法」
+                    Some(
+                        t.extends
+                            .first()
+                            .map(|ty| qualify(cu.package.as_deref(), ty))
+                            .unwrap_or_else(|| "java/lang/Object".to_string()),
+                    ),
                     t.implements.iter().map(|ty| qualify(cu.package.as_deref(), ty)).collect(),
                 )
             };
@@ -129,7 +178,14 @@ impl Resolver {
                 },
             );
         }
-        Resolver { own: RefCell::new(own), dirs: dirs.to_vec(), missing: RefCell::new(HashSet::new()) }
+        Resolver {
+            own: RefCell::new(own),
+            dirs: dirs.to_vec(),
+            missing: RefCell::new(HashSet::new()),
+            plat: RefCell::new(None),
+            object_is_placeholder: !declares_object,
+            static_imports: collect_static_imports(cu),
+        }
     }
 
     /// 本编译单元里的所有类（内部名），不含 java/lang/Object
@@ -205,15 +261,16 @@ impl Resolver {
     ///
     /// 接口方法也算：`Shape x; x.area()` 要从接口上取到 `()I` 这个描述符
     /// （`implements` 进来的接口在链上，接口自己的 `extends` 也要跟进去）。
-    pub fn instance_methods(&self, class: &str) -> Result<HashMap<String, String>, String> {
-        let mut out = HashMap::new();
+    pub fn instance_methods(&self, class: &str) -> Result<HashMap<String, Vec<String>>, String> {
+        let mut out: HashMap<String, Vec<String>> = HashMap::new();
         for c in self.chain_with_ifaces(class)? {
             let own = self.load(&c)?;
             for m in &own.methods {
                 if m.is_static || m.name == "<init>" {
                     continue;
                 }
-                out.entry(m.name.clone()).or_insert_with(|| m.desc.clone());
+                // 同名多签名全留：`update` 有 4 个重载，只留第一个必然挑错描述符
+                out.entry(m.name.clone()).or_default().push(m.desc.clone());
             }
         }
         Ok(out)
@@ -270,15 +327,15 @@ impl Resolver {
     }
 
     /// 静态方法：名字 → 描述符（含继承；返回 (描述符, 声明类)）
-    pub fn static_methods(&self, class: &str) -> Result<HashMap<String, (String, String)>, String> {
-        let mut out = HashMap::new();
+    pub fn static_methods(&self, class: &str) -> Result<HashMap<String, Vec<(String, String)>>, String> {
+        let mut out: HashMap<String, Vec<(String, String)>> = HashMap::new();
         for c in self.chain(class)? {
             let own = self.load(&c)?;
             for m in &own.methods {
                 if !m.is_static || m.name == "<init>" {
                     continue;
                 }
-                out.entry(m.name.clone()).or_insert_with(|| (m.desc.clone(), c.clone()));
+                out.entry(m.name.clone()).or_default().push((m.desc.clone(), c.clone()));
             }
         }
         Ok(out)
@@ -316,6 +373,9 @@ impl Resolver {
         if let Some(o) = self.own.borrow().get(class) {
             return Ok(o.clone());
         }
+        if let Some(o) = self.plat.borrow().as_ref().and_then(|m| m.get(class)) {
+            return Ok(o.clone());
+        }
         if let Some(o) = self.load_from_disk(class) {
             self.own.borrow_mut().insert(class.to_string(), o.clone());
             return Ok(o);
@@ -339,26 +399,33 @@ impl Resolver {
         self.own_from_bytes(&bytes)
     }
 
-    /// 把 classpath 目录里的 `.class` 全部预加载进符号表。
+    /// 把 classpath 目录里的 `.class` 全部反解进**进程级**缓存（见 `platform`），
+    /// 本编译单元只多背一个 `Rc`。
     ///
-    /// 跨编译单元引用（`PkgB b = new PkgB(...)`）需要知道对方的字段/方法表，
-    /// 而 codegen 的 `type_fields` / `type_methods` 是**一次性**建好的 —— 所以先把
-    /// classpath 上的类都读进来，后面查表就不会缺项。
-    ///
-    /// classpath 可能很大（java.base 7384 个 `.class`），批量编译时每文件反解一遍
-    /// 是不可接受的 —— 所以结果按**classpath 列表**缓存在进程级，第二次起只克隆。
+    /// classpath 上有真的 `java/lang/Object` 时用它替换内建那份占位 —— 占位只有
+    /// `<init>()V`，少了 `clone` / `getClass` / `notifyAll` 这些**每个类都能调**的方法，
+    /// 而 java.base 里这类调用遍地都是。
     pub fn preload(&self) {
-        let key = self.dirs.clone();
+        if !self.object_is_placeholder {
+            return;
+        }
+        let m = self.platform();
+        if let Some(real) = m.get("java/lang/Object") {
+            self.own.borrow_mut().insert("java/lang/Object".to_string(), real.clone());
+        }
+    }
+
+    /// classpath 的元数据：整进程只反解一次，之后都拿同一个 `Rc`
+    fn platform(&self) -> std::sync::Arc<HashMap<String, Own>> {
+        if let Some(m) = self.plat.borrow().as_ref() {
+            return m.clone();
+        }
         if let Ok(g) = platform_cache().lock() {
             if let Some((k, m)) = g.as_ref() {
-                if *k == key {
-                    let mut own = self.own.borrow_mut();
-                    for (n, o) in m.iter() {
-                        if !own.contains_key(n) {
-                            own.insert(n.clone(), o.clone());
-                        }
-                    }
-                    return;
+                if *k == self.dirs {
+                    let m = m.clone();
+                    *self.plat.borrow_mut() = Some(m.clone());
+                    return m;
                 }
             }
         }
@@ -367,38 +434,36 @@ impl Resolver {
             collect_class_files(d, 0, &mut files);
         }
         let mut loaded: HashMap<String, Own> = HashMap::with_capacity(files.len());
+        let mut mine: HashSet<String> = self.own.borrow().keys().cloned().collect();
+        if self.object_is_placeholder {
+            // 占位那份不是「本单元声明的类」，别让它挡住 classpath 上真的 `Object.class`
+            mine.remove("java/lang/Object");
+        }
         for p in files {
             let Ok(bytes) = std::fs::read(&p) else { continue };
-            let Some(o) = self.own_from_bytes(&bytes) else { continue };
             let Some(name) = class_name_of_bytes(&bytes) else { continue };
-            if self.own.borrow().contains_key(&name) {
+            if mine.contains(&name) {
                 continue;
             }
+            let Some(o) = self.own_from_bytes(&bytes) else { continue };
             loaded.insert(name, o);
         }
-        {
-            let mut own = self.own.borrow_mut();
-            for (n, o) in &loaded {
-                if !own.contains_key(n) {
-                    own.insert(n.clone(), o.clone());
-                }
-            }
-        }
+        let m = std::sync::Arc::new(loaded);
+        *self.plat.borrow_mut() = Some(m.clone());
         if let Ok(mut g) = platform_cache().lock() {
-            *g = Some((key, loaded));
+            *g = Some((self.dirs.clone(), m.clone()));
         }
+        m
     }
 
-    /// classpath 上预加载进来的类名集合（缓存里那份）
+    /// 静态导入表（`import static`）：成员名 → 声明类内部名，通配记在 `"*"` 下
+    pub fn static_imports(&self) -> &HashMap<String, Vec<String>> {
+        &self.static_imports
+    }
+
+    /// classpath 上预加载进来的类名集合
     fn platform_names(&self) -> HashSet<String> {
-        if let Ok(g) = platform_cache().lock() {
-            if let Some((k, m)) = g.as_ref() {
-                if *k == self.dirs {
-                    return m.keys().cloned().collect();
-                }
-            }
-        }
-        HashSet::new()
+        self.platform().keys().cloned().collect()
     }
 
     /// 世界快照：平台部分走进程缓存，本编译单元声明的类覆盖上去（源码优先于
@@ -517,9 +582,11 @@ impl Resolver {
 }
 
 /// 进程级平台类缓存：classpath 列表 → 反解好的元数据。批量编译 3000 个文件时
-/// classpath 不变，靠它把「7384 个 .class 反解一遍」从每文件一次降到整进程一次。
-fn platform_cache() -> &'static std::sync::Mutex<Option<(Vec<PathBuf>, HashMap<String, Own>)>> {
-    static C: std::sync::OnceLock<std::sync::Mutex<Option<(Vec<PathBuf>, HashMap<String, Own>)>>> =
+/// classpath 不变，靠它把「7350 个 .class 反解一遍」从每文件一次降到整进程一次。
+type PlatMap = std::sync::Arc<HashMap<String, Own>>;
+
+fn platform_cache() -> &'static std::sync::Mutex<Option<(Vec<PathBuf>, PlatMap)>> {
+    static C: std::sync::OnceLock<std::sync::Mutex<Option<(Vec<PathBuf>, PlatMap)>>> =
         std::sync::OnceLock::new();
     C.get_or_init(|| std::sync::Mutex::new(None))
 }
@@ -532,9 +599,9 @@ fn platform_cache() -> &'static std::sync::Mutex<Option<(Vec<PathBuf>, HashMap<S
 pub struct World {
     pub type_ctors: HashMap<String, std::sync::Arc<Vec<String>>>,
     pub type_fields: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
-    pub type_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
+    pub type_methods: HashMap<String, std::sync::Arc<HashMap<String, Vec<String>>>>,
     pub type_static_fields: HashMap<String, std::sync::Arc<HashMap<String, (String, String)>>>,
-    pub type_static_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
+    pub type_static_methods: HashMap<String, std::sync::Arc<HashMap<String, Vec<String>>>>,
     pub iface_types: HashSet<String>,
 }
 
@@ -553,8 +620,10 @@ impl World {
             self.type_static_fields.insert(c.to_string(), std::sync::Arc::new(x));
         }
         if let Ok(x) = res.static_methods(c) {
-            self.type_static_methods
-                .insert(c.to_string(), std::sync::Arc::new(x.into_iter().map(|(k, (d, _))| (k, d)).collect()));
+            self.type_static_methods.insert(
+                c.to_string(),
+                std::sync::Arc::new(x.into_iter().map(|(k, v)| (k, v.into_iter().map(|(d, _)| d).collect())).collect()),
+            );
         }
         if res.is_interface(c) {
             self.iface_types.insert(c.to_string());

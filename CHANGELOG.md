@@ -1486,3 +1486,42 @@ Cl   : cleaner ok | read=hi | tgroup=true
 拿到 0 之后自然对齐 —— 这也意味着**不能拿 HotSpot 的 `16` 去写测试**，那边基址不同。
 
 `verify.sh` 103/103、`cargo test` 106 passed。
+
+## 0.69.0 — 2026-11-18 · java.base 编译率 22.2% → 62.0%，NIO 全链路打通
+
+### 自研 javac：**2096 / 3381 = 62.0%**（原 750 / 3381 = 22.2%）
+五轮，每轮都重测全量：
+
+| 轮 | 通过率 | 关键改动 |
+|---|---|---|
+| R1 | 22.2 → **48.9%** | **调用点压根没用 classpath**（此前每个编译单元复制 7350 个 `Own`，370s→230s，改进程级共享 `Arc`）；「类存在」判断改**大小写敏感**（Windows 上变量 `cipher` 命中 `Cipher.class`，这是「未定义的变量」最大一桶） |
+| R2 | → 51.9% | 内建 `Object` 占位挡住了 classpath 上真的 `Object.class`（`clone`/`getClass`/`notifyAll` 全缺）；`Opcode.Kind.X` 这类嵌套类型的静态访问 |
+| R3 | → 56.3% | **同名重载只留第一个描述符** → 实参按错的类型转换 → 一堆假错误；改 `Vec<desc>` + `pick_desc`（个数→形状→精确）；class 字面量 |
+| R4 | → 58.9% | parser 的 cast 回溯漏了比较运算符（`(a&m) != 0` 被当交集类型）；**类型位置**的多段名按 `$` 拼（`Map.Entry` 原先生成 `LMap/Entry;` = 编过也是坏 class） |
+| R5 | → **62.0%** | `instanceof` 模式绑定（语句层）；`import static`；数组 `clone()` |
+
+**class 有效性（真 JVM 验）**：14 个编过的 java.base 文件 → 15 个 class，`javap -p -c` **15/15 解析通过**；
+成员名字+描述符与真 javac **13/15 完全一致**（另 2 个只差 `serialVersionUID` 的访问标志）。
+运行时对照：`ByteArrayOutputStream`/`DataOutputStream`/`CharArrayWriter` 三个类用
+`-Xverify:all -Xbootclasspath/a:<我们的输出>` 跑真 JVM，输出与 JDK 自带实现**逐字节相同**。
+
+### NIO / java.nio.file / java.net：153 个 native
+| 类 | 条数 |
+|---|---|
+| `sun.nio.fs.WindowsNativeDispatcher` | 59（含**整套 ACL/Token**） |
+| `sun.nio.ch.Net` | 36 |
+| `sun.nio.ch.FileDispatcherImpl` | 21 |
+| `sun.nio.ch.IOUtil` | 12 |
+| `SocketDispatcher` 5 + `InetAddress` 系 11 | 16 |
+
+实测与 java **逐字节一致**：`Files1` 18 行（含 1MB CRC、目录流、`toRealPath`、4 条异常路径）、
+`Path1` 17 行、大文件 `big=1048583 crc=3629882846`。
+
+### 两个新踩到的坑（都已写进注释）
+1. `read_wstr` 只读到 NUL 却不把 NUL 带回去 → 直接交给 Win32 会让它读到缓冲区垃圾，
+   症状是「同一路径第一次 FILE_NOT_FOUND、重试又好」。统一走 `read_wstr_z`（23 处调用点）。
+2. `sun.nio.fs` 里所有「把缓冲区地址交给 Win32 读写」的 native，地址都是 arena **假地址** ——
+   ACL/Token 必须「拷进真内存 → 调 Win32 → 拷回 arena」，返回的内部指针再按偏移换算
+   （SD 内部是相对偏移，整块搬过去语义不变）。
+
+**验证**：`verify.sh` 103/103、`cargo test` 106 passed。

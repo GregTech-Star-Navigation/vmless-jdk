@@ -23,9 +23,9 @@ pub(crate) struct Ctx {
     pub(crate) locals: HashMap<String, u8>,
     pub(crate) next_slot: u8,
     /// 本类里的静态方法名 → 描述符（用于 invokestatic）
-    pub(crate) static_methods: HashMap<String, String>,
+    pub(crate) static_methods: HashMap<String, Vec<String>>,
     /// 本类**及其父类**的实例方法：名字 → 描述符
-    pub(crate) instance_methods: HashMap<String, String>,
+    pub(crate) instance_methods: HashMap<String, Vec<String>>,
     /// 本类实例字段（含继承）：名字 → 下标
     pub(crate) fields: HashMap<String, usize>,
     /// 字段下标 → 描述符
@@ -43,7 +43,7 @@ pub(crate) struct Ctx {
     /// 任意类的实例字段表：类内部名 → (字段名 → 描述符)，含继承
     pub(crate) type_fields: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
     /// 任意类的实例方法表：类内部名 → (方法名 → 描述符)，含继承
-    pub(crate) type_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
+    pub(crate) type_methods: HashMap<String, std::sync::Arc<HashMap<String, Vec<String>>>>,
     /// 接口类型（内部名）集合：调用点据此发 invokeinterface
     pub(crate) iface_types: std::collections::HashSet<String>,
     /// 本类（含继承）静态字段：名字 → (声明类, 描述符)
@@ -51,7 +51,7 @@ pub(crate) struct Ctx {
     /// 任意类的静态字段表：类内部名 → (字段名 → (声明类, 描述符))
     pub(crate) type_static_fields: HashMap<String, std::sync::Arc<HashMap<String, (String, String)>>>,
     /// 任意类的静态方法表：类内部名 → (方法名 → 描述符)
-    pub(crate) type_static_methods: HashMap<String, std::sync::Arc<HashMap<String, String>>>,
+    pub(crate) type_static_methods: HashMap<String, std::sync::Arc<HashMap<String, Vec<String>>>>,
     /// 外层 `try { ... } finally { ... }` 的 finally 体，**外层在前**。
     /// `return` 要先把这些 finally 各编译一份（javac 的复制策略），再真正返回。
     pub(crate) finally_stack: Vec<Stmt>,
@@ -67,6 +67,9 @@ pub(crate) struct Ctx {
     pub(crate) tmp_seq: u32,
     /// `label: for (...)` 里刚读到、还没交给循环体的标签名
     pub(crate) pending_label: Option<String>,
+    /// 静态导入：成员名 → 声明类内部名（通配记在 `"*"` 下）。
+    /// `requireNonNull(x)` / `UTF_8` 这种没有接收者的写法全靠它找到声明类。
+    pub(crate) static_imports: HashMap<String, Vec<String>>,
     /// 任意类的构造器描述符表：类内部名 → 所有 `<init>` 的描述符。
     /// `new GenBox<>("x")` 的真实描述符是 `(Ljava/lang/Object;)V`（泛型擦除），
     /// 不能拿实参类型现拼。

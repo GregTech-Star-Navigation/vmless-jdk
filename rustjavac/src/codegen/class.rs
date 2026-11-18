@@ -38,12 +38,12 @@ pub(crate) fn compile_type(
         None => "java/lang/Object".to_string(),
     };
 
-    // 第一遍：收集静态方法签名（供 invokestatic 使用）
-    let mut static_sigs: HashMap<String, String> = HashMap::new();
+    // 第一遍：收集静态方法签名（供 invokestatic 使用）。同名重载全留，调用点按实参挑
+    let mut static_sigs: HashMap<String, Vec<String>> = HashMap::new();
     for m in &t.members {
         if let Member::Method(md) = m {
             if md.modifiers.iter().any(|x| x == "static") {
-                static_sigs.insert(md.name.clone(), method_descriptor(&md.params, &md.ret));
+                static_sigs.entry(md.name.clone()).or_default().push(method_descriptor(&md.params, &md.ret));
             }
         }
     }
@@ -108,6 +108,7 @@ pub(crate) fn compile_type(
         cont_labels: Vec::new(),
         tmp_seq: 0,
         pending_label: None,
+        static_imports: res.static_imports().clone(),
         type_ctors: type_ctors.clone(),
     };
 
@@ -208,6 +209,7 @@ pub(crate) fn compile_type(
         };
         let is_static = md.modifiers.iter().any(|x| x == "static");
         let desc = method_descriptor(&md.params, &md.ret);
+        let method_label = format!("{}.{}{}", t.name, md.name, desc);
 
         // 抽象方法（含接口里**没有方法体**的声明）没有 Code 属性 —— 写进去 HotSpot 直接 ClassFormatError。
         // 接口里带方法体的是 default 方法（Java 8+），静态接口方法也一样，都要真编出字节码。
@@ -279,13 +281,19 @@ pub(crate) fn compile_type(
         // 方法体
         match &md.body {
             Some(body) => {
-                // 构造器：实例字段的初始化式要在 `super(...)` / `this(...)` 之后、
-                // 构造器体之前执行（JLS 8.8.7）。`this(...)` 委托时由被委托的那个构造器
-                // 负责初始化，这里不能再做一遍。
+                // 报错要带方法名：codegen 没有行号信息，一个类几百个方法时光看
+                // 「未找到实例方法 clone」根本定位不到是哪一处
+                let in_method = |e: CompileError| CompileError {
+                    msg: format!("{}（方法 `{}`）", e.msg, method_label),
+                };
                 let terminated = if is_ctor_m && !ctor_delegates_to_this(md.body.as_ref()) {
-                    compile_ctor_body(body, &instance_field_inits, &mut em, &mut ctx, &mut cp)?
+                    // 构造器：实例字段的初始化式要在 `super(...)` / `this(...)` 之后、
+                    // 构造器体之前执行（JLS 8.8.7）。`this(...)` 委托时由被委托的
+                    // 那个构造器负责初始化，这里不能再做一遍。
+                    compile_ctor_body(body, &instance_field_inits, &mut em, &mut ctx, &mut cp)
+                        .map_err(in_method)?
                 } else {
-                    compile_stmt(body, &mut em, &mut ctx, &mut cp)?
+                    compile_stmt(body, &mut em, &mut ctx, &mut cp).map_err(in_method)?
                 };
                 if !terminated {
                     // 补一条默认返回。方法体里所有路径都 return 过时这里是死代码，
@@ -369,14 +377,15 @@ pub(crate) fn compile_type(
             let our_params = desc_params(&ours);
             for p in &parents {
                 let Some(map) = type_methods.get(p) else { continue };
-                let Some(pdesc) = map.get(&md.name) else { continue };
-                if *pdesc == ours || desc_params(pdesc) != our_params {
-                    continue;
+                for pdesc in map.get(&md.name).into_iter().flatten() {
+                    if *pdesc == ours || desc_params(pdesc) != our_params {
+                        continue;
+                    }
+                    if !seen.insert(format!("{}{}", md.name, pdesc)) {
+                        continue;
+                    }
+                    bridges.push((md.name.clone(), pdesc.clone(), ours.clone()));
                 }
-                if !seen.insert(format!("{}{}", md.name, pdesc)) {
-                    continue;
-                }
-                bridges.push((md.name.clone(), pdesc.clone(), ours.clone()));
             }
         }
         for (bname, bdesc, tdesc) in bridges {

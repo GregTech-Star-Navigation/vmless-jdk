@@ -534,6 +534,12 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
         // 其余按 `iterator()` / `hasNext()` / `next()` 协议（Iterable 的契约）。
         Stmt::ForEach { ty, name, iter, body } => compile_for_each(ty, name, iter, body, em, ctx, cp),
         Stmt::If { cond, then, els } => {
+            // `if (x instanceof T t)` / `if (!(x instanceof T t))`：模式变量只在
+            // 「测试为真」的那条路径上存在，必须在**语句层**做分支（表达式层没有
+            // 控制流可用，见 `compile_expr` 的 InstanceOf 分支）
+            if let Some(p) = pattern_cond(cond) {
+                return compile_if_pattern(p, then, els.as_deref(), em, ctx, cp);
+            }
             let l_else = em.new_label();
             let l_end = em.new_label();
             compile_cond_false(cond, em, ctx, cp, l_else)?;
@@ -907,4 +913,169 @@ fn compile_for_each(
         Stmt::While { cond: has_next, body: Box::new(Stmt::Block(vec![elem, body.clone()])) },
     ]);
     compile_stmt(&block, em, ctx, cp)
+}
+
+/// `if` 条件里的 instanceof 模式绑定
+enum PatCond<'a> {
+    /// `if (x instanceof T t)`
+    Pos(&'a Expr, &'a Type, &'a str),
+    /// `if (!(x instanceof T t))`
+    Neg(&'a Expr, &'a Type, &'a str),
+}
+
+fn pattern_cond(e: &Expr) -> Option<PatCond<'_>> {
+    match e {
+        Expr::InstanceOf { expr, ty, binding: Some(n) } => Some(PatCond::Pos(expr, ty, n)),
+        Expr::Unary { op: UnOp::Not, expr } => match &**expr {
+            Expr::InstanceOf { expr, ty, binding: Some(n) } => Some(PatCond::Neg(expr, ty, n)),
+            _ => None,
+        },
+        _ => None,
+    }
+}
+
+/// 发 `if (x instanceof T t) …`：值先存进脏槽（跳转点必须落在空栈上），
+/// 再在「测试为真」的那条路径上 checkcast + astore 到模式变量。
+///
+/// ```text
+///   <x> ; astore tmp ; aload tmp ; instanceof T
+///   ifeq  L_else         // Neg 时是 ifne：是 T 就直接去 L_else
+///   aload tmp ; checkcast T ; astore t      // Pos 的绑定
+///   <then>                                   // Pos 时 t 可见
+///   goto  L_end
+/// L_else:
+///   aload tmp ; checkcast T ; astore t      // Neg 的绑定
+///   <els>                                    // Neg 时 t 可见
+/// L_end:
+/// ```
+///
+/// Neg 且**没有 else** 时（`if (!(x instanceof T t)) return;` 这种守卫写法），
+/// `then` 一定终结，落进 L_else 就等于「测试为真」，所以 `t` 在 if 之后继续可见 ——
+/// 这是 JLS 的 flow scoping 在 java.base 里最常见的用法。
+fn compile_if_pattern(
+    p: PatCond<'_>,
+    then: &Stmt,
+    els: Option<&Stmt>,
+    em: &mut Emit,
+    ctx: &mut Ctx,
+    cp: &mut CpBuilder,
+) -> Result<bool, CompileError> {
+    let (expr, ty, name, negated) = match p {
+        PatCond::Pos(e, t, n) => (e, t, n, false),
+        PatCond::Neg(e, t, n) => (e, t, n, true),
+    };
+    let tmp = em.alloc_scratch()?;
+    let saved_tmp_ty = em.local_type_of(tmp);
+    compile_expr(expr, em, ctx, cp)?;
+    em.astore(tmp)?;
+    let tmp_vt = match expr_type(expr, ctx) {
+        Some(t) if !matches!(t, Type::Prim(_)) => ver_type(cp, &t),
+        _ => cp.class("java/lang/Object"),
+    };
+    em.set_local_type(tmp as usize, tmp_vt);
+    em.aload(tmp)?;
+    let cls = ver_type(cp, ty);
+    em.op_u2(0xC1, cls); // instanceof
+    em.pop(1);
+    em.push(1);
+
+    let slot = ctx.next_slot;
+    if slot >= SCRATCH_SLOT {
+        return err(format!("局部变量太多：槽位已用到 {slot}（上限 {SCRATCH_SLOT}）"));
+    }
+    ctx.next_slot += 1;
+    if em.max_locals < ctx.next_slot as u16 {
+        em.max_locals = ctx.next_slot as u16;
+    }
+    let pat_vt = ver_type(cp, ty);
+    let scope = em.local_types.clone();
+    let l_else = em.new_label();
+    let l_end = em.new_label();
+    em.branch(if negated { 0x9A } else { 0x99 }, l_else); // ifne / ifeq
+    em.pop(1);
+
+    // 把模式变量登记进作用域并发射 checkcast + astore
+    fn bind(
+        name: &str,
+        ty: &Type,
+        slot: u8,
+        pat_vt: u16,
+        em: &mut Emit,
+        ctx: &mut Ctx,
+        cp: &mut CpBuilder,
+        tmp: u8,
+        cls: u16,
+    ) -> Result<(), CompileError> {
+        ctx.locals.insert(name.to_string(), slot);
+        ctx.local_kind.insert(name.to_string(), K_REF);
+        ctx.local_ty.insert(name.to_string(), ty.clone());
+        em.aload(tmp)?;
+        em.op_u2(0xC0, cls); // checkcast
+        em.astore(slot)?;
+        em.set_local_type(slot as usize, pat_vt);
+        let _ = cp;
+        Ok(())
+    }
+
+    // 下游要恢复的旧绑定
+    let old_local = ctx.locals.get(name).copied();
+    let old_kind = ctx.local_kind.get(name).copied();
+    let old_ty = ctx.local_ty.get(name).cloned();
+
+    let mut then_term = false;
+    if negated {
+        then_term = compile_stmt(then, em, ctx, cp)?; // t 在这里不绑定
+    } else {
+        bind(name, ty, slot, pat_vt, em, ctx, cp, tmp, cls)?;
+        then_term = compile_stmt(then, em, ctx, cp)?;
+    }
+    em.local_types = scope.clone();
+    if !then_term {
+        em.goto(l_end);
+    }
+    em.bind(l_else);
+    match els {
+        Some(e) => {
+            if negated {
+                bind(name, ty, slot, pat_vt, em, ctx, cp, tmp, cls)?;
+            } else {
+                ctx.locals.remove(name);
+                ctx.local_kind.remove(name);
+                ctx.local_ty.remove(name);
+            }
+            compile_stmt(e, em, ctx, cp)?;
+            em.local_types = scope;
+            em.bind(l_end);
+        }
+        None => {
+            if negated && then_term {
+                // 落进 L_else 就等于测试为真：t 留到这里之后继续可见
+                bind(name, ty, slot, pat_vt, em, ctx, cp, tmp, cls)?;
+                em.bind(l_end);
+            } else {
+                em.local_types = scope;
+                em.bind(l_end);
+            }
+        }
+    }
+
+    // 恢复旧绑定（Neg + 无 else + then 终结 是唯一保留的情形）
+    let keep = negated && els.is_none() && then_term;
+    if !keep {
+        match old_local {
+            Some(v) => ctx.locals.insert(name.to_string(), v),
+            None => ctx.locals.remove(name),
+        };
+        match old_kind {
+            Some(v) => ctx.local_kind.insert(name.to_string(), v),
+            None => ctx.local_kind.remove(name),
+        };
+        match old_ty {
+            Some(v) => ctx.local_ty.insert(name.to_string(), v),
+            None => ctx.local_ty.remove(name),
+        };
+    }
+    em.free_scratch(tmp);
+    em.set_local_type(tmp as usize, saved_tmp_ty);
+    Ok(false)
 }

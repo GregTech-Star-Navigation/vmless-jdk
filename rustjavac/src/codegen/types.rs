@@ -562,6 +562,15 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
         // 字符串字面量的类型是 String：三元的结果类型、实参描述符都要靠它，
         // 漏了会让「引用槽」被声明成 integer（HotSpot: Inconsistent stackmap frames）
         Expr::StrLit(_) => Some(Type::Named { path: vec!["String".into()], args: vec![] }),
+        // class 字面量：`String.class` 是 `Class<String>`（擦除后就是 Class）
+        Expr::ClassLit(_) => Some(Type::Named {
+            path: vec!["java".into(), "lang".into(), "Class".into()],
+            args: vec![],
+        }),
+        Expr::MethodRef { name, .. } if name == "class" => Some(Type::Named {
+            path: vec!["java".into(), "lang".into(), "Class".into()],
+            args: vec![],
+        }),
         _ => None,
     }
 }
@@ -629,6 +638,9 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
             .map(|d| kind_from_ret(&d))
             .unwrap_or(K_INT),
         Expr::StrLit(_) | Expr::This | Expr::Super | Expr::New { .. } | Expr::ArrayNew { .. } | Expr::Null => K_REF,
+        // class 字面量是 java.lang.Class 的引用
+        Expr::ClassLit(_) => K_REF,
+        Expr::MethodRef { name, .. } if name == "class" => K_REF,
         Expr::InstanceOf { .. } | Expr::BoolLit(_) => K_BOOL,
         // 三元：两侧都是 boolean 才保持 boolean，否则按数值提升（引用任一侧即引用）。
         // 包装类不算「引用侧」：`c ? box : 1` 的结果是 int（先拆箱）
@@ -688,6 +700,98 @@ pub(crate) fn type_internal(ty: &Type) -> Option<String> {
         Type::Array(_) => Some(descriptor(ty)),
         _ => None,
     }
+}
+
+/// `X.class` 里的类型名 → 内部名。
+///
+/// 与 `type_internal` 的区别：这里按**上下文里已知的类**把包前缀与嵌套类型（`$`）补全。
+/// 因为表达式位置上的类名只经过 `qualify` 的 `imported_class` 处理 ——
+/// 同包的 `BufferedInputStream.class` 还是裸名，`Map.Entry.class` 是「外层.嵌套」点分形式。
+pub(crate) fn class_operand_name(ty: &Type, ctx: &Ctx) -> Option<String> {
+    let path = match ty {
+        Type::Named { path, .. } => path,
+        // `String[].class` 的 CONSTANT_Class 名字就是数组描述符
+        Type::Array(_) => return Some(descriptor(ty)),
+        _ => return None,
+    };
+    let known = |n: &str| {
+        ctx.type_fields.contains_key(n) || ctx.iface_types.contains(n) || ctx.type_ctors.contains_key(n)
+    };
+    let pkg = ctx.class_name.rsplit_once('/').map(|(p, _)| p.to_string());
+    let base = if path.len() == 1 { internal_name(path) } else { path.join("/") };
+    if known(&base) {
+        return Some(base);
+    }
+    if path.len() == 1 {
+        if let Some(p) = &pkg {
+            let q = format!("{p}/{base}");
+            if known(&q) {
+                return Some(q);
+            }
+        }
+    }
+    // 前缀当类型、其余按 `$` 拼：`Outer.Inner` / `java.util.Map.Entry`
+    for split in 1..path.len() {
+        let head = if split == 1 {
+            match &pkg {
+                Some(p) if known(&format!("{p}/{}", path[0])) => format!("{p}/{}", path[0]),
+                _ => path[0].clone(),
+            }
+        } else {
+            path[..split].join("/")
+        };
+        let j = format!("{head}${}", path[split..].join("$"));
+        if known(&j) {
+            return Some(j);
+        }
+    }
+    Some(base)
+}
+
+/// 从一组**同名的重载描述符**里挑一个：参数个数 → 形状（引用/数值）→ 精确命中数。
+///
+/// 只按名字存一个描述符是不行的：`CipherCore.update` 有 4 个重载，
+/// `Arrays.fill` 有十来种，挑错那个会连带把实参按错的类型转换，报出一堆假错误。
+pub(crate) fn pick_desc(cands: &[String], args: &[Expr], ctx: &Ctx) -> Option<String> {
+    let arg_descs: Vec<Option<String>> = args
+        .iter()
+        .map(|a| expr_type(a, ctx).map(|t| descriptor(&t)))
+        .collect();
+    let mut best: Option<(i32, &String)> = None;
+    for d in cands {
+        let ps = desc_params(d);
+        if ps.len() != args.len() {
+            continue;
+        }
+        let mut score = 0i32;
+        let mut shape_ok = true;
+        for (i, p) in ps.iter().enumerate() {
+            let want_ref = p.starts_with('L') || p.starts_with('[');
+            let got_ref = match arg_descs.get(i).and_then(|d| d.as_deref()) {
+                Some(d) => d.starts_with('L') || d.starts_with('['),
+                None => expr_kind(&args[i], ctx) == K_REF,
+            };
+            // 基本类型还要能宽化（`fill(a, 0)` 打给 `fill(byte[], byte)` 是合法的）
+            if want_ref != got_ref {
+                shape_ok = false;
+                break;
+            }
+            if arg_descs.get(i).and_then(|d| d.as_deref()) == Some(p.as_str()) {
+                score += 1;
+            }
+        }
+        if !shape_ok {
+            continue;
+        }
+        if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            best = Some((score, d));
+        }
+    }
+    // 一个形状都不匹配时退回第一个（参数个数相同的）；
+    // 再不行退回任意一个 —— 让下游的转换/转换错误报出更具体的信息，而不是「找不到方法」
+    best.map(|(_, d)| d.clone())
+        .or_else(|| cands.iter().find(|d| desc_params(d).len() == args.len()).cloned())
+        .or_else(|| cands.first().cloned())
 }
 
 /// java.lang.* 里我们**运行时真的实现了**的方法：类名 → (方法名, 描述符)。
@@ -782,29 +886,117 @@ pub(crate) fn builtin_static_desc(owner: &str, name: &str, args: &[Expr], ctx: &
 pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, args: &[Expr], ctx: &Ctx) -> Option<String> {
     let Some(r) = recv else {
         // 无接收者：先看本类静态方法，再看（含继承的）实例方法 —— 后者等于 `this.m()`
-        if let Some(d) = ctx.static_methods.get(name) {
-            return Some(d.clone());
+        if let Some(d) = ctx.static_methods.get(name).and_then(|c| pick_desc(c, args, ctx)) {
+            return Some(d);
         }
-        return ctx.instance_methods.get(name).cloned();
+        // `import static p.C.m;` 之后就是裸名字调用，没有接收者可查
+        if let Some((_, d)) = static_import_call(name, args, ctx) {
+            return Some(d);
+        }
+        return ctx.instance_methods.get(name).and_then(|c| pick_desc(c, args, ctx));
     };
     // super.m()：从**父类**开始解析（否则会调到自己，覆写就成了死循环）
     if matches!(r, Expr::Super) {
-        return ctx.type_methods.get(&ctx.super_name).and_then(|m| m.get(name)).cloned();
+        return ctx.type_methods.get(&ctx.super_name).and_then(|m| m.get(name)).and_then(|c| pick_desc(c, args, ctx));
     }
     // ClassName.staticMethod(...)
     if let Some((_, d)) = static_call(r, name, args, ctx) {
         return Some(d);
     }
     if let Some(owner) = expr_type(r, ctx).as_ref().and_then(type_internal) {
-        if let Some(d) = ctx.type_methods.get(&owner).and_then(|m| m.get(name)) {
-            return Some(d.clone());
+        if let Some(d) = ctx.type_methods.get(&owner).and_then(|m| m.get(name)).and_then(|c| pick_desc(c, args, ctx)) {
+            return Some(d);
         }
         if let Some(d) = builtin_method_desc(&owner, name, args, ctx) {
             return Some(d);
         }
     }
     // 包装类/字符串的接收者静态类型可能是 `Object`（泛型擦除）：协议方法仍要能编
-    ctx.instance_methods.get(name).cloned()
+    ctx.instance_methods.get(name).and_then(|c| pick_desc(c, args, ctx))
+}
+
+/// 简单类名 → 要试的内部名（先裸名，再补**当前包**）。
+///
+/// `sema::qualify` 只补 `import` 进来的名字 —— 同包的简单类名故意原样留着（怕和
+/// 同名局部变量混淆）。于是 `AESConstants.AES_BLOCK_SIZE` 这种同包静态访问到这一层
+/// 时 `cls` 还是裸名，查表要按 `pkg/AESConstants` 再试一次。
+pub(crate) fn class_name_forms(cls: &str, ctx: &Ctx) -> Vec<String> {
+    let base = internal_name(std::slice::from_ref(&cls.to_string()));
+    if base.contains('/') {
+        return vec![base];
+    }
+    let mut out = vec![base.clone()];
+    if let Some((pkg, _)) = ctx.class_name.rsplit_once('/') {
+        out.push(format!("{pkg}/{base}"));
+    }
+    out
+}
+
+/// 接收者可能是「类名 + 嵌套段」：`Opcode.Kind.ARRAY_LOAD` 里的 `Opcode.Kind` 是嵌套
+/// 类型 `java/lang/classfile/Opcode$Kind`，不是「Opcode 的实例字段 Kind」。
+/// 返回所有要试的所有者内部名（查不到就空，调用方按实例访问继续走）。
+pub(crate) fn class_owner_forms(e: &Expr, ctx: &Ctx) -> Vec<String> {
+    match e {
+        Expr::Ident(n) => {
+            if ctx.lookup(n).is_some() {
+                Vec::new()
+            } else {
+                class_name_forms(n, ctx)
+            }
+        }
+        // 只有「看起来像类型名」的段才拼 `$`：字段/方法是小写开头，嵌套类型是大写
+        Expr::Field(inner, seg) if seg.chars().next().is_some_and(|c| c.is_ascii_uppercase()) => {
+            class_owner_forms(inner, ctx).into_iter().map(|o| format!("{o}${seg}")).collect()
+        }
+        _ => Vec::new(),
+    }
+}
+
+/// 静态导入的**方法**：`requireNonNull(x)` 这种没有接收者的调用。
+pub(crate) fn static_import_call(name: &str, args: &[Expr], ctx: &Ctx) -> Option<(String, String)> {
+    for owner in static_import_owners(name, ctx) {
+        if let Some(d) = ctx
+            .type_static_methods
+            .get(&owner)
+            .and_then(|m| m.get(name))
+            .and_then(|c| pick_desc(c, args, ctx))
+        {
+            return Some((owner, d));
+        }
+        if let Some(d) = builtin_static_desc(&owner, name, args, ctx) {
+            return Some((owner, d));
+        }
+    }
+    None
+}
+
+/// 静态导入的**字段/常量**：`UTF_8` / `ERA` / `PRECISION` 这种裸名字。
+pub(crate) fn static_import_field(name: &str, ctx: &Ctx) -> Option<(String, String)> {
+    for owner in static_import_owners(name, ctx) {
+        if let Some(v) = ctx.type_static_fields.get(&owner).and_then(|m| m.get(name)) {
+            return Some(v.clone());
+        }
+        if let Some(d) = crate::jdk::field_desc(&owner, name) {
+            return Some((owner, d.to_string()));
+        }
+    }
+    None
+}
+
+/// 一个裸成员名可能要试的声明类：具名静态导入在前，通配静态导入在后
+fn static_import_owners(name: &str, ctx: &Ctx) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    if let Some(v) = ctx.static_imports.get(name) {
+        out.extend(v.iter().cloned());
+    }
+    if let Some(v) = ctx.static_imports.get("*") {
+        for o in v {
+            if !out.contains(o) {
+                out.push(o.clone());
+            }
+        }
+    }
+    out
 }
 
 /// 静态字段访问：`ClassName.f`，或者本类的静态字段名 `count`。
@@ -812,19 +1004,16 @@ pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, args: &[Expr], ctx: &Ct
 /// 返回 (声明类, 描述符)。`ClassName` 只有在不是局部变量名时才当类名。
 pub(crate) fn static_field_access(e: &Expr, ctx: &Ctx) -> Option<(String, String)> {
     match e {
-        Expr::Ident(n) => ctx.static_fields.get(n).cloned(),
+        Expr::Ident(n) => ctx.static_fields.get(n).cloned().or_else(|| static_import_field(n, ctx)),
         Expr::Field(recv, f) => {
-            if let Expr::Ident(cls) = &**recv {
-                if ctx.lookup(cls).is_none() {
-                    let owner = internal_name(std::slice::from_ref(cls));
-                    // 值里带**声明类**：继承来的静态字段要用父类的名字（getstatic 的 owner）
-                    if let Some(v) = ctx.type_static_fields.get(&owner).and_then(|m| m.get(f)) {
-                        return Some(v.clone());
-                    }
-                    // java.lang.* 的内建常量：`Integer.MAX_VALUE` / `Long.MIN_VALUE`
-                    if let Some(d) = crate::jdk::field_desc(&owner, f) {
-                        return Some((owner, d.to_string()));
-                    }
+            for owner in class_owner_forms(recv, ctx) {
+                // 值里带**声明类**：继承来的静态字段要用父类的名字（getstatic 的 owner）
+                if let Some(v) = ctx.type_static_fields.get(&owner).and_then(|m| m.get(f)) {
+                    return Some(v.clone());
+                }
+                // java.lang.* 的内建常量：`Integer.MAX_VALUE` / `Long.MIN_VALUE`
+                if let Some(d) = crate::jdk::field_desc(&owner, f) {
+                    return Some((owner, d.to_string()));
                 }
             }
             None
@@ -837,16 +1026,13 @@ pub(crate) fn static_field_access(e: &Expr, ctx: &Ctx) -> Option<(String, String
 ///
 /// `ClassName` 只有在不是局部变量名时才当类名。
 pub(crate) fn static_call(recv: &Expr, name: &str, args: &[Expr], ctx: &Ctx) -> Option<(String, String)> {
-    if let Expr::Ident(cls) = recv {
-        if ctx.lookup(cls).is_none() {
-            let owner = internal_name(std::slice::from_ref(cls));
-            if let Some(d) = ctx.type_static_methods.get(&owner).and_then(|m| m.get(name)) {
-                return Some((owner, d.clone()));
-            }
-            // 内建静态方法：`Integer.parseInt(s)` / `System.currentTimeMillis()`
-            if let Some(d) = builtin_static_desc(&owner, name, args, ctx) {
-                return Some((owner, d));
-            }
+    for owner in class_owner_forms(recv, ctx) {
+        if let Some(d) = ctx.type_static_methods.get(&owner).and_then(|m| m.get(name)).and_then(|c| pick_desc(c, args, ctx)) {
+            return Some((owner, d));
+        }
+        // 内建静态方法：`Integer.parseInt(s)` / `System.currentTimeMillis()`
+        if let Some(d) = builtin_static_desc(&owner, name, args, ctx) {
+            return Some((owner, d));
         }
     }
     None

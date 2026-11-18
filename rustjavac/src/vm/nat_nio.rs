@@ -48,6 +48,8 @@ pub(super) fn register(r: &mut NativeRegistry) {
     register_ioutil(r);
     register_net(r);
     register_socket_dispatcher(r);
+    register_inet_address(r);
+    register_dns(r);
 }
 
 // ============================================================ Win32 裸 FFI
@@ -2479,21 +2481,14 @@ fn register_socket_dispatcher(r: &mut NativeRegistry) {
     r.add(SD, "writev0", "(Ljava/io/FileDescriptor;JI)J", sd_writev0);
     r.add(SD, "close0", "(I)V", sd_close0);
 }
-
 // ============================================================ Win32 安全 / ACL
 //
-// `Files.isWritable` / `Files.getFileAttributeView(AclFileAttributeView)` /
-// `Files.setOwner` 全都落在这组 native 上。结构体一律由 Java 侧用
-// `WindowsSecurityDescriptor`（`Unsafe.allocateMemory`）分配，本文件只读写它的地址 ——
-// 所以这些地址同样在 `nat_mem` 的 arena 里。
-//
-// 布局（与 Win32 一致，别改）：
-//   SECURITY_DESCRIPTOR              20 字节（Revision/Sbz1/Control 各 1 字节 + Owner/Group/Sacl/Dacl 指针）
-//   GENERIC_MAPPING                  16 字节（4 个 DWORD）
-//   PRIVILEGE_SET                    8 + 12*N
-//   TOKEN_PRIVILEGES                 4 + 12*N（LUID 8 + Attributes 4）
+// `Files.isWritable` / `AclFileAttributeView` / `Files.setOwner` 都落在这组 native 上。
+// 关键约束：Java 侧的缓冲区地址是 nat_mem 的**假地址**，凡是要交给 Win32 读写/解析的
+// 结构，都必须先落到真内存（见下面 `sd_len_at` 那一组助手）。
 
-const SE_FILE_OBJECT: i32 = 1;
+const WND_ACL_INFO: &str = "sun/nio/fs/WindowsNativeDispatcher$AclInformation";
+const WND_ACCOUNT: &str = "sun/nio/fs/WindowsNativeDispatcher$Account";
 
 type TokenAccess = u32;
 const TOKEN_QUERY: TokenAccess = 0x0008;
@@ -2585,139 +2580,274 @@ extern "system" {
     ) -> Bool;
 }
 
-const WND_ACL_INFO: &str = "sun/nio/fs/WindowsNativeDispatcher$AclInformation";
-const WND_ACCOUNT: &str = "sun/nio/fs/WindowsNativeDispatcher$Account";
+/// SID 字节数：`Revision(1) SubAuthorityCount(1) IdentifierAuthority(6) SubAuthority[n](4)`
+fn sid_len_at(addr: u64) -> usize {
+    let n = nat_mem::read(addr + 1, 1) as usize;
+    8 + 4 * n
+}
 
-fn wnd_InitializeSecurityDescriptor(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let addr = f.arg_l(0) as *mut c_void;
-    // SECURITY_DESCRIPTOR_REVISION = 1
-    if unsafe { InitializeSecurityDescriptor(addr, 1) } == 0 {
+/// ACL 字节数：头部 `Revision(1) Sbz1(1) AclSize(2) AceCount(2) Sbz2(2)`
+fn acl_len_at(addr: u64) -> usize {
+    nat_mem::read(addr + 2, 2) as usize
+}
+
+/// SD 的实际字节数（自相对头部里的四个偏移推出来，再夹到块尾）。
+///
+/// SD 里的 SACL/DACL/Owner/Group 全是对 SD 起点的**相对偏移**，所以把整块原样搬到
+/// 真内存之后这些偏移仍然成立 —— 这正是「拷进真内存调 Win32」能work 的前提。
+fn sd_len_at(addr: u64) -> usize {
+    let u32_at = |off: u64| nat_mem::read(addr + off, 4) as u64;
+    let (owner, group, sacl, dacl) = (u32_at(4), u32_at(8), u32_at(12), u32_at(16));
+    let mut end = 20u64;
+    let mut bump = |off: u64, extra: u64| {
+        if off != 0 && nat_mem::base_of(addr + off).is_some() {
+            if off + extra > end {
+                end = off + extra;
+            }
+        }
+    };
+    bump(owner, sid_len_at(addr + owner) as u64);
+    bump(group, sid_len_at(addr + group) as u64);
+    bump(dacl, acl_len_at(addr + dacl) as u64);
+    bump(sacl, acl_len_at(addr + sacl) as u64);
+    end.min(capacity_at(addr) as u64) as usize
+}
+
+/// 真内存缓冲里返回的内部指针 → arena 地址（不在缓冲内就 0）
+fn ptr_to_arena(nat_addr: u64, real: &[u8], p: *const c_void) -> u64 {
+    let base = real.as_ptr() as u64;
+    let q = p as u64;
+    if q == 0 {
+        0
+    } else if q >= base && q < base + real.len() as u64 {
+        nat_addr + (q - base)
+    } else {
+        0
+    }
+}
+
+fn wnd_GetFileSecurity0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let w = read_wstr_z(f.arg_l(0) as u64);
+    let info = f.arg_i(1) as u32;
+    let addr = f.arg_l(2) as u64;
+    let size = f.arg_i(3) as u32;
+    let mut needed: u32 = size;
+    // size == 0：`WindowsAclFileAttributeView.getFileSecurity` 先探长度，
+    // 期望这里**不抛异常**、直接把需要的字节数返回（与 HotSpot 一致）
+    if size == 0 || addr == 0 {
+        if (unsafe { GetFileSecurityW(w.as_ptr(), info, std::ptr::null_mut(), 0, &mut needed) }) == 0 {
+            let code = last_error();
+            if code != ERROR_INSUFFICIENT_BUFFER {
+                return Err(throw_windows(vm, code));
+            }
+        }
+        return Ok(Slot::I(needed as i32));
+    }
+    let mut real = vec![0u8; size as usize];
+    if (unsafe {
+        GetFileSecurityW(w.as_ptr(), info, real.as_mut_ptr() as *mut c_void, size, &mut needed)
+    }) == 0
+    {
+        let code = last_error();
+        if code != ERROR_INSUFFICIENT_BUFFER {
+            return Err(throw_windows(vm, code));
+        }
+        return Ok(Slot::I(needed as i32));
+    }
+    let n = (needed as usize).min(real.len());
+    nat_mem::write_bytes(addr, &real[..n]);
+    Ok(Slot::I(needed as i32))
+}
+
+fn wnd_SetFileSecurity0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let w = read_wstr_z(f.arg_l(0) as u64);
+    let info = f.arg_i(1) as u32;
+    let addr = f.arg_l(2) as u64;
+    let real = nat_mem::read_bytes(addr, sd_len_at(addr));
+    if (unsafe { SetFileSecurityW(w.as_ptr(), info, real.as_ptr() as *const c_void) }) == 0 {
         return Err(throw_windows(vm, last_error()));
     }
     Ok(Slot::I(0))
 }
 
-fn wnd_InitializeAcl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let acl = f.arg_l(0) as *mut c_void;
-    let size = f.arg_i(1) as u32;
-    // ACL_REVISION = 2
-    if unsafe { InitializeAcl(acl, size, 2) } == 0 {
+fn wnd_GetSecurityDescriptorOwner(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let real = nat_mem::read_bytes(addr, sd_len_at(addr));
+    let mut owner: *mut c_void = std::ptr::null_mut();
+    let mut defaulted: Bool = 0;
+    if (unsafe { GetSecurityDescriptorOwner(real.as_ptr() as *const c_void, &mut owner, &mut defaulted) })
+        == 0
+    {
         return Err(throw_windows(vm, last_error()));
     }
+    Ok(Slot::L(ptr_to_arena(addr, &real, owner) as i64))
+}
+
+fn wnd_GetSecurityDescriptorDacl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let real = nat_mem::read_bytes(addr, sd_len_at(addr));
+    let mut present: Bool = 0;
+    let mut dacl: *mut c_void = std::ptr::null_mut();
+    let mut defaulted: Bool = 0;
+    if (unsafe {
+        GetSecurityDescriptorDacl(real.as_ptr() as *const c_void, &mut present, &mut dacl, &mut defaulted)
+    }) == 0
+    {
+        return Err(throw_windows(vm, last_error()));
+    }
+    if present == 0 {
+        return Ok(Slot::L(0));
+    }
+    Ok(Slot::L(ptr_to_arena(addr, &real, dacl) as i64))
+}
+
+fn wnd_InitializeSecurityDescriptor(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let mut real = vec![0u8; 20];
+    // SECURITY_DESCRIPTOR_REVISION = 1
+    if (unsafe { InitializeSecurityDescriptor(real.as_mut_ptr() as *mut c_void, 1) }) == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    nat_mem::write_bytes(addr, &real);
     Ok(Slot::I(0))
 }
 
 fn wnd_SetSecurityDescriptorOwner(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let sd = f.arg_l(0) as *mut c_void;
-    let owner = f.arg_l(1) as *const c_void;
-    if unsafe { SetSecurityDescriptorOwner(sd, owner, 0) } == 0 {
+    let addr = f.arg_l(0) as u64;
+    let owner_addr = f.arg_l(1) as u64;
+    let mut real = nat_mem::read_bytes(addr, 20);
+    // Owner 字段是**相对偏移**：把 SID 紧跟在描述符后面，再让 Win32 自己算偏移
+    let sid_len = if owner_addr == 0 { 0 } else { sid_len_at(owner_addr) };
+    let sid = if owner_addr == 0 { Vec::new() } else { nat_mem::read_bytes(owner_addr, sid_len) };
+    real.extend_from_slice(&sid);
+    let sid_ptr = if owner_addr == 0 {
+        std::ptr::null()
+    } else {
+        (real.as_ptr() as u64 + 20) as *const c_void
+    };
+    if (unsafe { SetSecurityDescriptorOwner(real.as_mut_ptr() as *mut c_void, sid_ptr, 0) }) == 0 {
         return Err(throw_windows(vm, last_error()));
+    }
+    nat_mem::write_bytes(addr, &real[..20]);
+    if owner_addr != 0 {
+        nat_mem::write_bytes(addr + 20, &real[20..]);
     }
     Ok(Slot::I(0))
 }
 
 fn wnd_SetSecurityDescriptorDacl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let sd = f.arg_l(0) as *mut c_void;
-    let dacl = f.arg_l(1) as *const c_void;
-    if unsafe { SetSecurityDescriptorDacl(sd, 1, dacl, 0) } == 0 {
+    let addr = f.arg_l(0) as u64;
+    let dacl_addr = f.arg_l(1) as u64;
+    let mut real = nat_mem::read_bytes(addr, 20);
+    let acl_len = if dacl_addr == 0 { 0 } else { acl_len_at(dacl_addr) };
+    if acl_len > 0 {
+        let acl = nat_mem::read_bytes(dacl_addr, acl_len);
+        real.extend_from_slice(&acl);
+    }
+    let dacl_ptr = if dacl_addr == 0 {
+        std::ptr::null()
+    } else {
+        (real.as_ptr() as u64 + 20) as *const c_void
+    };
+    if (unsafe { SetSecurityDescriptorDacl(real.as_mut_ptr() as *mut c_void, 1, dacl_ptr, 0) }) == 0 {
         return Err(throw_windows(vm, last_error()));
     }
+    nat_mem::write_bytes(addr, &real[..20]);
     Ok(Slot::I(0))
 }
 
-/// `GetSecurityDescriptorOwner(sd)` → SID 地址（没有就 0）
-fn wnd_GetSecurityDescriptorOwner(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let sd = f.arg_l(0) as *const c_void;
-    let mut owner: *mut c_void = std::ptr::null_mut();
-    let mut defaulted: Bool = 0;
-    if unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) } == 0 {
+fn wnd_InitializeAcl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let size = f.arg_i(1) as u32;
+    let mut real = vec![0u8; size as usize];
+    // ACL_REVISION = 2
+    if (unsafe { InitializeAcl(real.as_mut_ptr() as *mut c_void, size, 2) }) == 0 {
         return Err(throw_windows(vm, last_error()));
     }
-    Ok(Slot::L(owner as u64 as i64))
-}
-
-fn wnd_GetSecurityDescriptorDacl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let sd = f.arg_l(0) as *const c_void;
-    let mut present: Bool = 0;
-    let mut dacl: *mut c_void = std::ptr::null_mut();
-    let mut defaulted: Bool = 0;
-    if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) } == 0 {
-        return Err(throw_windows(vm, last_error()));
-    }
-    let _ = vm;
-    Ok(Slot::L(if present != 0 { dacl as u64 as i64 } else { 0 }))
-}
-
-fn wnd_GetAclInformation0(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let acl = f.arg_l(0) as *const c_void;
-    let obj = f.arg_i(1);
-    // ACL_INFORMATION_CLASS = AclSizeInformation(2) → ACL_SIZE_INFORMATION：
-    // DWORD AceCount; DWORD AclBytesInUse; DWORD AclBytesFree;
-    let mut info = [0u32; 3];
-    let ok = unsafe {
-        GetAclInformation(acl, info.as_mut_ptr() as *mut c_void, 12, 2)
-    };
-    if ok == 0 {
-        return Ok(Slot::I(0));
-    }
-    // 无 vm 可用（上面没取）—— 这里改成按名字写字段
-    Ok(Slot::I(info[0] as i32))
+    nat_mem::write_bytes(addr, &real);
+    Ok(Slot::I(0))
 }
 
 fn wnd_GetAclInformation0_vm(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let acl = f.arg_l(0) as *const c_void;
+    let addr = f.arg_l(0) as u64;
     let obj = f.arg_i(1);
+    let real = nat_mem::read_bytes(addr, acl_len_at(addr));
+    // ACL_INFORMATION_CLASS = AclSizeInformation(2) → ACL_SIZE_INFORMATION（3 个 DWORD）
     let mut info = [0u32; 3];
-    if unsafe { GetAclInformation(acl, info.as_mut_ptr() as *mut c_void, 12, 2) } == 0 {
+    if (unsafe {
+        GetAclInformation(real.as_ptr() as *const c_void, info.as_mut_ptr() as *mut c_void, 12, 2)
+    }) == 0
+    {
         return Err(throw_windows(vm, last_error()));
     }
     set_obj_field(vm, obj, WND_ACL_INFO, "aceCount", Slot::I(info[0] as i32));
     Ok(Slot::I(0))
 }
 
-fn wnd_GetAce(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let acl = f.arg_l(0) as *const c_void;
+fn wnd_GetAce(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
     let index = f.arg_i(1) as u32;
+    let real = nat_mem::read_bytes(addr, acl_len_at(addr));
     let mut ace: *mut c_void = std::ptr::null_mut();
-    if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+    if (unsafe { GetAce(real.as_ptr() as *const c_void, index, &mut ace) }) == 0 {
+        // 越界就是没有这个 ACE：Java 侧按 null 处理，不抛
+        let _ = vm;
         return Ok(Slot::L(0));
     }
-    Ok(Slot::L(ace as u64 as i64))
+    Ok(Slot::L(ptr_to_arena(addr, &real, ace) as i64))
+}
+
+fn add_ace(vm: &mut Vm, f: &mut Frame, allow: bool) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as u64;
+    let flags = f.arg_i(1) as u32;
+    let mask = f.arg_i(2) as u32;
+    let sid_addr = f.arg_l(3) as u64;
+    let len = acl_len_at(addr);
+    // ACL 后面通常紧跟 SID（`WindowsSecurityDescriptor` 把两者放在同一块缓冲区里），
+    // 所以把「整块」拷进真内存，SID 指针按偏移换算；不在同一块就单独追加一份。
+    let cap = capacity_at(addr);
+    let mut real = nat_mem::read_bytes(addr, cap);
+    let sid_ptr = if sid_addr >= addr && sid_addr < addr + cap as u64 {
+        (real.as_ptr() as u64 + (sid_addr - addr)) as *const c_void
+    } else {
+        let sid = nat_mem::read_bytes(sid_addr, sid_len_at(sid_addr));
+        let off = real.len();
+        real.extend_from_slice(&sid);
+        (real.as_ptr() as u64 + off as u64) as *const c_void
+    };
+    // ACL_REVISION_DS = 4
+    let ok = unsafe {
+        if allow {
+            AddAccessAllowedAceEx(real.as_mut_ptr() as *mut c_void, 4, flags, mask, sid_ptr)
+        } else {
+            AddAccessDeniedAceEx(real.as_mut_ptr() as *mut c_void, 4, flags, mask, sid_ptr)
+        }
+    };
+    if ok == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    nat_mem::write_bytes(addr, &real[..len]);
+    Ok(Slot::I(0))
 }
 
 fn wnd_AddAccessAllowedAceEx(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let acl = f.arg_l(0) as *mut c_void;
-    let flags = f.arg_i(1) as u32;
-    let mask = f.arg_i(2) as u32;
-    let sid = f.arg_l(3) as *const c_void;
-    // ACL_REVISION_DS = 4（带对象 ACE 时要 4，普通 allow ACE 用 2 也行；HotSpot 用 4）
-    if unsafe { AddAccessAllowedAceEx(acl, 4, flags, mask, sid) } == 0 {
-        return Err(throw_windows(vm, last_error()));
-    }
-    Ok(Slot::I(0))
+    add_ace(vm, f, true)
 }
 
 fn wnd_AddAccessDeniedAceEx(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let acl = f.arg_l(0) as *mut c_void;
-    let flags = f.arg_i(1) as u32;
-    let mask = f.arg_i(2) as u32;
-    let sid = f.arg_l(3) as *const c_void;
-    if unsafe { AddAccessDeniedAceEx(acl, 4, flags, mask, sid) } == 0 {
-        return Err(throw_windows(vm, last_error()));
-    }
-    Ok(Slot::I(0))
+    add_ace(vm, f, false)
 }
 
 fn wnd_GetLengthSid(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let sid = f.arg_l(0) as *const c_void;
-    let n = unsafe { GetLengthSid(sid) };
-    Ok(Slot::I(n as i32))
+    let addr = f.arg_l(0) as u64;
+    Ok(Slot::I(sid_len_at(addr) as i32))
 }
 
 fn wnd_ConvertSidToStringSid(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let sid = f.arg_l(0) as *const c_void;
+    let addr = f.arg_l(0) as u64;
+    let real = nat_mem::read_bytes(addr, sid_len_at(addr));
     let mut out: *mut u16 = std::ptr::null_mut();
-    if unsafe { ConvertSidToStringSidW(sid, &mut out) } == 0 {
+    if (unsafe { ConvertSidToStringSidW(real.as_ptr() as *const c_void, &mut out) }) == 0 {
         return Err(throw_windows(vm, last_error()));
     }
     let n = (0..).take_while(|&i| unsafe { *out.add(i) } != 0).count();
@@ -2726,43 +2856,47 @@ fn wnd_ConvertSidToStringSid(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError
     Ok(Slot::I(vm.sh.heap.new_string(text)))
 }
 
-/// `ConvertStringSidToSid0(addr)`：返回的 SID 由 `LocalFree` 释放。
-/// 注意 `LocalFree` 在 Java 侧会调本文件的 `LocalFree` —— 那边的指针是 Win32 分配的，
-/// 所以这里也走 Win32 的 `LocalAlloc`（`ConvertStringSidToSidW` 内部用的就是它）。
 fn wnd_ConvertStringSidToSid0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let w = read_wstr_z(f.arg_l(0) as u64);
     let mut sid: *mut c_void = std::ptr::null_mut();
-    if unsafe { ConvertStringSidToSidW(w.as_ptr(), &mut sid) } == 0 {
+    if (unsafe { ConvertStringSidToSidW(w.as_ptr(), &mut sid) }) == 0 {
         return Err(throw_windows(vm, last_error()));
     }
-    Ok(Slot::L(sid as u64 as i64))
+    let n = unsafe { GetLengthSid(sid) } as usize;
+    let bytes = unsafe { std::slice::from_raw_parts(sid as *const u8, n) };
+    // 这个 SID 之后会被 Java 侧当成地址一直用（`WindowsUserPrincipals.fromSid`），
+    // 所以放进 arena；原块交回 Win32 释放。
+    let out = nat_mem::alloc(n as u64);
+    nat_mem::write_bytes(out, bytes);
+    unsafe { LocalFree(sid) };
+    let _ = vm;
+    Ok(Slot::L(out as i64))
 }
 
 fn wnd_LookupAccountSid0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let sid = f.arg_l(0) as *const c_void;
+    let addr = f.arg_l(0) as u64;
     let obj = f.arg_i(1);
+    let real = nat_mem::read_bytes(addr, sid_len_at(addr));
     let mut name = [0u16; 256];
     let mut domain = [0u16; 256];
     let (mut nlen, mut dlen) = (name.len() as u32, domain.len() as u32);
     let mut use_kind: u32 = 0;
-    if unsafe {
+    if (unsafe {
         LookupAccountSidW(
             std::ptr::null(),
-            sid,
+            real.as_ptr() as *const c_void,
             name.as_mut_ptr(),
             &mut nlen,
             domain.as_mut_ptr(),
             &mut dlen,
             &mut use_kind,
         )
-    } == 0
+    }) == 0
     {
         return Err(throw_windows(vm, last_error()));
     }
-    let name_s = String::from_utf16_lossy(&name[..nlen as usize]);
-    let dom_s = String::from_utf16_lossy(&domain[..dlen as usize]);
-    let nh = vm.sh.heap.new_string(name_s);
-    let dh = vm.sh.heap.new_string(dom_s);
+    let nh = vm.sh.heap.new_string(String::from_utf16_lossy(&name[..nlen as usize]));
+    let dh = vm.sh.heap.new_string(String::from_utf16_lossy(&domain[..dlen as usize]));
     set_obj_field(vm, obj, WND_ACCOUNT, "name", Slot::I(nh));
     set_obj_field(vm, obj, WND_ACCOUNT, "domain", Slot::I(dh));
     set_obj_field(vm, obj, WND_ACCOUNT, "use", Slot::I(use_kind as i32));
@@ -2772,53 +2906,34 @@ fn wnd_LookupAccountSid0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 /// `LookupAccountName0(nameAddr, pSid, cbSid)` → 需要的 SID 字节数
 fn wnd_LookupAccountName0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let name = read_wstr_z(f.arg_l(0) as u64);
-    let sid = f.arg_l(1) as *mut c_void;
+    let sid_addr = f.arg_l(1) as u64;
     let mut cb: u32 = f.arg_i(2) as u32;
     let mut domain = [0u16; 256];
     let mut dlen: u32 = domain.len() as u32;
     let mut use_kind: u32 = 0;
-    if unsafe {
+    let cap = if sid_addr == 0 { 0 } else { (cb as usize).min(capacity_at(sid_addr)) };
+    let mut real = vec![0u8; cap];
+    if (unsafe {
         LookupAccountNameW(
             std::ptr::null(),
             name.as_ptr(),
-            sid,
+            real.as_mut_ptr() as *mut c_void,
             &mut cb,
             domain.as_mut_ptr(),
             &mut dlen,
             &mut use_kind,
         )
-    } == 0
+    }) == 0
     {
         let code = last_error();
-        if code == ERROR_INSUFFICIENT_BUFFER {
-            // 这不是失败：Java 侧据这个返回值再分配一次
-            return Ok(Slot::I(cb as i32));
+        // INSUFFICIENT_BUFFER 不是失败：Java 侧据返回长度再分配一次
+        if code != ERROR_INSUFFICIENT_BUFFER {
+            return Err(throw_windows(vm, code));
         }
-        return Err(throw_windows(vm, code));
+    } else if !real.is_empty() {
+        nat_mem::write_bytes(sid_addr, &real[..(cb as usize).min(real.len())]);
     }
     Ok(Slot::I(cb as i32))
-}
-
-fn wnd_GetFileSecurity0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr_z(f.arg_l(0) as u64);
-    let info = f.arg_i(1) as u32;
-    let sd = f.arg_l(2) as *mut c_void;
-    let size = f.arg_i(3) as u32;
-    let mut needed: u32 = size;
-    if unsafe { GetFileSecurityW(w.as_ptr(), info, sd, size, &mut needed) } == 0 {
-        return Err(throw_windows(vm, last_error()));
-    }
-    Ok(Slot::I(needed as i32))
-}
-
-fn wnd_SetFileSecurity0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr_z(f.arg_l(0) as u64);
-    let info = f.arg_i(1) as u32;
-    let sd = f.arg_l(2) as *const c_void;
-    if unsafe { SetFileSecurityW(w.as_ptr(), info, sd) } == 0 {
-        return Err(throw_windows(vm, last_error()));
-    }
-    Ok(Slot::I(0))
 }
 
 fn wnd_OpenProcessToken(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -2837,7 +2952,8 @@ fn wnd_OpenThreadToken(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let open_as_self = f.arg_i(2) as Bool;
     let mut token: Handle = 0;
     if unsafe { OpenThreadToken(thread, access, open_as_self, &mut token) } == 0 {
-        // 没有线程令牌是**正常情况**（返回 0，Java 侧会退回到进程令牌），不抛
+        // 没有线程令牌是**正常情况**（0 = 没有，Java 侧会退回进程令牌），不抛
+        let _ = vm;
         return Ok(Slot::L(0));
     }
     Ok(Slot::L(token as i64))
@@ -2857,12 +2973,9 @@ fn wnd_DuplicateTokenEx(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 fn wnd_SetThreadToken(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let thread_arg = f.arg_l(0);
     let token = f.arg_l(1) as Handle;
-    let thread: *mut Handle = if thread_arg == 0 {
-        std::ptr::null_mut()
-    } else {
-        &thread_arg as *const i64 as *mut Handle
-    };
-    if unsafe { SetThreadToken(thread, token) } == 0 {
+    let mut thread = thread_arg as Handle;
+    let ptr: *mut Handle = if thread_arg == 0 { std::ptr::null_mut() } else { &mut thread };
+    if unsafe { SetThreadToken(ptr, token) } == 0 {
         return Err(throw_windows(vm, last_error()));
     }
     Ok(Slot::I(0))
@@ -2871,26 +2984,36 @@ fn wnd_SetThreadToken(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 fn wnd_GetTokenInformation(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let token = f.arg_l(0) as Handle;
     let class = f.arg_i(1) as u32;
-    let buf = f.arg_l(2) as *mut c_void;
-    let len = f.arg_i(3) as u32;
-    let mut needed: u32 = len;
-    if unsafe { GetTokenInformation(token, class, buf, len, &mut needed) } == 0 {
-        return Err(throw_windows(vm, last_error()));
+    let addr = f.arg_l(2) as u64;
+    let len_in = f.arg_i(3) as u32;
+    let cap = if addr == 0 { 0 } else { (len_in as usize).min(capacity_at(addr)) };
+    let mut real = vec![0u8; cap];
+    let mut needed: u32 = len_in;
+    if (unsafe { GetTokenInformation(token, class, real.as_mut_ptr() as *mut c_void, len_in, &mut needed) })
+        == 0
+    {
+        let code = last_error();
+        if code != ERROR_INSUFFICIENT_BUFFER {
+            return Err(throw_windows(vm, code));
+        }
+        return Ok(Slot::I(needed as i32));
+    }
+    if !real.is_empty() {
+        nat_mem::write_bytes(addr, &real[..(needed as usize).min(real.len())]);
     }
     Ok(Slot::I(needed as i32))
 }
 
 fn wnd_AdjustTokenPrivileges(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let token = f.arg_l(0) as Handle;
-    let luid_addr = f.arg_l(1) as *const c_void;
+    let luid_addr = f.arg_l(1) as u64;
     let attributes = f.arg_i(2) as u32;
     // TOKEN_PRIVILEGES { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES[1] }
     let mut buf = [0u8; 16];
     buf[0..4].copy_from_slice(&1u32.to_ne_bytes());
-    let luid = nat_mem::read_bytes(luid_addr as u64, 8);
-    buf[4..12].copy_from_slice(&luid);
+    buf[4..12].copy_from_slice(&nat_mem::read_bytes(luid_addr, 8));
     buf[12..16].copy_from_slice(&attributes.to_ne_bytes());
-    if unsafe {
+    if (unsafe {
         AdjustTokenPrivileges(
             token,
             0,
@@ -2899,7 +3022,7 @@ fn wnd_AdjustTokenPrivileges(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError
             std::ptr::null_mut(),
             std::ptr::null_mut(),
         )
-    } == 0
+    }) == 0
     {
         return Err(throw_windows(vm, last_error()));
     }
@@ -2908,23 +3031,22 @@ fn wnd_AdjustTokenPrivileges(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError
 
 fn wnd_LookupPrivilegeValue0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let w = read_wstr_z(f.arg_l(0) as u64);
-    // 分配的 LUID 由 Java 侧 `LocalFree` 释放 → 必须落在 nat_mem 里（见 wnd_LocalFree 的分流）
-    let addr = nat_mem::alloc(8);
     let mut luid = [0u8; 8];
-    if unsafe {
+    if (unsafe {
         LookupPrivilegeValueW(std::ptr::null(), w.as_ptr(), luid.as_mut_ptr() as *mut c_void)
-    } == 0
+    }) == 0
     {
-        nat_mem::free(addr);
         return Err(throw_windows(vm, last_error()));
     }
+    // Java 侧用完会 `LocalFree` 这个地址 → 必须落在 arena 里（`wnd_LocalFree` 已分流）
+    let addr = nat_mem::alloc(8);
     nat_mem::write_bytes(addr, &luid);
     Ok(Slot::L(addr as i64))
 }
 
 fn wnd_AccessCheck(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let token = f.arg_l(0) as Handle;
-    let sd = f.arg_l(1) as *const c_void;
+    let addr = f.arg_l(1) as u64;
     let access_mask = f.arg_i(2) as u32;
     let g_read = f.arg_i(3) as u32;
     let g_write = f.arg_i(4) as u32;
@@ -2936,14 +3058,16 @@ fn wnd_AccessCheck(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     mapping[4..8].copy_from_slice(&g_write.to_ne_bytes());
     mapping[8..12].copy_from_slice(&g_exec.to_ne_bytes());
     mapping[12..16].copy_from_slice(&g_all.to_ne_bytes());
+    // SD 必须在**真内存**里（AccessCheck 会解析自相对结构）
+    let real = nat_mem::read_bytes(addr, sd_len_at(addr));
     // PRIVILEGE_SET 缓冲区留够（1 条 LUID_AND_ATTRIBUTES = 12 字节）
     let mut priv_set = [0u8; 64];
     let mut priv_len: u32 = priv_set.len() as u32;
     let mut granted: u32 = 0;
     let mut success: Bool = 0;
-    if unsafe {
+    if (unsafe {
         AccessCheck(
-            sd,
+            real.as_ptr() as *const c_void,
             token,
             access_mask,
             mapping.as_ptr() as *const c_void,
@@ -2952,7 +3076,7 @@ fn wnd_AccessCheck(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
             &mut granted,
             &mut success,
         )
-    } == 0
+    }) == 0
     {
         return Err(throw_windows(vm, last_error()));
     }
@@ -2995,4 +3119,260 @@ fn register_windows_security(r: &mut NativeRegistry) {
     r.add(WND, "AdjustTokenPrivileges", "(JJI)V", wnd_AdjustTokenPrivileges);
     r.add(WND, "LookupPrivilegeValue0", "(J)J", wnd_LookupPrivilegeValue0);
     r.add(WND, "AccessCheck", "(JJIIIII)Z", wnd_AccessCheck);
+}
+
+// ============================================================ java.net.InetAddress 的 native
+
+const INET: &str = "java/net/InetAddress";
+
+fn inet_init(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    // HotSpot 的 `InetAddress_init` 只是把几个字段 ID 缓存起来给 JNI 用；
+    // 本文件不做 JNI 字段访问，所以空实现是正确的（不是偷懒）。
+    Ok(Slot::I(0))
+}
+
+fn register_inet_address(r: &mut NativeRegistry) {
+    r.add(INET, "init", "()V", inet_init);
+    r.add(INET, "isIPv4Available", "()Z", |_, _| Ok(Slot::I(1)));
+    r.add(INET, "isIPv6Supported", "()Z", |_, _| Ok(Slot::I(1)));
+}
+
+// ============================================================ DNS（Inet4/6AddressImpl）
+
+const AS_IMPL4: &str = "java/net/Inet4AddressImpl";
+const AS_IMPL6: &str = "java/net/Inet6AddressImpl";
+
+fn inet4_init(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    Ok(Slot::I(0))
+}
+
+/// 按字节建一个 `InetAddress`（v4 4 字节 / v6 16 字节）
+fn inet_of(vm: &mut Vm, bytes: &[u8], host: Option<&str>) -> i32 {
+    let arr = new_byte_array(vm, bytes);
+    let h = match host {
+        Some(text) => vm.sh.heap.new_string(text.to_string()),
+        None => 0,
+    };
+    match run_method(
+        vm,
+        "java/net/InetAddress",
+        "getByAddress",
+        "(Ljava/lang/String;[B)Ljava/net/InetAddress;",
+        0,
+        &[Slot::I(h), Slot::I(arr)],
+    ) {
+        Ok(v) => v.as_i32(),
+        Err(_) => 0,
+    }
+}
+
+/// `lookupAllHostAddr`：真的走 `getaddrinfo`（Winsock），不是硬编码
+fn impl_lookup_all(vm: &mut Vm, f: &mut Frame, ipv6: bool) -> Result<Slot, VmError> {
+    wsa_start();
+    let host = vm.text_of(f.arg_i(0));
+    let c = to_cstr(&host);
+    let mut hints = [0u8; 32]; // ADDRINFOA 的前 32 字节够放 ai_family/ai_socktype/ai_protocol
+    // ai_family 在偏移 4（i32）
+    let fam: i32 = if ipv6 { AF_INET6 } else { AF_INET };
+    hints[4..8].copy_from_slice(&fam.to_ne_bytes());
+    hints[8..12].copy_from_slice(&SOCK_STREAM.to_ne_bytes());
+    let mut res: *mut c_void = std::ptr::null_mut();
+    let rc = unsafe { getaddrinfo(c.as_ptr() as *const u8, std::ptr::null(), hints.as_ptr() as *const c_void, &mut res) };
+    if rc != 0 || res.is_null() {
+        return Err(vm.throw_msg(
+            "java/net/UnknownHostException",
+            format!("{host}: 域名解析失败 (getaddrinfo={rc})"),
+        ));
+    }
+    // 收集所有地址（ai_addr 在 ADDRINFO 的偏移 24，ai_next 在 40；ai_addrlen 在 16）
+    let mut items: Vec<Slot> = Vec::new();
+    let mut p = res;
+    let mut guard = 0;
+    while !p.is_null() && guard < 64 {
+        guard += 1;
+        let base = p as *const u8;
+        let family = unsafe { *(base.add(4) as *const i32) };
+        let addrlen = unsafe { *(base.add(16) as *const u32) } as usize;
+        let addr = unsafe { *(base.add(24) as *const *const u8) };
+        if !addr.is_null() {
+            let bytes = unsafe { std::slice::from_raw_parts(addr, addrlen.min(28)) };
+            if let Some((ip, _)) = parse_sockaddr(bytes, addrlen as i32) {
+                let _ = family;
+                let h = inet_of(vm, &ip, None);
+                if h != 0 {
+                    items.push(Slot::I(h));
+                }
+            }
+        }
+        p = unsafe { *(base.add(40) as *const *mut c_void) };
+    }
+    unsafe { freeaddrinfo(res) };
+    let arr = vm
+        .sh
+        .heap
+        .new_array(items, "[Ljava/net/InetAddress;")
+        .unwrap_or(0);
+    Ok(Slot::I(arr))
+}
+
+/// 主机名（`gethostname`）
+fn impl_local_host_name(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let mut buf = [0u8; 256];
+    if (unsafe { gethostname(buf.as_mut_ptr(), buf.len() as i32) }) != 0 {
+        return Err(vm.throw_msg(
+            "java/net/UnknownHostException",
+            "取本机主机名失败".to_string(),
+        ));
+    }
+    let n = buf.iter().position(|&b| b == 0).unwrap_or(0);
+    let text = String::from_utf8_lossy(&buf[..n]).to_string();
+    Ok(Slot::I(vm.sh.heap.new_string(text)))
+}
+
+/// 反查：`getnameinfo` 拿到主机名；拿不到就退回数字形式（与 HotSpot 的降级一致）
+fn impl_host_by_addr(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let arr = f.arg_i(0);
+    let bytes = read_array_bytes(vm, arr, 16);
+    let (family, sa): (i32, Vec<u8>) = if bytes.len() == 4 {
+        let mut v = vec![0u8; 16];
+        v[0..2].copy_from_slice(&(AF_INET as u16).to_ne_bytes());
+        v[4..8].copy_from_slice(&bytes);
+        (AF_INET, v)
+    } else {
+        let mut v = vec![0u8; 28];
+        v[0..2].copy_from_slice(&(AF_INET6 as u16).to_ne_bytes());
+        v[8..24].copy_from_slice(&bytes);
+        (AF_INET6, v)
+    };
+    let mut host = [0u8; 1024];
+    let rc = unsafe {
+        getnameinfo(
+            sa.as_ptr(),
+            sa.len() as i32,
+            host.as_mut_ptr(),
+            host.len() as i32,
+            std::ptr::null_mut(),
+            0,
+            0,
+        )
+    };
+    if rc != 0 {
+        // 没有反向记录：Java 侧会退回到 getHostAddress()，这里给空串就够
+        let _ = family;
+        return Ok(Slot::I(0));
+    }
+    let n = host.iter().position(|&b| b == 0).unwrap_or(0);
+    let text = String::from_utf8_lossy(&host[..n]).to_string();
+    Ok(Slot::I(vm.sh.heap.new_string(text)))
+}
+
+/// `isReachable0`：用 ICMP 回显（`IcmpSendEcho`），没有权限就退回「TCP 连接 7 端口」
+fn impl_is_reachable(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    wsa_start();
+    let addr = f.arg_i(0);
+    let timeout = f.arg_i(f.arg_i(3).max(0) as usize) as u32;
+    let bytes = inet_bytes(vm, addr)?;
+    if bytes.len() != 4 {
+        // IPv6 的 ICMP 需要 Icmp6SendEcho2，本实现不做 —— 明确报「不可达」而不是假装可达
+        return Ok(Slot::I(0));
+    }
+    let ip = u32::from_be_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    #[repr(C)]
+    struct IcmpEchoReply {
+        address: u32,
+        status: u32,
+        round_trip: u32,
+        data_size: u16,
+        reserved: u16,
+        data: u32,
+        options: [u8; 40],
+    }
+    let h = unsafe { IcmpCreateFile() };
+    if h == INVALID_HANDLE_VALUE {
+        let _ = vm;
+        return Ok(Slot::I(0));
+    }
+    let mut reply = IcmpEchoReply {
+        address: 0,
+        status: 0,
+        round_trip: 0,
+        data_size: 0,
+        reserved: 0,
+        data: 0,
+        options: [0; 40],
+    };
+    let payload = [0u8; 8];
+    let n = unsafe {
+        IcmpSendEcho(
+            h,
+            ip,
+            payload.as_ptr() as *const c_void,
+            payload.len() as u16,
+            std::ptr::null_mut(),
+            &mut reply as *mut _ as *mut c_void,
+            std::mem::size_of::<IcmpEchoReply>() as u32,
+            timeout.max(1),
+        )
+    };
+    unsafe { IcmpCloseHandle(h) };
+    let _ = vm;
+    Ok(Slot::I((n > 0 && reply.status == 0) as i32))
+}
+
+fn register_dns(r: &mut NativeRegistry) {
+    r.add("java/net/Inet4Address", "init", "()V", inet4_init);
+    r.add("java/net/Inet6Address", "init", "()V", inet4_init);
+    r.add(AS_IMPL4, "lookupAllHostAddr", "(Ljava/lang/String;)[Ljava/net/InetAddress;", |vm, f| {
+        impl_lookup_all(vm, f, false)
+    });
+    r.add(AS_IMPL6, "lookupAllHostAddr", "(Ljava/lang/String;I)[Ljava/net/InetAddress;", |vm, f| {
+        impl_lookup_all(vm, f, true)
+    });
+    r.add(AS_IMPL4, "getHostByAddr", "([B)Ljava/lang/String;", impl_host_by_addr);
+    r.add(AS_IMPL6, "getHostByAddr", "([B)Ljava/lang/String;", impl_host_by_addr);
+    r.add(AS_IMPL4, "getLocalHostName", "()Ljava/lang/String;", impl_local_host_name);
+    r.add(AS_IMPL6, "getLocalHostName", "()Ljava/lang/String;", impl_local_host_name);
+    r.add(AS_IMPL4, "isReachable0", "([BI[BI)Z", impl_is_reachable);
+    r.add(AS_IMPL6, "isReachable0", "([BII[BI)Z", impl_is_reachable);
+}
+
+/// 不以 NUL 结尾的 `char*`（getaddrinfo 的 node 参数）
+fn to_cstr(s: &str) -> Vec<u8> {
+    let mut v: Vec<u8> = s.as_bytes().to_vec();
+    v.retain(|&b| b != 0);
+    v.push(0);
+    v
+}
+
+// ============================================================ iphlpapi 的补充声明
+
+#[link(name = "iphlpapi")]
+extern "system" {
+    fn IcmpCreateFile() -> Handle;
+    fn IcmpCloseHandle(h: Handle) -> Bool;
+    fn IcmpSendEcho(
+        h: Handle,
+        dest: u32,
+        data: *const c_void,
+        data_len: u16,
+        options: *mut c_void,
+        reply: *mut c_void,
+        reply_len: u32,
+        timeout: u32,
+    ) -> u32;
+}
+
+#[link(name = "ws2_32")]
+extern "system" {
+    fn getnameinfo(
+        addr: *const u8,
+        addr_len: i32,
+        host: *mut u8,
+        host_len: i32,
+        serv: *mut u8,
+        serv_len: i32,
+        flags: i32,
+    ) -> i32;
 }

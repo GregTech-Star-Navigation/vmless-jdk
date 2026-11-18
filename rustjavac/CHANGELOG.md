@@ -3,6 +3,37 @@
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
 
+## 0.67.0
+
+**为什么**：自研编译器对 OpenJDK `java.base` 全部源码（3381 个 `.java`）的通过率只有
+**22.2%（750/3381）**。这是 vmless 的两条硬判据之一，一直没达标。失败原因不是「某个
+复杂功能没做」，而是几处**通用机制**的缺口被放大：跨编译单元的符号来源只有本单元 +
+classpath 上的 `.class`，而调用点根本没用上 classpath；同名重载只保留第一个描述符；
+`System.err` 不在 `println` 特化里；嵌套类型一律按 `/` 拼；Windows 的文件系统大小写
+不敏感被当成了「类存在」的证据。
+
+**改了什么**（通过率 22.2% → 62.0%，`cargo test` 106 通过、`verify.sh` 103 一致 0 失败）
+
+- **测量脚手架**：`examples/cover_dir.rs` 重做（错误骨架归一化、失败桶表、直接出
+  `docs/java-base-失败分布.md`）+ 新增 `examples/probe_src.rs`（单文件诊断，报错带方法
+  名）与 `examples/emit_src.rs`（带 classpath 真编译落盘）。codegen 的错误消息统一加上
+  `（方法 C.m(desc)）` —— 没有行号时这是唯一能定位的线索。
+- **符号表**：classpath 的元数据改为整进程共享 `Arc`（此前每个编译单元复制 7350 个
+  `Own`，批量编译 99% 的时间花在搬这个）；classpath 上真有 `java/lang/Object` 时替换
+  内建占位（占位少了 `clone`/`getClass`/`notifyAll`）；没写 `extends` 的类显式补
+  `java/lang/Object`（否则本单元的类查不到 Object 的方法）。
+- **同名的多个重载全部保留**（`instance_methods`/`static_methods` → `Vec<desc>`），
+  调用点用 `pick_desc` 按实参个数 → 形状 → 精确描述符挑。只留第一个必然挑错，
+  然后实参按错的类型转换，报出一堆假错误。
+- **类名解析**：表达式位置补同包（`AESConstants.X`）与嵌套类型（`Opcode.Kind.X` →
+  `Opcode$Kind`）；类型位置的多段名按 `$` 拼（`Map.Entry` 不再生成 `LMap/Entry;` 这种
+  不存在的类名）；qualify 的「类存不存在」改成**大小写敏感**比较（Windows 上变量名
+  `key` 会命中 `Key.class`，这是「未定义的变量」最大的一桶）。
+- **Java 语法/语义补齐**：`import static`（方法与常量）、class 字面量（`X.class` /
+  `int.class`）、`instanceof` 模式绑定（`if (x instanceof T t)`、`!(…)` 与守卫写法）、
+  嵌套 record、`File[]::new`、`try (…)` 之外的 `(a & m) != 0`（cast 回溯）、
+  `System.err.println`、数组 `clone()`、引用转基本类型的 cast、`arr[纯表达式] op= v`。
+
 ## 0.58.0
 
 **为什么**：JIT 一直是「一遇不支持就整程序作废」——只要方法体里出现一条

@@ -228,6 +228,11 @@ pub(crate) fn is_pure_readable(e: &Expr) -> bool {
         | Expr::Null => true,
         Expr::Field(r, _) => is_pure_readable(r),
         Expr::ArrayAccess { array, index } => is_pure_readable(array) && is_pure_readable(index),
+        // 二元运算只要两侧都纯就是纯：`tk[i / 2] += x` 的下标是 `KC / 2`，
+        // 不放行会把「数组元素复合赋值」整体判死（java.base 里到处都是）
+        Expr::Binary { lhs, rhs, .. } => is_pure_readable(lhs) && is_pure_readable(rhs),
+        Expr::Cast { expr, .. } => is_pure_readable(expr),
+        Expr::Unary { expr, .. } => is_pure_readable(expr),
         _ => false,
     }
 }
@@ -665,7 +670,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             compile_expr(expr, em, ctx, cp)?;
             if to == K_REF {
                 // 引用转换不是数值转换：要发 checkcast（失败抛 ClassCastException）
-                if from != K_REF {
+                //
+                // 种类推不出来时（方法签名拿不到，`expr_kind` 会默认成 int）**按引用走**：
+                // 把「不认识」当成「不是引用」会凭空报错，而 `(T) foo()` 这种写法在
+                // 泛型擦除后的代码里遍地都是
+                if from != K_REF && expr_type(expr, ctx).is_some() {
                     return err("只能把引用值转成引用类型");
                 }
                 let cls = ver_type(cp, ty);
@@ -753,12 +762,17 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             }
             err(format!("未定义的变量 `{name}`"))
         }
-        // System.out.println(x)
-        Expr::Call { recv: Some(r), name, args, .. } if name == "println" => {
+        // System.out.println(x) / System.err.println(x)。
+        // **只接管 System.out / System.err 这一种接收者**：`s.println(x)`（s 是
+        // PrintStream 的局部变量或字段）交给下面的通用调用路径 —— 那里有 PrintStream
+        // 的完整重载表，能按实参类型挑对 `println(Object)` / `println(char[])`。
+        Expr::Call { recv: Some(r), name, args, .. }
+            if name == "println" && is_system_stream(r) =>
+        {
             if let Expr::Field(boxed, field) = &**r {
-                if field == "out" {
+                if field == "out" || field == "err" {
                     if let Expr::Ident(_) = &**boxed {
-                        let out = cp.field_ref("java/lang/System", "out", "Ljava/io/PrintStream;");
+                        let out = cp.field_ref("java/lang/System", field, "Ljava/io/PrintStream;");
                         if args.len() != 1 {
                             return err("println 目前只支持一个参数");
                         }
@@ -890,7 +904,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         }
         // 调用本类（或父类）的方法：静态走 invokestatic，实例走 this 的 invokevirtual
         Expr::Call { name, args, .. } => {
-            if let Some(desc) = ctx.static_methods.get(name.as_str()).cloned() {
+            if let Some(desc) = ctx.static_methods.get(name.as_str()).and_then(|c| pick_desc(c, args, ctx)) {
                 let sp = hoist_args(args, em, ctx, cp)?;
                 emit_call_args(args, &desc, &sp, em, ctx, cp)?;
                 let idx = cp.method_ref("<SELF>", name, &desc);
@@ -902,12 +916,27 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 }
                 return Ok(());
             }
-            // 无接收者的实例方法调用 = `this.m()`（父类的实现也算本类的可见方法）
+            // `import static p.C.m;` 之后的裸名字调用 → invokestatic 那个声明类
+            if let Some((owner, desc)) = static_import_call(name, args, ctx) {
+                let sp = hoist_args(args, em, ctx, cp)?;
+                emit_call_args(args, &desc, &sp, em, ctx, cp)?;
+                let idx = if ctx.iface_types.contains(&owner) {
+                    cp.interface_method_ref(&owner, name, &desc)
+                } else {
+                    cp.method_ref(&owner, name, &desc)
+                };
+                em.op_u2(0xB8, idx); // invokestatic
+                em.pop(desc_slots(&desc));
+                if !desc.ends_with(")V") {
+                    em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
+                }
+                return Ok(());
+            }
             let desc = ctx
                 .instance_methods
                 .get(name.as_str())
-                .ok_or_else(|| CompileError { msg: format!("未找到方法 `{name}`") })?
-                .clone();
+                .and_then(|c| pick_desc(c, args, ctx))
+                .ok_or_else(|| CompileError { msg: format!("未找到方法 `{name}`") })?;
             let sp = hoist_args(args, em, ctx, cp)?;
             em.op(0x2A); // aload_0
             em.push(1);
@@ -1077,8 +1106,76 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
         // `c ? a : b`：分叉求值 → 各自写进同一个脏槽 → 汇合点取回。
         // 两个跳转点（假分支入口、汇合点）操作数栈都是空的。
         Expr::Cond { cond, then, els } => compile_cond(cond, then, els, em, ctx, cp),
+        // class 字面量：`String.class` / `int.class` → `ldc` 一个 CONSTANT_Class
+        Expr::ClassLit(ty) => emit_class_literal(ty, em, ctx, cp),
+        // parser 把 `X.class` 记成 `MethodRef { recv: X, name: "class" }`
+        Expr::MethodRef { recv, name } if name == "class" => match expr_as_type(recv) {
+            Some(ty) => emit_class_literal(&ty, em, ctx, cp),
+            None => err(format!("`X.class` 的左边不是类型名: {recv:?}")),
+        },
         other => err(format!("暂不支持的表达式: {other:?}")),
     }
+}
+
+/// `System.out` / `System.err` 这种接收者（`getstatic java/lang/System.out`）
+fn is_system_stream(r: &Expr) -> bool {
+    match r {
+        Expr::Field(boxed, f) => {
+            (f == "out" || f == "err") && matches!(&**boxed, Expr::Ident(_))
+        }
+        _ => false,
+    }
+}
+
+/// 把「类名当表达式」的 `A.B.C` 还原成类型路径
+fn expr_as_type(e: &Expr) -> Option<Type> {
+    match e {
+        Expr::Ident(n) => Some(Type::Named { path: vec![n.clone()], args: vec![] }),
+        Expr::Field(inner, seg) => {
+            let mut t = expr_as_type(inner)?;
+            if let Type::Named { path, .. } = &mut t {
+                path.push(seg.clone());
+            }
+            Some(t)
+        }
+        _ => None,
+    }
+}
+
+/// `T.class`：引用类型 `ldc CONSTANT_Class`；基本类型没有对应的 class 常量，
+/// 按 javac 的做法取包装类的 `TYPE` 字段（`int.class == Integer.TYPE`）。
+fn emit_class_literal(
+    ty: &Type,
+    em: &mut Emit,
+    ctx: &Ctx,
+    cp: &mut CpBuilder,
+) -> Result<(), CompileError> {
+    if let Type::Prim(p) = ty {
+        let pname: &str = p;
+        let wrapper = match pname {
+            "int" => "java/lang/Integer",
+            "long" => "java/lang/Long",
+            "short" => "java/lang/Short",
+            "byte" => "java/lang/Byte",
+            "char" => "java/lang/Character",
+            "boolean" => "java/lang/Boolean",
+            "float" => "java/lang/Float",
+            "double" => "java/lang/Double",
+            "void" => "java/lang/Void",
+            other => return err(format!("不支持 `{other}.class`")),
+        };
+        let f = cp.field_ref(wrapper, "TYPE", "Ljava/lang/Class;");
+        em.op_u2(0xB2, f); // getstatic
+        em.push(1);
+        return Ok(());
+    }
+    let Some(name) = class_operand_name(ty, ctx) else {
+        return err(format!("不支持这个类型的 class 字面量: {ty:?}"));
+    };
+    let idx = cp.class(&name);
+    em.op_u2(0x13, idx); // ldc_w
+    em.push(1);
+    Ok(())
 }
 
 /// `a && b` / `a || b` 编成 0/1 的值：短路求值，两个跳转点都落在空栈上。

@@ -15,8 +15,48 @@
 
 use crate::ast::*;
 use crate::codegen::types::is_java_lang;
-use std::collections::HashSet;
-use std::path::PathBuf;
+use std::cell::RefCell;
+use std::collections::{HashMap, HashSet};
+use std::path::{Path, PathBuf};
+use std::rc::Rc;
+
+/// 目录里的文件名集合（进程级缓存）。
+fn dir_listing(dir: &Path) -> Option<Rc<HashSet<String>>> {
+    thread_local! {
+        static C: RefCell<HashMap<PathBuf, Option<Rc<HashSet<String>>>>> = RefCell::new(HashMap::new());
+    }
+    if let Some(hit) = C.with(|c| c.borrow().get(dir).cloned()) {
+        return hit;
+    }
+    let v = std::fs::read_dir(dir).ok().map(|rd| {
+        Rc::new(
+            rd.flatten()
+                .filter_map(|e| e.file_name().to_str().map(|s| s.to_string()))
+                .collect::<HashSet<String>>(),
+        )
+    });
+    C.with(|c| c.borrow_mut().insert(dir.to_path_buf(), v.clone()));
+    v
+}
+
+/// classpath 上有没有 `rel` 这个 `.class` —— 文件名按**大小写敏感**比较。
+///
+/// Windows 的文件系统不区分大小写，直接用 `is_file()` 会把表达式里的变量名当成类名：
+/// `key` 命中 `java/security/Key.class`、`cipher` 命中 `javax/crypto/Cipher.class`。
+/// java.base 上这就是「未定义的变量」那一大桶的根因。
+fn class_file_exists(dirs: &[PathBuf], rel: &str) -> bool {
+    let (parent, file) = match rel.rsplit_once('/') {
+        Some((p, f)) => (p, f),
+        None => ("", rel),
+    };
+    dirs.iter().any(|d| {
+        let dir = if parent.is_empty() { d.clone() } else { d.join(parent) };
+        match dir_listing(&dir) {
+            Some(set) => set.contains(file),
+            None => false,
+        }
+    })
+}
 
 struct Qualifier<'a> {
     pkg: String,
@@ -36,21 +76,14 @@ impl Qualifier<'_> {
             return None;
         }
         // 默认包里的类型没有前缀可加
-        let same_pkg = || {
-            let rel = format!("{}/{}.class", self.pkg, name);
-            self.dirs.iter().any(|d| d.join(&rel).is_file())
-        };
+        let same_pkg = || class_file_exists(self.dirs, &format!("{}/{}.class", self.pkg, name));
         let hit = if self.declared.contains(name) {
             Some(self.pkg.clone())
         } else if let Some((_, pfx)) = self.singles.iter().find(|(s, _)| s == name) {
             Some(pfx.clone())
         } else if same_pkg() {
             Some(self.pkg.clone())
-        } else if self
-            .dirs
-            .iter()
-            .any(|d| d.join(format!("java/lang/{name}.class")).is_file())
-        {
+        } else if class_file_exists(self.dirs, &format!("java/lang/{name}.class")) {
             // **隐式 `import java.lang.*;`**（JLS 7.3）：`Appendable` / `Readable` /
             // `CharSequence` 这类不在 `is_java_lang` 白名单里的 java.lang 类型，
             // 只要 classpath 上有就必须补成 `java/lang/X`。
@@ -58,10 +91,7 @@ impl Qualifier<'_> {
         } else {
             self.wildcards
                 .iter()
-                .find(|pfx| {
-                    let rel = format!("{}/{}.class", pfx, name);
-                    self.dirs.iter().any(|d| d.join(&rel).is_file())
-                })
+                .find(|pfx| class_file_exists(self.dirs, &format!("{}/{}.class", pfx, name)))
                 .cloned()
         };
         hit.filter(|p| !p.is_empty())
@@ -80,10 +110,7 @@ impl Qualifier<'_> {
         }
         self.wildcards
             .iter()
-            .find(|pfx| {
-                let rel = format!("{}/{}.class", pfx, name);
-                self.dirs.iter().any(|d| d.join(&rel).is_file())
-            })
+            .find(|pfx| class_file_exists(self.dirs, &format!("{}/{}.class", pfx, name)))
             .map(|pfx| format!("{pfx}/{name}"))
     }
 
@@ -93,14 +120,49 @@ impl Qualifier<'_> {
                 for a in args.iter_mut() {
                     self.ty(a);
                 }
-                if path.len() == 1 {
-                    if let Some(pfx) = self.package_of(&path[0]) {
-                        path.insert(0, pfx);
-                    }
-                }
+                self.resolve_path(path);
             }
             Type::Array(inner) => self.ty(inner),
             _ => {}
+        }
+    }
+
+    /// 类型路径 → 内部名分段（就地改写 `path`）。
+    ///
+    /// 两件事：
+    /// 1. 单段名补包（同包 / import / java.lang / 通配）；
+    /// 2. **多段名的最后几段可能是嵌套类型**：`Map.Entry` 要变成 `java/util/Map$Entry`，
+    ///    `SSLHandshake.HandshakeMessage` 是 `sun/security/ssl/SSLHandshake$HandshakeMessage`。
+    ///    不补的话描述符里会出现 `LMap/Entry;` 这种不存在的类名 —— 编过了也是坏 class。
+    fn resolve_path(&self, path: &mut Vec<String>) {
+        if path.is_empty() {
+            return;
+        }
+        // 整条按斜杠就是已知的类 → 完事（`java.util.List` 这种全限定的常见形态）
+        if path.len() > 1 && class_file_exists(self.dirs, &format!("{}.class", path.join("/"))) {
+            return;
+        }
+        // 找「最长的类型前缀」：前缀 = 包名 + 一个类名，其余段全部按嵌套类型拼 `$`
+        for split in 1..path.len() {
+            let head = if split == 1 {
+                match self.package_of(&path[0]) {
+                    Some(p) => format!("{p}/{}", path[0]),
+                    None => path[0].clone(),
+                }
+            } else {
+                path[..split].join("/")
+            };
+            let joined = format!("{head}${}", path[split..].join("$"));
+            if class_file_exists(self.dirs, &format!("{joined}.class")) {
+                let segs: Vec<String> = joined.split('/').map(|s| s.to_string()).collect();
+                *path = segs;
+                return;
+            }
+        }
+        if path.len() == 1 {
+            if let Some(pfx) = self.package_of(&path[0]) {
+                path.insert(0, pfx);
+            }
         }
     }
 
