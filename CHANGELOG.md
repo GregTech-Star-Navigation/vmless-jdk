@@ -1525,3 +1525,39 @@ Cl   : cleaner ok | read=hi | tgroup=true
    （SD 内部是相对偏移，整块搬过去语义不变）。
 
 **验证**：`verify.sh` 103/103、`cargo test` 106 passed。
+
+## 0.70.0 — 2026-11-18 · java.desktop 从 0 到「逐像素一致」；类加载 O(n) 修掉
+
+### java.desktop：BufferedImage + Graphics2D 渲染**逐像素与 HotSpot 相同**
+`nat_desktop.rs`（991 行，69 条注册，其中命中 `java.desktop` 声明的 61 条）。
+不实现 OpenJDK 那套上千个函数指针的 loops 注册表，而是**接管 `GraphicsPrimitiveMgr.register`**，
+让 `Graphics2D` 的操作直接落到我们自己的光栅化器。
+
+| 用例 | 结果 |
+|---|---|
+| `Img1n`（fillRect + drawLine + drawRect，`TYPE_INT_RGB`） | **diff 0 / 20000 像素**，两边 SHA256 均 `a046774a…53e6` |
+| `Img3`（三层半透明 SrcOver，`TYPE_INT_ARGB`） | **diff 0 / 19200 像素** |
+
+非预乘 ARGB 的 SrcOver 要「先预乘 → 合成 → **反预乘**」；少了最后一步 ref `r=0x8f` 我们会得 `0xff`。
+
+其它必须的胶水：`NativeLibraries.findBuiltinLib` 把 awt/fontmanager/javajpeg/lcms 认成内置（不 dlopen）；
+46 个类的 `initIDs`；`Class.getModule` override 返回 `ALL_UNNAMED_MODULE`（否则
+`Module.ensureNativeAccess` 会 `System.err.printf` → NPE，AWT 连类都初始化不了）。
+
+**没做的**：`drawString` 在 JDK 25 走 HarfBuzz/FFM，卡在 `jdk.internal.foreign.Utils.<clinit>` 的
+`Invalid alignment: 0`；`DrawGlyphList*` 现在**显式抛异常**（不装能跑）。真窗口（阶段二）未开始。
+
+### `ClassStore::add_class` 是 O(类总数)
+每次加载一个类都 `rebuild_methods()` + `build_metas()` 整体重建 —— 实测 **~85ms/类**，
+AWT 一个闭包几百个类就是几十秒，`Class.forName` 看起来像卡死。改成增量维护
+（`build_meta_one` + 只重插这个类的方法）。
+
+### `System.out/err/in` 恒 null 的根因
+`SharedSecrets.getJavaLangReflectAccess()` 的实装是 `ReflectionFactory` 的 `<clinit>` 里挂上去的。
+不先跑它，`System.initPhase1` 里的 `JavaLangReflectAccess.getRoot` 会以**空接收者**被调用
+（"找不到方法 getRoot … 接收者 null"），于是 `System.out/err/in` 一个都装不上 ——
+之后任何 `System.err.printf` 直接 NPE（`Module.ensureNativeAccess` 就是）。
+修法：`run_main` 里在 `initPhase1` **之前** `ensure_init("jdk/internal/reflect/ReflectionFactory")`，
+并补 `getRoot` 的 override（我们没有 root 机制，原样返回实参）。
+
+**验证**：`verify.sh` 103/103、`cargo test` 106 passed。

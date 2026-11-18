@@ -1569,6 +1569,7 @@ fn is_override_owner(cf: &crate::ClassFile) -> bool {
             | b"java/lang/reflect/Field"
             | b"java/lang/reflect/Method"
             | b"java/lang/reflect/Constructor"
+            | b"java/lang/reflect/ReflectAccess"
             | b"java/util/StringJoiner"
     )
 }

@@ -295,6 +295,12 @@ impl Vm {
         // 会直接 `InternalError: null property: java.home`。
         //
         // 独立模式（没有 java.base 字节码）里没有这个方法，`resolve_method` 返回 None，跳过即可。
+        // `SharedSecrets.getJavaLangReflectAccess()` 的实装是
+        // `jdk/internal/reflect/ReflectionFactory` 的 `<clinit>` 里挂上去的。
+        // 不先把它跑起来，`initPhase1` 里的 `JavaLangReflectAccess.getRoot` 会以**空接收者**
+        // 被调用（"找不到方法 getRoot … 接收者 null"），于是 `System.out/err/in` 一个都装不上 ——
+        // 之后任何 `System.err.printf` 直接 NPE。这一步必须在 initPhase1 之前。
+        let _ = self.ensure_init("jdk/internal/reflect/ReflectionFactory");
         if self.store.resolve_method("java/lang/System", "initPhase1", "()V").is_some() {
             self.ensure_init("java/lang/System")?;
             if let Some((ci, mi)) = self.store.resolve_method("java/lang/System", "initPhase1", "()V") {

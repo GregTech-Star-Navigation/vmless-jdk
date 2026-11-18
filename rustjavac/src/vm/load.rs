@@ -154,10 +154,42 @@ impl ClassStore {
                 self.classes.len() - 1
             }
         };
-        self.by_name.insert(name, idx);
-        self.rebuild_methods();
-        self.build_metas();
+        self.by_name.insert(name.clone(), idx);
+        // [dsk-scratch] 增量维护 methods / metas：整体重建是 O(类总数)，
+        // 每次 add_class 都是 80ms 级（AWT 一个闭包几百个类 = 几十秒）。
+        let existed = !self.metas.contains_key(&name) || self.metas.get(&name).is_some();
+        self.methods.retain(|(c, _, _), _| c != &name);
+        {
+            let cf = self.classes[idx].clone();
+            for (mi, m) in cf.methods.iter().enumerate() {
+                let mn = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
+                let md = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
+                self.methods.insert((name.clone(), mn, md), (idx, mi));
+            }
+        }
+        self.build_meta_one(&name);
+        let _ = existed;
         idx
+    }
+
+    /// 只重建**一个类**的字段元数据（`add_class` 用；语义与 `build_metas` 里同名那段一致）
+    fn build_meta_one(&mut self, name: &str) {
+        let chain = self.chain(name);
+        let mut fields = HashMap::new();
+        let mut count = 0usize;
+        for c in chain.iter().rev() {
+            let Some(&ci) = self.by_name.get(c) else { continue };
+            let cf = self.classes[ci].clone();
+            for f in &cf.fields {
+                if f.access_flags & 0x0008 != 0 {
+                    continue; // 静态字段不在对象里
+                }
+                let n = String::from_utf8_lossy(cf.utf8(f.name_index).unwrap_or_default()).into_owned();
+                fields.entry(n).or_insert(count);
+                count += 1;
+            }
+        }
+        self.metas.insert(name.to_string(), ClassMeta { fields, field_count: count });
     }
 
     fn rebuild_methods(&mut self) {
@@ -427,7 +459,7 @@ impl ClassStore {
 
     /// 字段下标 → 字段名（只在这个类**自己**的元数据里找）。
     ///
-    /// `Unsafe.staticFieldOffset` 给出「字段下标」，而 `staticFieldBase` 给出的是类对象 ——
+    /// `Unsafe.staticFieldOffset` 给出「字段下标」，而 `staticFieldBase` 给出的是哨兵对象 ——
     /// 于是 `Unsafe.putInt(base, off)` 落到这里时只剩一个下标，必须能反查名字才能定位静态字段。
     pub(super) fn field_name_at(&self, class: &str, idx: usize) -> Option<String> {
         let m = self.metas.get(class)?;

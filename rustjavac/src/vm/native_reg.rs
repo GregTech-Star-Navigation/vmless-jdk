@@ -348,6 +348,15 @@ fn synth_loader(vm: &mut Vm) -> i32 {
 }
 
 fn register_classloaders(r: &mut NativeRegistry) {
+    // `JavaLangReflectAccess.getRoot(AccessibleObject)`：返回「可访问性根」对象。
+    // 我们没有任何 root 机制（每个 `Field`/`Method` 只有它自己），所以**原样返回实参**。
+    // 少了它，`System.initPhase1` 在装 `SharedSecrets` 时就断，`System.out/err/in` 全 null。
+    r.add_override(
+        "java/lang/reflect/ReflectAccess",
+        "getRoot",
+        "(Ljava/lang/reflect/AccessibleObject;)Ljava/lang/reflect/AccessibleObject;",
+        |_, f| Ok(f.arg(0)),
+    );
     // ---- java.lang.ref.Reference：`Cleaner` 整套建立在这上面 ----
     // `refersTo0` 是比较「引用对象内部的 referent」与实参；我们的对象槽直接可读。
     r.add_override(
