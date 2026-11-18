@@ -253,12 +253,32 @@ impl BigUint {
         }
         Ok(BigUint { limbs: sub_limbs(&self.limbs, &other.limbs) })
     }
-    /// 模 `m` 下的减法：`(self - other) mod m`，输入要求 < m。
+    /// 模 `m` 下的减法：`(self - other) mod m`。
+    ///
+    /// 两个输入本该都 < m（`modinv` 里就是），但**不能假设**：RSA 的 CRT 合成里
+    /// `m1 = m^dp mod p`、`m2 = m^dq mod q`，而 p、q 谁大不定 —— q > p 时 m2 完全
+    /// 可能 >= p。原实现遇到 `other >= m` 会走到 `m.sub(&d)` 上溢分支、被
+    /// `unwrap_or_else(zero)` 静默吞成 0，于是 h=0、签名等于 m2，验签必错。
+    ///
+    /// 症状：2026-11-19 实测 `keytool -genkeypair` 约 **5%** 失败，报
+    /// 「RSA 验签失败：PKCS#1 v1.5 填充结构不正确」，且只在**长报文**（证书 TBS）上出现，
+    /// 短报文（"probe"）从不失败 —— 因为它要碰上 m2 >= m1 + p 才触发。
+    /// 这里改成：先各自归约到 [0, m)，再减。已归约的输入走快路径，不做除法。
     pub fn sub_mod(&self, other: &BigUint, m: &BigUint) -> BigUint {
-        if self.cmp_val(other) != std::cmp::Ordering::Less {
-            BigUint { limbs: sub_limbs(&self.limbs, &other.limbs) }
+        let (a, b) = if self.cmp_val(m) == std::cmp::Ordering::Less
+            && other.cmp_val(m) == std::cmp::Ordering::Less
+        {
+            (self.clone(), other.clone())
         } else {
-            let d = BigUint { limbs: sub_limbs(&other.limbs, &self.limbs) };
+            (
+                self.rem(m).unwrap_or_else(|_| BigUint::zero()),
+                other.rem(m).unwrap_or_else(|_| BigUint::zero()),
+            )
+        };
+        if a.cmp_val(&b) != std::cmp::Ordering::Less {
+            BigUint { limbs: sub_limbs(&a.limbs, &b.limbs) }
+        } else {
+            let d = BigUint { limbs: sub_limbs(&b.limbs, &a.limbs) };
             m.sub(&d).unwrap_or_else(|_| BigUint::zero())
         }
     }
@@ -629,12 +649,19 @@ impl Montgomery {
             let s = t[n] as u64 + carry as u64;
             t[n - 1] = s as u32;
             t[n] = t[n + 1] + (s >> 32) as u32;
+            t[n + 1] = 0;
         }
-        // CIOS 的中间结果可能落在 [m, 2m)，且高位 limb 可能非 0 —— 必须整体比较后再减
+        // CIOS 的结果应当落在 [0, 2m)，原先只做「比较一次、减一次」。这里改成减到真的 < m：
+        // Montgomery 乘法的输出一旦可能 >= 模，`to_mont` / `from_mont` / `modpow` 就会把
+        // 未归约的值传给上层，而 `sub_mod`、CRT 合成、`modinv` 全都隐含「输入 < m」。
+        // 减法保持同余、每次至少减去 m > 0，循环必然收敛（实际最多 2 次）。
+        // 注：这不是 keytool 那个 5% 失败的原因（根因见 `sub_mod` 的注释），是同一类
+        // 「值没归约」隐患的防御。
         let mut out = BigUint { limbs: t[..=n].to_vec() };
         trim(&mut out.limbs);
-        if out.cmp_val(&self.m) != std::cmp::Ordering::Less {
+        while out.cmp_val(&self.m) != std::cmp::Ordering::Less {
             out = BigUint { limbs: sub_limbs(&out.limbs, &self.m.limbs) };
+            trim(&mut out.limbs);
         }
         out
     }
@@ -673,9 +700,7 @@ pub fn ct_eq_biguint(a: &BigUint, b: &BigUint) -> bool {
 /// 小素数表（试除 + 素数筛）。
 pub fn small_primes(limit: u32) -> Vec<u32> {
     let mut sieve = vec![true; limit as usize + 1];
-    if limit >= 0 {
-        sieve[0] = false;
-    }
+    sieve[0] = false; // u32 恒 >= 0，原来的 `if limit >= 0` 是恒真条件（clippy 报 absurd_extreme_comparisons）
     if limit >= 1 {
         sieve[1] = false;
     }
@@ -749,6 +774,24 @@ mod tests {
         assert!(b(1).sub(&b(2)).is_err());
         assert_eq!(BigUint::from_hex("deadbeef").unwrap().to_hex(), "deadbeef");
         assert_eq!(BigUint::from_bytes_be(&[0, 0, 1]).to_hex(), "01");
+    }
+
+    /// 回归：`sub_mod` 允许 `other` 未归约（可以 >= m）。
+    ///
+    /// 2026-11-19 的真实事故：RSA 的 CRT 合成把 `m^dq mod q` 直接喂给 `sub_mod(_, p)`，
+    /// q > p 时它可能 >= p；原实现走进 `m.sub(&d)` 的上溢分支、被 `unwrap_or_else(zero)`
+    /// 静默吞成 0，于是签名 = m2，验签必错 —— 表现是 `keytool -genkeypair` 约 5% 失败。
+    /// 这条断言把「下溢必须归约、不能静默变 0」钉住。
+    #[test]
+    fn sub_mod_accepts_unreduced_other() {
+        let m = b(97);
+        assert_eq!(b(5).sub_mod(&b(3), &m), b(2)); // 常规路径
+        assert_eq!(b(5).sub_mod(&b(100), &m), b(2)); // 100 % 97 = 3
+        assert_eq!(b(5).sub_mod(&b(194), &m), b(5)); // 194 % 97 = 0
+        // 原实现会在这里静默返回 0（other - self = 145 > m → m.sub 上溢）
+        assert_eq!(b(5).sub_mod(&b(150), &m), b(49)); // 150 % 97 = 53 → (5-53) mod 97
+        // 两个都未归约也要对
+        assert_eq!(b(200).sub_mod(&b(150), &m), b(50)); // (6 - 53) mod 97
     }
 
     #[test]

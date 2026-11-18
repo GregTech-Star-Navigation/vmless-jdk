@@ -12,6 +12,7 @@ use super::call::{
 };
 use super::divmod;
 use super::exc::{class_uses_exceptions, ExcHelpers};
+use super::classes::ClassSet;
 use super::gcfree;
 use super::insn::{insn_len, insn_len_at};
 use super::layout::{
@@ -103,6 +104,15 @@ impl Jit {
             return Err(JitError(format!(
                 "JIT 不支持同步指令 {what}（0x{op:02x}@{pc}）：{class}.{name}{desc} 
                  只能由解释器执行（JIT 未接入对象监视器）"
+            )));
+        }
+        // 线程/并发：JIT 的堆是 `thread_local` 的（每个线程一个堆、一张静态区），
+        // 跨线程共享对象在架构上就不成立 → 明确拒绝，别等运行期报
+        // 「类 java/lang/Thread 没有虚方法」。`invokedynamic` 修好之后含
+        // `new Thread(() -> …)` 的方法会走到这里，必须在这里挡住。
+        if let Some(m) = find_thread_api(&cf, &body) {
+            return Err(JitError(format!(
+                "JIT 不支持多线程（{m}）：{class}.{name}{desc} 只能由解释器执行"
             )));
         }
         // 同一个道理：`java.lang.invoke.*` 的调用 JIT 也没有接手的地方
@@ -262,6 +272,20 @@ impl Jit {
         let println_obj_id = self
             .module
             .declare_function("vmless_println_obj", Linkage::Import, &sig_ps)
+            .map_err(|e| JitError(e.to_string()))?;
+
+        // `System.out.print(...)` 与 `System.out.println()`：`println_*` 之外的两个补充桩
+        let mut sig_ov = self.module.make_signature();
+        sig_ov.params.push(AbiParam::new(types::I32)); // 参数类型标签（`rt::K_*`）
+        sig_ov.params.push(AbiParam::new(types::I64)); // 值（double 走位模式）
+        let out_val_id = self
+            .module
+            .declare_function("vmless_out_val", Linkage::Import, &sig_ov)
+            .map_err(|e| JitError(e.to_string()))?;
+        let sig_nl = self.module.make_signature();
+        let out_nl_id = self
+            .module
+            .declare_function("vmless_out_nl", Linkage::Import, &sig_nl)
             .map_err(|e| JitError(e.to_string()))?;
 
         let mut sig_se = self.module.make_signature();
@@ -759,7 +783,7 @@ impl Jit {
                 0x43..=0x46 => {
                     // fstore_0..3
                     let slot = (op - 0x43) as usize;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     lvars.store(&mut fb, locals_ptr, slot, types::F32, v);
                 }
                 0x1a..=0x1d => {
@@ -770,12 +794,12 @@ impl Jit {
                 0x36 => {
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     lvars.store(&mut fb, locals_ptr, slot, types::I32, v);
                 }
                 0x3b..=0x3e => {
                     let slot = (op - 0x3b) as usize;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     lvars.store(&mut fb, locals_ptr, slot, types::I32, v);
                 }
                 0x84 => {
@@ -803,7 +827,7 @@ impl Jit {
                 }
                 // dup / dup_x1 / dup_x2 / dup2 / dup2_x1 / dup2_x2 / swap
                 0x59 => {
-                    let v = *stack.last().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = peek_ck(&stack, op, pc)?;
                     stack.push(v);
                 }
                 0x5a => {
@@ -830,7 +854,7 @@ impl Jit {
                 0x5c => {
                     // dup2
                     let n = stack.len();
-                    let top = *stack.last().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let top = peek_ck(&stack, op, pc)?;
                     if is_wide_ty(fb.func.dfg.value_type(top)) {
                         stack.push(top);
                     } else if n >= 2 {
@@ -888,8 +912,8 @@ impl Jit {
                 0x68 => bin(&mut fb, &mut stack, |f, a, b| f.ins().imul(a, b))?,
                 // idiv / irem：除数是编译期常量时换乘魔数（idiv 是 20~40 周期的串行指令）
                 0x6c | 0x70 => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     // 除数 0 不能走乘魔数（那会变成一次不抛异常的除法），留着走 idiv
                     let dv = iconst_of(&fb, b).filter(|d| *d != 0);
                     let v = match (dv, op) {
@@ -911,7 +935,7 @@ impl Jit {
                     stack.push(v);
                 }
                 0x74 => {
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().ineg(a));
                 }
                 // 与 0 比较的条件跳转
@@ -929,7 +953,7 @@ impl Jit {
                             p.emit(&mut fb, op)
                         }
                         _ => {
-                            let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                            let v = pop_ck(&mut stack, op, pc)?;
                             let zero = fb.ins().iconst(types::I32, 0);
                             let cc = match op {
                                 0x99 => IntCC::Equal,
@@ -954,7 +978,7 @@ impl Jit {
                     let off = i16::from_be_bytes([body[pc], body[pc + 1]]) as isize;
                     pc += 2;
                     let target = (pc as isize - 3 + off) as usize;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     let v = convert_to(&mut fb, v, types::I64);
                     let zero = fb.ins().iconst(types::I64, 0);
                     let cc = if op == 0xc6 { IntCC::Equal } else { IntCC::NotEqual };
@@ -973,8 +997,8 @@ impl Jit {
                     let off = i16::from_be_bytes([body[pc], body[pc + 1]]) as isize;
                     pc += 2;
                     let target = (pc as isize - 3 + off) as usize;
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let cc = match op {
                         0x9f => IntCC::Equal,
                         0xa0 => IntCC::NotEqual,
@@ -1028,7 +1052,7 @@ impl Jit {
                     let len = insn_len_at(&body, pc - 1);
                     let start = pc - 1;
                     let (pairs, default_off) = parse_switch(&body, start, len)?;
-                    let key = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let key = pop_ck(&mut stack, op, pc)?;
                     let key = convert_to(&mut fb, key, types::I32);
                     let blk = |off: i32| -> Result<cranelift_codegen::ir::Block, JitError> {
                         let target = (start as isize + off as isize) as usize;
@@ -1059,7 +1083,7 @@ impl Jit {
                 }
                 // ireturn / lreturn / freturn / dreturn / areturn：统一按方法签名声明的返回类型收口
                 0xac | 0xad | 0xae | 0xaf | 0xb0 => {
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     let v = convert_to(&mut fb, v, ret_ty);
                     if has_refs {
                         self.emit_frame_exit(&mut fb, root_ptr, reg)?;
@@ -1091,7 +1115,7 @@ impl Jit {
                 // athrow：把对象交给运行时，然后按本方法的异常表派发
                 0xbf => {
                     let op_pc = pc - 1;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     let v = convert_to(&mut fb, v, types::I64);
                     let f = self.module.declare_func_in_func(helpers.throw_, fb.func);
                     fb.ins().call(f, &[v]);
@@ -1118,12 +1142,12 @@ impl Jit {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let (bcls, bname, bdesc) = method_ref_of(&cf, idx)?;
-                    if let Some(op) = crate::jdk::sop(&bcls, &bname, &bdesc) {
+                    if let Some(sop) = crate::jdk::sop(&bcls, &bname, &bdesc) {
                         // 内建静态方法（`Integer.parseInt` / `System.arraycopy` …）
                         let params = param_descs(&bdesc);
                         let mut args = Vec::new();
                         for _ in 0..params.len() {
-                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                            args.push(pop_ck(&mut stack, op, pc)?);
                         }
                         args.reverse();
                         let op_pc = pc - 3;
@@ -1147,7 +1171,7 @@ impl Jit {
                                 Some(v) => abi_arg(&mut fb, *v, &params[1]),
                                 None => fb.ins().iconst(types::I64, 0),
                             };
-                            let oi = fb.ins().iconst(types::I32, op as i64);
+                            let oi = fb.ins().iconst(types::I32, sop as i64);
                             let fref =
                                 self.module.declare_func_in_func(builtin_static_id, fb.func);
                             let c = fb.ins().call(fref, &[oi, a64, b64]);
@@ -1166,7 +1190,7 @@ impl Jit {
                         let params = param_descs(&mdesc);
                         let mut args = Vec::new();
                         for _ in 0..params.len() {
-                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                            args.push(pop_ck(&mut stack, op, pc)?);
                         }
                         args.reverse();
                         let slot = fb.create_sized_stack_slot(
@@ -1211,7 +1235,7 @@ impl Jit {
                     // 参数出栈（逆序），写进为被调方法准备的栈槽
                     let mut args = Vec::new();
                     for _ in 0..argc {
-                        args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                        args.push(pop_ck(&mut stack, op, pc)?);
                     }
                     args.reverse();
                     let slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
@@ -1282,17 +1306,17 @@ impl Jit {
                 }
                 0x4b..=0x4e => {
                     let slot = (op - 0x4b) as usize;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     store_root(&mut fb, root_ptr, slot, v);
                 }
                 0x3a => {
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     store_root(&mut fb, root_ptr, slot, v);
                 }
                 0x59 => {
-                    let v = *stack.last().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = peek_ck(&stack, op, pc)?;
                     stack.push(v);
                 }
                 0xb7 => {
@@ -1319,7 +1343,7 @@ impl Jit {
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
                     let mut args = Vec::new();
                     for _ in 0..argc {
-                        args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                        args.push(pop_ck(&mut stack, op, pc)?);
                     }
                     args.reverse();
                     let slot = fb.create_sized_stack_slot(cranelift_codegen::ir::StackSlotData::new(
@@ -1391,7 +1415,7 @@ impl Jit {
                     // fstore(0x38) / dstore(0x39)：都只是把栈顶值按值存进 8 字节槽
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     // 按**值本身的类型**存（不按操作码猜），与旧行为一致
                     let ty = fb.func.dfg.value_type(v);
                     lvars.store(&mut fb, locals_ptr, slot, ty, v);
@@ -1399,7 +1423,7 @@ impl Jit {
                 0x47..=0x4a => {
                     // dstore_0..3
                     let slot = (op - 0x47) as usize;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     lvars.store(&mut fb, locals_ptr, slot, types::F64, v);
                 }
                 0x16 => {
@@ -1418,20 +1442,20 @@ impl Jit {
                 0x37 => {
                     let slot = body[pc] as usize;
                     pc += 1;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     lvars.store(&mut fb, locals_ptr, slot, types::I64, v);
                 }
                 0x3f..=0x42 => {
                     let slot = (op - 0x3f) as usize;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     lvars.store(&mut fb, locals_ptr, slot, types::I64, v);
                 }
                 0x61 => lng(&mut fb, &mut stack, |f, a, b| f.ins().iadd(a, b))?,
                 0x65 => lng(&mut fb, &mut stack, |f, a, b| f.ins().isub(a, b))?,
                 0x69 => lng(&mut fb, &mut stack, |f, a, b| f.ins().imul(a, b))?,
                 0x6d | 0x71 => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let dv = iconst_of(&fb, b).filter(|d| *d != 0);
                     let v = match (dv, op) {
                         (Some(d), 0x6d) => divmod::emit_sdiv_const(&mut fb, a, d, 64),
@@ -1442,7 +1466,7 @@ impl Jit {
                     stack.push(v);
                 }
                 0x75 => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().ineg(b));
                 }
                 // double 算术 / 取反
@@ -1452,14 +1476,14 @@ impl Jit {
                 0x6f => lng(&mut fb, &mut stack, |f, a, b| f.ins().fdiv(a, b))?,
                 0x73 => {
                     // drem：cranelift 没有 frem 指令，调 CRT 的 fmod
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let fref = self.module.declare_func_in_func(drem_id, fb.func);
                     let c = fb.ins().call(fref, &[a, b]);
                     stack.push(fb.inst_results(c)[0]);
                 }
                 0x77 => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fneg(b));
                 }
                 // float 算术 / 取反（F32 指令，f32 舍入由指令本身保证）
@@ -1469,42 +1493,42 @@ impl Jit {
                 0x6e => lng(&mut fb, &mut stack, |f, a, b| f.ins().fdiv(a, b))?,
                 0x72 => {
                     // frem：cranelift 没有 frem 指令，调 CRT 的 fmodf
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let fref = self.module.declare_func_in_func(frem_id, fb.func);
                     let c = fb.ins().call(fref, &[a, b]);
                     stack.push(fb.inst_results(c)[0]);
                 }
                 0x76 => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fneg(b));
                 }
                 // 数值类型转换
                 0x87 => {
                     // i2d
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_from_sint(types::F64, a));
                 }
                 0x8a => {
                     // l2d
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_from_sint(types::F64, a));
                 }
                 0x8e => {
                     // d2i
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_to_sint_sat(types::I32, a));
                 }
                 0x8f => {
                     // d2l
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_to_sint_sat(types::I64, a));
                 }
                 // long / double 比较：压出 -1 / 0 / 1
                 0x94 => {
                     // lcmp
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let lt = fb.ins().icmp(IntCC::SignedLessThan, a, b);
                     let gt = fb.ins().icmp(IntCC::SignedGreaterThan, a, b);
                     let lt = fb.ins().uextend(types::I32, lt);
@@ -1515,8 +1539,8 @@ impl Jit {
                 }
                 0x97 | 0x98 => {
                     // dcmpl(0x97: NaN → -1) / dcmpg(0x98: NaN → +1)
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let (cc_lt, cc_gt) = if op == 0x97 {
                         (FloatCC::UnorderedOrLessThan, FloatCC::GreaterThan)
                     } else {
@@ -1532,8 +1556,8 @@ impl Jit {
                 }
                 0x95 | 0x96 => {
                     // fcmpl(0x95: NaN → -1) / fcmpg(0x96: NaN → +1)
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let (cc_lt, cc_gt) = if op == 0x95 {
                         (FloatCC::UnorderedOrLessThan, FloatCC::GreaterThan)
                     } else {
@@ -1549,57 +1573,57 @@ impl Jit {
                 }
                 0x88 => {
                     // l2i
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().ireduce(types::I32, a));
                 }
                 0x85 => {
                     // i2l
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().sextend(types::I64, a));
                 }
                 // float 与其它数值类型的互转（F32 参与，位宽按目标类型走）
                 0x86 => {
                     // i2f
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_from_sint(types::F32, a));
                 }
                 0x89 => {
                     // l2f
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_from_sint(types::F32, a));
                 }
                 0x8b => {
                     // f2i（Rust/Cranelift 的饱和转换与 Java 语义一致：NaN → 0，超界钳到边界）
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_to_sint_sat(types::I32, a));
                 }
                 0x8c => {
                     // f2l
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fcvt_to_sint_sat(types::I64, a));
                 }
                 0x8d => {
                     // f2d
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fpromote(types::F64, a));
                 }
                 0x90 => {
                     // d2f
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().fdemote(types::F32, a));
                 }
                 // i2b / i2c / i2s：截断到目标宽度后**符号扩展**回 int
                 0x91 => {
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let a = fb.ins().ireduce(types::I8, a);
                     stack.push(fb.ins().sextend(types::I32, a));
                 }
                 0x92 => {
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     stack.push(fb.ins().band_imm(a, 0xFFFF));
                 }
                 0x93 => {
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let a = fb.ins().ireduce(types::I16, a);
                     stack.push(fb.ins().sextend(types::I32, a));
                 }
@@ -1653,7 +1677,7 @@ impl Jit {
                     self.emit_clinit_call(&mut fb, &owner)?;
                     let slot = rt::static_slot(&owner, &fname, is_ref_desc(&fdesc));
                     let (ty, _) = field_slot_type(&fdesc);
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
                     // 统一按 i64 位模式存
                     let v = if ty == types::F64 {
                         let b = fb.ins().bitcast(types::I64, MemFlags::new(), v);
@@ -1680,29 +1704,67 @@ impl Jit {
                         pc += 2; // count + 保留字节（invokeinterface 比 invokevirtual 多两字节）
                     }
                     let (cls, name, desc) = method_ref_of(&cf, idx)?;
-                    if name == "println" {
-                        // 栈上顺序是 [接收者, 参数]，先弹参数
-                        let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                        let _recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                        // 按重载选运行时函数：(I)V / (J)V / (D)V / (Ljava/lang/String;)V
-                        let (fid, want) = match desc.as_str() {
-                            "(J)V" => (println_long_id, types::I64),
-                            "(D)V" => (println_double_id, types::F64),
-                            "(F)V" => (println_float_id, types::F32),
-                            "(Z)V" => (println_bool_id, types::I32),
-                            "(C)V" => (println_char_id, types::I32),
-                            "(Ljava/lang/String;)V" | "(Ljava/lang/Object;)V" => {
-                                (println_obj_id, types::I64)
+                    if name == "println" || name == "print" {
+                        // 栈上顺序是 [接收者, 参数]。**`println()` / `print()` 没有参数**：
+                        // 无条件弹两个会让它们（以及它们之后的全部指令）报「栈下溢」——
+                        // R5.main 末尾那句 `System.out.println()` 就是这么炸的。
+                        let params = param_descs(&desc);
+                        // 引用型实参要先过文本化判据（覆盖了 `toString()` 的类型这里给不出
+                        // 正确文本 → 整个方法回退解释器）
+                        if let Some(p) = params.first() {
+                            if is_ref_desc(p) && !ref_text_ok(&self.classes, p) {
+                                return Err(JitError(format!(
+                                    "System.out.{name} 的引用实参 {p} 需要虚 toString 分派（JIT 未实现）"
+                                )));
                             }
-                            _ => (println_int_id, types::I32),
+                        }
+                        let arg = match params.first() {
+                            Some(_) => Some(pop_ck(&mut stack, op, pc)?),
+                            None => None,
                         };
-                        let v = convert_to(&mut fb, v, want);
-                        let fref = self.module.declare_func_in_func(fid, fb.func);
-                        fb.ins().call(fref, &[v]);
+                        let _recv = pop_ck(&mut stack, op, pc)?;
+                        if name == "print" {
+                            // 不换行的那一套：一个通用桩按参数类型格式化
+                            if let Some(v) = arg {
+                                let kind = match params[0].as_bytes()[0] {
+                                    b'Z' => rt::K_BOOL,
+                                    b'C' => rt::K_CHAR,
+                                    b'I' | b'S' | b'B' => rt::K_INT,
+                                    b'J' => rt::K_LONG,
+                                    b'F' => rt::K_FLOAT,
+                                    b'D' => rt::K_DOUBLE,
+                                    _ => rt::K_REF,
+                                };
+                                let raw = abi_arg(&mut fb, v, &params[0]);
+                                let ki = fb.ins().iconst(types::I32, kind as i64);
+                                let fref = self.module.declare_func_in_func(out_val_id, fb.func);
+                                fb.ins().call(fref, &[ki, raw]);
+                            }
+                        } else if let Some(v) = arg {
+                            // 按重载选运行时函数：(I)V / (J)V / (D)V / (Ljava/lang/String;)V
+                            let (fid, want) = match desc.as_str() {
+                                "(J)V" => (println_long_id, types::I64),
+                                "(D)V" => (println_double_id, types::F64),
+                                "(F)V" => (println_float_id, types::F32),
+                                "(Z)V" => (println_bool_id, types::I32),
+                                "(C)V" => (println_char_id, types::I32),
+                                "(Ljava/lang/String;)V" | "(Ljava/lang/Object;)V" => {
+                                    (println_obj_id, types::I64)
+                                }
+                                _ => (println_int_id, types::I32),
+                            };
+                            let v = convert_to(&mut fb, v, want);
+                            let fref = self.module.declare_func_in_func(fid, fb.func);
+                            fb.ins().call(fref, &[v]);
+                        } else {
+                            // println()：只换行
+                            let fref = self.module.declare_func_in_func(out_nl_id, fb.func);
+                            fb.ins().call(fref, &[]);
+                        }
                     } else if cls == "java/lang/StringBuilder" {
                         // 内置：字符串拼接（`StringBuilder` 没有 .class，进不了虚方法表）
                         if name == "toString" {
-                            let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                            let recv = pop_ck(&mut stack, op, pc)?;
                             let obj = convert_to(&mut fb, recv, types::I64);
                             let op_pc = pc - if op == 0xb9 { 5 } else { 3 };
                             let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
@@ -1712,8 +1774,16 @@ impl Jit {
                             reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
                             stack.push(fb.inst_results(c)[0]);
                         } else if name == "append" {
-                            let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                            let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                            let v = pop_ck(&mut stack, op, pc)?;
+                            let recv = pop_ck(&mut stack, op, pc)?;
+                            // 引用型实参：同 `println`，覆盖了 `toString()` 就给不出正确文本
+                            if let Some(p) = param_descs(&desc).first() {
+                                if is_ref_desc(p) && !ref_text_ok(&self.classes, p) {
+                                    return Err(JitError(format!(
+                                        "StringBuilder.append 的引用实参 {p} 需要虚 toString 分派（JIT 未实现）"
+                                    )));
+                                }
+                            }
                             let obj = convert_to(&mut fb, recv, types::I64);
                             let want = if desc.starts_with("(J)") || desc.starts_with("(L") {
                                 types::I64
@@ -1752,23 +1822,23 @@ impl Jit {
                         && desc == "(Ljava/lang/Object;)Z"
                     {
                         // 内置：按内容比（`String` 没有 .class，进不了虚方法表）
-                        let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                        let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                        let v = pop_ck(&mut stack, op, pc)?;
+                        let recv = pop_ck(&mut stack, op, pc)?;
                         let a = convert_to(&mut fb, recv, types::I64);
                         let b = convert_to(&mut fb, v, types::I64);
                         let fref = self.module.declare_func_in_func(str_equals_id, fb.func);
                         let call = fb.ins().call(fref, &[a, b]);
                         let res = fb.inst_results(call)[0];
                         stack.push(res);
-                    } else if let Some(op) = self.builtin_vop(&cls, &name, &desc) {
+                    } else if let Some(vop) = self.builtin_vop(&cls, &name, &desc) {
                         // 内建 JDK 类：统一走 `vmless_builtin_vcall(recv, op, a, b)`
                         let params = param_descs(&desc);
                         let mut args = Vec::new();
                         for _ in 0..params.len() {
-                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                            args.push(pop_ck(&mut stack, op, pc)?);
                         }
                         args.reverse();
-                        let recv = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                        let recv = pop_ck(&mut stack, op, pc)?;
                         let op_pc = pc - if op == 0xb9 { 5 } else { 3 };
                         let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
                         spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
@@ -1781,7 +1851,7 @@ impl Jit {
                             Some(v) => abi_arg(&mut fb, *v, &params[1]),
                             None => fb.ins().iconst(types::I64, 0),
                         };
-                        let oi = fb.ins().iconst(types::I32, op as i64);
+                        let oi = fb.ins().iconst(types::I32, vop as i64);
                         let fref = self.module.declare_func_in_func(builtin_vcall_id, fb.func);
                         let c = fb.ins().call(fref, &[recv64, oi, a64, b64]);
                         let raw = fb.inst_results(c)[0];
@@ -1800,7 +1870,7 @@ impl Jit {
                         let argc = argc_of(&desc) + 1;
                         let mut args = Vec::new();
                         for _ in 0..argc {
-                            args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                            args.push(pop_ck(&mut stack, op, pc)?);
                         }
                         args.reverse();
                         // 被调方法的 locals 布局：槽 0 是 this，参数从槽 1 起按描述符排
@@ -1923,7 +1993,7 @@ impl Jit {
                         .classes
                         .field_offset(&owner, &name)
                         .ok_or_else(|| JitError(format!("未知字段 {owner}.{name}")))?;
-                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let p = pop_ck(&mut stack, op, pc)?;
                     let addr = emit_ref_addr(&mut fb, p);
                     let off = field_off(f);
                     let v = if is_ref_desc(&desc) {
@@ -1946,8 +2016,8 @@ impl Jit {
                         .classes
                         .field_offset(&owner, &name)
                         .ok_or_else(|| JitError(format!("未知字段 {owner}.{name}")))?;
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
+                    let p = pop_ck(&mut stack, op, pc)?;
                     if is_ref_desc(&desc) {
                         // 引用字段走写屏障：老对象存年轻引用必须把卡标脏
                         let idx = fb.ins().iconst(types::I32, field_slot_idx(f) as i64);
@@ -1977,7 +2047,7 @@ impl Jit {
                         9 => ("[S", 4),
                         _ => ("[I", 4),
                     };
-                    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let n = pop_ck(&mut stack, op, pc)?;
                     let n = convert_to(&mut fb, n, types::I32);
                     let refs_pc = refs.at.get(&(pc - 2)).cloned().unwrap_or_default();
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
@@ -2002,7 +2072,7 @@ impl Jit {
                     };
                     let mut counts = Vec::with_capacity(ndims);
                     for _ in 0..ndims {
-                        counts.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                        counts.push(pop_ck(&mut stack, op, pc)?);
                     }
                     counts.reverse();
                     let slot = fb.create_sized_stack_slot(
@@ -2048,7 +2118,7 @@ impl Jit {
                     } else {
                         format!("[L{comp};")
                     };
-                    let n = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let n = pop_ck(&mut stack, op, pc)?;
                     let n = convert_to(&mut fb, n, types::I32);
                     let refs_pc = refs.at.get(&(pc - 3)).cloned().unwrap_or_default();
                     spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
@@ -2058,7 +2128,7 @@ impl Jit {
                 }
                 // arraylength（长度在偏移 0）
                 0xbe => {
-                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let p = pop_ck(&mut stack, op, pc)?;
                     let addr = emit_ref_addr(&mut fb, p);
                     // librustjrt 的数组头 16 字节：class_id / flags / 长度 / 填充
                     let v = fb.ins().load(types::I32, MemFlags::new(), addr, 8);
@@ -2075,8 +2145,8 @@ impl Jit {
                         0x32 => types::I64,
                         _ => types::I32,
                     };
-                    let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let idx = pop_ck(&mut stack, op, pc)?;
+                    let p = pop_ck(&mut stack, op, pc)?;
                     let paddr = emit_ref_addr(&mut fb, p);
                     let addr = elem_addr(&mut fb, paddr, idx, esize)?;
                     let v = if op == 0x32 {
@@ -2098,9 +2168,9 @@ impl Jit {
                         0x53 => types::I64,
                         _ => types::I32,
                     };
-                    let v = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let idx = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let p = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let v = pop_ck(&mut stack, op, pc)?;
+                    let idx = pop_ck(&mut stack, op, pc)?;
+                    let p = pop_ck(&mut stack, op, pc)?;
                     if op == 0x53 {
                         // 引用元素走写屏障（老数组存年轻引用）
                         let p64 = convert_to(&mut fb, p, types::I64);
@@ -2120,7 +2190,7 @@ impl Jit {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let tag = class_const_tag(&cf, idx)?;
-                    let obj = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let obj = pop_ck(&mut stack, op, pc)?;
                     let obj = convert_to(&mut fb, obj, types::I64);
                     let tg = fb.ins().iconst(types::I32, tag as i64);
                     let fref = self.module.declare_func_in_func(instanceof_id, fb.func);
@@ -2131,7 +2201,7 @@ impl Jit {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
                     let tag = class_const_tag(&cf, idx)?;
-                    let obj = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let obj = pop_ck(&mut stack, op, pc)?;
                     let obj = convert_to(&mut fb, obj, types::I64);
                     let tg = fb.ins().iconst(types::I32, tag as i64);
                     let fref = self.module.declare_func_in_func(checkcast_id, fb.func);
@@ -2140,8 +2210,8 @@ impl Jit {
                 }
                 // 移位：int 版本两个操作数都是 I32；long 版本的位数由 I32 扩展成 I64
                 0x78 | 0x7a | 0x7c => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let b = convert_to(&mut fb, b, types::I32);
                     let a = convert_to(&mut fb, a, types::I32);
                     let v = match op {
@@ -2152,8 +2222,8 @@ impl Jit {
                     stack.push(v);
                 }
                 0x79 | 0x7b | 0x7d => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let b32 = convert_to(&mut fb, b, types::I32);
                     let b = fb.ins().sextend(types::I64, b32);
                     let a = convert_to(&mut fb, a, types::I64);
@@ -2166,8 +2236,8 @@ impl Jit {
                 }
                 // 位运算
                 0x7e | 0x80 | 0x82 => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let a = convert_to(&mut fb, a, types::I32);
                     let b = convert_to(&mut fb, b, types::I32);
                     let v = match op {
@@ -2178,8 +2248,8 @@ impl Jit {
                     stack.push(v);
                 }
                 0x7f | 0x81 | 0x83 => {
-                    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
-                    let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+                    let b = pop_ck(&mut stack, op, pc)?;
+                    let a = pop_ck(&mut stack, op, pc)?;
                     let a = convert_to(&mut fb, a, types::I64);
                     let b = convert_to(&mut fb, b, types::I64);
                     let v = match op {
@@ -2195,16 +2265,66 @@ impl Jit {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     let op_pc = pc - 1;
                     pc += 4; // 2 字节索引 + 2 个保留字节（JVMS 规定必须为 0）
-                    let site = super::indy::classify(&cf, idx).map_err(|why| {
+                    let site = super::indy::classify_in(&cf, class, idx).map_err(|why| {
                         JitError(format!(
                             "JIT 不支持 invokedynamic（0xba@{op_pc}，{why}）：{class}.{name}{desc}"
                         ))
                     })?;
                     match site {
+                        super::indy::Site::Lambda(l) => {
+                            // 捕获实参先留在**操作数栈**上：分配 lambda 对象是 GC 点，
+                            // 留在栈上的引用会被 `spill_refs` 写进根区、搬动后能读回来。
+                            let class_id = self.spin_lambda(&l)?;
+                            let ncap = l.captured.len();
+                            let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
+                            spill_refs(&mut fb, &stack, &refs_pc, root_ptr, max_locals);
+                            let cid = fb.ins().iconst(types::I32, class_id as i64);
+                            let fref = self.module.declare_func_in_func(new_obj_id, fb.func);
+                            let c = fb.ins().call(fref, &[cid]);
+                            reload_refs(&mut fb, &mut stack, &refs_pc, root_ptr, max_locals);
+                            let obj = fb.inst_results(c)[0];
+                            // 捕获变量进字段：引用走写屏障，基本类型直接存 8 字节槽
+                            let mut vals = Vec::with_capacity(ncap);
+                            for _ in 0..ncap {
+                                vals.push(pop_ck(&mut stack, op, pc)?);
+                            }
+                            vals.reverse();
+                            for (i, (v, d)) in vals.iter().zip(l.captured.iter()).enumerate() {
+                                if is_ref_desc(d) {
+                                    let si = fb.ins().iconst(
+                                        types::I32,
+                                        super::layout::field_slot_idx(i) as i64,
+                                    );
+                                    let v64 = convert_to(&mut fb, *v, types::I64);
+                                    let sref =
+                                        self.module.declare_func_in_func(set_ref_id, fb.func);
+                                    fb.ins().call(sref, &[obj, si, v64]);
+                                } else {
+                                    let (ty, _) = field_slot_type(d);
+                                    let v = convert_to(&mut fb, *v, ty);
+                                    let addr = emit_ref_addr(&mut fb, obj);
+                                    fb.ins().store(
+                                        MemFlags::new(),
+                                        v,
+                                        addr,
+                                        super::layout::field_off(i),
+                                    );
+                                }
+                            }
+                            stack.push(obj);
+                        }
                         super::indy::Site::Concat { plan, params } => {
+                            // 引用型动态参数同样要先过文本化判据
+                            for p in &params {
+                                if is_ref_desc(p) && !ref_text_ok(&self.classes, p) {
+                                    return Err(JitError(format!(
+                                        "字符串拼接的动态参数 {p} 需要虚 toString 分派（JIT 未实现）"
+                                    )));
+                                }
+                            }
                             let mut args = Vec::with_capacity(params.len());
                             for _ in 0..params.len() {
-                                args.push(stack.pop().ok_or_else(|| JitError("栈下溢".into()))?);
+                                args.push(pop_ck(&mut stack, op, pc)?);
                             }
                             args.reverse();
                             // 参数一律拍成 i64（float/double 走位模式），运行时按计划解码
@@ -2357,7 +2477,11 @@ impl Jit {
         } else {
             rt::RET_I32
         };
-        let mut ml_max = 1usize;
+        // 槽位至少要装下「接收者 + 全部实参」。以前这里从 1 起、只按找到的实现放大，
+        // 于是「静态类型下一个实现都没找到」（JDK 接口、lambda 合成类）时调用点会拿
+        // 8 字节的栈槽去写 `this` + 实参 —— 直接写出栈槽外面（实测踩到返回地址）。
+        let need = 1 + param_slots(desc).iter().copied().max().map(|m| m + 1).unwrap_or(0);
+        let mut ml_max = need;
         let mut all_gc_free = true;
         let mut names = self.classes.names();
         names.sort();
@@ -2471,7 +2595,8 @@ fn bin(
     fb: &mut FunctionBuilder,
     stack: &mut Vec<Value>,
     f: impl FnOnce(&mut FunctionBuilder, Value, Value) -> Value,
-) -> Result<(), JitError> {    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
+) -> Result<(), JitError> {
+    let b = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
     let a = stack.pop().ok_or_else(|| JitError("栈下溢".into()))?;
     let v = f(fb, a, b);
     stack.push(v);
@@ -2904,6 +3029,96 @@ fn find_invoke_api(cf: &ClassFile, body: &[u8]) -> Option<String> {
             let idx = u16::from_be_bytes([body[pc + 1], body[pc + 2]]);
             if let Ok((c, n, d)) = method_ref_of(cf, idx) {
                 if c.starts_with("java/lang/invoke/") {
+                    return Some(format!("{c}.{n}{d}"));
+                }
+            }
+        }
+        pc += insn_len_at(body, pc).max(1);
+    }
+    None
+}
+
+/// 操作数栈弹出（带诊断）：下溢时把**是哪一条指令**报出来。
+///
+/// 以前这里只有「栈下溢」三个字，定位一个下溢要在 1500 行的 match 里逐个猜 ——
+/// 而栈形状算错时真正出问题的指令往往离根因好几条。
+fn pop_ck(
+    stack: &mut Vec<Value>,
+    op: u8,
+    pc: usize,
+) -> Result<Value, JitError> {
+    stack
+        .pop()
+        .ok_or_else(|| JitError(format!("栈下溢 op=0x{op:02x}@{}", pc - 1)))
+}
+
+/// 只看栈顶不弹出（带诊断，同上）
+fn peek_ck(stack: &[Value], op: u8, pc: usize) -> Result<Value, JitError> {
+    stack
+        .last()
+        .copied()
+        .ok_or_else(|| JitError(format!("栈下溢 op=0x{op:02x}@{}", pc - 1)))
+}
+
+/// 引用型实参的**文本化**是否可信（`append(Object)` / `println(Object)` / 拼接的 `\u0001` 槽）。
+///
+/// JIT 把对象变成文本只有一条路：`natives::obj_to_string` —— 它认 `String`、认包装类，
+/// 其余一律打成「类名@标识哈希」（= `Object.toString()` 的语义）。所以只要静态类型
+/// （或它的祖先）**覆盖了 `toString()`**，这条路给的就是错文本：JVM 会调用户的
+/// `toString()`，而桩函数在 Rust 侧只握着一个可能被 GC 搬走的偏移，**不能**回调 JIT 代码。
+///
+/// 覆盖了就返回 `false` 让**整个方法**回退解释器 —— 慢，但输出对。宁可回退也不许
+/// 「编得出来、打出来是错的」。
+fn ref_text_ok(classes: &ClassSet, desc: &str) -> bool {
+    let Some(inner) = desc.strip_prefix('L').and_then(|d| d.strip_suffix(';')) else {
+        return false; // 数组（`[C` / `[Ljava/lang/Object;`）：没有渲染路径
+    };
+    if inner == "java/lang/String" || crate::jdk::wrapper_prim(inner).is_some() {
+        return true;
+    }
+    let mut cur = inner.to_string();
+    for _ in 0..64 {
+        let Some(cf) = classes.get(&cur) else {
+            return false; // 不认识的类（JDK 侧）：无从判断它有没有覆盖
+        };
+        if cf.access_flags & 0x0200 != 0 {
+            return false; // 接口：实现类可能覆盖，静态类型看不出来
+        }
+        let overrides = cf.methods.iter().any(|m| {
+            cf.utf8(m.name_index).map(|b| b == b"toString").unwrap_or(false)
+                && cf.utf8(m.descriptor_index)
+                    .map(|b| b == b"()Ljava/lang/String;")
+                    .unwrap_or(false)
+        });
+        if overrides {
+            return false;
+        }
+        match classes.super_of(&cur) {
+            Some(s) if s != "java/lang/Object" => cur = s,
+            _ => return true, // 走到 Object 都没人覆盖：`类名@哈希` 就是 JVM 该给的
+        }
+    }
+    false
+}
+
+/// 方法体里第一条打在「JIT 没有的东西」上的调用（线程 / 并发 / 监视器协议）。
+///
+/// JIT 的堆是 `thread_local`（每线程一个堆、一张静态字段表），所以跨线程共享对象
+/// **在架构上**就不成立；`Object.wait/notify` 是监视器协议，而 JIT 连 `monitorenter`
+/// 都不接。这类调用以前很少暴露，是因为含 lambda 的 `main` 整方法就编不了；
+/// `invokedynamic` 接上之后 `new Thread(() -> …)` 会被编进来，必须在编译期挡住。
+fn find_thread_api(cf: &ClassFile, body: &[u8]) -> Option<String> {
+    let mut pc = 0usize;
+    while pc < body.len() {
+        let op = body[pc];
+        if matches!(op, 0xb6..=0xb9) && pc + 2 < body.len() {
+            let idx = u16::from_be_bytes([body[pc + 1], body[pc + 2]]);
+            if let Ok((c, n, d)) = method_ref_of(cf, idx) {
+                let bad = c == "java/lang/Thread"
+                    || c.starts_with("java/util/concurrent/")
+                    || (c == "java/lang/Object"
+                        && matches!(n.as_str(), "wait" | "notify" | "notifyAll"));
+                if bad {
                     return Some(format!("{c}.{n}{d}"));
                 }
             }

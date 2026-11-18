@@ -347,7 +347,7 @@ const USAGE: &str = "用法: jstat -<option> [-t] [-h<lines>] <vmid> [<interval>
 
 说明:
   <option>      class | compiler | gc | gcutil（本实现支持这 4 个）
-  <vmid>        <pid>（本实现只支持本地）
+  <vmid>        <pid> 或 <pid>@<host>:<port>（后者经 jstatd 取远程 perfdata）
   <interval>    采样间隔，<n>[ms|s]，默认 ms
   <count>       采样次数，默认 1
   -t            每行前加一列时间戳（相对 VM 启动的秒数）

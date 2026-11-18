@@ -344,7 +344,155 @@ fn register_all(r: &mut NativeRegistry) {
     nat_misc::register(r);
     nat_desktop::register(r);
 
+    // ---- 原子读-改-写：**必须最后登记**，覆盖上面各文件里的非原子实现 ----
+    //
+    // 顺序是这里的全部要点：`register_unsafe(r)` 在前、`nat_intrinsics::register(r)` 在后，
+    // 而登记表是 insert（后写赢）—— 所以 CAS / getAndAdd / getAndSet 实际跑的是
+    // `nat_intrinsics` 那几条「读一次、算、写一次」的实现，中间没有原子性。
+    // 后果不是「偶尔慢」而是**丢更新**：`AtomicInteger.incrementAndGet` 的 CAS 循环
+    // 4 线程 × 5000 次实测丢 ~10%（18001/20000），`ConcurrentHashMap.casTabAt`、
+    // `LongAdder`、`StampedLock` 全部跟着坏。
+    register_unsafe_atomic(r);
     register_classloaders(r);
+}
+
+// ================================================================ 原子读-改-写
+
+/// 分桶锁的数量。为什么要锁：槽位存储只提供 get/set（没有 per-cell CAS），
+/// 而 `compareAndSetInt` 的语义是「读-比较-写」**整体原子**。
+const RMW_STRIPES: usize = 64;
+
+static RMW_LOCKS: [std::sync::Mutex<()>; RMW_STRIPES] =
+    [const { std::sync::Mutex::new(()) }; RMW_STRIPES];
+
+/// 取一把分桶锁：键是 (对象句柄, 槽下标) —— 同一格永远同一把锁（正确性），
+/// 不同对象/不同槽基本不冲突（性能）。
+///
+/// 锁只覆盖「读 + 算 + 写」这几条指令，里面不调 Java、不分配、不 park，
+/// 所以不会和监视器形成嵌套死锁；64 桶下 4 线程的冲突率可以忽略。
+#[inline]
+pub(super) fn rmw_guard(obj: i32, off: i64) -> std::sync::MutexGuard<'static, ()> {
+    let k = (obj as u32 as usize)
+        .wrapping_mul(0x9E37_79B1)
+        ^ (off as usize).wrapping_mul(0x85EB_CA6B);
+    RMW_LOCKS[(k >> 4) & (RMW_STRIPES - 1)]
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+}
+
+/// 参数按宽度归一：宽度 4 取低 32 位（int / 引用句柄），宽度 8 取 64 位
+#[inline]
+fn rmw_arg(f: &Frame, i: usize, width: usize) -> u64 {
+    if width >= 8 {
+        f.arg_l(i) as u64
+    } else {
+        f.arg_i(i) as u32 as u64
+    }
+}
+
+/// 读到的旧值 → 返回值（int 零扩展到 32 位，long 原样）
+#[inline]
+fn rmw_ret(cur: u64, width: usize) -> Slot {
+    if width >= 8 {
+        Slot::L(cur as i64)
+    } else {
+        Slot::I(cur as u32 as i32)
+    }
+}
+
+/// `compareAndSet{Int,Long,Reference}`：整段「读-比较-写」在锁内完成
+fn rmw_cas(vm: &mut Vm, f: &mut Frame, width: usize) -> Result<Slot, VmError> {
+    let (obj, off) = (f.arg_i(0), f.arg_l(1));
+    let i = off.max(0) as usize;
+    let _g = rmw_guard(obj, off);
+    let cur = read_mem(vm, obj, i, width);
+    if cur == rmw_arg(f, 2, width) {
+        write_mem(vm, obj, i, width, rmw_arg(f, 3, width));
+        // Release：写出去的必须对下一个拿到锁的线程可见（acquire 在 lock() 里）
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+        return Ok(Slot::I(1));
+    }
+    Ok(Slot::I(0))
+}
+
+/// `compareAndExchange{Int,Long,Reference}` → 返回**旧值**
+fn rmw_cax(vm: &mut Vm, f: &mut Frame, width: usize) -> Result<Slot, VmError> {
+    let (obj, off) = (f.arg_i(0), f.arg_l(1));
+    let i = off.max(0) as usize;
+    let _g = rmw_guard(obj, off);
+    let cur = read_mem(vm, obj, i, width);
+    if cur == rmw_arg(f, 2, width) {
+        write_mem(vm, obj, i, width, rmw_arg(f, 3, width));
+        std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    }
+    Ok(rmw_ret(cur, width))
+}
+
+/// `getAndAdd{Int,Long}` → 返回**旧值**
+fn rmw_get_and_add(vm: &mut Vm, f: &mut Frame, width: usize) -> Result<Slot, VmError> {
+    let (obj, off) = (f.arg_i(0), f.arg_l(1));
+    let i = off.max(0) as usize;
+    let _g = rmw_guard(obj, off);
+    let cur = read_mem(vm, obj, i, width);
+    let next = cur.wrapping_add(rmw_arg(f, 2, width));
+    write_mem(vm, obj, i, width, next);
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    Ok(rmw_ret(cur, width))
+}
+
+/// `getAndSet{Int,Long,Reference}` → 返回**旧值**
+fn rmw_get_and_set(vm: &mut Vm, f: &mut Frame, width: usize) -> Result<Slot, VmError> {
+    let (obj, off) = (f.arg_i(0), f.arg_l(1));
+    let i = off.max(0) as usize;
+    let _g = rmw_guard(obj, off);
+    let cur = read_mem(vm, obj, i, width);
+    write_mem(vm, obj, i, width, rmw_arg(f, 2, width));
+    std::sync::atomic::fence(std::sync::atomic::Ordering::SeqCst);
+    Ok(rmw_ret(cur, width))
+}
+
+fn cas_i(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_cas(vm, f, 4) }
+fn cas_l(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_cas(vm, f, 8) }
+fn cax_i(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_cax(vm, f, 4) }
+fn cax_l(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_cax(vm, f, 8) }
+fn add_i(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_get_and_add(vm, f, 4) }
+fn add_l(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_get_and_add(vm, f, 8) }
+fn set_i(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_get_and_set(vm, f, 4) }
+fn set_l(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_get_and_set(vm, f, 8) }
+/// 引用：句柄是 32 位，但槽宽是 8 —— 与 `nat_intrinsics` 的 `u_cas_ref` 同一个口径
+fn cas_r(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_cas(vm, f, 8) }
+fn cax_r(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_cax(vm, f, 8) }
+fn set_r(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> { rmw_get_and_set(vm, f, 8) }
+
+/// 把**原子**版本登记上去（覆盖 `nat_intrinsics` 里的非原子实现）
+fn register_unsafe_atomic(r: &mut NativeRegistry) {
+    let u = "jdk/internal/misc/Unsafe";
+    r.add(u, "compareAndSetInt", "(Ljava/lang/Object;JII)Z", cas_i);
+    r.add(u, "compareAndSetLong", "(Ljava/lang/Object;JJJ)Z", cas_l);
+    r.add(
+        u,
+        "compareAndSetReference",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Z",
+        cas_r,
+    );
+    r.add(u, "compareAndExchangeInt", "(Ljava/lang/Object;JII)I", cax_i);
+    r.add(u, "compareAndExchangeLong", "(Ljava/lang/Object;JJJ)J", cax_l);
+    r.add(
+        u,
+        "compareAndExchangeReference",
+        "(Ljava/lang/Object;JLjava/lang/Object;Ljava/lang/Object;)Ljava/lang/Object;",
+        cax_r,
+    );
+    r.add(u, "getAndAddInt", "(Ljava/lang/Object;JI)I", add_i);
+    r.add(u, "getAndAddLong", "(Ljava/lang/Object;JJ)J", add_l);
+    r.add(u, "getAndSetInt", "(Ljava/lang/Object;JI)I", set_i);
+    r.add(u, "getAndSetLong", "(Ljava/lang/Object;JJ)J", set_l);
+    r.add(
+        u,
+        "getAndSetReference",
+        "(Ljava/lang/Object;JLjava/lang/Object;)Ljava/lang/Object;",
+        set_r,
+    );
 }
 
 /// 合成一个「系统类加载器」对象。

@@ -6,6 +6,7 @@
 //!
 //! 符号表本体在 `symbols`，本模块只做导出。
 
+pub mod capture;
 pub mod enums;
 pub mod erase;
 pub mod generic;
@@ -14,6 +15,7 @@ pub mod qualify;
 pub mod resolve;
 pub mod symbols;
 
+pub use capture::capture_unit;
 pub use enums::desugar_unit;
 pub use erase::erase_unit;
 pub use nested::flatten_unit;

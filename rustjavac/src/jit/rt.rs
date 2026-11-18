@@ -595,6 +595,32 @@ pub fn print_uncaught(obj: i64) -> ! {
 
 // ---------- 打印 ----------
 
+/// 一个值按 Java 的规则格式化成文本（`print` / `println` 共用一套取值规则）
+fn fmt_val(kind: u32, raw: i64) -> String {
+    match kind as u8 {
+        K_INT => (raw as i32).to_string(),
+        K_BOOL => (if raw as i32 != 0 { "true" } else { "false" }).to_string(),
+        K_CHAR => char::from_u32(raw as u32).unwrap_or('?').to_string(),
+        K_LONG => raw.to_string(),
+        K_FLOAT => crate::java_float_to_string(f32::from_bits(raw as u32)),
+        K_DOUBLE => crate::java_double_to_string(f64::from_bits(raw as u64)),
+        _ => super::natives::obj_to_string(raw),
+    }
+}
+
+/// `System.out.print(x)`：与 `println` 同一套取值规则，只是不追加换行。
+///
+/// 参数走「类型标签 + i64 位模式」而不是给每种类型一个符号：`print` 的重载
+/// 比 `println` 还多（`print(char[])` 除外），一个桩就够。
+pub extern "C" fn out_val(kind: u32, raw: i64) {
+    print!("{}", fmt_val(kind, raw));
+}
+
+/// `System.out.println()`：只换行（没有参数，别去弹栈上的「参数」）
+pub extern "C" fn out_nl() {
+    println!();
+}
+
 /// 打印一个 int（对应 System.out.println(int)）
 pub extern "C" fn println_int(v: i32) {
     println!("{v}");

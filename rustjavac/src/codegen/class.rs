@@ -436,6 +436,14 @@ pub(crate) fn compile_type(
                 }
             }
         }
+        // 匿名类 `new Callable<Long>(){ public Long call() … }` 的基类型写在 `extends`
+        // 上、上面挪进了 `interfaces[]` —— 桥接方法也必须看它，否则 `FutureTask` 按擦除
+        // 后的 `()Ljava/lang/Object;` 找不到方法，运行期 AbstractMethodError
+        for n in extra_ifaces.iter() {
+            if !parents.contains(n) {
+                parents.push(n.clone());
+            }
+        }
         let mut bridges: Vec<(String, String, String)> = Vec::new(); // (名字, 桥描述符, 目标描述符)
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         for m in &t.members {
@@ -823,6 +831,11 @@ fn compile_ctor_body(
                 post.push(it);
             }
         }
+        // 构造器体是**单条语句**时也要认 super(...)：匿名类（`Outer$AnonN`）的构造器
+        // 就是解析阶段合成的 `super(args)` 一条语句，不认它就会把它排到字段初始化式
+        // 之后 —— 而捕获字段（`val$k`）恰恰是**字段初始化式**，于是 `int v = k * 2`
+        // 编成「super() 之前 getfield uninitializedThis」，运行期 VerifyError
+        other if is_super_call_stmt(other) => pre.push(other),
         other => post.push(other),
     }
     // 前置部分（显式 super(...)）

@@ -15,7 +15,7 @@ Windows 下等价：`pwsh -File packaging\build.ps1`。
 
 | 文件 | 说明 |
 |---|---|
-| `vmless-<ver>-win-x64.zip` | 便携包：`bin\{rustjava,compile_src,run_jit}.exe` + `README.txt` + `LICENSE`，解压即用 |
+| `vmless-<ver>-win-x64.zip` | 便携包：`bin\` 下 **3 个运行时 + 32 个 JDK 工具**（见下节）+ `README.txt` + `LICENSE`，解压即用 |
 | `vmless-<ver>-setup.exe` | NSIS 安装包：装到 `%LOCALAPPDATA%\vmless`，可选加入用户 PATH，写卸载项，带 `uninstall.exe` |
 | `SHA256SUMS` | 上面两个文件的 sha256（`hash  文件名`，两空格，与 `sha256sum -c` 同格式） |
 | `release-notes.md` | Release 正文：从 `CHANGELOG.md` 抽版本对应小节 |
@@ -39,6 +39,28 @@ Windows 下等价：`pwsh -File packaging\build.ps1`。
 - 卸载：`uninstall.exe`，清文件、清 `HKCU\Software\vmless`、清卸载项、删 PATH 条目
 - 静默安装：`vmless-<ver>-setup.exe /S`（PATH 组件按默认勾选状态处理）
 
+## 工具集（bin/ 里另外 32 个 exe）
+
+工具的真身分布在 **6 个 crate** 里，`build.ps1` 的 `$ToolMap` 按 `(crate, bin)` 逐个列出：
+
+| crate | 工具 |
+|---|---|
+| `jdk-tools` | `jimage` `jmod` `jlink` `javadoc` `jdb` `jshell` `jrunscript` `jwebserver` `jpackage` `jdeprscan` `jnativescan` `serialver` `rmiregistry` `javaw` `jps` |
+| `jdk-attach` | `jcmd` `jinfo` `jmap` `jstack` `jstat` `jstatd` |
+| `jdk-crypto` | `jarsigner` `keytool` `ktab` |
+| `jdk-krb` | `kinit` `klist` |
+| `jdk-jfr` | `jfr` `jhsdb` |
+| `jdk-gui` | `jabswitch` `jaccessinspector` `jaccesswalker` `jconsole` |
+
+两条必须守住：
+
+- **不要按目录 glob 收集 exe**。`target/release/` 里会留着已经删掉源文件的旧产物
+  —— 2026-11-19 之前 `jdk-tools/src/bin` 下有 17 个「打印一句『本 crate 不提供该工具』然后
+  `exit 1`」的桩，正好把 `jstack`/`keytool`/`jfr` 这些真身挡在后面；glob 会把桩打进去，
+  那种包能装、能跑，但一敲就是退出码 1，极难查。
+- **`vmless.nsi` 用 `File "${STAGE}\bin\*.exe"` 通配**，不再硬编码清单：清单只维护
+  `build.ps1` 的 `$ToolMap` 一处，否则两份清单迟早不一致（以前就是只装了 3 个 exe）。
+
 ## 注意
 
 - **`LICENSE` 目前是占位文本**（`packaging/LICENSE.placeholder`）。分发包必须有 LICENSE，
@@ -48,6 +70,20 @@ Windows 下等价：`pwsh -File packaging\build.ps1`。
 - 打出来的 exe 没有代码签名，SmartScreen 会拦一下（「更多信息 → 仍要运行」）。
 
 ## 实测记录
+
+### 2026-11-19（工具集进包的这一次）
+
+`bash packaging/build.sh -SkipBuild -SkipInstaller`（本机没有 makensis，安装包这步没跑）：
+
+```
+vmless-0.70.0-win-x64.zip  12.31 MB   （37 个条目 / 解压后 28,121,411 B）
+```
+
+`bin\` 里是 3 个运行时 + 32 个工具，逐个核对过体积：最大的 `jdb.exe` 4,597,248、
+最小的 `jabswitch.exe` 129,024，**没有任何一个是 922,112 B**（那是删桩前 17 个桩的字节数，
+现在一个都不在包里）。`unzip -l` 的完整清单见提交信息。
+
+### 2026-11-17（第一版，只有 3 个运行时）
 
 2026-11-17，本机（Windows + Rust 1.100 + NSIS 3.10 解压版）实际跑出来的一次：
 

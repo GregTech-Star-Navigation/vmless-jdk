@@ -237,7 +237,14 @@ impl ClassPath {
                 }
             }
         }
-        self.cache.borrow_mut().insert(class.to_string(), got.clone());
+        // **只缓存未命中**。命中的字节一旦被 `crate::parse` 吃掉就没用了，把它留在
+        // 缓存里等于把整个 java.base 的原始字节再存一份（实测 5421 个类的闭包
+        // = 20.5 MB，而 hello 的峰值只有 116 MB —— 这一项就占了 1/6）。
+        // 重复 `find` 同一个类的路径几乎不存在（调用方都先 `has_class` 挡一道），
+        // 真重读一次盘也比常驻 20 MB 划算。
+        if got.is_none() {
+            self.cache.borrow_mut().insert(class.to_string(), None);
+        }
         Ok(got)
     }
 

@@ -5,3 +5,6 @@ edition = "2021"
 
 [dependencies]
 classfile = { path = "../rustjavac", package = "rustjavac" }
+# `jps` 要读 hsperfdata（挂了 attach 服务端的 VM 写出来的 HotSpot v2.0 计数器文件），
+# 那一层格式解析在 vmless-attach 里，不重复实现一份。它是零外部依赖的纯 Rust crate。
+vmless-attach = { path = "../jdk-attach" }

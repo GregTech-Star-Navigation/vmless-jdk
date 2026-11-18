@@ -18,6 +18,7 @@ mod classes;
 mod divmod;
 mod exc;
 mod indy;
+mod lambda;
 mod inline;
 mod insn;
 mod pure;
@@ -97,6 +98,8 @@ impl Jit {
         builder.symbol("vmless_str_const", strtab::str_const as *const u8);
         builder.symbol("vmless_str_equals", strtab::str_equals as *const u8);
         builder.symbol("vmless_println_obj", strtab::println_str as *const u8);
+        builder.symbol("vmless_out_val", rt::out_val as *const u8);
+        builder.symbol("vmless_out_nl", rt::out_nl as *const u8);
         builder.symbol("vmless_drem", rt::drem as *const u8);
         builder.symbol("vmless_frem", rt::frem as *const u8);
         builder.symbol("vmless_exc_throw", rt::exc_throw as *const u8);

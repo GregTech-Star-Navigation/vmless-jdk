@@ -39,17 +39,42 @@ fn dir_listing(dir: &Path) -> Option<Rc<HashSet<String>>> {
     v
 }
 
+/// jar/zip 里的条目名集合（进程级缓存，理由同 `dir_listing`：一个 jar 只读一次中央目录）。
+///
+/// `Rc` 而不是 `Arc`：编译是单线程的（`dir_listing` 同样用 `Rc`）。
+fn jar_listing(jar: &Path) -> Option<Rc<HashSet<String>>> {
+    thread_local! {
+        static C: RefCell<HashMap<PathBuf, Option<Rc<HashSet<String>>>>> = RefCell::new(HashMap::new());
+    }
+    if let Some(hit) = C.with(|c| c.borrow().get(jar).cloned()) {
+        return hit;
+    }
+    let v = crate::load::jar::JarSource::open(jar)
+        .ok()
+        .map(|z| Rc::new(z.names().into_iter().collect::<HashSet<String>>()));
+    C.with(|c| c.borrow_mut().insert(jar.to_path_buf(), v.clone()));
+    v
+}
+
 /// classpath 上有没有 `rel` 这个 `.class` —— 文件名按**大小写敏感**比较。
 ///
 /// Windows 的文件系统不区分大小写，直接用 `is_file()` 会把表达式里的变量名当成类名：
 /// `key` 命中 `java/security/Key.class`、`cipher` 命中 `javax/crypto/Cipher.class`。
 /// java.base 上这就是「未定义的变量」那一大桶的根因。
+///
+/// **jar 与目录等价**：classpath 条目是文件就是 jar/zip，条目名本身就是
+/// `p/A.class` 这种相对路径，直接按整串比对（不能拆成「目录 + 文件名」——
+/// jar 里没有「目录」这个东西）。少了这条，`import p.*;` 从 jar 里解析不出来，
+/// 于是「用 jar 当 classpath 就必须写全限定名」。
 fn class_file_exists(dirs: &[PathBuf], rel: &str) -> bool {
     let (parent, file) = match rel.rsplit_once('/') {
         Some((p, f)) => (p, f),
         None => ("", rel),
     };
     dirs.iter().any(|d| {
+        if d.is_file() {
+            return jar_listing(d).is_some_and(|set| set.contains(rel));
+        }
         let dir = if parent.is_empty() { d.clone() } else { d.join(parent) };
         match dir_listing(&dir) {
             Some(set) => set.contains(file),

@@ -65,6 +65,11 @@ fn parse_args(argv: &[String]) -> Result<Args> {
         match arg.as_str() {
             "-keystore" => a.keystore = next("-keystore")?,
             "-storepass" => a.storepass = Some(next("-storepass")?),
+            // PKCS12 的私钥口令与库口令必须相同，所以只吃掉参数、不另存 —— 但**必须吃掉**：
+            // 帮助里写了这个选项，不认就等于文档在骗人（真 jarsigner 的脚本都会带它）。
+            "-keypass" => {
+                let _ = next("-keypass")?;
+            }
             "-storetype" => a.storetype = next("-storetype")?,
             "-sigfile" => a.sigfile = Some(next("-sigfile")?),
             "-signedjar" => a.signedjar = Some(next("-signedjar")?),

@@ -98,6 +98,49 @@ $exes = @(
     @{ Name = 'compile_src.exe'; Path = Join-Path $ExamplesDir 'compile_src.exe' },
     @{ Name = 'run_jit.exe'; Path = Join-Path $ExamplesDir 'run_jit.exe' }
 )
+
+# ---------------------------------------------------------------- JDK 工具集
+# 工具的真身分布在 6 个 crate 里。**不能只打 jdk-tools**：除它自己的 15 个之外，
+# 其余 17 个名字的实现都在兄弟 crate 里 —— 它们在 jdk-tools/src/bin 下曾经是
+# 「打印一句『本 crate 不提供该工具』然后 exit 1」的桩，把真身整个挡住了（桩已删除）。
+#
+# 这里按 (crate, bin) 精确列出，**不按目录 glob**：残留的旧 exe（比如删桩之前的
+# 桩产物）会躺在 target/release 里被悄悄打进包，那种包"能装上、跑起来却是一句退出码 1"，
+# 是最难查的一类事故。
+$ToolMap = @(
+    @{ Crate = 'jdk-tools';  Bins = @('jimage', 'jmod', 'jlink', 'javadoc', 'jdb', 'jshell', 'jrunscript', 'jwebserver', 'jpackage', 'jdeprscan', 'jnativescan', 'serialver', 'rmiregistry', 'javaw', 'jps') },
+    @{ Crate = 'jdk-attach'; Bins = @('jcmd', 'jinfo', 'jmap', 'jstack', 'jstat', 'jstatd') },
+    @{ Crate = 'jdk-crypto'; Bins = @('jarsigner', 'keytool', 'ktab') },
+    @{ Crate = 'jdk-krb';    Bins = @('kinit', 'klist') },
+    @{ Crate = 'jdk-jfr';    Bins = @('jfr', 'jhsdb') },
+    @{ Crate = 'jdk-gui';    Bins = @('jabswitch', 'jaccessinspector', 'jaccesswalker', 'jconsole') }
+)
+
+if (-not $SkipBuild) {
+    foreach ($c in $ToolMap) {
+        Write-Step "cargo build --release（$($c.Crate)：$($c.Bins.Count) 个工具）"
+        $prevTarget = $env:CARGO_TARGET_DIR
+        # 每个 crate 用自己的 target：这几个 crate 不是同一个 workspace，共用一个目录
+        # 只会让并行构建互相等锁，还容易和别的活儿撞名。
+        $env:CARGO_TARGET_DIR = Join-Path $RepoRoot ("{0}\target" -f $c.Crate)
+        Push-Location (Join-Path $RepoRoot $c.Crate)
+        try {
+            & cargo build --release --bins
+            if ($LASTEXITCODE -ne 0) { throw "cargo build --bins（$($c.Crate)）失败（exit $LASTEXITCODE）" }
+        }
+        finally {
+            Pop-Location
+            $env:CARGO_TARGET_DIR = $prevTarget
+        }
+    }
+}
+
+foreach ($c in $ToolMap) {
+    foreach ($b in $c.Bins) {
+        $exes += @{ Name = "$b.exe"; Path = (Join-Path $RepoRoot ("{0}\target\release\{1}.exe" -f $c.Crate, $b)) }
+    }
+}
+
 foreach ($e in $exes) {
     if (-not (Test-Path $e.Path)) { throw "缺少 $($e.Path) —— 去掉 -SkipBuild 重新编译" }
 }

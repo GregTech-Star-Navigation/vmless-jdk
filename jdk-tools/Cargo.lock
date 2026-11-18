@@ -301,7 +301,7 @@ checksum = "6b1e7f9a428571be2dc5bc0505c13fb6bf936822b894ec87abf8a08a4e51742d"
 
 [[package]]
 name = "rustjavac"
-version = "0.67.0"
+version = "0.70.0"
 dependencies = [
  "cranelift-codegen",
  "cranelift-frontend",
@@ -376,10 +376,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "a2c754d6c33795a1c324727428e5a7dedb5b06195f9890bdbcba760d3e246563"
 
 [[package]]
+name = "vmless-attach"
+version = "0.1.0"
+
+[[package]]
 name = "vmless-tools"
 version = "0.1.0"
 dependencies = [
  "rustjavac",
+ "vmless-attach",
 ]
 
 [[package]]

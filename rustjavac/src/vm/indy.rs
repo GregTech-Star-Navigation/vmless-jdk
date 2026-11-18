@@ -1427,6 +1427,9 @@ impl Vm {
             };
             let coord = 2usize; // (数组, 下标) 之后才是值
             let params = param_descs(desc);
+            // 读-改-写必须**整体原子**（与 `Unsafe` 的 CAS 同一个根，走同一套分桶锁）：
+            // 键是 (数组句柄, 下标)，同一格永远同一把锁，不同元素基本不冲突。
+            let lock = |arr: i32, idx: i32| super::native_reg::rmw_guard(arr, idx as i64);
             return Ok(Some(match name {
                 "get" | "getVolatile" | "getAcquire" | "getOpaque" | "getPlain" => {
                     let v = read(self)?;
@@ -1438,16 +1441,19 @@ impl Vm {
                     write(self, v)?;
                     Slot::I(0)
                 }
-                "getAndSet" => {
+                "getAndSet" | "getAndSetAcquire" | "getAndSetRelease" => {
+                    let _g = lock(arr, idx);
                     let old = read(self)?;
                     let v = args[coord];
                     let v = self.coerce(v, &params[coord], &fdesc, name)?;
                     write(self, v)?;
                     self.coerce(old, &fdesc, &ret_desc(desc), name)?
                 }
-                "compareAndSet" | "weakCompareAndSet" => {
+                "compareAndSet" | "weakCompareAndSet" | "weakCompareAndSetPlain"
+                | "weakCompareAndSetAcquire" | "weakCompareAndSetRelease" => {
                     let expected = self.coerce(args[coord], &params[coord], &fdesc, name)?;
                     let newv = self.coerce(args[coord + 1], &params[coord + 1], &fdesc, name)?;
+                    let _g = lock(arr, idx);
                     let old = read(self)?;
                     let same = old == expected;
                     if same {
@@ -1455,14 +1461,37 @@ impl Vm {
                     }
                     Slot::I(if same { 1 } else { 0 })
                 }
-                "compareAndExchange" => {
+                "compareAndExchange" | "compareAndExchangeAcquire" | "compareAndExchangeRelease" => {
                     let expected = self.coerce(args[coord], &params[coord], &fdesc, name)?;
                     let newv = self.coerce(args[coord + 1], &params[coord + 1], &fdesc, name)?;
+                    let _g = lock(arr, idx);
                     let old = read(self)?;
                     if old == expected {
                         write(self, newv)?;
                     }
                     old
+                }
+                // `AtomicIntegerArray.incrementAndGet` 就是走这条
+                // （`getAndAdd(i, 1)` → `VarHandle.getAndAdd([III)I`）：数组形态少了它，
+                // 所有 `×Array` 原子类一调用就 `BootstrapMethodError`、线程直接死。
+                "getAndAdd" | "getAndAddAcquire" | "getAndAddRelease" | "getAndIncrement"
+                | "getAndDecrement" => {
+                    let _g = lock(arr, idx);
+                    let old = read(self)?;
+                    let delta = match name {
+                        "getAndIncrement" => Slot::I(1),
+                        "getAndDecrement" => Slot::I(-1),
+                        _ => self.coerce(args[coord], &params[coord], &fdesc, name)?,
+                    };
+                    // 宽度跟着元素类型走：`int[]` 按 32 位加、`long[]` 按 64 位加
+                    let sum = match fdesc.as_str() {
+                        "J" => Slot::L(old.as_i64().wrapping_add(delta.as_i64())),
+                        "D" => Slot::F(old.as_f64() + delta.as_f64()),
+                        "F" => Slot::Fl(old.as_f32() + delta.as_f32()),
+                        _ => Slot::I(old.as_i32().wrapping_add(delta.as_i32())),
+                    };
+                    write(self, sum)?;
+                    self.coerce(old, &fdesc, &ret_desc(desc), name)?
                 }
                 other => {
                     return Err(self.bsm_error(format!(

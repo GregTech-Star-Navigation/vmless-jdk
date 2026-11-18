@@ -1,6 +1,6 @@
 ; vmless 安装包（NSIS 3.x）
 ; 由 packaging/build.ps1 调用，三个必需的定义：
-;   /DSTAGE=<暂存目录>   含 bin\{rustjava,compile_src,run_jit}.exe + README.txt + LICENSE
+;   /DSTAGE=<暂存目录>   含 bin\*.exe（运行时 + 工具集）+ README.txt + LICENSE
 ;   /DVERSION=<版本号>
 ;   /DOUTFILE=<输出 exe 路径>
 ; 手动构建：makensis /INPUTCHARSET UTF8 /DSTAGE=..\dist\stage /DVERSION=0.1.0 /DOUTFILE=..\dist\vmless-0.1.0-setup.exe vmless.nsi
@@ -63,9 +63,9 @@ Section "运行时（必需）" SEC_CORE
     SectionIn RO
     SetOutPath "$INSTDIR"
     SetOutPath "$INSTDIR\bin"
-    File "${STAGE}\bin\rustjava.exe"
-    File "${STAGE}\bin\compile_src.exe"
-    File "${STAGE}\bin\run_jit.exe"
+    ; 通配：包里到底有哪些 exe 由 build.ps1 的 $exes 决定。这里再硬编码一份清单
+    ; 迟早会和它不一致 —— 以前就是只装了 3 个，工具集的 32 个 exe 装了包也看不到。
+    File "${STAGE}\bin\*.exe"
     SetOutPath "$INSTDIR"
     File "${STAGE}\README.txt"
     File "${STAGE}\LICENSE"
@@ -89,7 +89,7 @@ Section "把 bin 加入当前用户 PATH" SEC_PATH
 SectionEnd
 
 !insertmacro MUI_FUNCTION_DESCRIPTION_BEGIN
-!insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "rustjava / compile_src / run_jit 三个可执行文件，不能取消。"
+!insertmacro MUI_DESCRIPTION_TEXT ${SEC_CORE} "运行时（rustjava / compile_src / run_jit）与 JDK 工具集（32 个 exe），不能取消。"
 !insertmacro MUI_DESCRIPTION_TEXT ${SEC_PATH} "勾选后在任意目录可直接敲 rustjava；卸载时会一并移除。"
 !insertmacro MUI_FUNCTION_DESCRIPTION_END
 
@@ -115,9 +115,7 @@ FunctionEnd
 Section "Uninstall"
     SetShellVarContext current
 
-    Delete "$INSTDIR\bin\rustjava.exe"
-    Delete "$INSTDIR\bin\compile_src.exe"
-    Delete "$INSTDIR\bin\run_jit.exe"
+    Delete "$INSTDIR\bin\*.exe"
     RMDir "$INSTDIR\bin"
     Delete "$INSTDIR\README.txt"
     Delete "$INSTDIR\LICENSE"

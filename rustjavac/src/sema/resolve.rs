@@ -608,8 +608,7 @@ impl Resolver {
     }
 
     fn load_from_disk(&self, class: &str) -> Option<Own> {
-        let path = self.find_class_file(class)?;
-        let bytes = std::fs::read(&path).ok()?;
+        let bytes = self.find_class_bytes(class)?;
         self.own_from_bytes(&bytes)
     }
 
@@ -644,8 +643,13 @@ impl Resolver {
             }
         }
         let mut files: Vec<PathBuf> = Vec::new();
+        let mut jars: Vec<&PathBuf> = Vec::new();
         for d in &self.dirs {
-            collect_class_files(d, 0, &mut files);
+            if is_archive(d) {
+                jars.push(d);
+            } else {
+                collect_class_files(d, 0, &mut files);
+            }
         }
         let mut loaded: HashMap<String, Own> = HashMap::with_capacity(files.len());
         let mut mine: HashSet<String> = self.own.borrow().keys().cloned().collect();
@@ -661,6 +665,28 @@ impl Resolver {
             }
             let Some(o) = self.own_from_bytes(&bytes) else { continue };
             loaded.insert(name, o);
+        }
+        // classpath 上的 jar/zip 与目录等价：条目名去掉 `.class` 就是内部类名
+        // （`p/A.class` → `p/A`）。不解析字节码判类名 —— 字节反正要反解成 `Own`，
+        // 但 `this_class` 和条目名不一致的 jar 是坏 jar，按条目名走与 JVM 一致。
+        for j in jars {
+            let jar = match crate::load::jar::JarSource::open(j) {
+                Ok(z) => z,
+                // 静默跳过会让「classpath 里给了个坏文件」表现成「找不到类」，太难查
+                Err(e) => {
+                    eprintln!("classpath 条目不是 zip/jar，已跳过：{}", e);
+                    continue;
+                }
+            };
+            for entry in jar.names() {
+                let Some(name) = jar_entry_class(&entry) else { continue };
+                if mine.contains(&name) || loaded.contains_key(&name) {
+                    continue;
+                }
+                let Ok(Some(bytes)) = jar.find(&entry) else { continue };
+                let Some(o) = self.own_from_bytes(&bytes) else { continue };
+                loaded.insert(name, o);
+            }
         }
         let m = std::sync::Arc::new(loaded);
         *self.plat.borrow_mut() = Some(m.clone());
@@ -784,29 +810,29 @@ impl Resolver {
         })
     }
 
-    fn find_class_file(&self, class: &str) -> Option<PathBuf> {
+    /// 按内部类名在 classpath 里取 `.class` 的字节：目录里的文件，或 jar/zip 里的条目。
+    ///
+    /// 两者走同一条候选名序列（`p/A` → `p/A.class` / `p_A.class`，嵌套类型再按 `$`
+    /// 拼回去试），只是「取」的方式不同 —— classpath 上 jar 和目录必须等价，
+    /// 否则「能 `new p.A()` 但调不了它的方法」这种半通状态会一直存在（本函数的前身
+    /// `find_class_file` 只认目录，jar 里的类永远 `找不到类`）。
+    fn find_class_bytes(&self, class: &str) -> Option<Vec<u8>> {
         if self.missing.borrow().contains(class) {
             return None;
         }
         // compile_src 把包名的 `/` 换成 `_` 写盘，两种命名都试
-        let flat = class.replace('/', "_");
-        for d in &self.dirs {
-            for f in [format!("{class}.class"), format!("{flat}.class")] {
-                let p = d.join(f);
-                if p.is_file() {
-                    return Some(p);
-                }
-            }
-        }
+        let mut groups: Vec<Vec<String>> = vec![class_file_names(class)];
         // 嵌套类型被写成 `a/b/Outer/Inner`（`qualify` 把 import 的点全换成 `/`）：
         // 磁盘上叫 `Outer$Inner`，按 `$` 拼回去再试一次
         for cand in nested_dollar_forms(class) {
-            let flat = cand.replace('/', "_");
+            groups.push(class_file_names(&cand));
+        }
+        for group in groups {
+            // 目录优先级：同一个名字先在靠前的 classpath 条目里找
             for d in &self.dirs {
-                for f in [format!("{cand}.class"), format!("{flat}.class")] {
-                    let p = d.join(f);
-                    if p.is_file() {
-                        return Some(p);
+                for name in &group {
+                    if let Some(b) = read_classpath_entry(d, name) {
+                        return Some(b);
                     }
                 }
             }
@@ -814,6 +840,38 @@ impl Resolver {
         self.missing.borrow_mut().insert(class.to_string());
         None
     }
+}
+
+/// `p/A` 在 classpath 上可能叫的两种文件名（含 `flat` 形态）
+fn class_file_names(class: &str) -> Vec<String> {
+    let flat = class.replace('/', "_");
+    if flat == class {
+        vec![format!("{class}.class")]
+    } else {
+        vec![format!("{class}.class"), format!("{flat}.class")]
+    }
+}
+
+/// 一个 classpath 条目上的类：目录 → 文件；jar/zip → 同名条目。
+fn read_classpath_entry(entry: &std::path::Path, rel: &str) -> Option<Vec<u8>> {
+    if !is_archive(entry) {
+        let p = entry.join(rel);
+        return if p.is_file() { std::fs::read(&p).ok() } else { None };
+    }
+    let jar = crate::load::jar::JarSource::open(entry).ok()?;
+    jar.find(rel).ok().flatten()
+}
+
+/// classpath 条目是 jar/zip 吗？**按「是不是文件」判断，不看扩展名** ——
+/// JDK 自己的 `-cp` 也不看扩展名（`lib/modules` 反而是 jimage，不是 zip）。
+/// 目录一律走目录那条路。
+fn is_archive(entry: &std::path::Path) -> bool {
+    entry.is_file()
+}
+
+/// jar 里的条目名 → 内部类名（去掉 `.class` 后缀）
+fn jar_entry_class(entry: &str) -> Option<String> {
+    entry.strip_suffix(".class").map(|s| s.to_string())
 }
 
 /// 进程级平台类缓存：classpath 列表 → 反解好的元数据。批量编译 3000 个文件时

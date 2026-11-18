@@ -51,7 +51,11 @@ pub fn compile_with_path(
 ) -> Result<Vec<(String, Vec<u8>)>, CompileError> {
     // 嵌套类型先拍平成顶层类型（`Outer.Inner` → `Outer$Inner`）：必须在枚举降级之前，
     // 这样嵌套枚举走的是同一条「静态常量 + values/valueOf」的路径
-    let cu = &crate::sema::flatten_unit(cu);
+    // 匿名类的局部变量捕获（`val$x` 合成字段 + 构造器多传实参）：必须在拍平之后做 ——
+    // 拍平之后合成类 `Outer$AnonN` 才是顶层类型，创建点才认得它
+    let mut flat = crate::sema::flatten_unit(cu);
+    crate::sema::capture_unit(&mut flat).map_err(|msg| CompileError { msg })?;
+    let cu = &flat;
     // 泛型擦除：`Box<T>` 的字段/参数/返回值描述符用上界（默认 Object），
     // 之后的阶段（符号表、codegen、解释器、JIT）都不必认识类型参数
     let cu = &crate::sema::erase_unit(cu);

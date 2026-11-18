@@ -17,17 +17,48 @@ use crate::{ClassFile, CpEntry};
 pub enum Site {
     /// 字符串拼接：已登记的拼接计划编号 + 该站点参数描述符（按顺序）
     Concat { plan: u32, params: Vec<String> },
+    /// `LambdaMetafactory`：编译期就展开成「合成类实例 + 蹦床」（见 `jit::lambda`）
+    Lambda(LambdaSite),
+}
+
+/// 一个 lambda 调用点在编译期解析出来的全部材料（运行期不再解析）
+pub struct LambdaSite {
+    /// 站点编号（`类名 + 常量池下标` 唯一，**跨编译单元共享**）
+    pub id: u32,
+    /// 合成类名（`<实现类>$$lambda$<id>`）
+    pub class_name: String,
+    /// SAM 方法名（= invokedynamic 自己的名字）
+    pub sam_name: String,
+    /// SAM 方法描述符（引导方法第 1 个参数 `samMethodType`，已擦除）
+    pub sam_desc: String,
+    /// `instantiatedMethodType`（引导方法第 3 个参数：实际参数类型）
+    pub inst_desc: String,
+    /// 实现目标的 MethodHandle：种类 + `(类, 方法名, 描述符)`
+    pub impl_kind: u8,
+    pub impl_class: String,
+    pub impl_name: String,
+    pub impl_desc: String,
+    /// 站点自己的描述符：它的参数就是**捕获变量**（顺序 = 合成类字段顺序）
+    pub captured: Vec<String>,
 }
 
 /// 分类一个调用点。`Err` 里是**方法级回退原因**（JIT 不接这个引导方法）。
 pub fn classify(cf: &ClassFile, cp_index: u16) -> Result<Site, String> {
-    let (_name, desc, bsm_index) = site_of(cf, cp_index)?;
+    classify_in(cf, "", cp_index)
+}
+
+/// 同上，但带上**声明类名**（站点编号要按「类 + 常量池下标」唯一）
+pub fn classify_in(cf: &ClassFile, owner: &str, cp_index: u16) -> Result<Site, String> {
+    let (name, desc, bsm_index) = site_of(cf, cp_index)?;
     let table = crate::classfile::attr::bootstrap_methods(cf)
         .map_err(|e| format!("BootstrapMethods 属性解析失败: {e}"))?;
     let e = table
         .get(bsm_index as usize)
         .ok_or_else(|| format!("BootstrapMethods[{bsm_index}] 越界（共 {} 项）", table.len()))?;
     let (bcls, bname) = bsm_target(cf, e.method_ref)?;
+    if bcls == "java/lang/invoke/LambdaMetafactory" {
+        return lambda_site(cf, owner, cp_index, &name, &desc, &bname, e);
+    }
     let params = param_descs(&desc);
     if bcls != "java/lang/invoke/StringConcatFactory" {
         return Err(format!("引导方法 {bcls}.{bname} 不在 JIT 白名单里"));
@@ -57,6 +88,76 @@ pub fn classify(cf: &ClassFile, cp_index: u16) -> Result<Site, String> {
         plan: rt::register_concat(pieces),
         params,
     })
+}
+
+/// `LambdaMetafactory.{metafactory,altMetafactory}` 的静态材料。
+///
+/// 引导参数固定前三个：`(samMethodType, implMethod, instantiatedMethodType)`，
+/// `altMetafactory` 后面再跟 `flags` / 标记接口 / 桥方法 —— 那些 v1 不看
+/// （桥方法只是同一份实现在别的签名下再登记一次，没有也不影响正确性）。
+fn lambda_site(
+    cf: &ClassFile,
+    owner: &str,
+    cp_index: u16,
+    sam_name: &str,
+    site_desc: &str,
+    bname: &str,
+    e: &crate::classfile::attr::BootstrapMethod,
+) -> Result<Site, String> {
+    if bname != "metafactory" && bname != "altMetafactory" {
+        return Err(format!("LambdaMetafactory.{bname} 不在 JIT 白名单里"));
+    }
+    let sam_desc = method_type(cf, e.args.first().copied())?;
+    let (impl_kind, impl_class, impl_name, impl_desc) = impl_of(cf, e.args.get(1).copied())?;
+    let inst_desc = method_type(cf, e.args.get(2).copied())?;
+    let id = site_id(owner, cp_index);
+    Ok(Site::Lambda(LambdaSite {
+        id,
+        class_name: format!("{}$$lambda${id}", impl_class.replace('/', "_")),
+        sam_name: sam_name.to_string(),
+        sam_desc,
+        inst_desc,
+        impl_kind,
+        impl_class,
+        impl_name,
+        impl_desc,
+        captured: param_descs(site_desc),
+    }))
+}
+
+/// 「同一个类的同一个调用点只解析一次」——编号表是**进程级**的，
+/// 所以同一份代码被编译多次（多个 `Jit`、重编同一个方法）不会重复织类。
+static SITES: std::sync::Mutex<Vec<(String, u16)>> = std::sync::Mutex::new(Vec::new());
+
+fn site_id(owner: &str, cp_index: u16) -> u32 {
+    let mut g = SITES.lock().unwrap();
+    if let Some(i) = g.iter().position(|(c, p)| c == owner && *p == cp_index) {
+        return i as u32;
+    }
+    g.push((owner.to_string(), cp_index));
+    (g.len() - 1) as u32
+}
+
+/// 引导参数里的 `CONSTANT_MethodType` → 描述符字符串
+fn method_type(cf: &ClassFile, index: Option<u16>) -> Result<String, String> {
+    let index = index.ok_or_else(|| "lambda 引导方法参数不足（至少要 samMethodType/implMethod/instantiatedMethodType）".to_string())?;
+    match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::MethodType(d)) => Ok(
+            String::from_utf8_lossy(cf.utf8(*d).unwrap_or_default()).into_owned(),
+        ),
+        other => Err(format!("引导参数 #{index} 不是 MethodType: {other:?}")),
+    }
+}
+
+/// 引导参数里的实现目标 `CONSTANT_MethodHandle` → `(种类, 类, 名, 描述符)`
+fn impl_of(cf: &ClassFile, index: Option<u16>) -> Result<(u8, String, String, String), String> {
+    let index = index.ok_or_else(|| "lambda 引导方法没有 implMethod".to_string())?;
+    let (kind, refi) = match cf.constant_pool.get(index as usize).and_then(|e| e.as_ref()) {
+        Some(CpEntry::MethodHandle(k, i)) => (*k, *i),
+        other => return Err(format!("引导参数 #{index} 不是 MethodHandle: {other:?}")),
+    };
+    let (c, n, d) = crate::jit::call::method_ref_of(cf, refi).map_err(|e| e.0)?;
+    Ok((kind, c, n, d))
 }
 
 /// recipe → 拼接计划。`\u0001` 取下一个动态参数，`\u0002` 取下一个静态常量，其余是字面量。

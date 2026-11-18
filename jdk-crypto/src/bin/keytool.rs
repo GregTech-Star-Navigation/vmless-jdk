@@ -120,11 +120,45 @@ fn storepass(o: &Opts) -> String {
     line.trim().to_string()
 }
 
+/// 按文件头判断密钥库类型。只有 PKCS12 后端，所以这个函数存在的意义是**说出真话**：
+/// 拿一个 JKS 进来时，`P12::load` 只会吐一句「ASN.1 解析失败」，用户根本猜不到是格式不对。
+fn store_type_of(bytes: &[u8]) -> &'static str {
+    match bytes {
+        [0xFE, 0xED, 0xFE, 0xED, ..] => "JKS",
+        [0x30, 0x82, ..] | [0x30, 0x81, ..] => "PKCS12",
+        _ => "未知格式",
+    }
+}
+
+/// `-storetype` 只接受 PKCS12。
+///
+/// 为什么不"接受 JKS 但悄悄写 PKCS12"：那是**静默的错误输出** —— 脚本拿真 JKS 读会炸，
+/// 而炸点离这里很远。JKS 自己的私有 KeyProtector（基于 SHA-1 的 XOR 掩码）没有实现，
+/// 与其假装支持，不如当场说清。
+fn check_storetype(o: &Opts) -> Result<()> {
+    let t = o.storetype.trim().to_ascii_uppercase();
+    match t.as_str() {
+        "" | "PKCS12" | "PKCS#12" | "P12" => Ok(()),
+        "JKS" | "JCEKS" => Err(Error::new(format!(
+            "-storetype {t} 不受支持：本实现只有 PKCS12 后端（JKS/JCEKS 的私有 KeyProtector 未实现）。\
+             去掉 -storetype，或写 -storetype PKCS12。"
+        ))),
+        other => Err(Error::new(format!(
+            "-storetype {other} 不受支持：只支持 PKCS12"
+        ))),
+    }
+}
+
 fn load_store(o: &Opts) -> Result<(P12, String)> {
     let path = keystore_path(o);
     let pass = storepass(o);
     let bytes = std::fs::read(&path)
         .map_err(|e| Error::new(format!("密钥库文件不存在: {path} ({e})")))?;
+    if store_type_of(&bytes) == "JKS" {
+        return Err(Error::new(format!(
+            "{path} 是 JKS 密钥库（文件头 FE ED FE ED），本实现只能读 PKCS12"
+        )));
+    }
     Ok((P12::load(&bytes, &pass)?, pass))
 }
 
@@ -141,6 +175,16 @@ fn main() -> ExitCode {
             return ExitCode::from(1);
         }
     };
+    // 读写密钥库的命令才校验 -storetype（-version / -printcert 与密钥库无关）
+    match o.command.as_str() {
+        "list" | "genkeypair" | "genkey" | "exportcert" | "importcert" | "delete" => {
+            if let Err(e) = check_storetype(&o) {
+                eprintln!("keytool 错误: {e}");
+                return ExitCode::from(1);
+            }
+        }
+        _ => {}
+    }
     let result = match o.command.as_str() {
         "" | "help" | "h" => {
             print!("{USAGE}");
@@ -168,8 +212,12 @@ fn main() -> ExitCode {
 }
 
 fn cmd_list(o: &Opts) -> Result<()> {
+    // 类型按文件内容说，不回显 -storetype：那只是用户的请求，不是事实
+    let detected = std::fs::read(keystore_path(o))
+        .map(|b| store_type_of(&b))
+        .unwrap_or("未知格式");
     let (p12, _) = load_store(o)?;
-    println!("密钥库类型: {}", o.storetype.to_ascii_uppercase());
+    println!("密钥库类型: {detected}");
     println!("密钥库提供方: SUN");
     println!();
     if p12.entries.is_empty() {
