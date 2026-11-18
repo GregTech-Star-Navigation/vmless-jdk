@@ -325,14 +325,105 @@ impl Parser {
         }
         self.expect(&Tok::RBrace)?;
 
-        // record 的隐式字段
-        for p in record_params {
+        // record 的隐式成员：字段 + **同名访问器 + 规范构造器 + toString**
+        //
+        // 少了访问器，`p.x()` 报「未找到实例方法 x」；少了规范构造器，
+        // `new P(1,2)` 根本编不出来。三样都是语言规定的（JLS 8.10.3），
+        // 用户自己写了的同名方法不覆盖（自己的实现优先）。
+        let declared: Vec<String> = members
+            .iter()
+            .filter_map(|m| match m {
+                Member::Method(md) => Some(md.name.clone()),
+                _ => None,
+            })
+            .collect();
+        let ctor_params = record_params.clone();
+        for p in &record_params {
             members.push(Member::Field(FieldDecl {
                 modifiers: vec!["private".into(), "final".into()],
-                ty: p.ty,
-                name: p.name,
+                ty: p.ty.clone(),
+                name: p.name.clone(),
                 init: None,
             }));
+            // 访问器：`public int x() { return x; }`（名字与组件同名）
+            if !declared.contains(&p.name) {
+                members.push(Member::Method(MethodDecl {
+                    modifiers: vec!["public".into()],
+                    type_params: Vec::new(),
+                    ret: Some(p.ty.clone()),
+                    name: p.name.clone(),
+                    params: Vec::new(),
+                    throws: Vec::new(),
+                    body: Some(Stmt::Block(vec![Stmt::Return(Some(Expr::Ident(p.name.clone())))])),
+                }));
+            }
+        }
+        // 规范构造器：`P(int x, int y) { this.x = x; this.y = y; }`
+        if kind == TypeKind::Record && !declared.contains(&name) {
+            let body: Vec<Stmt> = ctor_params
+                .iter()
+                .map(|p| {
+                    Stmt::Expr(Expr::Assign {
+                        op: None,
+                        lhs: Box::new(Expr::Field(Box::new(Expr::This), p.name.clone())),
+                        rhs: Box::new(Expr::Ident(p.name.clone())),
+                    })
+                })
+                .collect();
+            members.push(Member::Method(MethodDecl {
+                modifiers: vec!["public".into()],
+                type_params: Vec::new(),
+                ret: None,
+                name: name.clone(),
+                params: ctor_params.clone(),
+                throws: Vec::new(),
+                body: Some(Stmt::Block(body)),
+            }));
+        }
+        // `toString()`：`"P[x=" + x + ", y=" + y + "]"`。record 的契约要求它按组件
+        // 打印；不生成就是 `Object.toString` 的 `P@1a2b`，语义上是错的。
+        if kind == TypeKind::Record && !declared.contains(&"toString".to_string()) {
+            let mut parts: Vec<Expr> = Vec::new();
+            if let [first, rest @ ..] = &ctor_params[..] {
+                let _ = first;
+                let mut e = Expr::StrLit(format!("{name}["));
+                for (i, c) in ctor_params.iter().enumerate() {
+                    if i > 0 {
+                        e = Expr::Binary {
+                            op: BinOp::Add,
+                            lhs: Box::new(e),
+                            rhs: Box::new(Expr::StrLit(", ".into())),
+                        };
+                    }
+                    e = Expr::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(e),
+                        rhs: Box::new(Expr::StrLit(format!("{}=", c.name))),
+                    };
+                    e = Expr::Binary {
+                        op: BinOp::Add,
+                        lhs: Box::new(e),
+                        rhs: Box::new(Expr::Ident(c.name.clone())),
+                    };
+                }
+                let _ = rest;
+                parts.push(Expr::Binary {
+                    op: BinOp::Add,
+                    lhs: Box::new(e),
+                    rhs: Box::new(Expr::StrLit("]".into())),
+                });
+            }
+            if let Some(expr) = parts.pop() {
+                members.push(Member::Method(MethodDecl {
+                    modifiers: vec!["public".into()],
+                    type_params: Vec::new(),
+                    ret: Some(Type::Named { path: vec!["String".into()], args: Vec::new() }),
+                    name: "toString".into(),
+                    params: Vec::new(),
+                    throws: Vec::new(),
+                    body: Some(Stmt::Block(vec![Stmt::Return(Some(expr))])),
+                }));
+            }
         }
 
         // 方法体里声明的局部类挂成这个类型的嵌套类型：`sema::flatten` 会把它们

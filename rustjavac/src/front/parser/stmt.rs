@@ -18,6 +18,11 @@ impl Parser {
     }
 
     pub(crate) fn parse_statement(&mut self) -> Result<Stmt, ParseError> {
+        // 多声明符语句（`int a = 1, b = 2;`）里排在后面的那几条：token 早就消费完了，
+        // 这里按序补发。**不能包成 Block**（见 `Parser::pending_stmts` 的注释）。
+        if !self.pending_stmts.is_empty() {
+            return Ok(self.pending_stmts.remove(0));
+        }
         if matches!(self.cur(), Tok::LBrace) {
             return self.parse_block();
         }
@@ -112,8 +117,19 @@ impl Parser {
         }
         if self.is_kw("synchronized") {
             self.advance();
-            self.skip_balanced(Tok::LParen, Tok::RParen)?;
-            return self.parse_block();
+            // 锁表达式**必须留下来**：`monitorexit` 要在正常路径和异常路径上各发一次，
+            // 两条路都得重新拿到同一个对象。以前这里是 `skip_balanced`，
+            // 于是整段 `synchronized` 被当成普通块编出去 —— 字节码里一条
+            // monitorenter/monitorexit 都没有，多线程数据静默丢失。
+            let lock = if self.eat(&Tok::LParen) {
+                let e = self.parse_expr()?;
+                self.expect(&Tok::RParen)?;
+                e
+            } else {
+                return Err(self.err("synchronized 后面缺少 (".into()));
+            };
+            let body = Box::new(self.parse_block()?);
+            return Ok(Stmt::Sync { lock, body });
         }
         if self.is_kw("assert") {
             self.advance();
@@ -141,7 +157,11 @@ impl Parser {
                 decls.push(Stmt::LocalVar { ty: ty.clone(), name: n2, init: i2 });
             }
             self.expect(&Tok::Semi)?;
-            return Ok(if decls.len() == 1 { decls.pop().unwrap() } else { Stmt::Block(decls) });
+            // 第一个当场返回，其余的排队补发 —— 它们在源码里与第一个**同一作用域**，
+            // 包成 Block 会让帧把槽退回 Top（多声明符的 `int[] a = …, b = …` 就编出过
+            // 非法 class：`aload_2` 的槽在帧里是 top）。
+            self.pending_stmts.extend(decls.drain(1..));
+            return Ok(decls.pop().unwrap());
         }
 
         let e = self.parse_expr()?;

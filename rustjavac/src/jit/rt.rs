@@ -346,43 +346,32 @@ pub extern "C" fn set_ref(obj: i64, idx: u32, val: i64) {
     with_heap(|h| h.set_ref(Handle(obj as u32), idx, Handle(val as u32)));
 }
 
-// ---------- 影子栈（根区）----------
+// ---------- 帧根区（指针式登记）----------
 //
 // JIT 每帧在**自己的栈帧**里留一块 `max_locals + max_stack` 个 u32 的根区：
-// 引用型局部变量只住在这里，操作数栈上的引用在 GC 点前也写进来。帧进入时整块
-// 登记进 `Heap` 的根表（拷贝），退出时收回并**把 GC 改写过的新偏移拷回根区**。
+// 引用型局部变量常驻这里，操作数栈上的引用在每个 GC 点前也写进来。
+//
+// **帧进入时只把这块内存的地址交给 GC（不拷贝值），退出时注销** —— GC 标记时
+// 按地址就地读、搬动后就地写回，所以调用点根本不用碰根表。旧的实现是把这块内存
+// **拷贝**进堆的根表，于是每个调用点都要 push/pop 一遍（实测 34.7ns/对，16M 次
+// 虚调用里占 83% 的时间）。
+//
+// 地址稳定的前提：根区是 Cranelift 的 `create_sized_stack_slot`，它落在帧内固定
+// 偏移上，从帧进入到 `ret` 不变。**绝不能换成 `Vec`** —— 那会在扩容时搬家，
+// 而 GC 手里只有一个旧地址。
 
-/// 把根区登记进堆的根表（帧入口 / 每次 GC 点）
+/// 登记本帧根区（帧入口一次）：把地址和槽数交给堆的根区表
 pub extern "C" fn roots_push(p: *mut u32, n: u32) {
-    with_heap(|h| {
-        let r = h.roots_handle();
-        let mut b = r.borrow_mut();
-        for i in 0..n as usize {
-            b.push(unsafe { *p.add(i) });
-        }
-    })
+    with_heap(|h| h.push_region(p, n));
 }
 
-/// 收回根表并把（可能被 GC 搬过的）偏移写回根区
+/// 注销本帧根区（帧的每一条退出路径都要走到）。
+///
+/// `n` 只为与 `roots_push` 对称而保留：注销只需要地址（并校验 LIFO）。
+/// 漏了这一步 = 堆里留下一根指向已经作废的栈帧的指针，下一轮 GC 会去读它。
 pub extern "C" fn roots_pop(p: *mut u32, n: u32) {
-    with_heap(|h| {
-        let r = h.roots_handle();
-        let mut b = r.borrow_mut();
-        let n = n as usize;
-        // 弹得比登记的多 = 生成的代码里 push/pop 不平衡：宁可直接报错，
-        // 也不能悄悄把常驻根（异常 / 字符串常量 / 静态引用字段）一起截掉
-        assert!(
-            b.len() >= n,
-            "roots_pop: 根表里只有 {} 项，却要弹出 {n} 项（影子栈 push/pop 不平衡）",
-            b.len()
-        );
-        let start = b.len() - n;
-        for i in 0..n {
-            let v = b[start + i];
-            unsafe { *p.add(i) = v };
-        }
-        b.truncate(start);
-    })
+    let _ = n;
+    with_heap(|h| h.pop_region(p));
 }
 
 // ---------- 类型判断 ----------

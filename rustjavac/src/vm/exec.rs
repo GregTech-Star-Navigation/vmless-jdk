@@ -120,6 +120,13 @@ impl Vm {
         args: &[Slot],
         receiver: bool,
     ) -> Result<Slot, VmError> {
+        // 方法级字节码校验（JVMS 4.10.1）：非法 class 必须**在跑任何一条指令之前**被拒，
+        // 这才是 HotSpot 的 VerifyError 语义。放在 `execute` 而不是 `execute_body`，
+        // 是为了连下面那条 JIT 快路也一起挡住 —— 否则非法方法被 JIT 编走了就没人验。
+        // 结论按 (ClassFile, 方法下标) 缓存，热路径上只剩一次线程本地缓存比对。
+        if let Err(why) = super::verify::ensure_verified(self, &self.store.classes[class], method) {
+            return Err(self.java_exception("java/lang/VerifyError", why));
+        }
         // 方法级回退的**反向**通道：这个方法在 JIT 那边已经编好了（纯数值、非实例），
         // 就直接调机器码。表是空的时侯这里只有一次借用 —— 全解释执行的路径不受影响。
         if !receiver {
@@ -1030,10 +1037,27 @@ impl Vm {
                     let target = class_name_of(&cf, idx)?;
                     let v = frame.pop_i()?;
                     if v != 0 && !self.is_instance(v, &target) {
+                        // 句柄已经失效（`hdr` 查不到）时 `type_name` 只会说 "null" ——
+                        // 那是**悬空句柄**（活对象被回收），不是真的 null。带上调用链和
+                        // 原始句柄值，两者一眼可分。
+                        let mut where_ = String::new();
+                        if self.sh.heap.hdr(v).is_none() {
+                            where_.push_str(&format!("（悬空句柄 h={v}，对象已被回收）"));
+                        }
+                        for fr in super::stacktrace::frames_current().iter().take(8) {
+                            where_.push_str(&format!(
+                                "\n\tat {}.{}({}:{})",
+                                fr.class.replace('/', "."),
+                                fr.method,
+                                fr.source.clone().unwrap_or_else(|| "?".into()),
+                                fr.line
+                            ));
+                        }
                         return err(format!(
-                            "ClassCastException: {} cannot be cast to {}",
+                            "ClassCastException: {} cannot be cast to {}{}",
                             self.type_name(v),
-                            target.replace('/', ".")
+                            target.replace('/', "."),
+                            where_
                         ));
                     }
                     frame.push(Slot::I(v));
@@ -1313,6 +1337,45 @@ impl Vm {
                             RefKind::Arr(_) => Some("java/lang/Object".to_string()),
                             RefKind::Null => None,
                         };
+                        // 打在 null 上的 invokevirtual/invokeinterface = **NullPointerException**
+                        // （JVMS 6.5）。以前这里直接掉进内建兜底：「内建方法 remove 未实现
+                        // （接收者 null）」—— 与事实无关、**还丢栈**，真正要查的
+                        // 「哪个字段本该非 null」完全看不见。
+                        // 只在引用类**真有字节码**时抛：独立模式下 `System.out` 之类就是
+                        // 句柄 0 的占位对象，那条老路（内建表）必须留着。
+                        if recv.as_i32() == 0 && self.store.has_class(&info.class) {
+                            // 消息里带**当前帧栈**（栈顶在前）：这条错误以前会被内建兜底吃掉，
+                            // 现在只剩「哪个字段是 null」，栈就是唯一定位依据。
+                            let mut where_ = String::new();
+                            for fr in super::stacktrace::frames_current().iter().take(8) {
+                                where_.push_str(&format!(
+                                    "\n\tat {}.{}({}:{})",
+                                    fr.class.replace('/', "."),
+                                    fr.method,
+                                    fr.source.clone().unwrap_or_else(|| "?".into()),
+                                    fr.line
+                                ));
+                            }
+                            let e = self.java_exception(
+                                "java/lang/NullPointerException",
+                                format!(
+                                    "Cannot invoke \"{}.{}{}\" because the receiver is null{}",
+                                    info.class.replace('/', "."),
+                                    info.name,
+                                    info.desc,
+                                    where_
+                                ),
+                            );
+                            match call_or_handle!(Err(e), op_pc) {
+                                CallOutcome::Value(_) => unreachable!("Err 不会给出值"),
+                                CallOutcome::Handler(t, h) => {
+                                    pc = t;
+                                    frame.stack.clear();
+                                    frame.push(Slot::I(h));
+                                    continue;
+                                }
+                            }
+                        }
                         let target = actual
                             .as_deref()
                             .and_then(|c| self.store.resolve_method(c, &info.name, &info.desc))
@@ -1334,9 +1397,24 @@ impl Vm {
                                 // 类字节码在的时候不会走到这里 —— resolve_method 会先命中。
                                 let builtin = self.builtin_virtual(&info.class, &info.name, &info.desc, recv.as_i32(), &all[1..]);
                                 match builtin {
-                                    Some(v) => {
-                                        frame.push(v?);
+                                    Some(Ok(v)) => {
+                                        frame.push(v);
                                         continue;
+                                    }
+                                    // 内建表自己报的错也补上**调用点**：只写「内建方法 remove 未实现」
+                                    // 时根本看不出是哪个类漏了加载（AWT 里一次就卡半天）。
+                                    Some(Err(e)) => {
+                                        return Err(VmError {
+                                            msg: format!(
+                                                "{}（调用点 {}.{}{}，接收者 {}）",
+                                                e.msg,
+                                                info.class,
+                                                info.name,
+                                                info.desc,
+                                                self.type_name(recv.as_i32())
+                                            ),
+                                            exc: e.exc,
+                                        })
                                     }
                                     None => {
                                         return Err(VmError {

@@ -70,9 +70,14 @@ pub(crate) fn needs_scratch(e: &Expr) -> bool {
             ) || needs_scratch(lhs)
                 || needs_scratch(rhs)
         }
+        // `!x`：先求 x 再 `ifne` 翻成 0/1 —— **它自己就带跳转**，必须单独算。
+        // 少了这条，`"deleted=" + !Files.exists(f)` 会在 builder 已经压栈的位置
+        // 撞上跳转点，报「比较结果作为表达式时，前面不能有未消费的操作数」。
+        Expr::Unary { op: UnOp::Not, .. } => true,
         Expr::Unary { expr, .. } => needs_scratch(expr),
         Expr::Cast { expr, .. } => needs_scratch(expr),
-        Expr::InstanceOf { expr, .. } => needs_scratch(expr),
+        // `x instanceof T` 同样落成「跳转 + 压 0/1」
+        Expr::InstanceOf { .. } => true,
         Expr::ArrayAccess { array, index } => needs_scratch(array) || needs_scratch(index),
         Expr::ArrayNew { dims, .. } => dims.iter().any(needs_scratch),
         Expr::ArrayInit(items) => items.iter().any(needs_scratch),
@@ -83,6 +88,8 @@ pub(crate) fn needs_scratch(e: &Expr) -> bool {
         }
         Expr::Assign { lhs, rhs, .. } => needs_scratch(lhs) || needs_scratch(rhs),
         Expr::Cond { .. } => true,
+        // switch 表达式内部有跳转表
+        Expr::SwitchExpr(_) => true,
         _ => false,
     }
 }
@@ -377,11 +384,22 @@ pub(crate) fn emit_val(
 }
 
 /// 实参的静态类型看着就是那个数组（`m(new String[]{"a"})` 不该再包一层）
+pub(crate) fn arg_looks_like_array_pub(a: &Expr, param_desc: &str, ctx: &Ctx) -> bool { arg_looks_like_array(a, param_desc, ctx) }
+
 fn arg_looks_like_array(a: &Expr, param_desc: &str, ctx: &Ctx) -> bool {
     match expr_type(a, ctx) {
         Some(t) => {
             let d = descriptor(&t);
-            d == param_desc || d == "Ljava/lang/Object;"
+            // 两边都是数组 → 传的就是整个数组，别再拿它当单个元素打包。
+            //
+            // 只比描述符会让 `Arrays.asList(stringArray)` 编成「一个 String[] 的
+            // 单元素列表」（`[Ljava/lang/String;` != `[Ljava/lang/Object;`），
+            // 于是 `new TreeSet<>(…).size()` 里塞的是数组，
+            // 运行时 `ClassCastException: [Ljava.lang.String; → Comparable`。
+            // 数组是协变的，元素类型能赋值就够，不需要描述符相等。
+            d == param_desc
+                || d == "Ljava/lang/Object;"
+                || (d.starts_with('[') && param_desc.starts_with('['))
         }
         // 推不出来时按种类判：非引用的值（`sum(1)` 的 1）不可能是数组，必须打包
         None => expr_kind(a, ctx) == K_REF,
@@ -508,22 +526,29 @@ fn pack_tail(
 /// （HotSpot 的报错是 `NoSuchMethodError: 'void GenBox.<init>(java.lang.String)'`）。
 /// 所以先按「精确匹配」试，再退回「形参个数相同里最贴的那个」。
 fn pick_ctor(owner: &str, args: &[Expr], ctx: &Ctx) -> Option<String> {
-    let list = ctx.type_ctors.get(owner)?;
+    let raw = ctx.type_ctors.get(owner)?;
+    // 跨包构造器只能选 public：`new TreeSet<>(someSet)` 曾经挑中包私有的
+    // `TreeSet(NavigableMap)`，编出来是合法 class 而真 JVM 抛 IllegalAccessError。
+    let list = crate::codegen::types::visible_overloads(owner, "<init>", raw, ctx);
+    let list = &list;
+    // 「精确命中」这条快路只有在**每个实参的静态类型都推得出来**时才可信：
+    // `args_desc` 对推不出类型的引用实参只能瞎猜 `Ljava/lang/String;`，于是
+    // `new Box(() -> {})` 会「精确命中」`Box(String)`，lambda 永远拿不到目标类型。
+    let all_known = args.iter().all(|a| expr_type(a, ctx).is_some() || !is_lambda_like(a));
     let exact = format!("({})V", args_desc(args, ctx));
-    if list.iter().any(|d| d == &exact) {
+    if all_known && list.iter().any(|d| d == &exact) {
         return Some(exact);
     }
-    let arg_descs: Vec<String> = args
-        .iter()
-        .map(|a| expr_type(a, ctx).map(|t| descriptor(&t)).unwrap_or_default())
-        .collect();
     let mut best: Option<(i32, String)> = None;
     for d in list.iter() {
         let ps = desc_params(d);
         let n = ps.len();
         let mut score = -1i32;
         if n == args.len() {
-            score = ps.iter().enumerate().filter(|(i, p)| arg_descs.get(*i) == Some(*p)).count() as i32;
+            match arg_score(&ps, args, ctx) {
+                Some(s) => score = s,
+                None => continue,
+            }
         } else if n > 0 && ps[n - 1].starts_with('[') && args.len() + 1 >= n {
             score = 0; // 可变参数构造器
         }
@@ -535,6 +560,156 @@ fn pick_ctor(owner: &str, args: &[Expr], ctx: &Ctx) -> Option<String> {
         }
     }
     best.map(|(_, d)| d)
+}
+
+/// 一组形参对一组实参打匹配分：`None` = 这个候选形状都不对（淘汰）。
+///
+/// 三点，缺一不可：
+/// - **形状**：形参是引用、实参却是个数值（或反过来）→ 直接淘汰。少了它，
+///   `new Thread(() -> {})` 会在 `Thread(String)` 上拿 0 分并被选中（重载按声明
+///   顺序，撞上哪个全看运气），lambda 于是「推断不出目标类型」。
+/// - **lambda 加分**：`Expr::Lambda` / 方法引用只能交给功能性接口形参，命中加
+///   `LAMBDA_HIT`；交给非功能性接口形参 **淘汰**（`new Thread(() -> {})` 不可能是
+///   `Thread(String)`）。这是语言规则，不是启发式。
+/// - **精确命中**：形参描述符与实参静态类型完全一致 +1。`append('y')` 的 `(C)` 与
+///   `(I)` 形状相同，只按形状会挑中 `append(int)` 打成 121。
+pub(crate) fn arg_score(ps: &[String], args: &[Expr], ctx: &Ctx) -> Option<i32> {
+    /// lambda / 方法引用命中功能性接口形参的加分。取 8 是为了压过「实参个数精确
+    /// 命中」那几分的总和（实参再多也不会到 8），让 lambda 的位置始终优先。
+    const LAMBDA_HIT: i32 = 8;
+    if ps.len() != args.len() {
+        return None;
+    }
+    let mut score = 0i32;
+    for (i, p) in ps.iter().enumerate() {
+        let want_ref = p.starts_with('L') || p.starts_with('[');
+        let ad = expr_type(&args[i], ctx).map(|t| descriptor(&t));
+        let got_ref = match ad.as_deref() {
+            Some(d) => d.starts_with('L') || d.starts_with('['),
+            None => expr_kind(&args[i], ctx) == K_REF,
+        };
+        // 形状**不一致不等于不适用**：`Object` 形参接 `int` 实参要自动装箱
+        // （`new Holder<>(10)` 的构造器是 `(Ljava/lang/Object;)V`），反过来是拆箱。
+        // 一律只降分、不淘汰 —— 淘汰会让 `pick_ctor` 一个候选都选不出来，
+        // 于是退回「拿实参类型现拼描述符」，拼出根本不存在的 `<init>(I)V`，
+        // 真 JVM 一跑就是 NoSuchMethodError。
+        if want_ref == got_ref {
+            score += 1;
+        }
+        if is_lambda_like(&args[i]) {
+            if !desc_is_fun_iface(p, ctx) {
+                return None;
+            }
+            // 参数个数也要对得上：`Comparator.compare(a,b)` 是 2 参，`Emp::name`
+            // 只会消费 1 个（未绑定实例方法），所以 `thenComparing(Comparator)` 不是
+            // 它的目标 —— 不排掉就会挑中先声明的那个 `thenComparing(Comparator)`，
+            // 然后把 String 当 int 返回（REF → INT 转换失败）。
+            if let (Some(hint), Some(sam)) = (lambda_arity(&args[i], ctx), sam_iface_desc(p, ctx)) {
+                if desc_params(&sam).len() != hint {
+                    return None;
+                }
+            }
+            score += LAMBDA_HIT;
+        }
+        if ad.as_deref() == Some(p.as_str()) {
+            score += 2;
+        } else if want_ref && got_ref {
+            // 形状对上了但类型不同：能赋值给这个形参的候选优先（+1），
+            // 不能的也不淘汰（擦除/泛型会让类型推不出来，硬淘汰会一个都选不出）。
+            if let (Some(at), true) = (ad.as_deref(), true) {
+                let a_owner = at.trim_start_matches('L').trim_end_matches(';');
+                let b_owner = p.trim_start_matches('L').trim_end_matches(';');
+                if !at.starts_with('[') && crate::codegen::types::is_assignable(a_owner, b_owner, ctx) {
+                    score += 1;
+                }
+            }
+        }
+    }
+    Some(score)
+}
+
+/// 实参是不是 lambda / 方法引用 —— 这种实参**只能**交给功能性接口形参
+///
+/// `X.class` 也被 parser 记成 `MethodRef { name: "class" }`，但它的值是一个
+/// `java.lang.Class`，不是方法引用，所以排除掉。
+pub(crate) fn is_lambda_like(e: &Expr) -> bool {
+    match e {
+        Expr::Lambda { .. } | Expr::LambdaStmt { .. } => true,
+        Expr::MethodRef { name, .. } => name != "class",
+        _ => false,
+    }
+}
+
+/// 形参描述符是个**已知的功能性接口**（能接 lambda）
+fn desc_is_fun_iface(d: &str, ctx: &Ctx) -> bool {
+    d.starts_with('L') && ctx.iface_sam.contains_key(d.trim_start_matches('L').trim_end_matches(';'))
+}
+
+/// 功能性接口形参的 SAM 描述符
+fn sam_iface_desc<'a>(d: &str, ctx: &'a Ctx) -> Option<&'a String> {
+    let name = d.trim_start_matches('L').trim_end_matches(';');
+    ctx.iface_sam.get(name).map(|(_, sam)| sam)
+}
+
+/// lambda / 方法引用**会消费几个实参** —— 也就是它要求的 SAM 参数个数。
+///
+/// 推不出来就返回 `None`（不施加约束），推得出来就必须精确相等：这是 Java 的
+/// 函数类型兼容规则，不是启发式。少了它，一个重载里只要有两个功能性接口形参
+/// （`thenComparing(Comparator)` / `thenComparing(Function)`）就完全看声明顺序，
+/// 撞错的那个会在 lambda 体里报出莫名其妙的转换错误。
+fn lambda_arity(e: &Expr, ctx: &Ctx) -> Option<usize> {
+    match e {
+        Expr::Lambda { params, .. } | Expr::LambdaStmt { params, .. } => Some(params.len()),
+        Expr::MethodRef { recv, name } if name != "class" => {
+            // 绑定形态（`o::m` / `this::m`）：只消费方法自己的形参
+            let bound_owner: Option<String> = match &**recv {
+                Expr::This | Expr::Super => Some(ctx.class_name.clone()),
+                Expr::Ident(n) => ctx
+                    .local_ty
+                    .get(n)
+                    .and_then(|t| crate::codegen::types::type_name_candidates(t, ctx).into_iter().next())
+                    .or_else(|| ctx.fields.get(n).and_then(|i| ctx.field_tys.get(*i)).and_then(|t| {
+                        crate::codegen::types::type_name_candidates(t, ctx).into_iter().next()
+                    })),
+                // 其它表达式（`get()::m` / `arr[0]::m`）当作绑定，但拿不到类型
+                _ => None,
+            };
+            if let Some(owner) = bound_owner {
+                return method_arity(&owner, name, ctx);
+            }
+            // 类名形态：静态方法引用（0 个接收者）或未绑定实例方法引用（+1 个接收者）
+            for owner in crate::codegen::types::class_owner_forms(recv, ctx) {
+                if let Some(n) = static_arity(&owner, name, ctx) {
+                    return Some(n);
+                }
+                if let Some(n) = method_arity(&owner, name, ctx) {
+                    return Some(n + 1);
+                }
+            }
+            None
+        }
+        _ => None,
+    }
+}
+
+/// `owner` 上同名重载的形参个数（重载个数不一致就当作推不出来）
+fn arity_of(cands: Option<&Vec<String>>) -> Option<usize> {
+    let cands = cands?;
+    let mut it = cands.iter().map(|d| desc_params(d).len());
+    let first = it.next()?;
+    if it.all(|n| n == first) {
+        Some(first)
+    } else {
+        None
+    }
+}
+
+fn method_arity(owner: &str, name: &str, ctx: &Ctx) -> Option<usize> {
+    arity_of(ctx.type_methods.get(owner).and_then(|m| m.get(name)))
+}
+
+fn static_arity(owner: &str, name: &str, ctx: &Ctx) -> Option<usize> {
+    arity_of(ctx.type_static_methods.get(owner).and_then(|m| m.get(name)))
 }
 
 pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) -> Result<(), CompileError> {
@@ -821,8 +996,17 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 if field == "out" || field == "err" {
                     if let Expr::Ident(_) = &**boxed {
                         let out = cp.field_ref("java/lang/System", field, "Ljava/io/PrintStream;");
+                        // `println()` —— 只换行，是最常用的一行；按 `println()V` 发
+                        if args.is_empty() {
+                            let println = cp.method_ref("java/io/PrintStream", "println", "()V");
+                            em.op_u2(0xB2, out);
+                            em.push(1);
+                            em.op_u2(0xB6, println);
+                            em.pop(1);
+                            return Ok(());
+                        }
                         if args.len() != 1 {
-                            return err("println 目前只支持一个参数");
+                            return err(format!("println 支持 0/1 个参数，实际 {}", args.len()));
                         }
                         // 实参内部有跳转（`println(a == b)`）时先算进脏槽：
                         // PrintStream 一旦压上栈，比较的跳转点就压着它了
@@ -935,7 +1119,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 .and_then(|t| resolve_type_owner(t, ctx))
                 .or_else(|| expr_type(r, ctx).as_ref().and_then(type_internal))
                 .unwrap_or_else(|| ctx.class_name.clone());
-            let n = args.len() as u16 + 1;
+            // invokeinterface 的 count 是**描述符里的参数槽数**（long/double 各 2 槽）
+            // + 1 个接收者，不是源码里的实参个数 —— 写成实参个数会得到
+            // `VerifyError: Inconsistent args count operand in invokeinterface`
+            let n = desc_slots(&desc) as u16 + 1;
             if ctx.iface_types.contains(&owner) || is_builtin_iface(&owner) {
                 // 接口方法调用必须是 invokeinterface：index, count(含 this), 0
                 let idx = cp.interface_method_ref(&owner, name, &desc);
@@ -951,6 +1138,27 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             // 返回值占的槽数：long/double 占 2 槽
             if !desc.ends_with(")V") {
                 em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
+                // 泛型方法的**静态**返回类型和擦除后不一样时，补一条 checkcast。
+                //
+                // 验证器只认描述符里的类型（`List.get` 发出去的是 `Object`），而后面
+                // 的 invokevirtual / 拆箱都按**静态**类型发（`l.get(0).isEmpty()` →
+                // `invokevirtual String.isEmpty`）。不补这一条，栈上的 Object 赋给
+                // String 形参就是 `VerifyError: Bad type on operand stack`。
+                //
+                // 只在擦除后是 `Object` 时才有必要：别的返回类型本来就对得上，
+                // 而 `generic_ret` 会递归求接收者的类型，无谓地查会拖慢批量编译。
+                if desc.rsplit(')').next() == Some("Ljava/lang/Object;") {
+                    if let Some(t) = crate::codegen::types::generic_ret(r, name, &desc, ctx) {
+                        let erased = type_from_desc("Ljava/lang/Object;");
+                        if kind_of(&t) == K_REF
+                            && !matches!(t, Type::Var)
+                            && descriptor(&t) != descriptor(&erased)
+                        {
+                            let cls = ver_type(cp, &t);
+                            em.op_u2(0xC0, cls); // checkcast
+                        }
+                    }
+                }
             }
             Ok(())
         }
@@ -1014,7 +1222,10 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             em.op(0x2A); // aload_0
             em.push(1);
             emit_call_args(args, &desc, &sp, em, ctx, cp)?;
-            let n = args.len() as u16 + 1;
+            // invokeinterface 的 count 是**描述符里的参数槽数**（long/double 各 2 槽）
+            // + 1 个接收者，不是源码里的实参个数 —— 写成实参个数会得到
+            // `VerifyError: Inconsistent args count operand in invokeinterface`
+            let n = desc_slots(&desc) as u16 + 1;
             // 接口里的 default 方法调另一个方法（`area()` = this.area()）：
             // 自己就是接口时必须是 invokeinterface，否则 JVM 报
             // "Found interface Shape, but class was expected"
@@ -1065,7 +1276,16 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                     _ => 0x7C,                      // iushr
                 };
                 em.op(code);
-                em.pop(if kind_wide(k) { 2 } else { 1 });
+                // 移位指令的栈效果：int 版弹 2 压 1（净 -1）；long 版弹 **3**
+                // （long 占 2 槽 + int 移位量 1 槽）压 2（净 -1）。
+                // 原来对 long 只按 `pop(2)` 记账，少减一槽，`max_stack` 于是偏小 1，
+                // 真 JVM 报 `VerifyError: Operand stack overflow`（`i2l` 那一步就超了）。
+                if kind_wide(k) {
+                    em.pop(3);
+                    em.push(2);
+                } else {
+                    em.pop(1);
+                }
                 return Ok(());
             }
             let k = promote(kl, kr);
@@ -1210,7 +1430,18 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 return err(format!("`{}` 不是功能性接口", tgt.iface.replace('/', ".")));
             };
             let named = sam_params_named(params, &sam_desc, &tgt.args);
-            let stmt = Stmt::Return(Some((**body).clone()));
+            // 表达式 lambda 的体怎么收尾，取决于 **SAM 的返回类型**：
+            // `Consumer<String> c = s -> list.add(s);` 的 `add` 返回 boolean，
+            // 直接 `Stmt::Return(Some(…))` 会按「返回 int」发 `ireturn`，
+            // 而合成方法的描述符是 `()V` —— 真 JVM 与我们的 VM 都报
+            // `VerifyError: Operand stack underflow … ireturn`。
+            // void 的 SAM 要把它当**语句**编（值算完丢掉），这才是 Java 的语义。
+            let sam_ret_void = sam_desc.rsplit(')').next().map(|r| r == "V").unwrap_or(false);
+            let stmt = if sam_ret_void {
+                Stmt::Expr((**body).clone())
+            } else {
+                Stmt::Return(Some((**body).clone()))
+            };
             let inst = body_uses_this(&stmt, ctx);
             emit_lambda(stmt, named, inst, em, ctx, cp)
         }
@@ -1300,9 +1531,18 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                         params.clone(),
                     )
                 } else {
-                    let Some(recv_ty) = expr_as_type(recv) else {
+                    let Some(recv_ty0) = expr_as_type(recv) else {
                         return err("方法引用的类名解析失败");
                     };
+                    // 类名要翻成符号表里的**内部名**：`Emp::salary` 写在 `R1` 里时真名是
+                    // `R1$Emp`，按裸名发 checkcast 会得到一个不存在的类
+                    // （运行时 `NoClassDefFoundError: Emp`）。
+                    let recv_ty = crate::codegen::types::resolve_type_owner(&recv_ty0, ctx)
+                        .map(|o| Type::Named {
+                            path: o.split('/').map(|s| s.to_string()).collect(),
+                            args: Vec::new(),
+                        })
+                        .unwrap_or(recv_ty0);
                     if params.is_empty() {
                         return err("未绑定实例方法引用要求 SAM 至少有一个参数");
                     }
@@ -2222,6 +2462,10 @@ fn collect_idents_s(s: &Stmt, out: &mut Vec<String>) {
                     collect_idents_s(b, out);
                 }
             }
+        }
+        Stmt::Sync { lock, body } => {
+            collect_idents_e(lock, out);
+            collect_idents_s(body, out);
         }
         Stmt::Try { body, catches, finally } => {
             collect_idents_s(body, out);

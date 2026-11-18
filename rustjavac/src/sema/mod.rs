@@ -8,6 +8,7 @@
 
 pub mod enums;
 pub mod erase;
+pub mod generic;
 pub mod nested;
 pub mod qualify;
 pub mod resolve;

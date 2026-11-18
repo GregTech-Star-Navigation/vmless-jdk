@@ -35,13 +35,29 @@ pub struct Parser {
     local_types: Vec<TypeDecl>,
     /// 字段多声明符（`int a, b;`）里**第一个之后的**那些，交给成员循环按序取走。
     pending_members: Vec<Member>,
+    /// 语句多声明符（`int[] a = …, b = …;`）里第一个之后的那些。
+    ///
+    /// **不能包成 `Stmt::Block`**：块在代码生成里意味着「作用域结束、帧里的槽退回
+    /// Top」，而这条源码并没有开作用域 —— `a`/`b` 在块后仍然可见、仍会被 load，
+    /// 帧与代码于是对不上（HotSpot: `Bad local variable type`）。这里把它们排成队，
+    /// `parse_statement` 每次先取一条，效果与源码里写成两条语句完全一样。
+    pending_stmts: Vec<Stmt>,
 }
 
 impl Parser {
     pub fn new(src: &str) -> Result<Self, ParseError> {
         let toks = tokenize(src).map_err(|e| ParseError { line: e.line, msg: e.msg })?;
         let line = toks.last().map(|t| t.line).unwrap_or(1);
-        Ok(Parser { toks, pos: 0, pending: None, line, no_lambda: false, local_types: Vec::new(), pending_members: Vec::new() })
+        Ok(Parser {
+            toks,
+            pos: 0,
+            pending: None,
+            line,
+            no_lambda: false,
+            local_types: Vec::new(),
+            pending_members: Vec::new(),
+            pending_stmts: Vec::new(),
+        })
     }
 
     // ---------- token 工具 ----------

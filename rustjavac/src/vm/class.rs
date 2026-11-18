@@ -80,6 +80,18 @@ pub(super) fn class_name_of(cf: &ClassFile, index: u16) -> Result<String, VmErro
 impl Vm {
     /// 静态初始化：先父类、再自己，只跑一次（JVM 的 `<clinit>` 语义）
     pub(super) fn ensure_init(&mut self, class: &str) -> Result<(), VmError> {
+        // 快速路径：已初始化直接返回（与原来「循环第一圈就命中」等价，不多付一次检查）
+        if lk(&self.sh.initialized).contains(class) {
+            return Ok(());
+        }
+        // 初始化蕴含**加载**（JVMS 5.5 第 1 步）。类还不在类表里就先按 classpath 拉进来 ——
+        // 少了这一步，下面 `method_in_class("<clinit>")` 拿到 None，整个初始化**静默成功**。
+        //
+        // 这不是理论问题：类名只写在 Rust 侧的 native（`new_obj("java/awt/image/DirectColorModel")`）
+        // 时，常量池闭包看不见它，于是对象造不出来 → 返回 0 → Java 侧拿到 null。
+        if !self.store.has_class(class) {
+            let _ = self.ensure_class_loaded(class);
+        }
         let me = super::thread::cur_tid();
         // JVMS 5.5：同一个类在同一时刻只能由**一个**线程初始化，别的线程要**阻塞等**。
         // 不做这件事的后果很具体：`<clinit>` 跑到一半（在 safepoint 上让出 GIL）时，

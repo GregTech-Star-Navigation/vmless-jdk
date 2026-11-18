@@ -1072,9 +1072,36 @@ fn unsafe_put_impl(vm: &mut Vm, obj: i32, off: i64, v: Slot) {
     }
     let Some(i) = slot_index(vm, obj, off) else { return };
     match vm.ref_kind(obj) {
-        RefKind::Arr(_) => vm.sh.heap.set(obj, i, v),
+        RefKind::Arr(_) | RefKind::Obj(_) => {
+            // **引用槽只能存成 `Slot::I`**：GC 的 `scan_refs` / `scan_refs_young`
+            // 只把 `Slot::I(h)` 当引用（`shared.rs` 里那条 `if let Slot::I(v)`），
+            // `Slot::L` 会被当成 primitive long 跳过 —— 于是「只被这一格指着的对象」
+            // 在下一轮回收里被扫掉，数组里留下一个**悬空句柄**，
+            // 读回来时 `type_name` 报 "null"（= 悬空，不是真的 null）。
+            //
+            // `write_mem` 的 width=8 分支原来就是这个写法（`Slot::L(v as i64)`），
+            // 所以凡是走 `Unsafe` 往**引用数组**里写引用的地方全中招：
+            // `ConcurrentHashMap.casTabAt` → `U.compareAndSetReference` 是第一个撞上的
+            // （`Properties` → `ConcurrentHashMap.put` → 那条 Node 被回收）。
+            // 实测：`VMLESS_GC_STRESS=1` 下 `System.initPhase1` 直接
+            // `ClassCastException: null cannot be cast to ConcurrentHashMap$Node（悬空句柄）`。
+            //
+            // 顺手把屏障也走 `set_ref`（不去按理算出来的位图判断）：
+            // 这里已经是「确定是引用」的分支，少一次 `is_ref` 判断，也不会因为位图
+            // 算错而漏记脏账。
+            //
+            // 只有**非 `Slot::I` 的写入**（= `write_mem` 的 width=8，`Slot::L`）才需要
+            // 转换：`Slot::I` 本来就是对的，多查一次页表纯属白花 —— 这是
+            // `Unsafe.put*/CAS*` 的热路径，别给它加常数。
+            let wrong_repr = !matches!(v, Slot::I(_));
+            let is_ref = wrong_repr && vm.sh.heap.hdr(obj).map(|o| o.is_ref(i)).unwrap_or(false);
+            if is_ref {
+                vm.sh.heap.set_ref(obj, i, Slot::I(v.as_i32()));
+            } else {
+                vm.sh.heap.set(obj, i, v);
+            }
+        }
         RefKind::Str => vm.str_field_write(obj, i, v),
-        RefKind::Obj(_) => vm.sh.heap.set(obj, i, v),
         _ => {}
     }
 }

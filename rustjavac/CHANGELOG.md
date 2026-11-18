@@ -3,6 +3,37 @@
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
 
+## 0.70.0
+
+**为什么**：VM 一直没有**字节码验证器**（`src/vm/` 下 30 个模块全是执行/GC/native），
+于是我们自己编译器产出的**非法 class 会被我们自己的 VM 照跑**：
+
+```
+java -cp out R4       → VerifyError: Operand stack overflow @49: i2l
+rustjava R4.class     → same=true min=38 max=999947 sum=15046571407   ← "正确"输出
+```
+
+三条验收腿（java / 解释器 / JIT）里后两条对非法 class 完全免疫，只有真 java 会报 ——
+编译器出错时我们**看不见**。`R4` 这类最危险：错的字节码碰巧算出了对的答案，换个输入就崩。
+
+**改了什么**（新增 `src/vm/verify.rs`，≈1900 行；JVMS 4.10.1 方法级校验）
+
+- 进入方法体**之前**跑一次，结论按 `(ClassFile, 方法下标)` 缓存；热路径只剩一次
+  线程本地比对（16M 次虚调用实测无退化）。放在 `exec::execute` 而不是 `execute_body`，
+  这样 JIT 快路（`try_call_jit`）也挡得住；`run_jit` 那条完全不建 `Vm` 的入口
+  另走 `vm::verify_class(&cf)`。
+- 覆盖：指令解码（含 `wide`/`tableswitch`/`lookupswitch`）、跳转目标必须是**指令边界**、
+  每条指令的净栈效应（`long`/`double` 占 2 槽）、`max_stack`/`max_locals` 越界、
+  局部变量与操作数栈的**类型汇合**（前驱求最小上界）、`xload`/`xstore` 槽位类型、
+  `invoke*` 与描述符一致、`getfield`/`putfield` 接收者非 `Top`、`aaload`/`aastore`
+  元素类型、`new` → `<init>` 之前不许用、`StackMapTable` 帧与数据流核对。
+- 失败抛 `java.lang.VerifyError`，消息 `类.方法 @bci: 原因`。
+- **宁可放过不可误杀**：只有两边类层次都能解析时才判「不可赋值」，解析不到（独立模式下
+  `java.*` 没有 class 文件）当未知放过；`jsr`/`ret` 直接跳过整个方法。
+- 判据（实测）：`R4`/`R2` 三条腿全部 `VerifyError`（`R2` 在 `run_jdk` 下与 HotSpot 同因：
+  `@3 invokevirtual` 的 `java.lang.String` 不能赋给 `java.net.URI`）；`verify.sh` 103/0、
+  `cargo test` 117 passed、`Smoke1` 输出正常、`GcBench` 跑完、`P1`/`P2` 不退化（19 / 64 ms）。
+
 ## 0.69.0
 
 **为什么**：改写堆的对象布局与回收策略。旧实现是「56 字节对象头 + 独立槽位数组」，

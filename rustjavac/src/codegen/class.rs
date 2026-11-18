@@ -101,6 +101,9 @@ pub(crate) fn compile_type(
     let iface_types = w.iface_types;
     let type_ctors = w.type_ctors;
     let iface_sam = w.iface_sam;
+    let type_hidden = w.type_hidden;
+    let type_supers = w.type_supers;
+    let type_method_generics = w.type_method_generics;
     // 本类（含继承）的静态字段：名字 → (声明类, 描述符)
     let static_fields_map = res.static_fields(&self_name)?;
 
@@ -154,6 +157,9 @@ pub(crate) fn compile_type(
         pending_label: None,
         static_imports: res.static_imports().clone(),
         type_ctors: type_ctors.clone(),
+        type_hidden: type_hidden.clone(),
+        type_supers: type_supers.clone(),
+        type_method_generics: type_method_generics.clone(),
         iface_sam: iface_sam.clone(),
         synth: std::rc::Rc::new(std::cell::RefCell::new(Vec::new())),
         lambda_seq: std::rc::Rc::new(std::cell::RefCell::new(0u32)),

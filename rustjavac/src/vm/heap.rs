@@ -125,7 +125,26 @@ impl Vm {
             }
         }
         let h = self.sh.heap.new_object(slots, "java/lang/Class").unwrap_or(0);
-        lk(&self.sh.class_obj_cache).insert(desc.to_string(), h);
+        // **收口必须原子**：上面那次 `class_obj_cache` 查询和这里相隔一整段构造，
+        // 两个线程同时 miss 就会各造一个 Class 对象、各自 return 自己那个
+        // （实测 4 线程并发首次 `ldc X.class`：15 次里 7 次拿到 2~3 个不同对象）。
+        // 后果是 `X.class == X.class` 为假，而 `synchronized (X.class)` 于是锁在
+        // **不同的锁**上 —— 临界区不互斥、`n++` 丢更新，且全程没有异常可看。
+        //
+        // 所以：同名的第一个赢，后来者**用自己刚造的那个换赢家的句柄**（输家那个
+        // 变成无主垃圾，下一轮 GC 收掉）。注意**不能**把 `new_object` 搬进锁里 ——
+        // 数组会递归调 `class_obj(comp)`，`sh.class_obj_cache` 是不可重入的
+        // `std::sync::Mutex`，搬进去就是永久挂死。
+        let h = {
+            let mut g = lk(&self.sh.class_obj_cache);
+            match g.get(desc) {
+                Some(&exist) => exist,
+                None => {
+                    g.insert(desc.to_string(), h);
+                    h
+                }
+            }
+        };
         lk(&self.sh.class_objs).insert(h, desc.to_string());
         h
     }

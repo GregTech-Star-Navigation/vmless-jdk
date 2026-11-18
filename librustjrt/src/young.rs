@@ -55,11 +55,22 @@ pub(crate) fn minor(env: &mut GcEnv) -> MinorReport {
     // 队列大小上界就是活对象数：先留好，省掉复制过程中的扩容搬迁
     env.work.reserve(env.young_objects.min(1 << 20));
 
-    // ---- 1) 显式根（JIT 的影子栈）----
+    // ---- 1) 显式根（值式影子栈 + 指针式帧根区）----
     for i in 0..env.roots.len() {
         let v = env.roots[i];
         if v != 0 {
             env.roots[i] = fix(env, v);
+        }
+    }
+    // 指针式帧根区：**就地**读、**就地**写回（JIT 帧的引用住在自己的栈槽里）
+    for k in 0..env.regions.len() {
+        let r = env.regions[k];
+        for i in 0..r.n as usize {
+            let p = unsafe { r.ptr.add(i) };
+            let v = unsafe { *p };
+            if v != 0 {
+                unsafe { *p = fix(env, v) };
+            }
         }
     }
 

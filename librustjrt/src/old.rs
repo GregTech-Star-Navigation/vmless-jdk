@@ -181,6 +181,16 @@ pub(crate) fn major(env: &mut GcEnv) -> MajorReport {
 
     let roots: Vec<u32> = env.roots.iter().copied().filter(|&o| o != 0).collect();
     env.work.extend(roots);
+    // 指针式帧根区（Mark 阶段只读，不搬动 —— 搬动在 compact 里）
+    for k in 0..env.regions.len() {
+        let r = env.regions[k];
+        for i in 0..r.n as usize {
+            let v = unsafe { *r.ptr.add(i) };
+            if v != 0 {
+                env.work.push(v);
+            }
+        }
+    }
     let satb = std::mem::take(env.satb);
     env.work.extend(satb.into_iter().filter(|&o| o != 0));
 
@@ -499,10 +509,20 @@ pub(crate) fn compact(env: &mut GcEnv) -> (MajorReport, Vec<(u32, u32)>) {
         }
     }
 
-    // 改根 / SATB
+    // 改根 / SATB / 指针式帧根区
     for r in env.roots.iter_mut() {
         if *r >= tail_start {
             *r = crate::handles::remap(&map, *r).unwrap_or(0);
+        }
+    }
+    for k in 0..env.regions.len() {
+        let r = env.regions[k];
+        for i in 0..r.n as usize {
+            let p = unsafe { r.ptr.add(i) };
+            let v = unsafe { *p };
+            if v >= tail_start {
+                unsafe { *p = crate::handles::remap(&map, v).unwrap_or(0) };
+            }
         }
     }
     for r in env.satb.iter_mut() {

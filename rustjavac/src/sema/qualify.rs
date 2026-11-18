@@ -271,6 +271,10 @@ impl Qualifier<'_> {
                     }
                 }
             }
+            Stmt::Sync { lock, body } => {
+                self.expr(lock);
+                self.stmt(body);
+            }
             Stmt::Try { body, catches, finally } => {
                 self.stmt(body);
                 for c in catches.iter_mut() {

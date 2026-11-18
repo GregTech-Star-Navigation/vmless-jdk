@@ -199,6 +199,16 @@ impl Marker {
         self.started_ns = uptime_ns();
 
         self.work.extend(env.roots.iter().copied().filter(|&o| o != 0));
+        // 指针式帧根区（增量标记的开始：只读，不搬动）
+        for k in 0..env.regions.len() {
+            let r = env.regions[k];
+            for i in 0..r.n as usize {
+                let v = unsafe { *r.ptr.add(i) };
+                if v != 0 {
+                    self.work.push(v);
+                }
+            }
+        }
         self.work.extend(env.satb.drain(..).filter(|&o| o != 0));
         self.work.extend(grey.drain(..).filter(|&o| o != 0));
         env.weak.cycle_begin();

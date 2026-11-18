@@ -43,6 +43,65 @@ use super::monitors::{thin_count, thin_owner, thin_word, WaitSet, COUNT_MAX, INF
 use super::slot::Slot;
 use super::{Vm, VmError};
 
+/// `VMLESS_MON_TRACE=1`：监视器占用账本（句柄 → 当前占着它的线程）。
+///
+/// 只在这个环境变量开着时才会被初始化；正常跑一个字节码都不多碰。
+static MON_OCC: Mutex<Option<HashMap<i32, u64>>> = Mutex::new(None);
+
+/// 开关**只在第一次问的时候查环境**。
+///
+/// 这是 `monitorenter` / `monitorexit` 的热路径：每次锁都做一次 `var_os` 就是每次
+/// 锁都拿一遍环境变量表的锁，实测会把无竞争的锁成本翻好几倍。缓存成一个字节的
+/// `AtomicU8`（0=没查过，1=开，2=关）之后，热路径上只剩一次 relaxed 读。
+static MON_TRACE: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(0);
+
+#[inline]
+fn mon_trace_on() -> bool {
+
+    match MON_TRACE.load(Ordering::Relaxed) {
+        1 => true,
+        2 => false,
+        _ => {
+            let on = std::env::var_os("VMLESS_MON_TRACE").is_some();
+            MON_TRACE.store(if on { 1 } else { 2 }, Ordering::Relaxed);
+            on
+        }
+    }
+}
+
+/// 进入临界区后核账：已经被**另一个**线程占着就打印现场（互斥坏掉的唯一可靠判据）
+fn mon_occ_check(handle: i32, me: u64) {
+    let prev = {
+        let mut g = MON_OCC.lock().unwrap_or_else(|e| e.into_inner());
+        let m = g.get_or_insert_with(HashMap::new);
+        m.insert(handle, me)
+    };
+    if let Some(other) = prev {
+        if other != me {
+            eprintln!("[mon] DOUBLE ENTER handle={handle} me={me} other={other}");
+            for (i, fr) in super::stacktrace::frames_current().iter().take(10).enumerate() {
+                eprintln!(
+                    "  #{i} {}.{}({}:{})",
+                    fr.class.replace('/', "."),
+                    fr.method,
+                    fr.source.clone().unwrap_or_else(|| "?".into()),
+                    fr.line
+                );
+            }
+        }
+    }
+}
+
+/// 释放时把账本那一格清掉（归零的只有真正退出临界区的那一次）
+fn mon_occ_exit(handle: i32, me: u64) {
+    let mut g = MON_OCC.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(m) = g.as_mut() {
+        if m.get(&handle) == Some(&me) {
+            m.remove(&handle);
+        }
+    }
+}
+
 /// 下一个 Java 线程 id（1 留给 main）
 static NEXT_TID: AtomicU64 = AtomicU64::new(2);
 
@@ -387,7 +446,18 @@ impl Vm {
     }
 
     /// `monitorenter`
+    /// `VMLESS_MON_TRACE=1` 的诊断外壳：拿到锁之后核一遍「这个句柄此刻是不是已经
+    /// 被别的线程占着」。互斥坏掉时**没有任何异常**（只是少加了几个数），
+    /// 所以只能靠这种主动取证把现场打出来 —— 判据是 `DOUBLE ENTER` 那一行。
     pub(super) fn monitor_enter(&mut self, handle: i32) -> Result<(), VmError> {
+        let r = self.monitor_enter_inner(handle);
+        if r.is_ok() && mon_trace_on() {
+            mon_occ_check(handle, cur_tid());
+        }
+        r
+    }
+
+    fn monitor_enter_inner(&mut self, handle: i32) -> Result<(), VmError> {
         if handle == 0 {
             return Err(self.java_exception(
                 "java/lang/NullPointerException",
@@ -474,6 +544,9 @@ impl Vm {
                 if thin_count(cur) <= 1 {
                     if w.compare_exchange(cur, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
                         self.held_pop(handle);
+                        if mon_trace_on() {
+                            mon_occ_exit(handle, me);
+                        }
                         return Ok(());
                     }
                     continue;
@@ -498,6 +571,9 @@ impl Vm {
         st.owner = 0;
         drop(st);
         self.held_pop(handle);
+        if mon_trace_on() {
+            mon_occ_exit(handle, me);
+        }
         self.mon_grant(&ws);
         Ok(())
     }
@@ -749,6 +825,10 @@ impl Vm {
         if obj > 0 {
             self.notify_unchecked(obj, true);
         }
+        if std::env::var_os("VMLESS_WDN_TRACE").is_some() {
+            let name = self.rec(tid).map(|t| t.name.clone()).unwrap_or_default();
+            eprintln!("[fin] tid={tid} name={name} exc={:?}", exc.as_deref());
+        }
         exc
     }
 
@@ -764,6 +844,10 @@ impl Vm {
 
     /// 主线程返回后：等所有**非 daemon** 线程跑完（JVM 语义），再让进程退出
     pub(super) fn wait_non_daemon(&mut self) {
+        // `VMLESS_WDN_TRACE=1`：每秒打一次「还在等谁」。`wait_non_daemon` 是 1ms 轮询的
+        // 死等循环 —— 进程「挂在这儿」时外部看不出在等哪条线程，这个开关直接点名。
+        let trace = std::env::var_os("VMLESS_WDN_TRACE").is_some();
+        let mut last = Instant::now();
         loop {
             let pending: Vec<u64> = lk(&self.sh.threads)
                 .values()
@@ -771,7 +855,19 @@ impl Vm {
                 .map(|t| t.tid)
                 .collect();
             if pending.is_empty() {
+                if trace {
+                    eprintln!("[wdn] 全部非 daemon 线程已结束，退出");
+                }
                 return;
+            }
+            if trace && last.elapsed() >= Duration::from_secs(1) {
+                last = Instant::now();
+                let names: Vec<String> = lk(&self.sh.threads)
+                    .values()
+                    .filter(|t| pending.contains(&t.tid))
+                    .map(|t| format!("{}#{} state={:#x}", t.name, t.tid, t.state))
+                    .collect();
+                eprintln!("[wdn] 仍在等: {names:?}");
             }
             std::thread::sleep(Duration::from_millis(1));
         }

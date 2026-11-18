@@ -7,7 +7,7 @@
 
 use crate::ast::*;
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::rc::Rc;
 
 /// 一个**合成方法**：lambda 体，或方法引用的转发体。
@@ -96,6 +96,13 @@ pub(crate) struct Ctx {
     /// `new GenBox<>("x")` 的真实描述符是 `(Ljava/lang/Object;)V`（泛型擦除），
     /// 不能拿实参类型现拼。
     pub(crate) type_ctors: HashMap<String, std::sync::Arc<Vec<String>>>,
+    /// 泛型方法的返回签名树：类内部名 → 方法名 → [(描述符, 返回签名, 声明类类型参数名)]。
+    /// `List<String>.get(int)` 的**静态**返回类型靠它代回（`sema::generic`）。
+    pub(crate) type_hidden: HashMap<String, std::sync::Arc<HashSet<String>>>,
+    /// 直接父类型（父类 + 接口）：内部名 → 列表，重载解析判可赋值性用
+    pub(crate) type_supers: HashMap<String, std::sync::Arc<Vec<String>>>,
+    pub(crate) type_method_generics:
+        HashMap<String, std::sync::Arc<HashMap<String, Vec<(String, crate::sema::generic::MethodSig, Vec<String>)>>>>,
     /// 功能性接口 → 唯一抽象方法 `(名字, 描述符)`（见 `Resolver::sam_of`）
     pub(crate) iface_sam: HashMap<String, (String, String)>,
     /// 待编的合成方法（lambda 体 / 方法引用转发体），所有方法共享同一个队列

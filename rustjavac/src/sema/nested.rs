@@ -227,6 +227,10 @@ impl Flattener {
                     }
                 }
             }
+            Stmt::Sync { lock, body } => {
+                self.rewrite_expr(lock, vis);
+                self.rewrite_stmt(body, vis);
+            }
             Stmt::Try { body, catches, finally } => {
                 self.rewrite_stmt(body, vis);
                 for c in catches.iter_mut() {

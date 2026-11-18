@@ -109,6 +109,11 @@ pub enum Stmt {
     /// `yield e;` —— switch 表达式里往外交值（只在 `Expr::SwitchExpr` 的语句树里合法）
     Yield(Expr),
     Try { body: Box<Stmt>, catches: Vec<Catch>, finally: Option<Box<Stmt>> },
+    /// `synchronized (lock) { body }`。
+    ///
+    /// 锁对象必须留下来：异常路径上还要再 `monitorexit` 一次（否则异常一次就永久
+    /// 死锁），所以 codegen 把它存进一个隐藏局部槽、两条路都 `aload` 它。
+    Sync { lock: Expr, body: Box<Stmt> },
     Empty,
 }
 

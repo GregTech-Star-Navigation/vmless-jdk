@@ -698,6 +698,70 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
             em.pop(1);
             Ok(true) // 之后不可达
         }
+        // `synchronized (lock) { body }` —— 照 javac 的形态发：
+        //
+        //   <lock>; astore L          ← 只求值一次，异常路径还要再用
+        //   aload L; monitorenter
+        //   body                       ← 保护区 [body_start, body_end)
+        //   aload L; monitorexit
+        //   goto end
+        //   handler: astore E; aload L; monitorexit; aload E; athrow
+        //   end:
+        //
+        // 关键是**异常路径上也要 monitorexit**：漏了就是「抛一次异常永久死锁」。
+        // 另外 `aload` 之后不能插 null 检查 —— JVMS 规定 null 由 `monitorenter`
+        // 自己抛 NPE，提前检查反而改变语义（异常类型/时机都不对）。
+        Stmt::Sync { lock, body } => {
+            let entry = em.local_types.clone();
+            let lk = bump_slot(ctx, em, false)?;
+            let ex = bump_slot(ctx, em, false)?;
+            let obj_cls = ver_type(cp, &Type::Named { path: vec!["Object".into()], args: vec![] });
+            // 锁对象先算出来存好（它自己可能有跳转，必须在栈空时算）
+            compile_expr(lock, em, ctx, cp)?;
+            em.set_local_type(lk as usize, obj_cls);
+            em.store_slot(lk, K_REF)?; // astore
+            // handler 的帧：锁槽**已声明**（handler 里要 `aload` 它），
+            // 异常槽**还是 Top**（那一刻它还没被赋值 —— 声明成 Object 会让
+            // 验证器算出的「当前帧 = top」和栈图打架，报
+            // `Inconsistent stackmap frames`）。
+            let handler_entry = em.local_types.clone();
+            em.load_slot(lk, K_REF)?;
+            em.op(0xC2); // monitorenter
+            em.pop(1); // monitorenter 弹掉锁对象：不记账的话整个方法后面都多算一槽，
+                       // 后续每一处 `&&`/`||` 都会被判「栈非空」（44 个文件是这么挂的）
+            let body_start = em.new_label();
+            let body_end = em.new_label();
+            let handler = em.new_label();
+            let end = em.new_label();
+            em.place(body_start);
+            let terminated = compile_stmt(body, em, ctx, cp)?;
+            em.place(body_end);
+            if !terminated {
+                em.load_slot(lk, K_REF)?;
+                em.op(0xC3); // monitorexit
+                em.pop(1);
+                em.goto(end);
+            }
+            // 异常路径：接住任何异常 → 解锁 → 原样抛出
+            em.bind_handler(handler, handler_entry, cp.class("java/lang/Throwable"));
+            em.push(1); // 栈上已经有一个异常对象
+            em.set_local_type(ex as usize, cp.class("java/lang/Throwable"));
+            em.store_slot(ex, K_REF)?; // astore
+            em.load_slot(lk, K_REF)?;
+            em.op(0xC3); // monitorexit
+            em.pop(1);
+            em.load_slot(ex, K_REF)?;
+            em.op(0xBF); // athrow
+            em.pop(1); // athrow 弹掉异常对象：不记账会让 end 之后的代码从 +1 槽开始算
+            em.exc(body_start, body_end, handler, 0);
+            // **先**把隐藏槽的声明退回入口快照，**再**绑定汇合标签：
+            // 反过来的话（先 bind 再退回）end 那一帧会带着 handler 里刚声明的
+            // 异常槽类型，而数据流上那个槽根本没赋值 —— 验证器报
+            // `Inconsistent stackmap frames`。
+            em.local_types = entry;
+            em.bind(end);
+            Ok(false)
+        }
         Stmt::Try { body, catches, finally } => {
             // try 入口的局部变量快照：handler / 汇合帧只声明到这一层，多出来的槽按
             // Top 处理 —— 栈图里 Top 接受任何类型，反过来「声明得比实际多」才会 VerifyError。

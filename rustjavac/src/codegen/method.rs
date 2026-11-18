@@ -127,6 +127,25 @@ pub(crate) fn compile_return(
         match e {
             None => em.op(0xB1),
             Some(x) => {
+                // 方法声明是 void（`Runnable` 的 lambda 体就是这种）：表达式算完
+                // **丢掉值**再发 `return`。
+                //
+                // 少了这条会按表达式的种类发 `ireturn`/`areturn`，而合成方法的描述符
+                // 是 `()V` —— 真 JVM 与我们的 VM 都报
+                // `VerifyError: Operand stack underflow … ireturn`。
+                if ctx.ret_ty.as_ref().map(|t| matches!(t, Type::Prim("void"))).unwrap_or(true) {
+                    let k = expr_kind(x, ctx);
+                    compile_expr(x, em, ctx, cp)?;
+                    if kind_wide(k) {
+                        em.op(0x58); // pop2
+                        em.pop(2);
+                    } else {
+                        em.op(0x57); // pop
+                        em.pop(1);
+                    }
+                    em.op(0xB1); // return
+                    return Ok(true);
+                }
                 let kind = ret_kind_for(x, ctx, em, cp)?;
                 emit_xreturn(em, kind);
             }

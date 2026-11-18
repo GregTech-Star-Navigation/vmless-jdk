@@ -940,8 +940,18 @@ fn call_java(
     let Some((ci, mi)) = target else {
         return Err(VmError { msg: format!("找不到 {class}.{name}{desc}"), exc: None });
     };
+    // 参数约定：`args` **只放实参**，接收者由 `recv` 单独给 —— `Vm::execute` 那边
+    // `receiver=true` 的含义是「args[0] 就是 this」（`place_args` 的 `off = 1`），
+    // 所以这里要把 `recv` 补到最前面。**漏了这一步的后果是静默的**：args[0]（第一个实参）
+    // 被当成 `this`，其余实参整体前移一格、最后一个槽留 0 ——
+    // 实测 `new DisplayMode(320,200,32,0)` 回显 `0x0[Multi depth][Unknown refresh rate]`。
+    let mut full: Vec<Slot> = Vec::with_capacity(args.len() + 1);
+    if receiver {
+        full.push(Slot::I(recv));
+    }
+    full.extend_from_slice(args);
     vm.depth += 1;
-    let r = vm.execute(ci, mi, desc, args, receiver);
+    let r = vm.execute(ci, mi, desc, &full, receiver);
     vm.depth -= 1;
     r
 }
@@ -961,7 +971,7 @@ fn make_prim(vm: &mut Vm, class: &str, id: i64, src: i32, comp: i32, dst: i32) -
         return 0;
     }
     let desc = "(JLsun/java2d/loops/SurfaceType;Lsun/java2d/loops/CompositeType;Lsun/java2d/loops/SurfaceType;)V";
-    let _ = call_java(vm, class, "<init>", desc, &[Slot::I(obj), Slot::L(id), Slot::I(src), Slot::I(comp), Slot::I(dst)], obj);
+    let _ = call_java(vm, class, "<init>", desc, &[Slot::L(id), Slot::I(src), Slot::I(comp), Slot::I(dst)], obj);
     obj
 }
 
@@ -1650,16 +1660,24 @@ extern "system" fn wnd_proc(hwnd: isize, msg: u32, wp: usize, lp: isize) -> isiz
             let mut ps: w32::PaintStruct = std::mem::zeroed();
             let _ = w32::BeginPaint(hwnd, &mut ps);
             // 只读一次状态：`try_lock` 防止和创建/上屏路径互锁（拿不到就交给系统重画）
+            let mut ask_java = None;
             if let Ok(st) = wstate().try_lock() {
                 if let Some(peer) = st.by_hwnd.get(&hwnd) {
                     if let Some(w) = st.by_peer.get(peer) {
                         if w.visible {
                             blit_px(hwnd, &w.px, w.w, w.h);
+                            ask_java = Some((w.w, w.h));
                         }
                     }
                 }
             }
             let _ = w32::EndPaint(hwnd, &ps);
+            // 系统只是提醒「这块要重画」。像素得由 Java 侧 `Component.paint()` 产出来，
+            // 所以把重画请求转给事件泵：`handlePaint` → `PaintEvent` → `paint()`。
+            // 不转这一步窗口就永远是我们自己那张空白 `px`（实测：客户区全白）。
+            if let Some((w, h)) = ask_java {
+                push_event(InputEvt::Paint { hwnd, w, h });
+            }
             0
         },
         // 背景我们自己画（`WM_PAINT` 里整块重绘），别让系统刷白
@@ -1870,6 +1888,14 @@ fn set_i64_field(vm: &Vm, obj: i32, class: &str, name: &str, v: i64) {
     }
 }
 
+/// 写引用字段。**必须 `Slot::I`**：`scan_refs`/`scan_refs_young` 只认 `Slot::I`，
+/// 存成 `Slot::L` 会被当 primitive long 跳过 —— 引用不是 GC 根，随后变悬空句柄。
+fn set_ref_field(vm: &Vm, obj: i32, class: &str, name: &str, v: i32) {
+    if let Some(i) = vm.store.field_index(class, name) {
+        vm.sh.heap.set_ref(obj, i, Slot::I(v));
+    }
+}
+
 fn component_size(vm: &Vm, target: i32) -> (i32, i32) {
     if target <= 0 {
         return (1, 1);
@@ -1946,14 +1972,37 @@ fn atrace(msg: &str) {
 
 fn new_obj(vm: &mut Vm, class: &str, desc: &str, args: &[Slot]) -> i32 {
     atrace("new_obj");
-    let Ok(handle) = vm.new_instance(class, desc) else { return 0 };
-    let _ = call_java(vm, class, "<init>", desc, args, handle);
+    // **只分配，不在这里跑构造器**：`Vm::new_instance(class, desc)` 只给得出 `this`，
+    // 带参数的构造器会被零填充跑一遍（`DirectColorModel(0,0,0,0)` 直接抛
+    // IllegalArgumentException → 返回 0 → Java 侧拿到 null
+    // → 建窗时 `InvalidPipeException: Unsupported bit depth: 0`）。
+    // 构造器这条路统一走 `call_java`：它会把 `this` 补到 args 最前面。
+    let handle = alloc_instance(vm, class);
+    if handle == 0 {
+        atrace(&format!("new_obj {class}: 分配失败（类没加载到）"));
+        return 0;
+    }
+    if let Err(e) = call_java(vm, class, "<init>", desc, args, handle) {
+        // 吞掉构造器异常会让对象「字段全 0」地流出去（表现为 pixelSize=0 之类），
+        // 排查时先看这一行。
+        atrace(&format!("new_obj {class}.<init>{desc} 失败: {}", e.msg));
+    }
     handle
 }
 
 fn make_cm(vm: &mut Vm) -> i32 {
     atrace("make_cm");
-    new_obj(vm, "java/awt/image/DirectColorModel", "(IIII)V", &[Slot::I(0x00FF_0000u32 as i32), Slot::I(0xFF00), Slot::I(0xFF), Slot::I(0)])
+    // 5 参 `DirectColorModel(bits, rmask, gmask, bmask, amask)`（JDK 25 没有 3 参版本，
+    // `javap java.awt.image.DirectColorModel` 只有 (IIII)、(IIIII) 和 8 参那份）。
+    // bits 必须是 **32**：之前错写成 `(IIII)V` 并把 0x00FF0000 当 bits，
+    // pixelSize 变成 16711680 → `GDIWindowSurfaceData.getSurfaceType` 直接
+    // `InvalidPipeException: Unsupported bit depth: 16711680`。
+    new_obj(
+        vm,
+        "java/awt/image/DirectColorModel",
+        "(IIIII)V",
+        &[Slot::I(32), Slot::I(0x00FF_0000), Slot::I(0xFF00), Slot::I(0xFF), Slot::I(0)],
+    )
 }
 
 /// `WToolkit.makeColorModel()Ljava/awt/image/ColorModel;`
@@ -1972,7 +2021,7 @@ fn toolkit_get_windows_version(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmErr
 ///
 /// 我们的消息泵在 Rust 侧的 UI 线程里（见 [`ui_thread_main`]）：Win32 的消息只能由
 /// **建窗口的那个线程**取出来，而 Java 侧的 `AWT-Windows` 线程并不建窗口。
-fn toolkit_init(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+fn toolkit_init(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     atrace("WToolkit.init enter");
     // 返回 true = 「原生侧已经把消息泵起好了」：Java 侧于是
     // ① 装关机钩子（它调 `shutdown()` 让 eventLoop 退出）② 调 `eventLoop()`。
@@ -1982,6 +2031,16 @@ fn toolkit_init(_: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     // 必须由一条 Java 线程投给组件**（Rust 侧没有解释器上下文）。所以现在
     // `eventLoop()` 就是那个投递点：它不碰 Win32，只把 Rust 队列里的事件
     // `dispatchEvent` 出去。
+    //
+    // **必须配平 `AWTAutoShutdown` 的记账**：`WToolkit` 构造器一进门就
+    // `notifyToolkitThreadBusy()`（= `toolkitThreadBusy = true` + 拉起一条**非 daemon**
+    // 的 `AWT-Shutdown` 线程）。真 JVM 里这个标志由 **awt.dll 的消息泵**在空闲时清
+    // （`AwtToolkit::SetBusy(false)` → `notifyToolkitThreadFree()`）。我们这条 Java 线程
+    // 跑完 `run()` 就没了，没人清 → `isReadyToShutdown()` 永远 false → `AWT-Shutdown`
+    // 永不退出 → `main` 在 `wait_non_daemon()` 里死等（现象：进程不退出、CPU 0、
+    // main 帧已弹空）。所以在返回「不起泵」的同时，把 busy 记成 false ——
+    // 这正是「原生侧此刻空闲」的真实语义。
+    let _ = call_java(vm, "sun/awt/AWTAutoShutdown", "notifyToolkitThreadFree", "()V", &[], 0);
     atrace("WToolkit.init -> false");
     Ok(Slot::I(0))
 }
@@ -2068,21 +2127,32 @@ fn dev_make_color_model(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn dev_display_mode(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+    // 真实屏幕尺寸（`SM_CXSCREEN`/`SM_CYSCREEN`）。以前这里写死 320×200：
+    // AWT 会拿它做窗口位置钳制/居中，写死会让窗口跑到屏幕外。
+    let (w, h) = screen_size();
     Ok(Slot::I(new_obj(
         vm,
         "java/awt/DisplayMode",
         "(IIII)V",
-        &[Slot::I(320), Slot::I(200), Slot::I(32), Slot::I(0)],
+        &[Slot::I(w), Slot::I(h), Slot::I(32), Slot::I(0)],
     )))
+}
+
+/// 主屏像素尺寸（`GetSystemMetrics(SM_CXSCREEN/SM_CYSCREEN)`）
+fn screen_size() -> (i32, i32) {
+    unsafe { (w32::GetSystemMetrics(0), w32::GetSystemMetrics(1)) }
 }
 
 fn gconfig_get_bounds(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
     atrace("Win32GraphicsConfig.getBounds");
+    // 真实屏幕边界（以前写死 320×200：AWT 的窗口夹取/居中都用它，
+    // 写死会让 setSize(320,200) 的窗口看起来"刚好贴满屏幕"、坐标全错）
+    let (w, h) = screen_size();
     Ok(Slot::I(new_obj(
         vm,
         "java/awt/Rectangle",
         "(IIII)V",
-        &[Slot::I(0), Slot::I(0), Slot::I(320), Slot::I(200)],
+        &[Slot::I(0), Slot::I(0), Slot::I(w), Slot::I(h)],
     )))
 }
 
@@ -2114,6 +2184,25 @@ fn peer_create(vm: &mut Vm, f: &mut Frame, frame: bool) -> Result<Slot, VmError>
     }
     set_i64_field(vm, peer, "sun/awt/windows/WComponentPeer", "hwnd", hwnd as i64);
     set_i64_field(vm, peer, "sun/awt/windows/WObjectPeer", "pData", 1);
+    // `WComponentPeer.<init>` **不填** `winGraphicsConfig` —— 真实 HotSpot 是
+    // `Component.addNotify()` → `Component.updateGraphicsData(gc)` → `peer.updateGraphicsData(gc)`
+    // 那条路填的。我们绕开 addNotify 直接 `new WFramePeer` + `createAwtFrame`，于是
+    // `WWindowPeer.show()` → `updateGC()` 第 33 行 `winGraphicsConfig.getDevice()` 撞 null
+    // （NPE 消息里的 "receiver is null" 指的是这一步，不是 `graphicsConfig`）。
+    // 没有 `setGraphicsConfiguration` 方法可调：那是 `AWTAccessor$ComponentAccessor` 上的，
+    // 改的是 Component 一侧的字段，peer 这一侧还得靠这里补。
+    let gc = call_java(
+        vm,
+        "sun/awt/windows/WComponentPeer",
+        "getGraphicsConfiguration",
+        "()Ljava/awt/GraphicsConfiguration;",
+        &[],
+        peer,
+    )?;
+    if gc.as_i32() > 0 {
+        set_ref_field(vm, peer, "sun/awt/windows/WComponentPeer", "winGraphicsConfig", gc.as_i32());
+        atrace("peer.winGraphicsConfig <- target.getGraphicsConfiguration()");
+    }
     let jbuf = new_int_array(vm, (w as usize) * (h as usize), 0x00FF_FFFF);
     {
         let mut st = wstate().lock().unwrap_or_else(|e| e.into_inner());
@@ -2157,6 +2246,16 @@ fn peer_show(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     };
     if gdi != 0 {
         flush_surface(vm, gdi);
+    }
+    // 第一次上屏后主动要一帧 Java 的 `paint()`：`ShowWindow` 带来的 `WM_PAINT` 不保证
+    // 落在这之后（实测它可能在 `pShow` 之前就被系统合并掉了），缺这一下客户区会一直是我们
+    // 自己那张空白 `px`。
+    if hwnd != 0 {
+        let (w, h) = {
+            let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+            st.by_peer.get(&peer).map(|i| (i.w, i.h)).unwrap_or((0, 0))
+        };
+        push_event(InputEvt::Paint { hwnd, w, h });
     }
     void()
 }
@@ -2394,6 +2493,31 @@ pub(super) fn register_window(r: &mut NativeRegistry) {
     r.add("sun/awt/windows/WButtonPeer", "initIDs", "()V", no_op_taking);
     r.add("sun/awt/windows/WDefaultFontCharset", "initIDs", "()V", no_op_taking);
     r.add("sun/awt/windows/WDesktopProperties", "initIDs", "()V", no_op_taking);
+    // `WDesktopProperties.init()`：真机上它读注册表/系统主题色。我们不读，
+    // 但**必须注册**——`Win32GraphicsEnvironment.<clinit>` 之后必经此处，
+    // 缺了就是 UnsatisfiedLinkError，连 `new Frame()` 都过不去。
+    r.add("sun/awt/windows/WDesktopProperties", "init", "()V", no_op_taking);
+    // 同一条链上的另两个：`getWindowsParameters()` 填主题/字体参数，`playWindowsSound`
+    // 播放系统音 —— 我们都不做，但**必须注册**（少一个就是建窗期 UnsatisfiedLinkError）。
+    r.add("sun/awt/windows/WDesktopProperties", "getWindowsParameters", "()V", no_op_taking);
+    r.add(
+        "sun/awt/windows/WDesktopProperties",
+        "playWindowsSound",
+        "(Ljava/lang/String;)V",
+        no_op_taking,
+    );
+    // `D3DGraphicsDevice.<clinit>`：真 JDK 默认 `WindowsFlags.d3dEnabled=true`，
+    // 所以 `makeScreenDevice` **一定会**走这里。返回 false = 「本机没有 D3D」，
+    // 于是 `createDevice` 返回 null 回落 `Win32GraphicsDevice`（这就是真 JDK 在
+    // 无 D3D 机器上的行为）。**不要**去实现 D3D。
+    r.add("sun/java2d/d3d/D3DGraphicsDevice", "initD3D", "()Z", |_, _| zi(0));
+    // `WCanvasPeer.setNativeBackgroundErase(ZZ)V`：告诉原生侧「别擦背景」。
+    // 我们的绘制是自己 blit 到窗口像素缓冲，没有 WM_ERASEBKGND 这条路径，no-op 即可；
+    // 不注册的话 `WCanvasPeer.initialize()` 里直接 UnsatisfiedLinkError，建 peer 就断。
+    r.add("sun/awt/windows/WCanvasPeer", "setNativeBackgroundErase", "(ZZ)V", no_op_taking);
+    // `SunToolkit.closeSplashScreen()`：第一个窗口 show 的时候调，用来关掉启动画面。
+    // 我们没有启动画面 → no-op（**static**，所以用 no_op 不是 no_op_taking）。
+    r.add("sun/awt/SunToolkit", "closeSplashScreen", "()V", no_op);
     r.add("sun/awt/windows/WEmbeddedFrame", "initIDs", "()V", no_op_taking);
     r.add("sun/awt/windows/WFileDialogPeer", "initIDs", "()V", no_op_taking);
     r.add("sun/awt/windows/WFontMetrics", "initIDs", "()V", no_op_taking);
@@ -2448,6 +2572,59 @@ pub(super) fn register_window(r: &mut NativeRegistry) {
     r.add("sun/awt/windows/WToolkit", "quitSecondaryEventLoop", "()V", traced!("quitSecondaryEventLoop", no_op));
     r.add("sun/awt/windows/WToolkit", "setDynamicLayoutNative", "(Z)V", traced!("setDynamicLayoutNative", no_op));
     r.add("sun/awt/windows/WToolkit", "isDynamicLayoutSupportedNative", "()Z", traced!("isDynamicLayoutSupportedNative", |_, _| zi(1)));
+
+    // ---- WGlobalCursorManager
+    //
+    // `Component.show()` 收尾会 `Toolkit.updateCursorImmediately()` →
+    // `GlobalCursorManager._updateCursor()` → 这四个 native。
+    // 鼠标还没接进来之前统一答「光标下没有窗口」：`_updateCursor` 拿到 null 就直接
+    // `updateCursorOutOfJava()` 返回，后两个（`getCursorPos`/`getLocationOnScreen`）走不到。
+    r.add(
+        "sun/awt/windows/WGlobalCursorManager",
+        "findHeavyweightUnderCursor",
+        "(Z)Ljava/awt/Component;",
+        traced!("findHeavyweightUnderCursor", |_, _| zi(0)),
+    );
+    r.add("sun/awt/windows/WGlobalCursorManager", "setCursor", "(Ljava/awt/Component;Ljava/awt/Cursor;Z)V", traced!("setCursor", no_op_taking));
+    r.add("sun/awt/windows/WGlobalCursorManager", "getCursorPos", "(Ljava/awt/Point;)V", traced!("getCursorPos", no_op_taking));
+    r.add("sun/awt/windows/WGlobalCursorManager", "getLocationOnScreen", "(Ljava/awt/Component;)Ljava/awt/Point;", traced!("getLocationOnScreen", |_, _| zi(0)));
+    r.add("sun/awt/windows/WGlobalCursorManager", "nativeUpdateCursor", "(Ljava/awt/Component;)V", traced!("nativeUpdateCursor", no_op_taking));
+
+    // ---- WInputMethod
+    //
+    // `WInputMethodDescriptor.getNativeAvailableLocales` 返回**空数组**而不是 null：
+    // `getAvailableLocales()` 拿到就遍历，null 会在 `AWT-EventQueue` 上炸掉那条线程。
+    //
+    fn ime_available_locales(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
+        Ok(Slot::I(vm.sh.heap.new_array(Vec::<Slot>::new(), "[Ljava/util/Locale;").unwrap_or(0)))
+    }
+    //
+    // 不走 IME（输入法）整条链：窗口 dispose/失焦时会摸到它，缺一个 native 就把
+    // `AWT-EventQueue` 线程打死、整个进程收不了尾。统一答「没有 native IME」。
+    r.add("sun/awt/windows/WInputMethod", "createNativeContext", "()I", traced!("createNativeContext", |_, _| zi(1)));
+    r.add("sun/awt/windows/WInputMethod", "destroyNativeContext", "(I)V", traced!("destroyNativeContext", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "enableNativeIME", "(Lsun/awt/windows/WComponentPeer;IZ)V", traced!("enableNativeIME", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "disableNativeIME", "(Lsun/awt/windows/WComponentPeer;)V", traced!("disableNativeIME", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "handleNativeIMEEvent", "(Lsun/awt/windows/WComponentPeer;Ljava/awt/AWTEvent;)V", traced!("handleNativeIMEEvent", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "endCompositionNative", "(IZ)V", traced!("endCompositionNative", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "setConversionStatus", "(II)V", traced!("setConversionStatus", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "getConversionStatus", "(I)I", traced!("getConversionStatus", |_, _| zi(0)));
+    r.add("sun/awt/windows/WInputMethod", "setOpenStatus", "(IZ)V", traced!("setOpenStatus", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "getOpenStatus", "(I)Z", traced!("getOpenStatus", |_, _| zi(0)));
+    r.add("sun/awt/windows/WInputMethod", "setStatusWindowVisible", "(Lsun/awt/windows/WComponentPeer;Z)V", traced!("setStatusWindowVisible", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "getNativeIMMDescription", "()Ljava/lang/String;", traced!("getNativeIMMDescription", |_, _| zi(0)));
+    r.add("sun/awt/windows/WInputMethod", "getNativeLocale", "()Ljava/util/Locale;", traced!("getNativeLocale", |_, _| zi(0)));
+    r.add("sun/awt/windows/WInputMethod", "setNativeLocale", "(Ljava/lang/String;Z)Z", traced!("setNativeLocale", |_, _| zi(0)));
+    r.add("sun/awt/windows/WInputMethod", "openCandidateWindow", "(Lsun/awt/windows/WComponentPeer;II)V", traced!("openCandidateWindow", no_op_taking));
+    r.add("sun/awt/windows/WInputMethod", "isCompositionStringAvailable", "(I)Z", traced!("isCompositionStringAvailable", |_, _| zi(0)));
+    // 没有 native IME → 可用 locale 列表就是空数组（返回 null 会让 `getAvailableLocales` 里
+    // 直接遍历数组时报 NPE，而它是在 `AWT-EventQueue` 上跑的，一炸线程就没了）。
+    r.add(
+        "sun/awt/windows/WInputMethodDescriptor",
+        "getNativeAvailableLocales",
+        "()[Ljava/util/Locale;",
+        ime_available_locales,
+    );
 
     // ---- WComponentPeer
     r.add("sun/awt/windows/WComponentPeer", "isObscured", "()Z", traced!("isObscured", |_, _| zi(0)));
@@ -3450,6 +3627,15 @@ enum InputEvt {
         ch: u16,
         modifiers: i32,
     },
+    /// `WM_PAINT`：让 Java 侧 `Component.paint()` 重新产出像素。
+    ///
+    /// 不带上「脏矩形」——`handlePaint(0,0,w,h)` 就是整窗重画，够用且省得同步 `BeginPaint`
+    /// 的矩形。窗口还不大的时候整画比裁剪便宜。
+    Paint {
+        hwnd: isize,
+        w: i32,
+        h: i32,
+    },
 }
 
 static EVENTS: OnceLock<Mutex<Vec<InputEvt>>> = OnceLock::new();
@@ -3604,7 +3790,78 @@ fn drain_events(vm: &mut Vm) {
                 dispatch_mouse(vm, hwnd, id, x, y, button, clicks, modifiers)
             }
             InputEvt::Key { hwnd, id, code, ch, modifiers } => dispatch_key(vm, hwnd, id, code, ch, modifiers),
+            InputEvt::Paint { hwnd, w, h } => dispatch_paint(vm, hwnd, w, h),
         }
+    }
+}
+
+/// 把一次 `WM_PAINT` 转成 Java 的「该重画了」。
+///
+/// 三步必须按这个顺序，缺一步就是黑窗口：
+/// 1. `WComponentPeer.handlePaint(x,y,w,h)` —— 只是 `postPaintIfNecessary`，
+///    把 `PaintEvent` 投进 EventQueue 就返回（**同步画完的是下面那步**）；
+/// 2. `SunToolkit.flushPendingEvents()` —— 等 EventQueue 真的把 `paint()` 跑完。
+///    不等就会拿旧的 `px` 去 BitBlt，屏幕上还是上一帧；
+/// 3. `flush_surface` —— 把 Java 面里的像素搬到 `px` 并 `BitBlt` 上屏。
+fn dispatch_paint(vm: &mut Vm, hwnd: isize, w: i32, h: i32) {
+    let peer = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        match st.by_hwnd.get(&hwnd) {
+            Some(p) => *p,
+            None => return,
+        }
+    };
+    if peer <= 0 {
+        return;
+    }
+    atrace("dispatch_paint");
+    // **不走 `WComponentPeer.handlePaint`**：它只是把 `PaintEvent` 投进 `EventQueue`，
+    // 真正跑 `paint()` 的是 `AWT-EventQueue-0`，而那条线程要执行 `Runnable.run()` ——
+    // VM 对**匿名类**的接口方法解析目前是坏的（`new Runnable(){…}` 在 EDT 上直接报
+    // 「找不到方法 java/lang/Runnable.run()V」，见样张 E1；命名类 E2 与静态嵌套类 E3 都正常）。
+    // 于是事件投出去没人消费，客户区就永远是我们自己那张空白 `px`（实测）。
+    // 改法：在这条泵线程上**同步**画一次，无异步依赖。
+    let target = get_ref_field(vm, peer, "sun/awt/windows/WComponentPeer", "target");
+    atrace(&format!("dispatch_paint peer={peer} target={target}"));
+    if target > 0 {
+        let g = call_java(
+            vm,
+            "sun/awt/windows/WComponentPeer",
+            "getGraphics",
+            "()Ljava/awt/Graphics;",
+            &[],
+            peer,
+        )
+        .map(|v| v.as_i32())
+        .unwrap_or(0);
+        if g > 0 {
+            // 必须调 **peer** 的 `paint(Graphics)`：它体内是
+            // `target.paint(g)` 的 `invokevirtual`，虚分派由字节码自己做，
+            // 所以 `PaintFrame` 的覆盖方法一定会跑到。（若直接调
+            // `Component.paint`，解析到的是基类那个空实现 —— 实测画不出来。）
+            let r = call_java(
+                vm,
+                "sun/awt/windows/WComponentPeer",
+                "paint",
+                "(Ljava/awt/Graphics;)V",
+                &[Slot::I(g)],
+                peer,
+            );
+            if let Err(e) = &r {
+                atrace(&format!("peer.paint 失败: {}", e.msg));
+            }
+            // Graphics 必须还回去：`SunGraphics2D` 里挂着 SurfaceData 的引用
+            let _ = call_java(vm, "java/awt/Graphics", "dispose", "()V", &[], g);
+        } else {
+            atrace("getGraphics 返回 null");
+        }
+    }
+    let gdi = {
+        let st = wstate().lock().unwrap_or_else(|e| e.into_inner());
+        st.by_peer.get(&peer).map(|i| i.gdi).unwrap_or(0)
+    };
+    if gdi != 0 {
+        flush_surface(vm, gdi);
     }
 }
 

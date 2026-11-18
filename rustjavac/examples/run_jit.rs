@@ -24,6 +24,13 @@ fn main() {
     let path = std::env::args().nth(1).expect("用法: run_jit <class 文件>");
     let bytes = std::fs::read(&path).expect("read");
     let cf = classfile::parse(&bytes).expect("parse");
+    // 字节码校验：JIT 直接编机器码、**不经过** `Vm::execute`，所以这里必须先验一遍，
+    // 否则非法 class 会被编成机器码照跑（`R4` 就是这样「算出了对的答案」的）。
+    // 与 HotSpot 一样：验证失败 → `VerifyError`，一条指令都不执行。
+    if let Err(why) = classfile::vm::verify_class(&cf) {
+        eprintln!("Exception in thread \"main\" java.lang.VerifyError: {why}");
+        std::process::exit(1);
+    }
     let mut jit = classfile::jit::Jit::new();
     // 继承：把同目录的其它 .class 也读进来（父类/子类的方法都要编）
     jit.load_class_path(&path);

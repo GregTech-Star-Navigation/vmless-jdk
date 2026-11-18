@@ -166,6 +166,10 @@ fn erase_stmt(s: &mut Stmt, env: &Env) {
                 }
             }
         }
+        Stmt::Sync { lock, body } => {
+            erase_expr(lock, env);
+            erase_stmt(body, env);
+        }
         Stmt::Try { body, catches, finally } => {
             erase_stmt(body, env);
             for c in catches.iter_mut() {

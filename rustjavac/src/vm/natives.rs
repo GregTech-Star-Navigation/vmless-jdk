@@ -319,7 +319,12 @@ impl Vm {
                 Ok(Slot::I(h))
             }
             "equals" => Ok(Slot::I(if recv == a.as_i32() { 1 } else { 0 })),
-            other => Err(VmError { msg: format!("内建方法 {other} 未实现"), exc: None }),
+            other => Err(VmError {
+                // 带上接收者类型：这个错误只在「类没有字节码 → 走内建表」时出现，
+                // 原来只说方法名，根本看不出是哪个类漏了（AWT 里一次就卡住排查）
+                msg: format!("内建方法 {other} 未实现（接收者 {}）", self.type_name(recv)),
+                exc: None,
+            }),
         }
     }
 

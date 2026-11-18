@@ -46,6 +46,7 @@ mod shared;
 mod slot;
 pub mod stacktrace;
 mod thread;
+mod verify;
 
 pub use bridge::{
     call_interpreted_ptr, has_ref, install_jit, interp_ready, interp_targets, jit_table_len, open_interp,
@@ -53,6 +54,7 @@ pub use bridge::{
     JitEntry, JitTable,
 };
 pub use slot::Slot;
+pub use verify::verify_class;
 pub(crate) use class::builtin_super;
 use load::ClassStore;
 use shared::Shared;
@@ -266,6 +268,11 @@ impl Vm {
             return Ok(f);
         }
         let key = format!("{class}.{name}{desc}");
+        // `VMLESS_NATIVE_TRACE=1`：缺哪个 native **当场**打出来。挂在失败路径上，
+        // 不影响正常执行；排查「AWT/JDBC 走到哪一步缺实现」时不必再猜。
+        if std::env::var_os("VMLESS_NATIVE_TRACE").is_some() {
+            eprintln!("[t{}][native-missing] {key}", thread::cur_tid());
+        }
         self.sh
             .missing_natives
             .lock()
@@ -356,6 +363,13 @@ impl Vm {
         }
         if self.store.resolve_method("java/lang/System", "initPhase1", "()V").is_some() {
             self.ensure_init("java/lang/System")?;
+            // `System.props` 必须在 initPhase1 **之前**就位：initPhase1 一开始注册
+            // SharedSecrets 时就会走到 `ConcurrentHashMap.put` → `ThreadLocalRandom.<clinit>`
+            // → `RandomSupport.<clinit>` → `Boolean.getBoolean("java.util.secureRandomSeed")`
+            // → `System.getProperty(k,def)` → `props.getProperty(...)`。
+            // props 为 null 时这条路要么静默给 null、要么 NPE 把整个 initPhase1 掐断
+            // （后果：`System.out` 永远是 null）。
+            self.init_system_props();
             if let Some((ci, mi)) = self.store.resolve_method("java/lang/System", "initPhase1", "()V") {
                 // `initPhase1` 里 `setOut0/setErr0/setIn0` 一旦没跑到，`System.out` 就是 null ——
                 // 而 `println` 被 `exec` 按方法名拦截，所以**从 println 看不出来**，
@@ -383,7 +397,28 @@ impl Vm {
                 }
             }
         }
+        // `System.props` 必须非 null：`System.getProperty(k,def)` / `clearProperty` /
+        // `getProperties` / `Boolean.getBoolean` 的**真字节码**都直接 `props.xxx(...)`
+        // （`clearProperty` 就是 `props.remove(key)`，一次 invokeinterface）。
+        // 我们只接管了 1 参 `System.getProperty`，所以 props 为 null 时这些方法
+        // 全部打在 null 接收者上 —— 要么被内建兜底静默吞成 null（`Boolean.getBoolean`
+        // 恒 false → `ResourceBundle.<clinit>` 走错分支），要么在 AWT 里变成
+        // 「内建方法 remove 未实现（接收者 null）」这种看不出所以然的 VM 错误。
         let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);
+        // `VMLESS_WDN_TRACE=1`：把 main 的结局**先**打出来。`wait_non_daemon()` 可能挂死
+        // （非 daemon 线程退出不了），而 main 的异常文本原本要等它返回之后才由调用方打印 ——
+        // 一挂死就永远看不到「main 到底抛了什么」。这个开关就是给那种场景用的。
+        if std::env::var_os("VMLESS_WDN_TRACE").is_some() {
+            let txt = match &r {
+                Ok(_) => "Ok".to_string(),
+                Err(e) => match e.exc {
+                    Some(h) => format!("ERR(exc) {}", self.exc_text(h)),
+                    None => format!("ERR(vm) {}", e.msg),
+                },
+            };
+            eprintln!("[main] {txt}");
+            eprintln!("[native-missing] {:?}", self.missing_natives());
+        }
         // 主线程返回 ≠ 进程退出：非 daemon 线程要继续跑完（`System.exit` 已经在 native 里直接退）
         self.wait_non_daemon();
         self.thread_terminate_main();
@@ -450,6 +485,53 @@ impl Vm {
         self.store.class_names()
     }
 
+    /// 填 `System.props`（只做一次；已经有就不动）。
+    ///
+    /// 走**真 `Properties.put`**：`Properties` 的键值实际存在 `Hashtable.table` 里，
+    /// 手工往字段塞会让 `size`/`threshold` 与实际条目对不上，之后
+    /// `props.remove()`/`get()` 就会读到坏状态。所以这里只负责「造对象 + 灌键值」，
+    /// 内部结构交给 Java 自己维护。
+    pub(crate) fn init_system_props(&mut self) {
+        let key = ("java/lang/System".to_string(), "props".to_string());
+        let cur = crate::vm::shared::lk(&self.sh.statics).get(&key).copied().unwrap_or(Slot::I(0));
+        if cur.as_i32() > 0 {
+            return;
+        }
+        if !self.ensure_class_loaded("java/util/Properties") {
+            return;
+        }
+        let props = match self.new_instance("java/util/Properties", "()V") {
+            Ok(h) if h > 0 => h,
+            _ => return,
+        };
+        let pairs: [(&str, String); 7] = [
+            ("java.home", std::env::var("VMLESS_JAVA_HOME").unwrap_or_else(|_| ".".into())),
+            ("java.class.path", ".".into()),
+            ("file.separator", std::path::MAIN_SEPARATOR.to_string()),
+            ("path.separator", ";".into()),
+            ("line.separator", "\n".into()),
+            ("os.name", "Windows 10".into()),
+            ("user.dir", std::env::current_dir().map(|p| p.display().to_string()).unwrap_or_else(|_| ".".into())),
+        ];
+        for (k, v) in pairs {
+            let (kh, vh) = (self.str_new(k.to_string()), self.str_new(v));
+            if let Some((ci, mi)) = self.store.resolve_method(
+                "java/util/Properties",
+                "setProperty",
+                "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+            ) {
+                let _ = self.execute(
+                    ci,
+                    mi,
+                    "(Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;",
+                    &[Slot::I(props), Slot::I(kh), Slot::I(vh)],
+                    true,
+                );
+            }
+        }
+        crate::vm::shared::lk(&self.sh.statics).insert(key, Slot::I(props));
+    }
+
     /// 按 classpath 建 VM（**公开入口**，`examples/run_jdk.rs` 与 `rustjava -cp` 共用）。
     ///
     /// `VMLESS_JDK` 设了就把它挂到 classpath **末尾**（用户自己的类优先）：
@@ -458,7 +540,19 @@ impl Vm {
         let mut cp = crate::load::ClassPath::from_spec(spec).map_err(|e| VmError { msg: e, exc: None })?;
         push_jdk(&mut cp);
         let name = internal_name(main_class);
-        let mut vm = Self::from_store(ClassStore::load_path(&cp, &name)?);
+        Self::from_cp(cp, &name)
+    }
+
+    /// 用一份已经拼好的 classpath 建 VM：**加载类立刻就装好运行期 classpath**。
+    ///
+    /// 两个入口（`Vm::open` / `run_class_file` / `run_jar`）必须走同一段 —— 之前
+    /// `run_class_file` 忘了把 cp 写进 `sh.cp`，后果是**运行期按名字才出现**的类
+    /// 一律 `ClassNotFoundException`：加载期只沿常量池闭包走，而
+    /// `Class.forName("sun.java2d.marlin.DMarlinRenderingEngine")` 那种名字写在
+    /// **字符串**里的类闭包根本看不见。症状是 `java2d` 起不来
+    /// （`InternalError: No RenderingEngine module found`）、`AWT` 建窗失败。
+    pub(crate) fn from_cp(cp: crate::load::ClassPath, main: &str) -> Result<Self, VmError> {
+        let mut vm = Self::from_store(ClassStore::load_path(&cp, main)?);
         // classpath 留着：`Class.forName` 要在运行期按需加载闭包（见 `reflect.rs`）
         *vm.sh.cp.lock().unwrap_or_else(|e| e.into_inner()) = Some(cp);
         Ok(vm)
@@ -511,8 +605,7 @@ pub fn run_class_file(path: &str) -> Result<ExecResult, VmError> {
     let mut cp = crate::load::ClassPath::from_spec(&root.to_string_lossy())
         .map_err(|e| VmError { msg: e, exc: None })?;
     push_jdk(&mut cp);
-    let mut vm = Vm::from_store(ClassStore::load_path(&cp, &name)?);
-    vm.run_main()
+    Vm::from_cp(cp, &name)?.run_main()
 }
 
 /// `a.b.C` / `a/b/C` / `a/b/C.class` → `a/b/C`
@@ -547,8 +640,7 @@ pub fn run_jar(path: &str, main: Option<&str>) -> Result<ExecResult, VmError> {
     };
     let mut cp = crate::load::ClassPath::from_spec(path).map_err(|e| VmError { msg: e, exc: None })?;
     push_jdk(&mut cp);
-    let store = ClassStore::load_path(&cp, &name)?;
-    Vm::from_store(store).run_main()
+    Vm::from_cp(cp, &name)?.run_main()
 }
 
 /// 类文件所在目录 → **包根**：`…/out/app/X.class` 的包根是 `…/out`。

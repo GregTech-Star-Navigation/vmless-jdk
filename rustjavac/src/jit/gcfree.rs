@@ -59,8 +59,8 @@ fn may_gc_opcode(op: u8) -> bool {
         0xc2 | 0xc3 => true,
         // checkcast 会分配 ClassCastException；instanceof/length 走运行时调用
         0xc0 | 0xc1 | 0xbe => true,
-        // 除/余：除零要陷入异常
-        0x6c | 0x6d | 0x70 | 0x71 => true,
+        // 除/余：除零要陷入异常（0x72/0x73 的 drem/frem 走运行时调用，一并按会 GC 处理）
+        0x6c | 0x6d | 0x70 | 0x71 | 0x72 | 0x73 => true,
         // 老式子程序
         0xa8 | 0xa9 => true,
         // 多数组分配已覆盖；arraylength(0xbe) 已覆盖

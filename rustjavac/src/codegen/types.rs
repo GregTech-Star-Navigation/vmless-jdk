@@ -1,6 +1,7 @@
 //! 类型种类、描述符、验证类型与表达式类型推断。
 
 use crate::ast::*;
+use std::collections::HashSet;
 
 use super::constpool::CpBuilder;
 use super::ctx::Ctx;
@@ -216,8 +217,18 @@ pub(crate) fn desc_params(desc: &str) -> Vec<String> {
 /// 表达式的**装箱前**类型：基本类型描述符（`I`/`J`/`D`/`Z`/`C`）。
 ///
 /// 包装类（`Integer` 等）当作它的基本类型看 —— 数值上下文里要先拆箱。
-pub(crate) fn unwrap_prim(t: &Type) -> Option<&'static str> {
-    match t {
+/// 种类（`K_INT` / `K_LONG` …）→ 基本类型描述符。装箱时用来挑 `Integer.valueOf` 之类。
+pub(crate) fn prim_desc_of_kind(k: u8) -> &'static str {
+    match k {
+        K_LONG => "J",
+        K_DOUBLE => "D",
+        K_FLOAT => "F",
+        K_BOOL => "Z",
+        _ => "I",
+    }
+}
+
+pub(crate) fn unwrap_prim(t: &Type) -> Option<&'static str> {    match t {
         Type::Prim("int") => Some("I"),
         Type::Prim("long") => Some("J"),
         Type::Prim("double") => Some("D"),
@@ -363,6 +374,11 @@ pub(crate) fn coerce_to(
             if kind_of(t) != K_REF {
                 return emit_box(unwrap_prim(t).unwrap_or("I"), em, cp);
             }
+        } else if expr_kind(e, ctx) != K_REF {
+            // 类型推不出来的**数值**表达式也必须装箱：放过这一条，栈上留一个 int
+            // 交给 `Map.put(Object,Object)`，真 JVM 直接 VerifyError ——
+            // 而且 `javap` 完全看不出来（描述符是对的，错的是没发 valueOf）。
+            return emit_box(prim_desc_of_kind(expr_kind(e, ctx)), em, cp);
         }
         if descriptor(target) == "Ljava/lang/Object;" {
             return Ok(());
@@ -620,19 +636,63 @@ pub(crate) fn expr_type(e: &Expr, ctx: &Ctx) -> Option<Type> {
             let desc = call_desc(recv.as_deref(), name, args, ctx)?;
             let ret = desc.rsplit(')').next().unwrap_or("");
             if ret.is_empty() || ret == "V" {
-                None
-            } else {
-                Some(type_from_desc(ret))
+                return None;
             }
+            // 泛型方法的**静态**返回类型：`List<String>.get(int)` 擦除后是 Object，
+            // 但源码里它是 String —— 不代回去，`l.get(0).isEmpty()` 就在 Object 上
+            // 找不到 isEmpty（java.base 里占这一个桶的四成）。
+            //
+            // **只在擦除后的返回是 Object 时才查签名**：`generic_ret` 要递归求接收者
+            // 的类型，而接收者本身又可能是调用 —— 对 `sb.append(a).append(b).append(c)`
+            // 这种链，无条件查会让整条链的 `expr_type` 退化成子树重算，
+            // 批量编译 java.base 的墙钟时间实测因此涨到 3 倍。
+            // 返回 Object 的调用只占少数，条件化之后收益还在、代价回到原样。
+            if ret == "Ljava/lang/Object;" || ret.starts_with("TT;") {
+                if let Some(t) = recv.as_deref().and_then(|r| generic_ret(r, name, &desc, ctx)) {
+                    if !matches!(t, Type::Var) {
+                        return Some(t);
+                    }
+                }
+            }
+            Some(type_from_desc(ret))
         }
         // `switch` 表达式：结果类型就是交值点的类型
         Expr::SwitchExpr(s) => switch_expr_type(s, ctx),
         // 三元：两侧一致就用它，否则按 `cond_type` 的规则挑一个
         Expr::Cond { then, els, .. } => super::expr::cond_type(then, els, ctx),
-        // 字符串拼接的结果类型是 String（描述符/println 重载都靠它）
+        // 字符串拼接的结果类型是 String（描述符/println 重载都靠它）。
+        // **必须排在下面那条通用 Binary 之前**：`"a" + 1` 是 String 不是 int。
         Expr::Binary { op: BinOp::Add, .. } if is_string_val(e, ctx) => {
             Some(Type::Named { path: vec!["String".into()], args: vec![] })
         }
+        // 算术/位运算/比较的结果类型。
+        //
+        // 少了这一条，`m.put(i * 7919, …)` 的键、`f(a + 1)` 的实参都**推不出类型**，
+        // 于是 `coerce_to(Object, …)` 走「不知道就放过」那条路 —— **不装箱**，
+        // 运行时 `Map.put` 收到一个 int，HotSpot 直接 VerifyError。
+        // 比全是坑更糟的是它静默：javap 看着没错，跑起来才炸。
+        Expr::Binary { op, lhs, rhs } => match op {
+            BinOp::Lt | BinOp::Le | BinOp::Gt | BinOp::Ge | BinOp::Eq | BinOp::Ne | BinOp::And
+            | BinOp::Or => Some(Type::Prim("boolean")),
+            _ => Some(match promote(num_kind(lhs, ctx), num_kind(rhs, ctx)) {
+                K_LONG => Type::Prim("long"),
+                K_FLOAT => Type::Prim("float"),
+                K_DOUBLE => Type::Prim("double"),
+                K_BOOL => Type::Prim("boolean"),
+                _ => Type::Prim("int"),
+            }),
+        },
+        Expr::Unary { op, expr, .. } => match op {
+            UnOp::Not => Some(Type::Prim("boolean")),
+            _ => Some(match num_kind(expr, ctx) {
+                K_LONG => Type::Prim("long"),
+                K_FLOAT => Type::Prim("float"),
+                K_DOUBLE => Type::Prim("double"),
+                K_BOOL => Type::Prim("boolean"),
+                _ => Type::Prim("int"),
+            }),
+        },
+        Expr::InstanceOf { .. } => Some(Type::Prim("boolean")),
         // 字符串字面量的类型是 String：三元的结果类型、实参描述符都要靠它，
         // 漏了会让「引用槽」被声明成 integer（HotSpot: Inconsistent stackmap frames）
         Expr::StrLit(_) => Some(Type::Named { path: vec!["String".into()], args: vec![] }),
@@ -724,7 +784,12 @@ pub(crate) fn expr_kind(e: &Expr, ctx: &Ctx) -> u8 {
         Expr::Call { recv, name, args, .. } => call_desc(recv.as_deref(), name, args, ctx)
             .map(|d| kind_from_ret(&d))
             .unwrap_or(K_INT),
-        Expr::StrLit(_) | Expr::This | Expr::Super | Expr::New { .. } | Expr::ArrayNew { .. } | Expr::Null => K_REF,
+        // `{1,2}` / `ArrayInit` 也是**引用**（它算出的是一个数组）。漏了这一条，
+        // `int[][] m = {{1,2},{3,4}}` 的内层数组会被当成 int，于是在它上面发
+        // `Integer.valueOf(I)` —— 栈上明明是 `[I`，HotSpot 直接
+        // `VerifyError: Bad type on operand stack`。
+        Expr::StrLit(_) | Expr::TextBlock(_) | Expr::This | Expr::Super | Expr::New { .. }
+        | Expr::ArrayNew { .. } | Expr::ArrayInit(_) | Expr::Null => K_REF,
         // class 字面量是 java.lang.Class 的引用
         Expr::ClassLit(_) => K_REF,
         Expr::MethodRef { name, .. } if name == "class" => K_REF,
@@ -844,45 +909,108 @@ pub(crate) fn class_operand_name(ty: &Type, ctx: &Ctx) -> Option<String> {
 /// 只按名字存一个描述符是不行的：`CipherCore.update` 有 4 个重载，
 /// `Arrays.fill` 有十来种，挑错那个会连带把实参按错的类型转换，报出一堆假错误。
 pub(crate) fn pick_desc(cands: &[String], args: &[Expr], ctx: &Ctx) -> Option<String> {
-    let arg_descs: Vec<Option<String>> = args
-        .iter()
-        .map(|a| expr_type(a, ctx).map(|t| descriptor(&t)))
-        .collect();
     let mut best: Option<(i32, &String)> = None;
     for d in cands {
-        let ps = desc_params(d);
-        if ps.len() != args.len() {
+        // 形状 + lambda 约束 + 精确命中，全部交给 `arg_score` —— 构造器与普通方法
+        // **必须用同一套判据**，否则 `new Thread(() -> {})` 这种会在重载里撞运气
+        let Some(score) = super::expr::arg_score(&desc_params(d), args, ctx) else {
             continue;
-        }
-        let mut score = 0i32;
-        let mut shape_ok = true;
-        for (i, p) in ps.iter().enumerate() {
-            let want_ref = p.starts_with('L') || p.starts_with('[');
-            let got_ref = match arg_descs.get(i).and_then(|d| d.as_deref()) {
-                Some(d) => d.starts_with('L') || d.starts_with('['),
-                None => expr_kind(&args[i], ctx) == K_REF,
-            };
-            // 基本类型还要能宽化（`fill(a, 0)` 打给 `fill(byte[], byte)` 是合法的）
-            if want_ref != got_ref {
-                shape_ok = false;
-                break;
-            }
-            if arg_descs.get(i).and_then(|d| d.as_deref()) == Some(p.as_str()) {
-                score += 1;
-            }
-        }
-        if !shape_ok {
-            continue;
-        }
+        };
         if best.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
             best = Some((score, d));
         }
     }
-    // 一个形状都不匹配时退回第一个（参数个数相同的）；
-    // 再不行退回任意一个 —— 让下游的转换/转换错误报出更具体的信息，而不是「找不到方法」
-    best.map(|(_, d)| d.clone())
-        .or_else(|| cands.iter().find(|d| desc_params(d).len() == args.len()).cloned())
-        .or_else(|| cands.first().cloned())
+    if let Some((score, d)) = best {
+        // 固定参数候选的**最优分**先留着，和可变参数候选比一比：
+        // 「形状对上但类型不对」（1 分）不该压过「固定部分精确命中」（2 分），
+        // 否则 `Paths.get("x")` 会挑 `Paths.get(URI)` 而不是
+        // `Paths.get(String, String...)` —— 编出来是个非法 class。
+        if score >= 2 {
+            return Some(d.clone());
+        }
+    }
+    // 固定参数候选择不出合适的（比如 0 分里混着形状不对的）：再试可变参数。
+    //
+    // `Paths.get(String, String...)` 与 `Paths.get(URI)` 就是这一类：实参一个
+    // String，固定参数版只有 `(URI)`（形状对不上），可变参数版才是正确的。
+    let mut vbest: Option<(i32, &String)> = None;
+    for d in cands {
+        let ps = desc_params(d);
+        let Some(last) = ps.last() else { continue };
+        if !last.starts_with('[') {
+            continue;
+        }
+        let fixed = ps.len() - 1;
+        if args.len() < fixed {
+            continue;
+        }
+        // 形式一：末位实参就是那个数组（`m(arr)`），交给固定参数路径更合适
+        if args.len() == ps.len()
+            && super::expr::arg_looks_like_array_pub(&args[fixed], last, ctx)
+        {
+            continue;
+        }
+        let mut score = 0i32;
+        let mut ok = true;
+        for (i, p) in ps[..fixed].iter().enumerate() {
+            let want_ref = p.starts_with('L') || p.starts_with('[');
+            let ad = expr_type(&args[i], ctx).map(|t| descriptor(&t));
+            let got_ref = match ad.as_deref() {
+                Some(dd) => dd.starts_with('L') || dd.starts_with('['),
+                None => expr_kind(&args[i], ctx) == K_REF,
+            };
+            if want_ref != got_ref {
+                ok = false;
+                break;
+            }
+            if ad.as_deref() == Some(p.as_str()) {
+                score += 2;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        // 尾部实参要能装进元素类型
+        let elem = &last[1..];
+        for a in &args[fixed..] {
+            let ad = match expr_type(a, ctx).map(|t| descriptor(&t)) {
+                Some(dd) => dd,
+                None => continue,
+            };
+            let want_ref = elem.starts_with('L') || elem.starts_with('[');
+            let got_ref = ad.starts_with('L') || ad.starts_with('[');
+            if want_ref != got_ref {
+                ok = false;
+                break;
+            }
+            if ad == elem {
+                score += 1;
+            }
+        }
+        if !ok {
+            continue;
+        }
+        if vbest.as_ref().map(|(s, _)| score > *s).unwrap_or(true) {
+            vbest = Some((score, d));
+        }
+    }
+    // 可变参数候选分数更高才替换固定参数那个（平手优先固定参数）
+    match (best, vbest) {
+        (Some((bs, bd)), Some((vs, vd))) => {
+            if vs > bs {
+                Some(vd.clone())
+            } else {
+                Some(bd.clone())
+            }
+        }
+        (Some((_, bd)), None) => Some(bd.clone()),
+        (None, Some((_, vd))) => Some(vd.clone()),
+        (None, None) => cands
+            .iter()
+            .find(|d| desc_params(d).len() == args.len())
+            .cloned()
+            .or_else(|| cands.first().cloned()),
+    }
 }
 
 /// java.lang.* 里我们**运行时真的实现了**的方法：类名 → (方法名, 描述符)。
@@ -1010,10 +1138,11 @@ pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, args: &[Expr], ctx: &Ct
     // `s.length()` 这种最基本的东西编不过。
     if let Some(t) = expr_type(r, ctx) {
         for owner in type_name_candidates(&t, ctx) {
-            if let Some(d) =
-                ctx.type_methods.get(&owner).and_then(|m| m.get(name)).and_then(|c| pick_desc(c, args, ctx))
-            {
-                return Some(d);
+            if let Some(cands) = ctx.type_methods.get(&owner).and_then(|m| m.get(name)) {
+                let vis = visible_overloads(&owner, name, cands, ctx);
+                if let Some(d) = pick_desc(&vis, args, ctx) {
+                    return Some(d);
+                }
             }
             if let Some(d) = builtin_method_desc(&owner, name, args, ctx) {
                 return Some(d);
@@ -1112,9 +1241,147 @@ pub(crate) fn type_name_candidates(ty: &Type, ctx: &Ctx) -> Vec<String> {
     out
 }
 
+/// 泛型方法的**静态**返回类型：把接收者的类型实参代进声明处的返回签名。
+///
+/// ```text
+/// List<String> l;  l.get(0)      →  E := String    → String
+/// Map<K,V> m;      m.get(k)      →  V := V'        → V'
+/// Map<String,Integer> m; m.keySet() → Set<String>
+/// ```
+///
+/// 代不回去就返回 `None`，调用方退回擦除后的类型 —— 也就是现状，不会更差。
+pub(crate) fn generic_ret(recv: &Expr, name: &str, desc: &str, ctx: &Ctx) -> Option<Type> {
+    let recv_ty = expr_type(recv, ctx)?;
+    generic_ret_of(&recv_ty, name, desc, ctx)
+}
+
+/// `generic_ret` 的核心：接收者类型已知时按它查（转发调用点用这个）
+pub(crate) fn generic_ret_of(recv_ty: &Type, name: &str, desc: &str, ctx: &Ctx) -> Option<Type> {
+    let sig = generic_sig(recv_ty, name, desc, ctx)?;
+    let (targs, tparams, sig) = sig;
+    let map = |n: &str| -> Option<Type> { tparams.iter().position(|p| p == n).map(|i| targs[i].clone()) };
+    Some(crate::sema::generic::subst(&sig.ret, &map))
+}
+
+/// 泛型方法**第 `i` 个形参**的静态类型（实参位置的 lambda 要靠它拿类型实参）。
+///
+/// `thenComparing(Function<? super T,? extends U>)` 在 `Comparator<Emp>` 上就是
+/// `Function<Emp,?> `—— lambda 的形参于是是 `Emp` 而不是 `Object`。
+pub(crate) fn generic_param_ty(
+    recv_ty: &Type,
+    name: &str,
+    desc: &str,
+    i: usize,
+    ctx: &Ctx,
+) -> Option<Type> {
+    let (targs, tparams, sig) = generic_sig(recv_ty, name, desc, ctx)?;
+    let p = sig.params.get(i)?;
+    if !p.has_var() {
+        return None;
+    }
+    let map = |n: &str| -> Option<Type> { tparams.iter().position(|p| p == n).map(|k| targs[k].clone()) };
+    Some(crate::sema::generic::subst(p, &map))
+}
+
+/// 找到「接收者类型 `recv_ty` 上 `name(desc)` 这个方法的泛型签名」
+/// → `(接收者的类型实参, 声明类的类型参数名, 方法签名)`
+fn generic_sig(
+    recv_ty: &Type,
+    name: &str,
+    desc: &str,
+    ctx: &Ctx,
+) -> Option<(Vec<Type>, Vec<String>, crate::sema::generic::MethodSig)> {
+    let targs = match recv_ty {
+        Type::Named { args, .. } if !args.is_empty() => args.clone(),
+        _ => return None,
+    };
+    for owner in type_name_candidates(recv_ty, ctx) {
+        let Some(table) = ctx.type_method_generics.get(&owner) else { continue };
+        let Some(cands) = table.get(name) else { continue };
+        let Some((_, sig, tparams)) = cands.iter().find(|(d, _, _)| d == desc) else { continue };
+        // 类型参数按**位置**对应类型实参。声明类与接收者是同一个类时这必然正确；
+        // 声明在祖先上时（`List.get` 之于 `ArrayList`）两边参数个数与含义一致
+        // （`E` 之于 `E`、`K,V` 之于 `K,V`），按位置也对。
+        if tparams.len() != targs.len() {
+            return None;
+        }
+        return Some((targs, tparams.clone(), sig.clone()));
+    }
+    None
+}
+
+/// 两个内部名是不是同一个包（默认包算一个包）
+pub(crate) fn same_package(a: &str, b: &str) -> bool {
+    let pa = a.rsplit_once('/').map(|(p, _)| p);
+    let pb = b.rsplit_once('/').map(|(p, _)| p);
+    pa == pb
+}
+
+/// `a` 能不能赋给 `b`（只看引用，沿父类型 BFS；查不到就当不成立）
+///
+/// 重载解析必须用得上它：`new TreeSet<>(someSet)` 的 `someSet` 是 `Set`，
+/// 候选 `TreeSet(Comparator)` / `TreeSet(Collection)` / `TreeSet(SortedSet)`
+/// 全是「一个引用参数」—— 只按形状比等于没比，最后全看类文件里的声明顺序，
+/// 撞上 `TreeSet(Comparator)` 就是编译通过、运行时 ClassCastException。
+pub(crate) fn is_assignable(a: &str, b: &str, ctx: &Ctx) -> bool {
+    if a == b {
+        return true;
+    }
+    let mut seen: HashSet<&str> = HashSet::new();
+    let mut queue: Vec<&str> = vec![a];
+    let mut steps = 0;
+    while let Some(cur) = queue.pop() {
+        if !seen.insert(cur) {
+            continue;
+        }
+        if cur == b {
+            return true;
+        }
+        // 上限：避免巨型继承链上把编译时间吃光（java.base 最深也就十几层）
+        steps += 1;
+        if steps > 64 {
+            break;
+        }
+        if let Some(ss) = ctx.type_supers.get(cur) {
+            for s in ss.iter() {
+                queue.push(s);
+            }
+        }
+    }
+    false
+}
+
+/// 从「接收者类 `owner` 上的同名重载」里去掉**跨包不可见**的那些。
+///
+/// 同包一律放行（零拷贝直接返回）；跨包时按 `type_hidden` 过滤 ——
+/// `new TreeSet<>(someSet)` 曾经挑中包私有的 `TreeSet(NavigableMap)`，
+/// 编出来是合法 class 但真 JVM 抛 `IllegalAccessError`。
+pub(crate) fn visible_overloads<'a>(
+    owner: &str,
+    name: &str,
+    cands: &'a [String],
+    ctx: &Ctx,
+) -> std::borrow::Cow<'a, [String]> {
+    if same_package(owner, &ctx.class_name) {
+        return std::borrow::Cow::Borrowed(cands);
+    }
+    let Some(hidden) = ctx.type_hidden.get(owner) else {
+        return std::borrow::Cow::Borrowed(cands);
+    };
+    let keep: Vec<String> = cands
+        .iter()
+        .filter(|d| !hidden.contains(&format!("{name}\u{0}{d}")))
+        .cloned()
+        .collect();
+    // 全被过滤掉时退回原表：宁可报下游的具体错误，也不要一句「找不到方法」
+    if keep.is_empty() {
+        return std::borrow::Cow::Borrowed(cands);
+    }
+    std::borrow::Cow::Owned(keep)
+}
+
 /// 类型 → 符号表里真实存在的内部名（先直拼，再试嵌套 `$` / 包前缀 / `java.lang`）
-pub(crate) fn resolve_type_owner(ty: &Type, ctx: &Ctx) -> Option<String> {
-    type_name_candidates(ty, ctx).into_iter().find(|c| {
+pub(crate) fn resolve_type_owner(ty: &Type, ctx: &Ctx) -> Option<String> {    type_name_candidates(ty, ctx).into_iter().find(|c| {
         ctx.type_methods.contains_key(c)
             || ctx.type_fields.contains_key(c)
             || ctx.type_static_methods.contains_key(c)

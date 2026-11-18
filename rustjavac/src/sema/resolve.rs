@@ -112,6 +112,14 @@ pub struct MethodMeta {
     /// 抽象（没有方法体）。lambda / 方法引用要按功能性接口的**唯一抽象方法**取
     /// SAM 签名，没有这一位就分不清 `compare`（抽象）和 `reversed`（default）。
     pub is_abstract: bool,
+    /// `Signature` 属性原文（擦除前的泛型签名）。只有泛型方法才有。
+    /// `List<String>.get(int)` 的**静态**返回类型靠它代回，见 `sema::generic`。
+    pub sig: Option<String>,
+    /// 访问标志（JVMS 4.6）。只用最低几位判可见性：跨包调用只能选 public
+    /// （`+ protected` 的子类场景暂按 public 处理）。少了这一位，
+    /// `new TreeSet<>(someSet)` 会挑中包私有的 `TreeSet(NavigableMap)`，
+    /// 编译通过、真 JVM 抛 `IllegalAccessError`。
+    pub flags: u16,
 }
 
 /// 本类**自己声明**的成员；继承来的部分在查询时沿链拼起来
@@ -127,6 +135,9 @@ struct Own {
     /// 只含静态字段（`<clinit>` 初始化与 getstatic 用）
     static_fields: Vec<FieldMeta>,
     methods: Vec<MethodMeta>,
+    /// 类自己的类型参数名（`java/util/List` → `["E"]`）。按**位置**对应类型实参，
+    /// 是 `Signature` 属性里那种「`List<String>` 的 `E` 就是 `String`」的唯一依据。
+    tparams: Vec<String>,
 }
 
 pub struct Resolver {
@@ -155,7 +166,8 @@ fn object_meta() -> Own {
         is_iface: false,
         fields: Vec::new(),
         static_fields: Vec::new(),
-        methods: vec![MethodMeta { name: "<init>".into(), desc: "()V".into(), is_static: false, is_abstract: false }],
+        methods: vec![MethodMeta { name: "<init>".into(), desc: "()V".into(), is_static: false, is_abstract: false, sig: None, flags: 0x0001 }],
+        tparams: Vec::new(),
     }
 }
 
@@ -220,6 +232,11 @@ impl Resolver {
                             is_static: md.modifiers.iter().any(|x| x == "static"),
                             // 接口里没有方法体的声明是抽象方法；类里 `abstract` 方法也一样
                             is_abstract: md.body.is_none(),
+                        flags: member_flags(&md.modifiers),
+                            // 本单元自己声明的泛型方法：源码里就有类型参数，但 AST 这条
+                            // 路径给不出「形参/返回用的是哪个变量」的映射，所以不给签名
+                            // （调用点退化成擦除类型，与现状一致）
+                            sig: None,
                         });
                     }
                     _ => {}
@@ -234,6 +251,8 @@ impl Resolver {
                     fields,
                     static_fields,
                     methods,
+                    // 本单元自己的类：源码里就有类型参数表
+                    tparams: t.type_params.iter().map(|p| p.name.clone()).collect(),
                 },
             );
         }
@@ -331,6 +350,39 @@ impl Resolver {
         Ok(out)
     }
 
+    /// 泛型方法的返回类型规则：名字 → [(描述符, 返回签名树, 声明类的类型参数名)]。
+    ///
+    /// 只收**有 `Signature` 属性**的方法，且沿继承链拼好（和 `instance_methods`
+    /// 一致）—— 调用点只看接收者的静态类型，拿不到「这条链上谁声明的」。
+    /// 类型参数名陪着一起来，才能在调用点把接收者的类型实参按位置代进去。
+    pub fn instance_method_generics(
+        &self,
+        class: &str,
+    ) -> Result<HashMap<String, Vec<(String, crate::sema::generic::MethodSig, Vec<String>)>>, String> {
+        let mut out: HashMap<String, Vec<(String, crate::sema::generic::MethodSig, Vec<String>)>> = HashMap::new();
+        for c in self.chain_with_ifaces(class)? {
+            let own = match self.load(&c) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            for m in &own.methods {
+                if m.is_static || m.name == "<init>" {
+                    continue;
+                }
+                let Some(sig) = m.sig.as_deref().and_then(crate::sema::generic::method_sig) else {
+                    continue;
+                };
+                // 只收「返回或某个形参的类型要靠类型变量代回」的方法：其余代回也等于
+                // 原类型，存下来纯属浪费内存（java.base 有几千个泛型方法）。
+                if !sig.ret.has_var() && !sig.params.iter().any(|p| p.has_var()) {
+                    continue;
+                }
+                out.entry(m.name.clone()).or_default().push((m.desc.clone(), sig, own.tparams.clone()));
+            }
+        }
+        Ok(out)
+    }
+
     /// 静态字段：名字 → (声明类, 描述符)，含继承
     pub fn static_fields(&self, class: &str) -> Result<HashMap<String, (String, String)>, String> {
         let mut out = HashMap::new();
@@ -346,9 +398,28 @@ impl Resolver {
         Ok(out)
     }
 
+    /// 直接父类型（父类 + 直接接口）。重载解析用它判可赋值性。
+    pub fn direct_supers(&self, class: &str) -> HashSet<String> {
+        let mut out: HashSet<String> = HashSet::new();
+        let own = match self.load(class) {
+            Ok(o) => o,
+            Err(_) => return out,
+        };
+        if let Some(s) = own.super_name {
+            if s != class {
+                out.insert(s);
+            }
+        }
+        for i in own.ifaces {
+            if i != class {
+                out.insert(i);
+            }
+        }
+        out
+    }
+
     /// 这个类型是不是接口
-    pub fn is_interface(&self, class: &str) -> bool {
-        self.load(class).map(|o| o.is_iface).unwrap_or(false)
+    pub fn is_interface(&self, class: &str) -> bool {        self.load(class).map(|o| o.is_iface).unwrap_or(false)
     }
 
     /// 功能性接口的**唯一抽象方法**（SAM）：`(方法名, 擦除后的描述符)`。
@@ -482,6 +553,33 @@ impl Resolver {
     pub fn ctor_descs(&self, class: &str) -> Result<Vec<String>, String> {
         let own = self.load(class)?;
         Ok(own.methods.iter().filter(|m| m.name == "<init>").map(|m| m.desc.clone()).collect())
+    }
+
+    /// 对**跨包调用者不可见**的成员（`name\0desc`）：包私有 / private。
+    ///
+    /// protected 也收进来：跨包能调 protected 的前提是「接收者类型是自己的子类」，
+    /// 那个判断这里不做 —— 少选一个 protected 重载最多退回别的重载，
+    /// 而选中一个包私有的会编出 `IllegalAccessError` 的 class（编译通过、运行时炸），
+    /// 两害相权取前者。
+    ///
+    /// 沿继承链拼（与 `instance_methods` 一致），键里带声明处的**接收者类**，
+    /// 调用点按「调用者与接收者同包」决定放不放行。
+    pub fn hidden_members(&self, class: &str) -> Result<HashSet<String>, String> {
+        let mut out: HashSet<String> = HashSet::new();
+        for c in self.chain_with_ifaces(class)? {
+            let own = match self.load(&c) {
+                Ok(o) => o,
+                Err(_) => continue,
+            };
+            for m in &own.methods {
+                // public 一律放行；接口成员与枚举的隐式 public 由 flags 位表示
+                if m.flags & 0x0001 != 0 {
+                    continue;
+                }
+                out.insert(format!("{}\u{0}{}", m.name, m.desc));
+            }
+        }
+        Ok(out)
     }
 
     /// 取一个类的元数据；本单元里没有就去 classpath 找
@@ -659,6 +757,8 @@ impl Resolver {
                 desc: String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned(),
                 is_static: m.access_flags & 0x0008 != 0,
                 is_abstract: m.access_flags & 0x0400 != 0,
+                flags: m.access_flags,
+                sig: crate::classfile::annot::signature(&cf, &m.attributes),
             });
         }
         let ifaces = cf
@@ -676,6 +776,11 @@ impl Resolver {
             fields,
             static_fields,
             methods,
+            // 类自己的类型参数名（`java/util/List` → `["E"]`）。调用点靠它把接收者的
+            // 类型实参对到签名里的类型变量上。
+            tparams: crate::classfile::annot::signature(&cf, &cf.attributes)
+                .map(|s| crate::sema::generic::class_tparams(&s))
+                .unwrap_or_default(),
         })
     }
 
@@ -735,6 +840,19 @@ pub struct World {
     pub iface_types: HashSet<String>,
     /// 功能性接口 → 唯一抽象方法 `(名字, 描述符)`。lambda / 方法引用按它取 SAM 签名。
     pub iface_sam: HashMap<String, (String, String)>,
+    /// 泛型方法 → 擦除前返回类型的签名树（含声明类的类型参数名）。
+    /// `List<String>.get(int)` 的静态类型全靠它，见 `sema::generic`。
+    pub type_method_generics:
+        HashMap<String, std::sync::Arc<HashMap<String, Vec<(String, crate::sema::generic::MethodSig, Vec<String>)>>>>,
+    /// 跨包不可见的成员（`name\0desc`）：类内部名 → 集合。
+    ///
+    /// 跨包重载解析要按它排除包私有/private 的候选 —— `new TreeSet<>(set)` 误选
+    /// 包私有的 `TreeSet(NavigableMap)`，编译通过但运行时 `IllegalAccessError`。
+    pub type_hidden: HashMap<String, std::sync::Arc<HashSet<String>>>,
+    /// 直接父类型（父类 + 接口）：内部名 → 列表。重载解析靠它判「实参能不能赋给形参」
+    /// —— 只按「都是引用」比等价于没比，`new TreeSet<>(someSet)` 会挑中
+    /// `TreeSet(Comparator)`（两者都是引用，纯看声明顺序）。
+    pub type_supers: HashMap<String, std::sync::Arc<Vec<String>>>,
 }
 
 impl World {
@@ -756,6 +874,21 @@ impl World {
                 c.to_string(),
                 std::sync::Arc::new(x.into_iter().map(|(k, v)| (k, v.into_iter().map(|(d, _)| d).collect())).collect()),
             );
+        }
+        if let Ok(x) = res.hidden_members(c) {
+            if !x.is_empty() {
+                self.type_hidden.insert(c.to_string(), std::sync::Arc::new(x));
+            }
+        }
+        let supers = res.direct_supers(c);
+        if !supers.is_empty() {
+            self.type_supers.insert(c.to_string(), std::sync::Arc::new(supers.into_iter().collect()));
+        }
+        if let Ok(x) = res.instance_method_generics(c) {
+            // 全空的类不留键：java.base 里绝大多数类没有泛型返回，留一堆空表白占内存
+            if !x.is_empty() {
+                self.type_method_generics.insert(c.to_string(), std::sync::Arc::new(x));
+            }
         }
         if res.is_interface(c) {
             self.iface_types.insert(c.to_string());
@@ -821,9 +954,23 @@ fn qualify(package: Option<&str>, ty: &Type) -> String {
     }
 }
 
+/// 修饰符 → 访问标志的可见性部分（只保留判重载可见性用得上的几位）
+fn member_flags(mods: &[String]) -> u16 {
+    let mut f = 0u16;
+    for m in mods {
+        f |= match m.as_str() {
+            "public" => 0x0001,
+            "private" => 0x0002,
+            "protected" => 0x0004,
+            _ => 0,
+        };
+    }
+    // 接口成员隐式 public
+    f
+}
+
 /// 方法描述符（构造器返回 V）
-fn method_desc(md: &MethodDecl) -> String {
-    let mut s = String::from("(");
+fn method_desc(md: &MethodDecl) -> String {    let mut s = String::from("(");
     for p in &md.params {
         s.push_str(&descriptor(&p.ty));
     }

@@ -29,7 +29,7 @@ use crate::object::{
     SLOT_BYTES,
 };
 use crate::old::{self, MajorReport, OldSpace};
-use crate::roots::{Handle, RootScope};
+use crate::roots::{Handle, RootRegion, RootScope};
 use crate::stats::{GcKind, GcRecord, Stats};
 use crate::weak::{FinalizerQueue, WeakRef, WeakTable};
 use crate::young::{self, MinorReport};
@@ -129,6 +129,8 @@ pub(crate) struct GcEnv<'a> {
     pub cards: &'a mut CardTable,
     pub starts: &'a mut StartMap,
     pub roots: &'a mut Vec<u32>,
+    /// 指针式帧根区（JIT 每帧登记一次）：标记时就地读，搬动后就地写回
+    pub regions: &'a mut Vec<RootRegion>,
     pub satb: &'a mut Vec<u32>,
     pub tenuring_threshold: u32,
     pub work: Vec<u32>,
@@ -229,6 +231,8 @@ pub struct Heap {
     cards: CardTable,
     starts: StartMap,
     roots: Rc<RefCell<Vec<u32>>>,
+    /// 指针式帧根区。地址由 JIT 帧给，**必须**在注销前保持有效（见 `RootRegion`）
+    regions: Vec<RootRegion>,
     satb: Vec<u32>,
     tlab: Tlab,
 
@@ -295,6 +299,7 @@ impl Heap {
             young_end,
             old: OldSpace::new(young_end),
             roots: Rc::new(RefCell::new(Vec::new())),
+            regions: Vec::new(),
             satb: Vec::new(),
             tlab: Tlab::new(),
             handles: HandleTable::new(),
@@ -468,6 +473,48 @@ impl Heap {
     pub fn with_roots<R>(&self, f: impl FnOnce(&mut Vec<u32>) -> R) -> R {
         let mut g = self.roots.borrow_mut();
         f(&mut g)
+    }
+
+    // ---------- 指针式帧根区 ----------
+    //
+    // 与上面的值式根表并存：值式登记的是**偏移的拷贝**（调用方得在每个 GC 点上
+    // 重新同步），指针式登记的是**帧根区的地址**（GC 就地读写，帧只在进入/退出
+    // 时各碰一次根表）。JIT 走的是后者 —— 见 `roots::RootRegion`。
+
+    /// 登记一个帧根区（JIT 帧**入口**调一次）。
+    ///
+    /// `ptr` 必须指向 `n` 个连续的 `u32` 槽，且从登记到注销地址不变。
+    #[inline]
+    pub fn push_region(&mut self, ptr: *mut u32, n: u32) {
+        assert!(!ptr.is_null(), "push_region: 帧根区指针为空");
+        self.regions.push(RootRegion { ptr, n });
+    }
+
+    /// 注销栈顶帧根区（帧**退出**调一次，必须与 `push_region` 严格 LIFO 配对）。
+    ///
+    /// 校验栈顶指针：不平衡意味着某个退出路径漏了注销，而漏注销的条目是悬空的
+    /// 栈地址 —— 下一轮 GC 会读到一个作废的帧。宁可在产生它的那一帧就炸掉。
+    #[inline]
+    pub fn pop_region(&mut self, ptr: *mut u32) {
+        let top = match self.regions.pop() {
+            Some(r) => r,
+            None => panic!("pop_region: 帧根区表是空的（push/pop 不平衡）"),
+        };
+        assert!(
+            top.ptr == ptr,
+            "pop_region: 栈顶帧根区 {:p} 不是要注销的 {ptr:p}（push/pop 不平衡）",
+            top.ptr
+        );
+    }
+
+    /// 当前登记了几层帧根区
+    pub fn regions_len(&self) -> usize {
+        self.regions.len()
+    }
+
+    /// 截断到 `n` 层（异常展开 / 帧整体作废时用）
+    pub fn truncate_regions(&mut self, n: usize) {
+        self.regions.truncate(n);
     }
 
     /// RAII 根作用域
@@ -1190,6 +1237,7 @@ impl Heap {
             cards: &mut self.cards,
             starts: &mut self.starts,
             roots,
+            regions: &mut self.regions,
             satb: &mut self.satb,
             tenuring_threshold: self.cfg.tenuring_threshold.max(1),
             work: Vec::new(),
@@ -1485,5 +1533,123 @@ impl Heap {
         if n > 0 {
             self.stats.handles_pruned += n as u64;
         }
+    }
+}
+
+#[cfg(test)]
+mod region_tests {
+    //! 指针式帧根区（JIT 帧每帧登记一次，GC 就地读写）。
+    //!
+    //! 这里测的是**最容易写错的两种失效**：GC 搬了对象却没把新偏移写回帧栈槽
+    //! （下一句字节码就用一个作废的偏移去读内存），以及注销不严格 LIFO 时把
+    //! 别人的帧当成自己的。
+    use super::*;
+
+    fn heap() -> Heap {
+        Heap::new(HeapConfig {
+            initial: 8 << 20,
+            min_capacity: 8 << 20,
+            max: 64 << 20,
+            tenuring_threshold: 1,
+            auto_compact: false,
+            ..Default::default()
+        })
+    }
+
+    fn node(heap: &mut Heap) -> u32 {
+        heap.register_object("Node", &[SlotKind::Prim, SlotKind::Ref])
+    }
+
+    /// minor 把对象搬走之后，帧根区里的偏移必须**就地**被改写成新位置
+    #[test]
+    fn minor_rewrites_region_slot_in_place() {
+        let mut h = heap();
+        let node = node(&mut h);
+        let o = h.alloc(node);
+        h.set_i32(o, 0, 7);
+        let mut slots = [o.raw(), 0u32];
+        h.push_region(slots.as_mut_ptr(), slots.len() as u32);
+
+        h.minor();
+
+        // 对象要么被搬走（偏移变），要么留在原地；两种情况下槽里的值都得指向它
+        let now = Handle(slots[0]);
+        assert_ne!(now.raw(), 0, "minor 之后根区槽被清成 0 = 活对象被当成垃圾");
+        assert_eq!(h.get_i32(now, 0), 7, "根区槽没有跟着对象搬家（读到的是作废偏移）");
+        assert!(now.raw() != o.raw() || h.get_i32(now, 0) == 7);
+    }
+
+    /// 老年代压缩（会真正搬块）之后，帧根区里的偏移也必须被重新映射
+    #[test]
+    fn compact_remaps_region_slot() {
+        let mut h = Heap::new(HeapConfig {
+            initial: 8 << 20,
+            min_capacity: 8 << 20,
+            max: 64 << 20,
+            tenuring_threshold: 1,
+            ..Default::default()
+        });
+        let node = node(&mut h);
+        // 造两个老对象 + 一个空洞，逼出一次压缩
+        let a = h.alloc(node);
+        h.set_i32(a, 0, 11);
+        let b = h.alloc(node);
+        h.set_i32(b, 0, 22);
+        h.minor(); // 都晋升
+        let mut slots = [a.raw(), b.raw()];
+        h.push_region(slots.as_mut_ptr(), 2);
+        // 撤掉值式根，只留帧根区 —— 它们必须靠指针式登记活下来
+        h.with_roots(|r| r.clear());
+        h.major();
+        h.major();
+        assert_eq!(h.get_i32(Handle(slots[0]), 0), 11, "压缩后 a 的偏移没被重新映射");
+        assert_eq!(h.get_i32(Handle(slots[1]), 0), 22, "压缩后 b 的偏移没被重新映射");
+    }
+
+    /// 只登记在帧根区里的对象**不能**被回收（反向：撤掉登记就该被回收）
+    #[test]
+    fn region_root_keeps_object_alive() {
+        let mut h = heap();
+        let node = node(&mut h);
+        let o = h.alloc(node);
+        h.set_i32(o, 0, 5);
+        let mut slots = [o.raw()];
+        h.push_region(slots.as_mut_ptr(), 1);
+        h.with_roots(|r| r.clear()); // 值式根清空：只靠帧根区
+
+        for _ in 0..3 {
+            h.minor();
+        }
+        assert_eq!(h.get_i32(Handle(slots[0]), 0), 5, "只由帧根区引用的对象被回收了");
+        assert!(h.starts.contains(slots[0]), "活对象不在对象起点图上");
+
+        // 反向实验：注销之后它就没人引用了 —— 回收一轮，那个偏移不该再是对象起点
+        h.pop_region(slots.as_mut_ptr());
+        h.major();
+        assert!(
+            !h.starts.contains(slots[0]),
+            "注销之后对象居然还活着 —— 这条测试没在测它"
+        );
+    }
+
+    /// 注销必须严格 LIFO：写错就是把别的帧当成自己的
+    #[test]
+    #[should_panic(expected = "push/pop 不平衡")]
+    fn pop_region_checks_lifo() {
+        let mut h = heap();
+        let mut a = [0u32; 1];
+        let mut b = [0u32; 1];
+        h.push_region(a.as_mut_ptr(), 1);
+        h.push_region(b.as_mut_ptr(), 1);
+        h.pop_region(a.as_mut_ptr()); // 错：栈顶是 b
+    }
+
+    /// 空表上注销 = 漏登记，同样当场报错（悬空栈地址的另一种来源）
+    #[test]
+    #[should_panic(expected = "push/pop 不平衡")]
+    fn pop_region_on_empty_panics() {
+        let mut h = heap();
+        let mut a = [0u32; 1];
+        h.pop_region(a.as_mut_ptr());
     }
 }
