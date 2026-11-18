@@ -106,25 +106,39 @@ fn desc_width(d: &str) -> usize {
     }
 }
 
+/// 按宽度截断。**必须截断**：`Slot::I` 的 `as_i64()` 是**符号扩展**，
+/// 而 `weakCompareAndSetInt` 之类传进来的期望值是**零扩展**的。
+/// 一个负的 int 字段读出来 `0xFFFF_FFFF_C389_0C8E`、期望值是 `0x0000_0000_C389_0C8E`，
+/// 于是 CAS 永远不相等 → `Unsafe.getAndAddInt` 的字节码 CAS 循环永不收敛（看起来像卡死）。
+fn trunc_width(v: u64, width: usize) -> u64 {
+    match width {
+        1 => v & 0xFF,
+        2 => v & 0xFFFF,
+        4 => v & 0xFFFF_FFFF,
+        _ => v,
+    }
+}
+
 /// 读 `width` 字节：(null, addr) → 裸内存；(o, offset) → 堆（对象字段按声明类型取值）
 fn get_mem(vm: &Vm, obj: i32, off: i64, width: usize) -> u64 {
     if obj == 0 {
-        return arena::read(off as u64, width);
+        return trunc_width(arena::read(off as u64, width), width);
     }
     if let (RefKind::Obj(cls), true) = (vm.ref_kind(obj), off >= 0) {
         if let Some(ft) = field_type(vm, &cls, off as usize) {
             if desc_width(&ft) == width {
                 let s = super::unsafe_slot(vm, obj, off).unwrap_or(Slot::I(0));
-                return match ft.as_str() {
+                let raw = match ft.as_str() {
                     "D" => s.as_f64().to_bits(),
                     "F" => s.as_f32().to_bits() as u64,
                     _ => s.as_i64() as u64,
                 };
+                return trunc_width(raw, width);
             }
         }
     }
     // `read_mem` 收的是**原始偏移**（它自己再按元素宽度除一次，别在这除）
-    super::read_mem(vm, obj, off.max(0) as usize, width)
+    trunc_width(super::read_mem(vm, obj, off.max(0) as usize, width), width)
 }
 
 fn put_mem(vm: &mut Vm, obj: i32, off: i64, width: usize, v: u64) {
@@ -479,11 +493,62 @@ fn u_set_memory(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 /// `copyMemory0(Object src, long srcOff, Object dst, long dstOff, long bytes)`
 ///
 /// 先全部读出来再写 —— 源与目标重叠时「边读边写」会把没读到的部分提前盖掉。
+/// 数组元素的字节宽度（`[B`=1、`[C`/`[S`=2、`[I`/`[F`=4、`[J`/`[D`=8，对象/非数组=1）
+fn elem_bytes(vm: &Vm, obj: i32) -> usize {
+    match vm.ref_kind(obj) {
+        RefKind::Arr(d) => {
+            let e = d.trim_start_matches('[');
+            if d.starts_with("[[") || e.starts_with('L') {
+                1
+            } else {
+                desc_width(e)
+            }
+        }
+        _ => 1,
+    }
+}
+
+/// 按**字节偏移**取一个字节。数组的元素宽度已经进了 `slot_index`（偏移 ÷ 宽度），
+/// 所以这里要自己把「第 k 个字节」拆成「第几个元素 + 元素内第几字节」。
+fn get_byte(vm: &Vm, obj: i32, off: i64) -> u64 {
+    let w = elem_bytes(vm, obj);
+    if w <= 1 {
+        return trunc_width(get_mem(vm, obj, off, 1), 1);
+    }
+    let elem = off / w as i64;
+    let sub = (off % w as i64) as u32;
+    let v = get_mem(vm, obj, elem, w);
+    (v >> (8 * sub)) & 0xFF
+}
+
+fn put_byte(vm: &mut Vm, obj: i32, off: i64, b: u64) {
+    let w = elem_bytes(vm, obj);
+    if w <= 1 {
+        put_mem(vm, obj, off, 1, b & 0xFF);
+        return;
+    }
+    let elem = off / w as i64;
+    let sub = (off % w as i64) as u32;
+    let old = get_mem(vm, obj, elem, w);
+    let shift = 8 * sub;
+    let merged = (old & !(0xFFu64 << shift)) | ((b & 0xFF) << shift);
+    put_mem(vm, obj, elem, w, merged);
+}
+
+/// `copyMemory0(src, srcOff, dst, dstOff, bytes)`
+///
+/// **不能逐字节按 `width=1` 拷**：`slot_index` 会把字节偏移除以元素宽度，`read_mem(1)` 只取
+/// 元素的低字节。于是 `char[] → native` 时每个字符的低字节会被写两遍 ——
+/// `sun/nio/fs/WindowsNativeDispatcher.asNativeBuffer` 正是
+/// `copyMemory(chars, ARRAY_CHAR_BASE_OFFSET, null, addr, len * 2)`，
+/// 路径字符串会变成 `D:\\vmless → DD::\\vvmmlleessss`，所有 `Files.*` 一律 `NoSuchFileException`。
 fn u_copy_memory(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let (so, soff, dobj, doff, len) = (f.arg_i(0), f.arg_l(1), f.arg_i(2), f.arg_l(3), f.arg_l(4));
-    let bytes: Vec<u64> = (0..len.max(0) as usize).map(|k| get_mem(vm, so, soff + k as i64, 1)).collect();
+    let bytes: Vec<u64> = (0..len.max(0) as usize)
+        .map(|k| get_byte(vm, so, soff + k as i64))
+        .collect();
     for (k, b) in bytes.into_iter().enumerate() {
-        put_mem(vm, dobj, doff + k as i64, 1, b);
+        put_byte(vm, dobj, doff + k as i64, b);
     }
     super::void()
 }

@@ -3,6 +3,9 @@
 use super::shared::lk;
 use crate::CpEntry;
 
+/// 进程级指令计数（`VMLESS_HANG_DUMP` 卡死探针用）。
+static HANG_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
 use super::call::count_args;
 use super::class::class_name_of;
 use super::err;
@@ -243,7 +246,9 @@ impl Vm {
             .and_then(|v| v.to_string_lossy().parse().ok())
             .map(|s: f64| (s * 25_000_000.0) as u64)
             .unwrap_or(0);
-        let mut ticks: u64 = 0;
+        // 计数器**必须是进程级**的：方法体内是局部量的话，「方法进→native→返回」这种
+        // 循环每次调用只有几十条指令，永远到不了阈值 —— 探针就永远不打印。
+
         let dump_ctx = if hang_n > 0 {
             Some((
                 cf.this_class_name().unwrap_or_default(),
@@ -259,13 +264,17 @@ impl Vm {
             // （包括被调方正在跑、本帧停着不动）都能拿到**精确**的引用位图。
             frame.pc = pc;
             // 卡死探针：每 ~1600 万条指令打一次「我在哪」
+            // 卡死探针：每 ~1600 万条指令打一次「我在哪」。
+            // 计数器是**进程级原子量**：方法体内局部量的话，「方法进 → native → 返回」
+            // 这种循环每次调用只有几十条指令，永远到不了阈值，探针就永远不打印
+            // （这正是之前误判「不是 spin 是阻塞」的原因）。
             if hang_n > 0 {
-                ticks += 1;
-                if ticks % 16_000_000 == 0 {
+                let g = HANG_TICKS.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+                if g % 16_000_000 == 0 {
                     if let Some((c, n, d)) = &dump_ctx {
                         eprintln!(
                             "[hang] {} ms  {}.{}{}  pc={pc}",
-                            ticks / 25_000,
+                            g / 25_000,
                             c, n, d
                         );
                     }

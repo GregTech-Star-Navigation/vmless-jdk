@@ -1421,3 +1421,47 @@ NaN 语义按 `cmpl`/`cmpg` 分别映射到 Cranelift 的 `UnorderedOr*` 条件�
 也不是静态字段原子操作（已修）。要定位需要**线程转储**能力，而本 VM 没有帧栈模型
 （`Vm` 只有 `depth` 计数），`StackWalker`/`getStackTrace` 都只能给空。
 这条是下一步做帧栈的直接动因。
+
+## 0.68.0 — 2026-11-18 · 符号扩展 vs 零扩展：一个 bug 卡死半个 JVM
+
+### 症状
+`new ThreadLocal<...>(){}` 建到**第 3 个**时整个程序卡死（有 CPU、无输出）。
+看起来「时好时坏」，因为前两个恰好能过。
+
+### 根因：`get_mem` 符号扩展、`weakCompareAndSetInt` 零扩展
+```rust
+// get_mem：int 字段 → as_i64() 是**符号扩展**
+_ => s.as_i64() as u64,              // 负 int 读出来 0xFFFF_FFFF_C389_0C8E
+// u_cas_int：期望值 → as u32 as u64 是**零扩展**
+let exp = f.arg_i(2) as u32 as u64;  // 0x0000_0000_C389_0C8E
+```
+`ThreadLocal` 的 `nextHashCode` 每次 `+0x61C88647`，**第 3 次就跨过 INT_MAX 变负** ——
+于是 `Unsafe.getAndAddInt`（JDK 25 里是字节码 CAS 循环）永远 CAS 失败，永不收敛。
+
+修法：`get_mem` 的三条返回路径统一按 width 截断（新增 `trunc_width`）。
+
+### 顺带：`copyMemory` 逐字节拷没按元素宽度换算
+`u_copy_memory` 对每个输出字节都 `get_mem(..., width=1)`，而 `slot_index` 已把字节偏移
+除以元素宽度、`read_mem(1)` 只取元素低字节 → `char[] → native` 时每个字符低字节被写两遍：
+
+```
+D:\vmless\nio\work  →  DD::\vvmmlleessss…\work
+```
+
+而 `sun/nio/fs/WindowsNativeDispatcher.asNativeBuffer` 正是
+`copyMemory(chars, ARRAY_CHAR_BASE_OFFSET, null, addr, len * 2)` —— 所以**所有 `Files.*` 的路径都是坏的**。
+修法：新增 `elem_bytes`/`get_byte`/`put_byte`，按「第几个元素 + 元素内第几字节」拆解。
+
+### 另外修了探针本身
+`VMLESS_HANG_DUMP` 的计数器原来是**方法体内局部量** —— 「方法进 → native → 返回」这种循环
+每次调用只有几十条指令，永远到不了阈值，于是**探针一条都不打印**，导致我误判成「不是 spin 是阻塞」。
+改成进程级原子量 `HANG_TICKS`。判定 spin/阻塞还可以看 `Get-Process` 的 CPU 时间两次采样是否在涨。
+
+### 实测（三条过去卡死/算错的路径全通）
+```
+Tl   : base ok | sub ok                       ← 原卡死
+U2   : soff=0 baseNull=false | sget=5 cas=true now=9
+At   : mid=-1013904242 | add1=-1013904242 | now=-1013904241   ← 与 java 一致
+Cl   : cleaner ok | read=hi | tgroup=true
+```
+`verify.sh` 103/103、`cargo test` 106 passed。

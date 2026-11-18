@@ -43,6 +43,7 @@ use super::NativeRegistry;
 
 pub(super) fn register(r: &mut NativeRegistry) {
     register_windows_dispatcher(r);
+    register_windows_security(r);
     register_file_dispatcher(r);
     register_ioutil(r);
     register_net(r);
@@ -407,6 +408,18 @@ fn read_path(addr: u64) -> String {
     String::from_utf16_lossy(&read_wstr(addr))
 }
 
+/// 读 NUL 结尾 UTF-16，**并且把终止符一起留在末尾**。
+///
+/// 给 Win32 传指针时必须用这个：`LPCWSTR` 的契约是「以 NUL 结尾」，
+/// 只读到 NUL 却不把它放回去，Win32 会继续读缓冲区后面的字节 ——
+/// 表现是「同一个路径第一次调用报 FILE_NOT_FOUND / INVALID_NAME，
+/// 重试又好了」（后面那段垃圾取决于缓冲区上一次的内容）。
+fn read_wstr_z(addr: u64) -> Vec<u16> {
+    let mut v = read_wstr(addr);
+    v.push(0);
+    v
+}
+
 /// 往地址写 NUL 结尾 UTF-16，**不越过块尾**（越界就截断，绝不多写一个字节）
 fn write_wstr(addr: u64, text: &str) -> usize {
     let w: Vec<u16> = text.encode_utf16().collect();
@@ -598,7 +611,7 @@ fn wnd_CloseHandle(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_DeleteFile0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     if w.is_empty() {
         return Err(throw_windows(vm, ERROR_INVALID_PARAMETER));
     }
@@ -609,7 +622,7 @@ fn wnd_DeleteFile0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_CreateDirectory0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     if w.is_empty() {
         return Err(throw_windows(vm, ERROR_INVALID_PARAMETER));
     }
@@ -620,7 +633,7 @@ fn wnd_CreateDirectory0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_RemoveDirectory0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     if w.is_empty() {
         return Err(throw_windows(vm, ERROR_INVALID_PARAMETER));
     }
@@ -631,8 +644,8 @@ fn wnd_RemoveDirectory0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_MoveFileEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let from = read_wstr(f.arg_l(0) as u64);
-    let to = read_wstr(f.arg_l(1) as u64);
+    let from = read_wstr_z(f.arg_l(0) as u64);
+    let to = read_wstr_z(f.arg_l(1) as u64);
     let flags = f.arg_i(2) as u32;
     if from.is_empty() || to.is_empty() {
         return Err(throw_windows(vm, ERROR_INVALID_PARAMETER));
@@ -645,8 +658,8 @@ fn wnd_MoveFileEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 
 fn wnd_CopyFileEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     // CopyFileEx0(LPCWSTR existing, LPCWSTR new, int flags, jlong progress)
-    let from = read_wstr(f.arg_l(0) as u64);
-    let to = read_wstr(f.arg_l(1) as u64);
+    let from = read_wstr_z(f.arg_l(0) as u64);
+    let to = read_wstr_z(f.arg_l(1) as u64);
     let flags = f.arg_i(2) as u32;
     // COPY_FILE_COPY_SYMLINK = 0x800，COPY_FILE_NO_BUFFERING = 0x1000
     let _ = flags;
@@ -657,7 +670,7 @@ fn wnd_CopyFileEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_GetFileAttributes0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let a = unsafe { GetFileAttributesW(w.as_ptr()) };
     if a == u32::MAX {
         return Err(throw_windows(vm, last_error()));
@@ -666,7 +679,7 @@ fn wnd_GetFileAttributes0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_SetFileAttributes0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     if unsafe { SetFileAttributesW(w.as_ptr(), f.arg_i(1) as u32) } == 0 {
         return Err(throw_windows(vm, last_error()));
     }
@@ -674,7 +687,7 @@ fn wnd_SetFileAttributes0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_GetFileAttributesEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let buf = f.arg_l(1) as u64;
     trace(&format!("GetFileAttributesEx {:?}", String::from_utf16_lossy(&w)));
     let mut data = Win32FileAttributeData::default();
@@ -730,7 +743,7 @@ fn wnd_SetFileTime0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_FindFirstFile0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let obj = f.arg_i(1);
     let mut data = Win32FindDataW::default();
     let h = unsafe { FindFirstFileW(w.as_ptr(), &mut data) };
@@ -757,7 +770,7 @@ fn wnd_FindFirstFile0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_FindFirstFile1(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let addr = f.arg_l(1) as u64;
     let mut data = Win32FindDataW::default();
     let h = unsafe { FindFirstFileW(w.as_ptr(), &mut data) };
@@ -794,7 +807,7 @@ fn wnd_FindClose(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_GetFullPathName0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     trace(&format!("GetFullPathName0 {:?}", String::from_utf16_lossy(&w)));
     // 先问长度（传 0 长度）：Win32 返回需要的字符数（不含 NUL）
     let need = unsafe { GetFullPathNameW(w.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut()) };
@@ -832,7 +845,7 @@ fn wnd_GetFinalPathNameByHandle(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmEr
 }
 
 fn wnd_GetVolumePathName0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let mut buf = vec![0u16; 1024];
     if unsafe { GetVolumePathNameW(w.as_ptr(), buf.as_mut_ptr(), buf.len() as u32) } == 0 {
         return Err(throw_windows(vm, last_error()));
@@ -850,7 +863,7 @@ fn wnd_GetLogicalDrives(vm: &mut Vm, _: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_GetDriveType0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let t = unsafe { GetDriveTypeW(w.as_ptr()) };
     if t == 0 {
         // DRIVE_UNKNOWN：Java 侧有专门的判断，不当错误
@@ -861,7 +874,7 @@ fn wnd_GetDriveType0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 }
 
 fn wnd_GetVolumeInformation0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let obj = f.arg_i(1);
     let mut name = [0u16; 261];
     let mut fs_name = [0u16; 261];
@@ -896,7 +909,7 @@ fn wnd_GetVolumeInformation0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError
 }
 
 fn wnd_GetDiskFreeSpaceEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let obj = f.arg_i(1);
     let (mut free_avail, mut total, mut total_free) = (0u64, 0u64, 0u64);
     if unsafe {
@@ -920,7 +933,7 @@ fn wnd_GetDiskFreeSpaceEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> 
 }
 
 fn wnd_GetDiskFreeSpace0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let w = read_wstr(f.arg_l(0) as u64);
+    let w = read_wstr_z(f.arg_l(0) as u64);
     let obj = f.arg_i(1);
     let mut spc = 0u32;
     let mut bps = 0u32;
@@ -1025,8 +1038,8 @@ fn wnd_DeviceIoControlGetReparsePoint(vm: &mut Vm, f: &mut Frame) -> Result<Slot
 }
 
 fn wnd_CreateSymbolicLink0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let link = read_wstr(f.arg_l(0) as u64);
-    let target = read_wstr(f.arg_l(1) as u64);
+    let link = read_wstr_z(f.arg_l(0) as u64);
+    let target = read_wstr_z(f.arg_l(1) as u64);
     let flags = f.arg_i(2) as u32;
     if unsafe { CreateSymbolicLinkW(link.as_ptr(), target.as_ptr(), flags) } == 0 {
         return Err(throw_windows(vm, last_error()));
@@ -1035,8 +1048,8 @@ fn wnd_CreateSymbolicLink0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> 
 }
 
 fn wnd_CreateHardLink0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
-    let link = read_wstr(f.arg_l(0) as u64);
-    let target = read_wstr(f.arg_l(1) as u64);
+    let link = read_wstr_z(f.arg_l(0) as u64);
+    let target = read_wstr_z(f.arg_l(1) as u64);
     if unsafe { CreateHardLinkW(link.as_ptr(), target.as_ptr(), std::ptr::null()) } == 0 {
         return Err(throw_windows(vm, last_error()));
     }
@@ -2465,4 +2478,521 @@ fn register_socket_dispatcher(r: &mut NativeRegistry) {
     r.add(SD, "readv0", "(Ljava/io/FileDescriptor;JI)J", sd_readv0);
     r.add(SD, "writev0", "(Ljava/io/FileDescriptor;JI)J", sd_writev0);
     r.add(SD, "close0", "(I)V", sd_close0);
+}
+
+// ============================================================ Win32 安全 / ACL
+//
+// `Files.isWritable` / `Files.getFileAttributeView(AclFileAttributeView)` /
+// `Files.setOwner` 全都落在这组 native 上。结构体一律由 Java 侧用
+// `WindowsSecurityDescriptor`（`Unsafe.allocateMemory`）分配，本文件只读写它的地址 ——
+// 所以这些地址同样在 `nat_mem` 的 arena 里。
+//
+// 布局（与 Win32 一致，别改）：
+//   SECURITY_DESCRIPTOR              20 字节（Revision/Sbz1/Control 各 1 字节 + Owner/Group/Sacl/Dacl 指针）
+//   GENERIC_MAPPING                  16 字节（4 个 DWORD）
+//   PRIVILEGE_SET                    8 + 12*N
+//   TOKEN_PRIVILEGES                 4 + 12*N（LUID 8 + Attributes 4）
+
+const SE_FILE_OBJECT: i32 = 1;
+
+type TokenAccess = u32;
+const TOKEN_QUERY: TokenAccess = 0x0008;
+const TOKEN_IMPERSONATE: TokenAccess = 0x0004;
+const TOKEN_ADJUST_PRIVILEGES: TokenAccess = 0x0020;
+const TOKEN_DUPLICATE: TokenAccess = 0x0002;
+
+#[link(name = "advapi32")]
+extern "system" {
+    fn OpenProcessToken(process: Handle, access: TokenAccess, out: *mut Handle) -> Bool;
+    fn OpenThreadToken(thread: Handle, access: TokenAccess, open_as_self: Bool, out: *mut Handle) -> Bool;
+    fn DuplicateTokenEx(
+        existing: Handle,
+        access: TokenAccess,
+        sa: *mut c_void,
+        level: u32,
+        ty: u32,
+        out: *mut Handle,
+    ) -> Bool;
+    fn SetThreadToken(thread: *mut Handle, token: Handle) -> Bool;
+    fn GetTokenInformation(token: Handle, class: u32, buf: *mut c_void, len: u32, needed: *mut u32) -> Bool;
+    fn AdjustTokenPrivileges(
+        token: Handle,
+        disable_all: Bool,
+        new_state: *const c_void,
+        len: u32,
+        prev: *mut c_void,
+        ret_len: *mut u32,
+    ) -> Bool;
+    fn LookupPrivilegeValueW(system: *const u16, name: *const u16, luid: *mut c_void) -> Bool;
+    fn AccessCheck(
+        sd: *const c_void,
+        token: Handle,
+        access_mask: u32,
+        mapping: *const c_void,
+        privileges: *mut c_void,
+        priv_len: *mut u32,
+        granted: *mut u32,
+        success: *mut Bool,
+    ) -> Bool;
+    fn GetFileSecurityW(
+        name: *const u16,
+        info: u32,
+        sd: *mut c_void,
+        len: u32,
+        needed: *mut u32,
+    ) -> Bool;
+    fn SetFileSecurityW(name: *const u16, info: u32, sd: *const c_void) -> Bool;
+    fn InitializeSecurityDescriptor(sd: *mut c_void, revision: u32) -> Bool;
+    fn InitializeAcl(acl: *mut c_void, len: u32, revision: u32) -> Bool;
+    fn GetSecurityDescriptorOwner(sd: *const c_void, owner: *mut *mut c_void, defaulted: *mut Bool) -> Bool;
+    fn GetSecurityDescriptorDacl(
+        sd: *const c_void,
+        present: *mut Bool,
+        dacl: *mut *mut c_void,
+        defaulted: *mut Bool,
+    ) -> Bool;
+    fn SetSecurityDescriptorOwner(sd: *mut c_void, owner: *const c_void, defaulted: Bool) -> Bool;
+    fn SetSecurityDescriptorDacl(
+        sd: *mut c_void,
+        present: Bool,
+        dacl: *const c_void,
+        defaulted: Bool,
+    ) -> Bool;
+    fn GetAclInformation(acl: *const c_void, info: *mut c_void, len: u32, class: u32) -> Bool;
+    fn GetAce(acl: *const c_void, index: u32, ace: *mut *mut c_void) -> Bool;
+    fn AddAccessAllowedAceEx(acl: *mut c_void, revision: u32, flags: u32, mask: u32, sid: *const c_void) -> Bool;
+    fn AddAccessDeniedAceEx(acl: *mut c_void, revision: u32, flags: u32, mask: u32, sid: *const c_void) -> Bool;
+    fn GetLengthSid(sid: *const c_void) -> u32;
+    fn ConvertSidToStringSidW(sid: *const c_void, out: *mut *mut u16) -> Bool;
+    fn ConvertStringSidToSidW(s: *const u16, out: *mut *mut c_void) -> Bool;
+    fn LookupAccountSidW(
+        system: *const u16,
+        sid: *const c_void,
+        name: *mut u16,
+        name_len: *mut u32,
+        domain: *mut u16,
+        domain_len: *mut u32,
+        use_kind: *mut u32,
+    ) -> Bool;
+    fn LookupAccountNameW(
+        system: *const u16,
+        account: *const u16,
+        sid: *mut c_void,
+        sid_len: *mut u32,
+        domain: *mut u16,
+        domain_len: *mut u32,
+        use_kind: *mut u32,
+    ) -> Bool;
+}
+
+const WND_ACL_INFO: &str = "sun/nio/fs/WindowsNativeDispatcher$AclInformation";
+const WND_ACCOUNT: &str = "sun/nio/fs/WindowsNativeDispatcher$Account";
+
+fn wnd_InitializeSecurityDescriptor(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let addr = f.arg_l(0) as *mut c_void;
+    // SECURITY_DESCRIPTOR_REVISION = 1
+    if unsafe { InitializeSecurityDescriptor(addr, 1) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_InitializeAcl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let acl = f.arg_l(0) as *mut c_void;
+    let size = f.arg_i(1) as u32;
+    // ACL_REVISION = 2
+    if unsafe { InitializeAcl(acl, size, 2) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_SetSecurityDescriptorOwner(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_l(0) as *mut c_void;
+    let owner = f.arg_l(1) as *const c_void;
+    if unsafe { SetSecurityDescriptorOwner(sd, owner, 0) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_SetSecurityDescriptorDacl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_l(0) as *mut c_void;
+    let dacl = f.arg_l(1) as *const c_void;
+    if unsafe { SetSecurityDescriptorDacl(sd, 1, dacl, 0) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+/// `GetSecurityDescriptorOwner(sd)` → SID 地址（没有就 0）
+fn wnd_GetSecurityDescriptorOwner(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_l(0) as *const c_void;
+    let mut owner: *mut c_void = std::ptr::null_mut();
+    let mut defaulted: Bool = 0;
+    if unsafe { GetSecurityDescriptorOwner(sd, &mut owner, &mut defaulted) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::L(owner as u64 as i64))
+}
+
+fn wnd_GetSecurityDescriptorDacl(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sd = f.arg_l(0) as *const c_void;
+    let mut present: Bool = 0;
+    let mut dacl: *mut c_void = std::ptr::null_mut();
+    let mut defaulted: Bool = 0;
+    if unsafe { GetSecurityDescriptorDacl(sd, &mut present, &mut dacl, &mut defaulted) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    let _ = vm;
+    Ok(Slot::L(if present != 0 { dacl as u64 as i64 } else { 0 }))
+}
+
+fn wnd_GetAclInformation0(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let acl = f.arg_l(0) as *const c_void;
+    let obj = f.arg_i(1);
+    // ACL_INFORMATION_CLASS = AclSizeInformation(2) → ACL_SIZE_INFORMATION：
+    // DWORD AceCount; DWORD AclBytesInUse; DWORD AclBytesFree;
+    let mut info = [0u32; 3];
+    let ok = unsafe {
+        GetAclInformation(acl, info.as_mut_ptr() as *mut c_void, 12, 2)
+    };
+    if ok == 0 {
+        return Ok(Slot::I(0));
+    }
+    // 无 vm 可用（上面没取）—— 这里改成按名字写字段
+    Ok(Slot::I(info[0] as i32))
+}
+
+fn wnd_GetAclInformation0_vm(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let acl = f.arg_l(0) as *const c_void;
+    let obj = f.arg_i(1);
+    let mut info = [0u32; 3];
+    if unsafe { GetAclInformation(acl, info.as_mut_ptr() as *mut c_void, 12, 2) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    set_obj_field(vm, obj, WND_ACL_INFO, "aceCount", Slot::I(info[0] as i32));
+    Ok(Slot::I(0))
+}
+
+fn wnd_GetAce(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let acl = f.arg_l(0) as *const c_void;
+    let index = f.arg_i(1) as u32;
+    let mut ace: *mut c_void = std::ptr::null_mut();
+    if unsafe { GetAce(acl, index, &mut ace) } == 0 {
+        return Ok(Slot::L(0));
+    }
+    Ok(Slot::L(ace as u64 as i64))
+}
+
+fn wnd_AddAccessAllowedAceEx(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let acl = f.arg_l(0) as *mut c_void;
+    let flags = f.arg_i(1) as u32;
+    let mask = f.arg_i(2) as u32;
+    let sid = f.arg_l(3) as *const c_void;
+    // ACL_REVISION_DS = 4（带对象 ACE 时要 4，普通 allow ACE 用 2 也行；HotSpot 用 4）
+    if unsafe { AddAccessAllowedAceEx(acl, 4, flags, mask, sid) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_AddAccessDeniedAceEx(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let acl = f.arg_l(0) as *mut c_void;
+    let flags = f.arg_i(1) as u32;
+    let mask = f.arg_i(2) as u32;
+    let sid = f.arg_l(3) as *const c_void;
+    if unsafe { AddAccessDeniedAceEx(acl, 4, flags, mask, sid) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_GetLengthSid(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sid = f.arg_l(0) as *const c_void;
+    let n = unsafe { GetLengthSid(sid) };
+    Ok(Slot::I(n as i32))
+}
+
+fn wnd_ConvertSidToStringSid(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sid = f.arg_l(0) as *const c_void;
+    let mut out: *mut u16 = std::ptr::null_mut();
+    if unsafe { ConvertSidToStringSidW(sid, &mut out) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    let n = (0..).take_while(|&i| unsafe { *out.add(i) } != 0).count();
+    let text = String::from_utf16_lossy(unsafe { std::slice::from_raw_parts(out, n) });
+    unsafe { LocalFree(out as *mut c_void) };
+    Ok(Slot::I(vm.sh.heap.new_string(text)))
+}
+
+/// `ConvertStringSidToSid0(addr)`：返回的 SID 由 `LocalFree` 释放。
+/// 注意 `LocalFree` 在 Java 侧会调本文件的 `LocalFree` —— 那边的指针是 Win32 分配的，
+/// 所以这里也走 Win32 的 `LocalAlloc`（`ConvertStringSidToSidW` 内部用的就是它）。
+fn wnd_ConvertStringSidToSid0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let w = read_wstr_z(f.arg_l(0) as u64);
+    let mut sid: *mut c_void = std::ptr::null_mut();
+    if unsafe { ConvertStringSidToSidW(w.as_ptr(), &mut sid) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::L(sid as u64 as i64))
+}
+
+fn wnd_LookupAccountSid0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let sid = f.arg_l(0) as *const c_void;
+    let obj = f.arg_i(1);
+    let mut name = [0u16; 256];
+    let mut domain = [0u16; 256];
+    let (mut nlen, mut dlen) = (name.len() as u32, domain.len() as u32);
+    let mut use_kind: u32 = 0;
+    if unsafe {
+        LookupAccountSidW(
+            std::ptr::null(),
+            sid,
+            name.as_mut_ptr(),
+            &mut nlen,
+            domain.as_mut_ptr(),
+            &mut dlen,
+            &mut use_kind,
+        )
+    } == 0
+    {
+        return Err(throw_windows(vm, last_error()));
+    }
+    let name_s = String::from_utf16_lossy(&name[..nlen as usize]);
+    let dom_s = String::from_utf16_lossy(&domain[..dlen as usize]);
+    let nh = vm.sh.heap.new_string(name_s);
+    let dh = vm.sh.heap.new_string(dom_s);
+    set_obj_field(vm, obj, WND_ACCOUNT, "name", Slot::I(nh));
+    set_obj_field(vm, obj, WND_ACCOUNT, "domain", Slot::I(dh));
+    set_obj_field(vm, obj, WND_ACCOUNT, "use", Slot::I(use_kind as i32));
+    Ok(Slot::I(0))
+}
+
+/// `LookupAccountName0(nameAddr, pSid, cbSid)` → 需要的 SID 字节数
+fn wnd_LookupAccountName0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let name = read_wstr_z(f.arg_l(0) as u64);
+    let sid = f.arg_l(1) as *mut c_void;
+    let mut cb: u32 = f.arg_i(2) as u32;
+    let mut domain = [0u16; 256];
+    let mut dlen: u32 = domain.len() as u32;
+    let mut use_kind: u32 = 0;
+    if unsafe {
+        LookupAccountNameW(
+            std::ptr::null(),
+            name.as_ptr(),
+            sid,
+            &mut cb,
+            domain.as_mut_ptr(),
+            &mut dlen,
+            &mut use_kind,
+        )
+    } == 0
+    {
+        let code = last_error();
+        if code == ERROR_INSUFFICIENT_BUFFER {
+            // 这不是失败：Java 侧据这个返回值再分配一次
+            return Ok(Slot::I(cb as i32));
+        }
+        return Err(throw_windows(vm, code));
+    }
+    Ok(Slot::I(cb as i32))
+}
+
+fn wnd_GetFileSecurity0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let w = read_wstr_z(f.arg_l(0) as u64);
+    let info = f.arg_i(1) as u32;
+    let sd = f.arg_l(2) as *mut c_void;
+    let size = f.arg_i(3) as u32;
+    let mut needed: u32 = size;
+    if unsafe { GetFileSecurityW(w.as_ptr(), info, sd, size, &mut needed) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(needed as i32))
+}
+
+fn wnd_SetFileSecurity0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let w = read_wstr_z(f.arg_l(0) as u64);
+    let info = f.arg_i(1) as u32;
+    let sd = f.arg_l(2) as *const c_void;
+    if unsafe { SetFileSecurityW(w.as_ptr(), info, sd) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_OpenProcessToken(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let process = f.arg_l(0) as Handle;
+    let access = f.arg_i(1) as TokenAccess;
+    let mut token: Handle = 0;
+    if unsafe { OpenProcessToken(process, access, &mut token) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::L(token as i64))
+}
+
+fn wnd_OpenThreadToken(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let thread = f.arg_l(0) as Handle;
+    let access = f.arg_i(1) as TokenAccess;
+    let open_as_self = f.arg_i(2) as Bool;
+    let mut token: Handle = 0;
+    if unsafe { OpenThreadToken(thread, access, open_as_self, &mut token) } == 0 {
+        // 没有线程令牌是**正常情况**（返回 0，Java 侧会退回到进程令牌），不抛
+        return Ok(Slot::L(0));
+    }
+    Ok(Slot::L(token as i64))
+}
+
+fn wnd_DuplicateTokenEx(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let existing = f.arg_l(0) as Handle;
+    let access = f.arg_i(1) as TokenAccess;
+    let mut out: Handle = 0;
+    // SecurityImpersonation = 2, TokenImpersonation = 2
+    if unsafe { DuplicateTokenEx(existing, access, std::ptr::null_mut(), 2, 2, &mut out) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::L(out as i64))
+}
+
+fn wnd_SetThreadToken(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let thread_arg = f.arg_l(0);
+    let token = f.arg_l(1) as Handle;
+    let thread: *mut Handle = if thread_arg == 0 {
+        std::ptr::null_mut()
+    } else {
+        &thread_arg as *const i64 as *mut Handle
+    };
+    if unsafe { SetThreadToken(thread, token) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_GetTokenInformation(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let token = f.arg_l(0) as Handle;
+    let class = f.arg_i(1) as u32;
+    let buf = f.arg_l(2) as *mut c_void;
+    let len = f.arg_i(3) as u32;
+    let mut needed: u32 = len;
+    if unsafe { GetTokenInformation(token, class, buf, len, &mut needed) } == 0 {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(needed as i32))
+}
+
+fn wnd_AdjustTokenPrivileges(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let token = f.arg_l(0) as Handle;
+    let luid_addr = f.arg_l(1) as *const c_void;
+    let attributes = f.arg_i(2) as u32;
+    // TOKEN_PRIVILEGES { DWORD PrivilegeCount; LUID_AND_ATTRIBUTES[1] }
+    let mut buf = [0u8; 16];
+    buf[0..4].copy_from_slice(&1u32.to_ne_bytes());
+    let luid = nat_mem::read_bytes(luid_addr as u64, 8);
+    buf[4..12].copy_from_slice(&luid);
+    buf[12..16].copy_from_slice(&attributes.to_ne_bytes());
+    if unsafe {
+        AdjustTokenPrivileges(
+            token,
+            0,
+            buf.as_ptr() as *const c_void,
+            buf.len() as u32,
+            std::ptr::null_mut(),
+            std::ptr::null_mut(),
+        )
+    } == 0
+    {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I(0))
+}
+
+fn wnd_LookupPrivilegeValue0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let w = read_wstr_z(f.arg_l(0) as u64);
+    // 分配的 LUID 由 Java 侧 `LocalFree` 释放 → 必须落在 nat_mem 里（见 wnd_LocalFree 的分流）
+    let addr = nat_mem::alloc(8);
+    let mut luid = [0u8; 8];
+    if unsafe {
+        LookupPrivilegeValueW(std::ptr::null(), w.as_ptr(), luid.as_mut_ptr() as *mut c_void)
+    } == 0
+    {
+        nat_mem::free(addr);
+        return Err(throw_windows(vm, last_error()));
+    }
+    nat_mem::write_bytes(addr, &luid);
+    Ok(Slot::L(addr as i64))
+}
+
+fn wnd_AccessCheck(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let token = f.arg_l(0) as Handle;
+    let sd = f.arg_l(1) as *const c_void;
+    let access_mask = f.arg_i(2) as u32;
+    let g_read = f.arg_i(3) as u32;
+    let g_write = f.arg_i(4) as u32;
+    let g_exec = f.arg_i(5) as u32;
+    let g_all = f.arg_i(6) as u32;
+    // GENERIC_MAPPING { GenericRead, GenericWrite, GenericExecute, GenericAll }
+    let mut mapping = [0u8; 16];
+    mapping[0..4].copy_from_slice(&g_read.to_ne_bytes());
+    mapping[4..8].copy_from_slice(&g_write.to_ne_bytes());
+    mapping[8..12].copy_from_slice(&g_exec.to_ne_bytes());
+    mapping[12..16].copy_from_slice(&g_all.to_ne_bytes());
+    // PRIVILEGE_SET 缓冲区留够（1 条 LUID_AND_ATTRIBUTES = 12 字节）
+    let mut priv_set = [0u8; 64];
+    let mut priv_len: u32 = priv_set.len() as u32;
+    let mut granted: u32 = 0;
+    let mut success: Bool = 0;
+    if unsafe {
+        AccessCheck(
+            sd,
+            token,
+            access_mask,
+            mapping.as_ptr() as *const c_void,
+            priv_set.as_mut_ptr() as *mut c_void,
+            &mut priv_len,
+            &mut granted,
+            &mut success,
+        )
+    } == 0
+    {
+        return Err(throw_windows(vm, last_error()));
+    }
+    Ok(Slot::I((success != 0) as i32))
+}
+
+fn register_windows_security(r: &mut NativeRegistry) {
+    r.add(WND, "InitializeSecurityDescriptor", "(J)V", wnd_InitializeSecurityDescriptor);
+    r.add(WND, "InitializeAcl", "(JI)V", wnd_InitializeAcl);
+    r.add(WND, "GetSecurityDescriptorOwner", "(J)J", wnd_GetSecurityDescriptorOwner);
+    r.add(WND, "SetSecurityDescriptorOwner", "(JJ)V", wnd_SetSecurityDescriptorOwner);
+    r.add(WND, "GetSecurityDescriptorDacl", "(J)J", wnd_GetSecurityDescriptorDacl);
+    r.add(WND, "SetSecurityDescriptorDacl", "(JJ)V", wnd_SetSecurityDescriptorDacl);
+    r.add(
+        WND,
+        "GetAclInformation0",
+        "(JLsun/nio/fs/WindowsNativeDispatcher$AclInformation;)V",
+        wnd_GetAclInformation0_vm,
+    );
+    r.add(WND, "GetAce", "(JI)J", wnd_GetAce);
+    r.add(WND, "AddAccessAllowedAceEx", "(JIIJ)V", wnd_AddAccessAllowedAceEx);
+    r.add(WND, "AddAccessDeniedAceEx", "(JIIJ)V", wnd_AddAccessDeniedAceEx);
+    r.add(WND, "GetLengthSid", "(J)I", wnd_GetLengthSid);
+    r.add(WND, "ConvertSidToStringSid", "(J)Ljava/lang/String;", wnd_ConvertSidToStringSid);
+    r.add(WND, "ConvertStringSidToSid0", "(J)J", wnd_ConvertStringSidToSid0);
+    r.add(
+        WND,
+        "LookupAccountSid0",
+        "(JLsun/nio/fs/WindowsNativeDispatcher$Account;)V",
+        wnd_LookupAccountSid0,
+    );
+    r.add(WND, "LookupAccountName0", "(JJI)I", wnd_LookupAccountName0);
+    r.add(WND, "GetFileSecurity0", "(JIJI)I", wnd_GetFileSecurity0);
+    r.add(WND, "SetFileSecurity0", "(JIJ)V", wnd_SetFileSecurity0);
+    r.add(WND, "OpenProcessToken", "(JI)J", wnd_OpenProcessToken);
+    r.add(WND, "OpenThreadToken", "(JIZ)J", wnd_OpenThreadToken);
+    r.add(WND, "DuplicateTokenEx", "(JI)J", wnd_DuplicateTokenEx);
+    r.add(WND, "SetThreadToken", "(JJ)V", wnd_SetThreadToken);
+    r.add(WND, "GetTokenInformation", "(JIJI)I", wnd_GetTokenInformation);
+    r.add(WND, "AdjustTokenPrivileges", "(JJI)V", wnd_AdjustTokenPrivileges);
+    r.add(WND, "LookupPrivilegeValue0", "(J)J", wnd_LookupPrivilegeValue0);
+    r.add(WND, "AccessCheck", "(JJIIIII)Z", wnd_AccessCheck);
 }
