@@ -436,6 +436,11 @@ fn stack_init_elements(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 // 不会被调，所以那几条直接抛。
 
 fn continuation_reg(r: &mut NativeRegistry) {
+    // `VirtualThread.<clinit>` 第一句就是它（HotSpot 在这里把那 7 个 native 注册进
+    // 各自的方法槽）。本 VM 的 VirtualThread 用平台线程顶，那 7 条已在
+    // `native_reg.rs` 里按 (类,名,描述符) 静态登记，这里只需要一个空的注册点 ——
+    // 不注册的话 `Thread.ofVirtual()` 连类都初始化不了。
+    r.add("java/lang/VirtualThread", "registerNatives", "()V", no_op);
     const C: &str = "jdk/internal/vm/Continuation";
     r.add(C, "registerNatives", "()V", no_op);
     r.add(C, "enterSpecial", "(Ljdk/internal/vm/Continuation;ZZ)V", continuation_unsupported);
@@ -1044,6 +1049,9 @@ fn misc_reg(r: &mut NativeRegistry) {
     // `Console.readPassword` 的回显开关：没有真终端，回显状态由调用方自己决定 ——
     // 返回「你要求的状态已生效」（就是入参），语义上等价于「console 不回显」。
     r.add("jdk/internal/io/JdkConsoleImpl", "echo", "(Z)Z", |_, f| zi(f.arg_i(0)));
+    // `sun.io.Win32ErrorMode.initialize()` → `SetErrorMode`：进程启动时把「系统弹窗」
+    // 关掉（`ProcessImpl` 一族初始化时会走它）。真调 Win32，别给假值。
+    r.add("sun/io/Win32ErrorMode", "setErrorMode", "(J)J", win32_set_error_mode);
 }
 
 fn env_var(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
@@ -1092,4 +1100,23 @@ fn native_generate_seed(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
         vm.sh.heap.set(h, i, Slot::I(i32::from(*b)));
     }
     zi(1)
+}
+
+
+/// `SetErrorMode(mode)` → 旧值。非 Windows 上原样返回入参（没有这个概念）。
+fn win32_set_error_mode(_vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
+    let mode = f.arg_l(0) as u32;
+    #[cfg(windows)]
+    {
+        #[link(name = "kernel32")]
+        extern "system" {
+            fn SetErrorMode(mode: u32) -> u32;
+        }
+        let old = unsafe { SetErrorMode(mode) };
+        return Ok(Slot::L(i64::from(old)));
+    }
+    #[cfg(not(windows))]
+    {
+        Ok(Slot::L(i64::from(mode)))
+    }
 }

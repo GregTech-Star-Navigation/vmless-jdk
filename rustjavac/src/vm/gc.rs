@@ -1437,8 +1437,14 @@ fn scan_shared_roots(m: &mut Marker) {
 /// 所以不需要给堆分区，抢一个全局队列最简单也最不容易错。
 fn mark_all(sh: &Arc<Shared>, epoch: u32, seeds: &mut Vec<i32>) -> u64 {
     let threads = gc_threads();
-    // 活对象很少时（校验/小样例）单线程就地标完：起 7 个线程比标几百个对象还贵
-    if threads <= 1 || seeds.is_empty() || sh.heap.live() < 16_384 {
+    // 并行实际能省多少，取决于**这一轮有多少活干**；起一个线程约 60µs（Windows），
+    // 7 个就是 0.4ms —— 那比标一千个对象还贵。所以判据取「上一轮真正标了多少」
+    // （`last_marked`）；第一轮还没有历史值时才退回 `live()`。
+    let hint = match sh.heap.last_marked.load(Ordering::Acquire) {
+        0 => sh.heap.live(),
+        n => n,
+    };
+    if threads <= 1 || seeds.is_empty() || hint < 20_000 {
         let mut m = Marker::new(sh, epoch);
         m.work.append(seeds);
         m.drain();
@@ -1674,6 +1680,8 @@ impl Vm {
         let nroots = m.work.len();
         let mut seeds = std::mem::take(&mut m.work);
         let marked = mark_all(&sh, epoch, &mut seeds);
+        // 下一轮并行与否按**这一轮真正标了多少**决定（见 mark_all 里的阈值）
+        sh.heap.last_marked.store(marked, Ordering::Release);
         if sh.gc_stats {
             eprintln!(
                 "[gc]   根 {} 个（{:.2}ms）/ 标记 {} 个（{:.2}ms）/ 线程 {}",

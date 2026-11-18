@@ -127,10 +127,21 @@ pub(crate) enum RefBits {
     Big(Box<[u64]>),
 }
 
+/// `RefBits::None` 的进程级共享实例（基本类型数组、无引用字段的对象）
+fn refbits_none() -> Arc<RefBits> {
+    static NONE: std::sync::OnceLock<Arc<RefBits>> = std::sync::OnceLock::new();
+    Arc::clone(NONE.get_or_init(|| Arc::new(RefBits::None)))
+}
+
+/// `RefBits::All` 的进程级共享实例（引用数组、布局未知时的保守答案）
+fn refbits_all() -> Arc<RefBits> {
+    static ALL: std::sync::OnceLock<Arc<RefBits>> = std::sync::OnceLock::new();
+    Arc::clone(ALL.get_or_init(|| Arc::new(RefBits::All)))
+}
+
 impl RefBits {
     #[inline]
-    pub(crate) fn is_ref(&self, i: usize) -> bool {
-        match self {
+    pub(crate) fn is_ref(&self, i: usize) -> bool {        match self {
             RefBits::None => false,
             RefBits::All => true,
             RefBits::Small(w) => (i as u32) < 64 && (w & (1u64 << i)) != 0,
@@ -388,6 +399,14 @@ pub(crate) struct Heap {
     pub(crate) allocs_since_gc: AtomicU64,
     /// 上一次回收后有多少个对象/数组活着（阈值与统计用）
     pub(crate) live_after_gc: AtomicU64,
+    /// 上一轮标记**实际扫过**多少个对象。决定下一轮要不要起并行标记线程。
+    ///
+    /// 为什么不用 `live()`：它把「本轮已分配但还没扫掉的垃圾」也算进去 —— 短命对象
+    /// 负载下它在 26 万上下，而真正被标记的可能只有一千个（实测 G1：live=262159、
+    /// 标记 1163）。按 `live()` 判就会为了标 1163 个对象去起 7 个线程，光创建线程
+    /// 就占掉停顿的六成。改用上一轮的真实标记数，短命负载下停顿从 0.76ms 降到 0.35ms，
+    /// 大活集（G2，150 万）仍然走并行。
+    pub(crate) last_marked: AtomicU64,
     /// 累计已释放的对象数（`live()` 用它把页表高水位折成活对象数）
     pub(crate) reclaimed: AtomicU64,
     /// 类表快照（算字段引用位图用；`store_publish` 与构造时挂上）
@@ -409,6 +428,7 @@ impl Heap {
             gc_epoch: AtomicU32::new(1),
             allocs_since_gc: AtomicU64::new(0),
             live_after_gc: AtomicU64::new(0),
+            last_marked: AtomicU64::new(0),
             reclaimed: AtomicU64::new(0),
             store: RwLock::new(None),
             layouts: RwLock::new(HashMap::new()),
@@ -461,19 +481,28 @@ impl Heap {
             cells: cells.into_boxed_slice(),
         };
         self.allocs_since_gc.fetch_add(1, Ordering::Relaxed);
-        self.objs.push(hdr).map(|i| i as i32 + 1)
+        // 句柄 = 下标 + 1，而 `handle >= STR_BASE` 会被 `ref_kind` 判成**字符串**。
+        // 所以对象下标必须 < STR_BASE - 1，否则第 16777216 个对象起会拿到一个
+        // 「看起来是字符串」的句柄 —— 那是静默的语义错乱，比 OOM 糟得多。
+        // 页表本身能放到 3355 万个，这道闸是句柄编码先撞上的，所以按句柄上限拦。
+        let i = self.objs.push(hdr)?;
+        if i as i32 + 1 >= STR_BASE {
+            return None;
+        }
+        Some(i as i32 + 1)
     }
 
     /// 分配一个数组，返回句柄（< 0）
     pub(crate) fn new_array(&self, elems: Vec<Slot>, desc: &str) -> Option<i32> {
         let n = elems.len();
-        // 数组元素类型由描述符决定：`[L…;` / `[[…` 是引用数组，其余是基本类型
-        let refs: Arc<RefBits> = if n == 0 {
-            Arc::new(RefBits::None)
-        } else if is_ref_array_desc(desc) {
-            Arc::new(RefBits::All)
+        // 数组元素类型由描述符决定：`[L…;` / `[[…` 是引用数组，其余是基本类型。
+        // 两种情况都用**进程级共享**的那两个 Arc：此前每次 `new int[3]` 都要为
+        // `RefBits::None` 单独 Arc 分配一次（~40 字节 + 一次 malloc + 之后一次原子减），
+        // 而它恰恰是两个常量之一 —— 短命数组多的负载里这是纯浪费。
+        let refs: Arc<RefBits> = if n > 0 && is_ref_array_desc(desc) {
+            refbits_all()
         } else {
-            Arc::new(RefBits::None)
+            refbits_none()
         };
         let cells: Vec<Cell> = elems.into_iter().map(Cell::new).collect();
         let hdr = ObjHdr {

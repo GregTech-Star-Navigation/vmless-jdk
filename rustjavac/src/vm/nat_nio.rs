@@ -464,6 +464,15 @@ fn to_wide(s: &str) -> Vec<u16> {
 
 // ============================================================ 错误
 
+/// 调试开关：`VMLESS_NIO_TRACE=1` 时把每次 Win32 调用打到 stderr（排查「卡在哪个 native」用）
+fn trace(what: &str) {
+    use std::sync::OnceLock;
+    static ON: OnceLock<bool> = OnceLock::new();
+    if *ON.get_or_init(|| std::env::var_os("VMLESS_NIO_TRACE").is_some()) {
+        eprintln!("[nio] {what}");
+    }
+}
+
 fn last_error() -> u32 {
     unsafe { GetLastError() }
 }
@@ -569,6 +578,7 @@ fn create_file_w(path: &str, access: u32, share: u32, disposition: u32, flags: u
 
 fn wnd_CreateFile0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let path = read_path(f.arg_l(0) as u64);
+    trace(&format!("CreateFile0 {path:?} access={} flags={}", f.arg_i(1), f.arg_i(5)));
     let access = f.arg_i(1) as u32;
     let share = f.arg_i(2) as u32;
     let disposition = f.arg_i(4) as u32;
@@ -666,6 +676,7 @@ fn wnd_SetFileAttributes0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 fn wnd_GetFileAttributesEx0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let w = read_wstr(f.arg_l(0) as u64);
     let buf = f.arg_l(1) as u64;
+    trace(&format!("GetFileAttributesEx {:?}", String::from_utf16_lossy(&w)));
     let mut data = Win32FileAttributeData::default();
     if unsafe { GetFileAttributesExW(w.as_ptr(), 0, &mut data as *mut _ as *mut c_void) } == 0 {
         return Err(throw_windows(vm, last_error()));
@@ -784,6 +795,7 @@ fn wnd_FindClose(_: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
 
 fn wnd_GetFullPathName0(vm: &mut Vm, f: &mut Frame) -> Result<Slot, VmError> {
     let w = read_wstr(f.arg_l(0) as u64);
+    trace(&format!("GetFullPathName0 {:?}", String::from_utf16_lossy(&w)));
     // 先问长度（传 0 长度）：Win32 返回需要的字符数（不含 NUL）
     let need = unsafe { GetFullPathNameW(w.as_ptr(), 0, std::ptr::null_mut(), std::ptr::null_mut()) };
     if need == 0 {
