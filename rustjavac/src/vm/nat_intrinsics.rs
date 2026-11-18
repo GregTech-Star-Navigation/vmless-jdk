@@ -510,14 +510,19 @@ fn elem_bytes(vm: &Vm, obj: i32) -> usize {
 
 /// 按**字节偏移**取一个字节。数组的元素宽度已经进了 `slot_index`（偏移 ÷ 宽度），
 /// 所以这里要自己把「第 k 个字节」拆成「第几个元素 + 元素内第几字节」。
+///
+/// **注意不要自己再除一次宽度**：`get_mem → read_mem → unsafe_slot → slot_index`
+/// 里面本来就会做 `off / w`。这里传的是**元素起点的字节偏移** `off - off % w`，
+/// 让 `slot_index` 只除一次。（传元素下标会变成 `off / w / w`，
+/// `char[]` 上就是每 4 个字节才能对上 1 个字符 —— 路径字符串立刻变乱码。）
 fn get_byte(vm: &Vm, obj: i32, off: i64) -> u64 {
     let w = elem_bytes(vm, obj);
     if w <= 1 {
         return trunc_width(get_mem(vm, obj, off, 1), 1);
     }
-    let elem = off / w as i64;
     let sub = (off % w as i64) as u32;
-    let v = get_mem(vm, obj, elem, w);
+    let base = off - off % w as i64;
+    let v = get_mem(vm, obj, base, w);
     (v >> (8 * sub)) & 0xFF
 }
 
@@ -527,12 +532,12 @@ fn put_byte(vm: &mut Vm, obj: i32, off: i64, b: u64) {
         put_mem(vm, obj, off, 1, b & 0xFF);
         return;
     }
-    let elem = off / w as i64;
     let sub = (off % w as i64) as u32;
-    let old = get_mem(vm, obj, elem, w);
+    let base = off - off % w as i64;
+    let old = get_mem(vm, obj, base, w);
     let shift = 8 * sub;
     let merged = (old & !(0xFFu64 << shift)) | ((b & 0xFF) << shift);
-    put_mem(vm, obj, elem, w, merged);
+    put_mem(vm, obj, base, w, merged);
 }
 
 /// `copyMemory0(src, srcOff, dst, dstOff, bytes)`

@@ -1465,3 +1465,24 @@ At   : mid=-1013904242 | add1=-1013904242 | now=-1013904241   ← 与 java 一�
 Cl   : cleaner ok | read=hi | tgroup=true
 ```
 `verify.sh` 103/103、`cargo test` 106 passed。
+
+## 0.68.1 — 2026-11-18 · `copyMemory` 的偏移只能除一次
+
+`get_byte`/`put_byte` 里我先写了 `elem = off / w` 再传给 `get_mem`，
+而 `get_mem → read_mem → unsafe_slot → slot_index` **里面本来就会做 `off / w`** ——
+于是实际读的是第 `off / w / w` 个元素（`char[]` 上每 4 个字节才对上 1 个字符）。
+
+改成传「元素起点的**字节偏移**」`off - off % w`，让 `slot_index` 只除一次。
+
+实测（`char[]{'A','B'}` ↔ native 往返）：
+
+```
+改前  back=0 0
+改后  back=41 42      ← 与预期一致
+```
+
+补充一个模型事实：本 VM 的 `Unsafe.arrayBaseOffset(char[].class)` 返回 **0**（HotSpot 是 16），
+`arrayIndexScale` 是 2。所以内部所有偏移都是 0 基的，`sun.nio.fs` 用 `Unsafe.ARRAY_CHAR_BASE_OFFSET`
+拿到 0 之后自然对齐 —— 这也意味着**不能拿 HotSpot 的 `16` 去写测试**，那边基址不同。
+
+`verify.sh` 103/103、`cargo test` 106 passed。
