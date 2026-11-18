@@ -60,3 +60,26 @@ REPS=1 BIN=/d/vmless/bjb5 bash /d/vmless/corpus/run.sh   # 编译通过 43/45，
 
 7 个 verify 失败**全部是 JIT 侧 float/double 没实现**（`run_jit` 输出为空），与编译器
 改动无关；基线 `bin_l7v` 是 88/12（且它连 `ArrInit1/2`、`SwitchTable` 都编不过）。
+| 2026-11-18 R1 | rt_jbc1 | — | **750/3381 = 22.2%**（源码集换成 3381 个，src.zip 解出） | 未找到实例方法 755、找不到类 ~430、未定义的变量 129 |
+| 2026-11-18 R1' | rt_jbc1 | — | **1653/3381 = 48.9%** | **调用点压根没用 classpath**（改进程级共享 `Arc`）+ 类名判断改大小写敏感 |
+| 2026-11-18 R2 | rt_jbc2 | — | 1754/3381 = 51.9% | 内建 `Object` 占位挡住真的 `Object.class`；嵌套类型静态访问 |
+| 2026-11-18 R3 | rt_jbc3 | — | 1903/3381 = 56.3% | **同名重载只留第一个描述符** → 实参按错类型转换；class 字面量 |
+| 2026-11-18 R4 | rt_jbc3 | — | 1991/3381 = 58.9% | cast 回溯漏比较运算符；**类型位置多段名按 `$` 拼**（`Map.Entry` 生成不存在的类名） |
+| 2026-11-18 R5 | rt_jbc4 | — | **2096/3381 = 62.0%** | `instanceof` 模式绑定、`import static`、数组 `clone()` |
+| 2026-11-18 R6 | rt_jbc5 | — | **2271/3381 = 67.2%** | `var` 推导、通配静态导入、字段隐藏、嵌套类看外层静态成员、switch 表达式 + `yield` |
+
+
+
+> **口径提醒**：这份表里的 3058 是早期的源码集；2026-11-18 起换成 `C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/lib/src.zip`
+> 解出的 **3381** 个文件，所以 40.9% 与 48.9% **不能直接比**。
+
+### R7–R9（2026-11-18，同上口径 3381 文件 + classpath）
+
+| 轮 | 改动 | 通过率 |
+| --- | --- | --- |
+| R7 | `case CONST ->` 的 lambda 误判、`private record X(...)` 成员识别 | 70.9%（2398） |
+| R8 | 名字解析顺序改成「本类嵌套 → 同包 → `java.lang`」；嵌套类型 class 文件按 `$` 找 | 72.3%（2444） |
+| R9 | **VarHandle/MethodHandle 签名多态调用**（`(int) vh.getVolatile(o,i)`、`MethodHandle.linkToStatic`） | 72.7%（2459） |
+| R10 | 模式绑定的 `&&` 链（`if (a && P && b)`、三元条件） | **73.9%（2497）** |
+
+**当前：73.9%（2497 / 3381）**。最新桶表见 [`rustjavac/docs/java-base-失败分布.md`](../rustjavac/docs/java-base-失败分布.md)。

@@ -1,19 +1,74 @@
 # vmless
 
-**不带 JVM 的 Java 工具链**：自己把 `.java` 编成 `.class`，自己把 `.class` 跑起来。
-没有 `jvm.dll`、没有 HotSpot、没有 `java.exe` —— 三个原生可执行文件搞定编译与执行。
+**用 Rust 从零写的一套 JDK 25**：自己的编译器、自己的 VM（解释器 + JIT）、自己的 GC、自己的 39 个工具。
+没有 `jvm.dll`、没有 HotSpot —— **它能直接执行 OpenJDK 自己的 `.class`**。
 
+```bash
+bin/javac.exe   H.java        # 自研编译器：.java → 标准 .class（真 JVM 也能加载）
+bin/java.exe    H.class       # 自研 VM：解释器 + JIT + 分代 GC
+VMLESS_JDK=<jdk/lib/modules>  # 指定后，java.base 走 OpenJDK 自己的字节码
 ```
-bin/compile_src.exe   .java → .class
-bin/rustjava.exe      解释器：直接跑 .class
-bin/run_jit.exe       JIT：字节码 → Cranelift IR → 本机机器码
-```
 
-目标是**把 Java 从 JVM 里拆出来**：编译器、执行器、内存管理都是自己写的 Rust 实现，
-产出的 `.class` 仍然是标准字节码（能被真 JVM 加载 —— `verify.sh` 就是拿 HotSpot 当参照物）。
+这条路线的取舍：**JDK 的类库不自己重写**（`java.base` 有 7350 个类，重写不现实），
+而是让自研 VM 去执行 OpenJDK 编好的字节码；**VM 之下的一切都是自己写的** ——
+字节码解释器、Cranelift JIT、分代 GC、类加载器、native 层（JNI 与会话内建）、JPMS、线程与监视器。
 
-- 支持范围（逐条指令 + 逐条语法）：[docs/支持矩阵.md](docs/支持矩阵.md)
-- 内部结构（流水线、两个引擎、内存层）：[docs/架构.md](docs/架构.md)
+- 逐条指令 + 逐条语法：[docs/支持矩阵.md](docs/支持矩阵.md)
+- **现在做到哪、什么不能用、踩过哪些坑**：[docs/状态.md](docs/状态.md)
+- 内部结构：[docs/架构.md](docs/架构.md) · 为什么这么设计：[docs/设计.md](docs/设计.md)
+- 构建与验收：[docs/工程.md](docs/工程.md) · 命令行契约：[docs/接口.md](docs/接口.md)
+- 给 agent 的约定：[AGENTS.md](AGENTS.md)
+
+## 当前状态（2026-11-18）
+
+| 判据 | 当前值 | 怎么测 |
+| --- | --- | --- |
+| **三路一致**（HotSpot / 解释器 / JIT 逐字节） | **103 / 103，失败 0** | `bash verify.sh <bin目录>` |
+| 单元测试 | **106 passed** | `cargo test --release` |
+| **自研 javac 编 `java.base`** | **73.9%**（2497 / 3381 个源文件） | `cover_dir <源码根> <classpath>` |
+| 字节码覆盖 | 解释器 **200/202**、JIT **197/202** | 见支持矩阵 |
+| `java.base` native 注册 | **约 800 条** | `grep -c 'r\.add(' src/vm/nat_*.rs` |
+| 代码规模 | **109,852 行 Rust** / 8 个 crate / 82 次提交 | — |
+
+### 已完成的能力
+
+| 能力 | 实测证据 |
+| --- | --- |
+| **执行真 OpenJDK 字节码** | `VMLESS_JDK` 指 `lib/modules`，`String` / `ArrayList` / `HashMap` 全走 OpenJDK 自己的 class |
+| **类来源三路** | 目录 / **jar（自写 inflate，零依赖）** / **jimage 真二进制格式**（30482 条） |
+| **JIT** | Cranelift；优化器已开、除余常数换魔数（**i32 对 2^32 全量穷举验证**）、局部变量驻留寄存器、方法内联、cmp 与跳转融合 |
+| **GC** | **精确引用位图**（字节码数据流分析，96.3% 槽精确、失配 0）、标记-清扫不搬动、并行标记；**停顿 12.5 ms ≈ G1 的 12.7 ms** |
+| **线程** | 每 Java 线程一个 OS 线程、无全局锁（真并行）、`monitorenter/exit` 可重入、`LockSupport.park` 带许可 |
+| **JNI** | `JNINativeInterface_` 236 槽位 / **196 条真实现**，含 `RegisterNatives`、回调进 Java、`ThrowNew` |
+| **反射 + 注解** | `Field.get/set`、`Method.invoke`、`getAnnotation` 一族、`getParameters0`（真读 `MethodParameters`） |
+| **JPMS** | 70 个模块 `describe` 内容全对；`--add-opens` / `--add-exports` / `-m` 与真 JDK 一致 |
+| **`invokedynamic`** | `LambdaMetafactory` / `StringConcatFactory` / `MethodHandles` 构造族 + 调用点缓存 |
+| **`java.desktop`** | `BufferedImage` + `Graphics2D`（fillRect/drawLine/Blit + SrcOver）**与 HotSpot 逐像素相同** |
+| **工具 39 个** | `jimage extract` 逐字节相同、`jmod` 真 JDK 能读、我们签的 jar 真 `jarsigner` 验得过、真 `jfr` 能读我们录的文件 |
+| **attach 协议** | perfdata 用 **HotSpot v2.0 二进制格式** → **真 `jps`/`jstat` 能直接读我们的 VM** |
+
+### 性能（同机、同一份 `.class`、多次取中位）
+
+|  | vmless | HotSpot 25 | |
+| --- | --- | --- | --- |
+| P1（4 线程 × 800 万累加） | **22–34 ms** | 44–48 ms | **快约 2×** |
+| P2（同 + 字符串拼接） | 90–105 ms | 77–86 ms | 落后 1.03–1.2× |
+| GC 最大停顿 | **12.5–12.9 ms** | 12.7 ms | 持平 |
+| 启动（空 main） | **133.9 ms** | 727.3 ms | 快 5.4× |
+| 常驻 RSS | **5.5 MB** | 42.7 MB | 省 7.8× |
+| 解释执行（无 JIT） | 慢 96.9× | — | 已知短板（JIT 方法级回退兜住） |
+
+### 还没做到的
+
+| 缺口 | 说明 |
+| --- | --- |
+| **帧栈模型** | 没有 → `Thread.getStackTrace` / `StackWalker` 给不出帧，死锁只能看监视器图 |
+| **`Condition.await/signal`** | `ReentrantLock`/`CountDownLatch`/`Semaphore` 已通，这一条还挂 |
+| **`drawString`** | JDK 25 走 HarfBuzz/FFM；AWT 真窗口代码写了但起不来 |
+| **自研 javac 剩 26.1%** | 144 个长尾桶，最大的是「未找到实例方法」242 次 |
+| FFM / `Continuation` / 内存映射文件 | 明确抛异常，不装能跑 |
+
+详见 [docs/状态.md](docs/状态.md)。
 
 ## 装
 
@@ -21,16 +76,13 @@ bin/run_jit.exe       JIT：字节码 → Cranelift IR → 本机机器码
 
 | 方式 | 命令 | 说明 |
 |---|---|---|
-| 便携包 | 解压 `vmless-<ver>-win-x64.zip` | 只有 `bin/` 三个 exe + `README.txt` + `LICENSE`，不写注册表 |
+| 便携包 | 解压 `vmless-<ver>-win-x64.zip` | 只有 `bin/` + `README.txt` + `LICENSE`，不写注册表 |
 | 安装包 | 运行 `vmless-<ver>-setup.exe` | 装到 `%LOCALAPPDATA%\vmless`，可选加入用户 PATH，带卸载 |
-| 源码 | `cargo build --release --bin rustjava` + `--example compile_src --example run_jit` | 需要 Rust（实测 1.100）|
+| 源码 | `cargo build --release --bins --examples` | 需要 Rust；构建与验收命令见 [docs/工程.md](docs/工程.md) |
 
-产物由 `packaging/build.sh` 一条命令出（zip + 安装包 + `SHA256SUMS` + `release-notes.md`），
-详见 [packaging/README.md](packaging/README.md)。
+产物由 `packaging/build.sh` 一条命令出（zip + 安装包 + `SHA256SUMS` + `release-notes.md`）。
 
 ## 第一个例子
-
-写 `Hello.java`：
 
 ```java
 public class Hello {
@@ -40,127 +92,38 @@ public class Hello {
 }
 ```
 
-编译并运行（实测输出 `hello, vmless`，退出码 0）：
-
 ```bash
-bin/compile_src.exe Hello.java out     # hello: 379 字节 → out/Hello.class
-bin/rustjava.exe out/Hello.class       # 解释器
-bin/run_jit.exe  out/Hello.class       # JIT（stderr 会打编译/执行耗时）
+bin/javac.exe Hello.java out          # 自研编译器 → out/Hello.class
+bin/java.exe  out/Hello.class         # 解释器
 ```
 
-> 上面的 `bin/` 指**装好之后**的布局（便携包解压 / 安装包装完都长这样）。
-> 直接在仓库里用源码构建时，三个程序的路径是
-> `rustjavac/target/release/rustjava.exe` 与 `rustjavac/target/release/examples/{compile_src,run_jit}.exe`。
+跑真实库代码（用 OpenJDK 自己的 `java.base`）：
+
+```bash
+export VMLESS_JDK='C:/Program Files/Eclipse Adoptium/jdk-25.0.4.101-hotspot/lib/modules'
+bin/run_jdk.exe 'D:/out' Hello        # 目录 + 主类名
+```
 
 两个引擎的输出必须逐字节一致 —— 这正是验收脚本在做的事：
 
 ```bash
-bash scripts/verify-samples.sh          # 20 个代表样例，三方对照（解释器/JIT/HotSpot）
-bash scripts/verify-samples.sh --all    # samples/ 下全部样例
+bash verify.sh <bin目录>              # 103 个样例，三路对照（解释器/JIT/HotSpot）
 ```
-
-## 能跑什么（摘要）
-
-完整版在 [docs/支持矩阵.md](docs/支持矩阵.md)（29 项 ✅ / 3 项 ⚠️ / 13 项 ❌，每条都有实测依据）。
-
-| 类别 | 支持 |
-|---|---|
-| 基础语句、循环、递归、三元、标签跳转 | ✅ |
-| `switch`（int / String / enum，含箭头 `case ->`） | ✅ |
-| 类、继承、`super`、虚分派、接口（含 `default`/`static`） | ✅ |
-| 枚举、嵌套类型、静态字段与 `<clinit>` | ✅ |
-| 泛型**擦除**（含桥接方法）、变参、for-each | ✅ |
-| 异常：`throw` / `try-catch-finally` / 多重 catch / try-with-resources | ✅ |
-| 数组（含多维、`new int[3][]`）、字符串拼接（真 StringBuilder） | ✅ |
-| `long` / `double` 全链路 | ✅ |
-| lambda、方法引用、`record`、文本块、`instanceof` 模式绑定、`var` | ❌ |
-| 装箱/拆箱、非静态内部类 | ❌（能编过，但生成的字节码被 HotSpot 判 VerifyError）|
-| 线程、反射、JNI、类加载器、jar | ❌（设计上没有）|
-| `float` 算术 | ❌（相关指令一条没实现）|
-| 包名 + `import` 跨编译单元 | ❌（当前提交上解析有 bug，见支持矩阵）|
-
-## 当前状态（2026-11-17 · 65,055 行 Rust / 8 个 crate / 57 次提交）
-
-### 已完成
-
-| 能力 | 实测 |
-|---|---|
-| **字节码覆盖** | 解释器 **195/202**、JIT **195/202**（两边完全一致）；缺的 7 条是 `jsr ret wide goto_w jsr_w`（本编译器不产）+ `monitorenter/monitorexit` |
-| **解释器 + JIT + HotSpot 三路一致** | `verify.sh` **103/103** 逐字节比对（含退出码）|
-| **`invokedynamic`** | `StringConcatFactory`（`\u0001`/`\u0002` 语义）、`LambdaMetafactory`（含 `altMetafactory`）、`ConstantBootstraps`；调用点缓存实测 `解析 2 次 / 执行 100001 次` |
-| **执行真 OpenJDK 字节码** | `VMLESS_JDK=<lib/modules>` 后，`String` / `ArrayList` / `HashMap` 走 **OpenJDK 自己的字节码**（`String.hashCode("hello")` = `99162322`，`ArrayList`/`HashMap` 零新增 native）|
-| **native 方法机制** | `ACC_NATIVE` 注册表（102 条）；未命中报 `UnsatisfiedLinkError: 类.名描述符 not registered` |
-| **类来源** | 目录 / **jar（自写 inflate，零依赖）** / **jimage 真二进制格式**（30482 条）；`-cp` / `-jar` |
-| **内存层** | 分代 + **压缩式老年代** + **增量标记**（最大单步 0.683ms vs 全停顿 26.9ms）+ 并发 TLAB + 弱引用/finalization；分配 10.2ns/对象 |
-| **工具** | `jimage jmod serialver jnativescan jdeprscan javaw jwebserver jlink jshell javadoc jpackage jrunscript rmiregistry jps jdb`（15 个真实现）|
-| **密码学** | 零依赖 SHA/RSA/ASN.1/X.509/PKCS#7/PKCS#12；**与真 `jarsigner`/`keytool` 双向互通**；50 万例 fuzz 0 panic |
-| **Kerberos** | `kinit`/`klist`/自写 KDC；**真 JDK 25 的 `kinit` 能登进我们的 KDC** |
-| **attach 协议** | perfdata 用 **HotSpot v2.0 二进制格式**，所以**真 `jps`/`jstat` 能直接读我们的 VM**；1000 次 attach 句柄零变化 |
-
-### 还没做（按优先级）
-
-| 缺口 | 影响 | 规模 |
-|---|---|---|
-| **线程 + `monitorenter`/`monitorexit`** | Minecraft 起不来（渲染线程 + 逻辑线程 + 工作池）| 中 |
-| **反射 + 注解** | FML / Jackson 这一层全靠它 | 中 |
-| **JNI** | LWJGL 的 GLFW/OpenGL 绑定；没有它开不出窗口 | 大 |
-| **模块系统（JPMS）** | 带 mod 的路线是硬要求（`--add-opens`）| 中 |
-| **`java.desktop`** | `jconsole`/`jaccess*` 我们改用 Win32 原生 GUI 实现，不依赖它 | — |
-| **`SwitchBootstraps` / `ObjectMethods`** | `case null ->` 与 record 的 `equals/hashCode/toString` | 小 |
-
-### 一句话
-
-**VM、JIT、GC、类加载、native 层、字节码层、工具链都是自研的**，
-JDK 的类库走「执行 OpenJDK 自己的 class 文件」这条路（`java.base` 7350 个类，自己重写不现实）。
-要跑 Minecraft，还差**线程/monitor、反射、JNI、JPMS** 四块。
-## 基准（历史实测，出处逐条标）
-
-> 下列数字来自 `CHANGELOG.md` 里记录的实测，**本轮没有重测**；每次记录的机器状态与日期不同，比较的是同一次记录里的两个数。
-
-| 指标 | 结果 | 对照 | 出处 |
-|---|---|---|---|
-| 启动耗时（减去 50 ms 进程创建基线） | `rustjava` **≈2 ms** | `java` ≈96 ms | CHANGELOG `0.15.0` |
-| 分代堆分配（8M 分配 / 1M 存活） | **10.2 ns/对象**（多类 + 屏障 + TLAB） | 旧实现 10.8 ns/对象（单类、无屏障） | CHANGELOG `0.36.0` |
-| 同上，与 G1 交替 4 轮取最小值 | **4.0 ns** | G1 12.6 ns | CHANGELOG `0.18.0` |
-| 一次回收（同上场景） | **34.5 ms** | G1 39.8 ms | CHANGELOG `0.18.0` |
-| 最大单步停顿 | **0.021 ms**（0.17 实现）/ **0.918 ms**（0.36 新实现） | G1 23.4 ms | CHANGELOG `0.17.0` / `0.36.0` |
-| `fib(30)`（270 万次调用） | **8.1 ms** | HotSpot 247 ms | CHANGELOG `0.21.0` |
-| 50M 次循环累加 | 解释器 3281.9 ms / **JIT 140.9 ms**（快 23.3×） | HotSpot 278 ms（含 96 ms 启动） | CHANGELOG `0.20.0` |
-| 单对象内存 | **12–16 B** | HotSpot 24 B | CHANGELOG `0.17.0` |
-| bump 分配 vs `Box`（10M 对象，4 字段） | 19.1 ns/对象 | `Box` 69.9 ns/对象 | CHANGELOG `0.2.0` |
-| JIT 侧 GC 压测（50 万次短命对象） | `ALLOC_NS=188.4 GC_COUNT=6 LIVE_AFTER=4026528 HEAP_MB=3.84` | 分配量翻 4 倍堆占用不变 | CHANGELOG `0.39.0` |
-
-复现用的基准程序在 `librustjrt/examples/bench_*.rs` 与 `rustjavac/examples/bench_jit*.rs`：
-
-```bash
-cd librustjrt && cargo run --release --example bench_final    # ALLOC_NS / GC_MS / MAX_STEP_MS / BYTES_PER_OBJ
-cd rustjavac  && cargo run --release --example bench_jit_gc
-```
-
-## 已知坑
-
-- `rustjava.exe` / `run_jit.exe` 的路径参数**要带目录**（`out/Hello.class`）。裸文件名（`Hello.class`）
-  在 `0.42` 上会报「没有可执行的 class」（加载器把空的父路径当作类目录）。
-- `rustjavac/samples/` 不存在时，crate 里那个「class 往返逐字节一致」的测试会**自动跳过** ——
-  样例集现在放在仓库根的 `samples/`。
-- 仓库历史版本号：`CHANGELOG.md` 记到 `0.42.0`，而 `rustjavac/Cargo.toml` 还是 `0.1.0`（没跟着动）。
-  打包脚本按 `Cargo.toml` 取版本，两者不一致时会打警告并在 release notes 里写明。
 
 ## 仓库结构
 
 | 路径 | 内容 |
 |---|---|
-| `rustjavac/` | 编译器（crate 名 `rustjavac`，库名 `classfile`）+ 解释器 + JIT |
-| `librustjrt/` | 内存层：分代堆、TLAB、写屏障、卡表、根集 |
-| `rustcore/` | 给 OpenJDK `javac` 名字池用的 Rust arena（另一条线）|
-| `launcher/` `patches/` | 无 JVM 的 `bin/javac.exe` 那条线（OpenJDK 补丁 + native-image 入口）|
+| `rustjavac/` | 编译器（`front`/`sema`/`codegen`）+ VM（解释器/JIT/GC/native）+ 类加载 |
+| `librustjrt/` | 内存层：分代堆、TLAB、写屏障、卡表、根集、句柄表 |
+| `jdk-tools/` `jdk-crypto/` `jdk-gui/` `jdk-jfr/` `jdk-krb/` `jdk-attach/` | 6 个工具 crate（39 个 exe） |
 | `samples/` | 验收样例（`.java`），CI 与本地验收共用 |
-| `scripts/` | `verify-samples.sh`（样例三方对照）、`opcode-support.mjs`（指令支持表生成）|
-| `packaging/` | 打包脚本（portable zip + NSIS 安装包 + Release 清单）|
-| `verify.sh` | 本机全量验收（106 个样例，路径写死在本机）|
-| `docs/` | 架构、支持矩阵 |
+| `scripts/` | `verify-samples.sh`（样例三方对照） |
+| `packaging/` | 打包脚本（portable zip + NSIS 安装包 + Release 清单） |
+| `docs/` | [状态](docs/状态.md) · [架构](docs/架构.md) · [设计](docs/设计.md) · [工程](docs/工程.md) · [接口](docs/接口.md) · [支持矩阵](docs/支持矩阵.md) |
+| `patches/` `launcher/` `rustcore/` | 早期「无 JVM 的 `javac.exe`」那条线（OpenJDK 补丁 + native-image 入口），现已是支线 |
 
 ## 许可
 
 `patches/` 下的文件源自 OpenJDK，沿用 **GPLv2 + Classpath Exception**。
-其余原创代码的许可证**尚未指定** —— 分发包里的 `LICENSE` 目前是占位说明，定了之后放进仓库根即可。
+其余原创代码的许可证**尚未指定** —— 分发包里的 `LICENSE` 目前是 GPLv2 + CPE 全文占位，定了之后替换即可。
