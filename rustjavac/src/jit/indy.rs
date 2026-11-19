@@ -23,8 +23,6 @@ pub enum Site {
 
 /// 一个 lambda 调用点在编译期解析出来的全部材料（运行期不再解析）
 pub struct LambdaSite {
-    /// 站点编号（`类名 + 常量池下标` 唯一，**跨编译单元共享**）
-    pub id: u32,
     /// 合成类名（`<实现类>$$lambda$<id>`）
     pub class_name: String,
     /// SAM 方法名（= invokedynamic 自己的名字）
@@ -43,12 +41,9 @@ pub struct LambdaSite {
 }
 
 /// 分类一个调用点。`Err` 里是**方法级回退原因**（JIT 不接这个引导方法）。
-pub fn classify(cf: &ClassFile, cp_index: u16) -> Result<Site, String> {
-    classify_in(cf, "", cp_index)
-}
-
-/// 同上，但带上**声明类名**（站点编号要按「类 + 常量池下标」唯一）
-pub fn classify_in(cf: &ClassFile, owner: &str, cp_index: u16) -> Result<Site, String> {
+///
+/// `owner` 是**声明类名**：lambda 的站点编号按「类 + 常量池下标」唯一。
+pub fn classify(cf: &ClassFile, owner: &str, cp_index: u16) -> Result<Site, String> {
     let (name, desc, bsm_index) = site_of(cf, cp_index)?;
     let table = crate::classfile::attr::bootstrap_methods(cf)
         .map_err(|e| format!("BootstrapMethods 属性解析失败: {e}"))?;
@@ -112,7 +107,6 @@ fn lambda_site(
     let inst_desc = method_type(cf, e.args.get(2).copied())?;
     let id = site_id(owner, cp_index);
     Ok(Site::Lambda(LambdaSite {
-        id,
         class_name: format!("{}$$lambda${id}", impl_class.replace('/', "_")),
         sam_name: sam_name.to_string(),
         sam_desc,

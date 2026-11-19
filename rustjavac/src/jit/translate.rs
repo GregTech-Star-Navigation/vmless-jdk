@@ -2265,7 +2265,7 @@ impl Jit {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     let op_pc = pc - 1;
                     pc += 4; // 2 字节索引 + 2 个保留字节（JVMS 规定必须为 0）
-                    let site = super::indy::classify_in(&cf, class, idx).map_err(|why| {
+                    let site = super::indy::classify(&cf, class, idx).map_err(|why| {
                         JitError(format!(
                             "JIT 不支持 invokedynamic（0xba@{op_pc}，{why}）：{class}.{name}{desc}"
                         ))
@@ -2986,20 +2986,6 @@ impl Jit {
     ) -> Result<(), JitError> {
         self.emit_roots(fb, root, n, false)
     }
-}
-
-/// 方法体里第一条 `invokedynamic`（0xba）的偏移。
-///
-/// 按指令长度走，不会把操作数里的 0xba 当成指令（`insn_len_at` 处理变长的 switch）。
-fn find_invokedynamic(body: &[u8]) -> Option<usize> {
-    let mut pc = 0usize;
-    while pc < body.len() {
-        if body[pc] == 0xba {
-            return Some(pc);
-        }
-        pc += insn_len_at(body, pc).max(1);
-    }
-    None
 }
 
 /// 方法体里第一条 `monitorenter`(0xc2) / `monitorexit`(0xc3)。
