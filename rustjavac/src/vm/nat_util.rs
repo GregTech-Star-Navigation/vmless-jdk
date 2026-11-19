@@ -177,8 +177,16 @@ fn group_a_vm_system(r: &mut NativeRegistry) {
         // 我们从不产生 pending Reference（`hasReferencePendingList` 恒 false），于是三种写法：
         //   · 立刻返回        → handler 线程 **100% CPU 空转** + 疯狂打 safepoint，别的线程被饿死
         //   · 无限期 park     → 它是在持有监视器时进来的，直接把主线程锁死
-        //   · **睡一小片再返回** ← 取这个：让出 CPU，也不改变任何锁语义
-        std::thread::sleep(std::time::Duration::from_millis(1));
+        //   · 睡一小片再返回  → 让出 CPU，但 1 ms 一片就是**每秒 1000 次空醒**
+        //                       （实测 1.3 s 的运行里被叫了 1157 次，白烧一个核）
+        //
+        // 取「真 park + 长超时」：条件变量上睡满 1 秒才醒一次，期间 0 CPU。
+        // 不无限期等是因为要留一条「万一以后真产生 pending 列表」的出路；
+        // 1 秒一次空醒等于把开销砍到 1/1000，而不是把语义改成别的样子。
+        static PARK: (std::sync::Mutex<()>, std::sync::Condvar) =
+            (std::sync::Mutex::new(()), std::sync::Condvar::new());
+        let g = PARK.0.lock().unwrap_or_else(|e| e.into_inner());
+        let _ = PARK.1.wait_timeout(g, std::time::Duration::from_secs(1));
         Ok(Slot::I(0))
     });
     // ---- java.lang.VirtualThread ----

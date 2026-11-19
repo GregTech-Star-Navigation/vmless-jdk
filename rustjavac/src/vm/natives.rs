@@ -1712,11 +1712,18 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+
+/// 与 `native_reg::now_nanos` 同一口径：一次 QPC（见那边的注释）。
 fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    static BASE: std::sync::OnceLock<(std::time::Instant, i64)> = std::sync::OnceLock::new();
+    let (t0, v0) = BASE.get_or_init(|| {
+        let e = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        (std::time::Instant::now(), e)
+    });
+    v0 + t0.elapsed().as_nanos() as i64
 }
 
 /// 数组元素描述符 → 类型名（`Ljava/lang/TypeVariable;` → `java/lang/TypeVariable`）

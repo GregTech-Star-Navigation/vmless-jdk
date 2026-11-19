@@ -17,7 +17,7 @@
 
 use super::shared::lk;
 use super::frame::Frame;
-use super::heap::RefKind;
+use super::heap::{RefKind, STR_BASE};
 use super::slot::Slot;
 use super::{Vm, VmError};
 use std::collections::HashMap;
@@ -1158,14 +1158,44 @@ fn elem_width(desc: &str) -> usize {
     }
 }
 
+/// 数组元素宽度缓存：`class_id → 宽度 | 0x10（是 `[B`）`。
+///
+/// `class_id` 与描述符的对应关系**永久不变**（`Shared::intern_class_id` 只增、
+/// 不复用 id），所以这张直连表可以无锁读写：读到的条目 id 不匹配就重算再写回。
+/// **不要**在这里缓存布局（槽数 / 引用位图）—— 那是并行加载下会变的东西。
+static ARR_W: [std::sync::atomic::AtomicU32; 8192] =
+    [const { std::sync::atomic::AtomicU32::new(0) }; 8192];
+
+/// 句柄 → `Some((元素字节宽度, 是不是 `[B`))`；不是数组返回 `None`。
+///
+/// 数组句柄是**负数**、对象/字符串是正数（见 `shared.rs` 的
+/// `new_object`/`new_array`/`new_string`），所以一次符号判断就分开了 ——
+/// 不用 `Vm::ref_kind`：它会为**每个**句柄分配一个 `String` 类名，
+/// 而 `Unsafe` 的每次读写都要问一次（实测这是 putByte 体里最大的一格）。
+#[inline]
+fn arr_kind(vm: &Vm, h: i32) -> Option<(usize, bool)> {
+    if h >= 0 {
+        return None;
+    }
+    let id = vm.sh.heap.hdr(h)?.class_id;
+    let slot = (id as usize) & (ARR_W.len() - 1);
+    let e = ARR_W[slot].load(std::sync::atomic::Ordering::Relaxed);
+    let code = if (e >> 8) == id.wrapping_add(1) {
+        e as u8
+    } else {
+        let d = vm.sh.heap.class_of(h)?;
+        let c = (elem_width(&d) as u8) | if &*d == "[B" { 0x10 } else { 0 };
+        ARR_W[slot].store((id.wrapping_add(1) << 8) | c as u32, std::sync::atomic::Ordering::Relaxed);
+        c
+    };
+    Some(((code & 0x0F) as usize, code & 0x10 != 0))
+}
+
 /// `Unsafe` 的 `offset`（字节偏移）→ 我们数组堆里的**元素下标**
 fn slot_index(vm: &Vm, obj: i32, off: i64) -> Option<usize> {
     let off = usize::try_from(off).ok()?;
-    match vm.ref_kind(obj) {
-        RefKind::Arr(ref d) => {
-            let w = elem_width(d);
-            Some(off / w)
-        }
+    match arr_kind(vm, obj) {
+        Some((w, _)) => Some(off / w),
         _ => Some(off),
     }
 }
@@ -1174,16 +1204,24 @@ fn slot_index(vm: &Vm, obj: i32, off: i64) -> Option<usize> {
 /// 一次读 8 / 4 个字节并打包（小端）。`ArraysSupport.vectorizedMismatch` 正是靠它
 /// 按机器字比较。
 fn read_mem(vm: &Vm, obj: i32, i: usize, width: usize) -> u64 {
-    let is_bytes = matches!(vm.ref_kind(obj), RefKind::Arr(ref d) if d == "[B");
-    if is_bytes && width > 1 {
-        let mut out = 0u64;
-        if let Some(a) = vm.sh.heap.snapshot(obj) {
+    if let Some((w, is_bytes)) = arr_kind(vm, obj) {
+        if is_bytes && width > 1 {
+            let mut out = 0u64;
             for k in 0..width {
-                out |= ((a.get(i + k).map(|s| s.as_i32() as u8).unwrap_or(0) as u64) & 0xFF) << (8 * k);
+                let b = vm.sh.heap.get(obj, i + k).map(|s| s.as_i32() as u8).unwrap_or(0) as u64;
+                out |= (b & 0xFF) << (8 * k);
             }
+            return out;
         }
-        return out;
+        let s = vm.sh.heap.get(obj, i / w).unwrap_or(Slot::I(0));
+        let raw = match width {
+            8 => s.as_i64() as u64,
+            _ => s.as_i32() as u32 as u64,
+        };
+        let mask = if width >= 8 { u64::MAX } else { (1u64 << (8 * width)) - 1 };
+        return raw & mask;
     }
+    // 不是数组：类对象静态字段 / 字符串字段视图 / 对象实例槽
     let s = unsafe_slot(vm, obj, i as i64).unwrap_or(Slot::I(0));
     let raw = match width {
         8 => s.as_i64() as u64,
@@ -1194,12 +1232,25 @@ fn read_mem(vm: &Vm, obj: i32, i: usize, width: usize) -> u64 {
 }
 
 fn write_mem(vm: &mut Vm, obj: i32, i: usize, width: usize, v: u64) {
-    let is_bytes = matches!(vm.ref_kind(obj), RefKind::Arr(ref d) if d == "[B");
-    if is_bytes && width > 1 {
-        if vm.sh.heap.array_len(obj).is_some() {
+    if let Some((w, is_bytes)) = arr_kind(vm, obj) {
+        if is_bytes && width > 1 {
             for k in 0..width {
                 vm.sh.heap.set(obj, i + k, Slot::I(((v >> (8 * k)) & 0xFF) as i32));
             }
+            return;
+        }
+        let slot = match width {
+            8 => Slot::L(v as i64),
+            _ => Slot::I(v as u32 as i32),
+        };
+        let idx = i / w;
+        // 引用槽必须存成 `Slot::I` + 走 `set_ref`（见 `unsafe_put_impl` 的长注释）
+        let wrong_repr = !matches!(slot, Slot::I(_));
+        let is_ref = wrong_repr && vm.sh.heap.hdr(obj).map(|o| o.is_ref(idx)).unwrap_or(false);
+        if is_ref {
+            vm.sh.heap.set_ref(obj, idx, Slot::I(slot.as_i32()));
+        } else {
+            vm.sh.heap.set(obj, idx, slot);
         }
         return;
     }
@@ -1209,8 +1260,6 @@ fn write_mem(vm: &mut Vm, obj: i32, i: usize, width: usize, v: u64) {
     };
     unsafe_put_impl(vm, obj, i as i64, slot);
 }
-
-/// `Unsafe.get*` 的 `(Object o, long offset)`：`offset` 在我们的模型里就是**槽下标**
 fn unsafe_slot(vm: &Vm, obj: i32, off: i64) -> Option<Slot> {
     // `staticFieldBase` 给的是**类对象**：这类访问要落到静态字段表，不是某个实例的槽。
     if let Some(cn) = vm.class_obj_name(obj) {
@@ -1223,16 +1272,33 @@ fn unsafe_slot(vm: &Vm, obj: i32, off: i64) -> Option<Slot> {
         );
     }
     let i = slot_index(vm, obj, off)?;
-    match vm.ref_kind(obj) {
-        RefKind::Arr(_) => vm.sh.heap.get(obj, i),
-        // 字符串常量的字段视图（材料化过才有；没材料化就当成 0，调用方自己会重新取）
-        RefKind::Str => vm.sh.heap.str_field_get(obj, i),
-        RefKind::Obj(_) => vm.sh.heap.get(obj, i),
-        _ => None,
+    // 字符串句柄（`ldc "abc"` 的字段视图）走字符串堆；其余（数组/对象）都是堆槽。
+    // 这里不再问 `ref_kind`：它每次都要分配一个 String 类名，而只有「是不是字符串」
+    // 这一位有用 —— 句柄编码里已经带着（`STR_BASE` 以上是字符串）。
+    if obj >= STR_BASE {
+        // 材料化过才有；没材料化就当成 0，调用方自己会重新取
+        vm.sh.heap.str_field_get(obj, i)
+    } else {
+        vm.sh.heap.get(obj, i)
     }
 }
 
 fn unsafe_put_impl(vm: &mut Vm, obj: i32, off: i64, v: Slot) {
+    // **数组快路**：数组句柄是负数，所以「是不是类对象」这一问可以整段跳过 ——
+    // `class_obj_name` 一次 54 ns（拿 `class_objs` 的互斥量 + clone 一个 String），
+    // 而 `Unsafe.put*` 的热路径（`StringLatin1/StringUTF16` 写 `byte[]`/`char[]`）
+    // 全是数组。它在对象路径上仍然必须留着（静态字段访问要靠它认类对象）。
+    if let Some((w, _)) = arr_kind(vm, obj) {
+        let Some(i) = usize::try_from(off).ok().map(|o| o / w) else { return };
+        let wrong_repr = !matches!(v, Slot::I(_));
+        let is_ref = wrong_repr && vm.sh.heap.hdr(obj).map(|o| o.is_ref(i)).unwrap_or(false);
+        if is_ref {
+            vm.sh.heap.set_ref(obj, i, Slot::I(v.as_i32()));
+        } else {
+            vm.sh.heap.set(obj, i, v);
+        }
+        return;
+    }
     // 同上：`staticFieldBase` 的类对象 → 写静态字段表
     if let Some(cn) = vm.class_obj_name(obj) {
         if let Some(fname) = vm.store.field_name_at(&cn, off.max(0) as usize) {
@@ -1243,26 +1309,6 @@ fn unsafe_put_impl(vm: &mut Vm, obj: i32, off: i64, v: Slot) {
     let Some(i) = slot_index(vm, obj, off) else { return };
     match vm.ref_kind(obj) {
         RefKind::Arr(_) | RefKind::Obj(_) => {
-            // **引用槽只能存成 `Slot::I`**：GC 的 `scan_refs` / `scan_refs_young`
-            // 只把 `Slot::I(h)` 当引用（`shared.rs` 里那条 `if let Slot::I(v)`），
-            // `Slot::L` 会被当成 primitive long 跳过 —— 于是「只被这一格指着的对象」
-            // 在下一轮回收里被扫掉，数组里留下一个**悬空句柄**，
-            // 读回来时 `type_name` 报 "null"（= 悬空，不是真的 null）。
-            //
-            // `write_mem` 的 width=8 分支原来就是这个写法（`Slot::L(v as i64)`），
-            // 所以凡是走 `Unsafe` 往**引用数组**里写引用的地方全中招：
-            // `ConcurrentHashMap.casTabAt` → `U.compareAndSetReference` 是第一个撞上的
-            // （`Properties` → `ConcurrentHashMap.put` → 那条 Node 被回收）。
-            // 实测：`VMLESS_GC_STRESS=1` 下 `System.initPhase1` 直接
-            // `ClassCastException: null cannot be cast to ConcurrentHashMap$Node（悬空句柄）`。
-            //
-            // 顺手把屏障也走 `set_ref`（不去按理算出来的位图判断）：
-            // 这里已经是「确定是引用」的分支，少一次 `is_ref` 判断，也不会因为位图
-            // 算错而漏记脏账。
-            //
-            // 只有**非 `Slot::I` 的写入**（= `write_mem` 的 width=8，`Slot::L`）才需要
-            // 转换：`Slot::I` 本来就是对的，多查一次页表纯属白花 —— 这是
-            // `Unsafe.put*/CAS*` 的热路径，别给它加常数。
             let wrong_repr = !matches!(v, Slot::I(_));
             let is_ref = wrong_repr && vm.sh.heap.hdr(obj).map(|o| o.is_ref(i)).unwrap_or(false);
             if is_ref {
@@ -1276,7 +1322,6 @@ fn unsafe_put_impl(vm: &mut Vm, obj: i32, off: i64, v: Slot) {
     }
 }
 
-/// `(o, offset)` —— 全部 `Unsafe` 访问器的前两个参数
 fn target(f: &Frame) -> (i32, usize) {
     let off = f.arg_l(1);
     (f.arg_i(0), off.max(0) as usize)
@@ -1509,11 +1554,70 @@ fn now_millis() -> i64 {
         .unwrap_or(0)
 }
 
+
+/// `System.nanoTime()`：**一次 `QueryPerformanceCounter`**。
+///
+/// 契约只要求「单调、单位纳秒、起点任意」，不要求对齐 epoch —— 原来每次调
+/// `SystemTime::now()`（`GetSystemTimePreciseAsFileTime` 一路）实测 48 ns，
+/// 而且系统时间被回拨时不单调。`Instant::now()` 在 Windows 上就是 QPC，
+/// 起点在首次调用时取一次 epoch 纳秒，量级保持不变（有代码会拿它跟
+/// `currentTimeMillis()*1e6` 比大小，别改原点）。
+#[cfg(windows)]
+extern "system" {
+    fn QueryPerformanceCounter(out: *mut i64) -> i32;
+    fn QueryPerformanceFrequency(out: *mut i64) -> i32;
+}
+
+#[cfg(windows)]
+#[inline]
+fn qpc() -> i64 {
+    let mut v = 0i64;
+    unsafe { QueryPerformanceCounter(&mut v) };
+    v
+}
+
+/// `System.nanoTime()`：一次 `QueryPerformanceCounter` + 一次乘法。
+///
+/// 契约只要求「单调、纳秒、起点任意」—— 原来每次调 `SystemTime::now()`
+/// （`GetSystemTimePreciseAsFileTime` 一路）实测 **47.6 ns**，而且系统时间被回拨时
+/// **不单调**。这里直接读 QPC：Windows 的 QPC 频率一般是 10 MHz（整除 1e9），
+/// 于是纳秒 = 刻度 × 100，一次乘法搞定；频率不能整除时才走 u128 除法（每次进程只
+/// 判一次）。起点仍是首次调用时的 epoch 纳秒：量级不变，别处拿它跟
+/// `currentTimeMillis()*1e6` 比大小也不会炸。
+#[cfg(windows)]
 fn now_nanos() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos() as i64)
-        .unwrap_or(0)
+    static BASE: std::sync::OnceLock<(i64, i64, i64)> = std::sync::OnceLock::new();
+    let (q0, v0, per) = *BASE.get_or_init(|| {
+        let mut f = 0i64;
+        unsafe { QueryPerformanceFrequency(&mut f) };
+        let e = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        // 频率整除 1e9 时 per 是每刻度纳秒数，否则是 0（走慢路）
+        let per = if f > 0 && 1_000_000_000 % f == 0 { 1_000_000_000 / f } else { 0 };
+        (qpc(), e, per)
+    });
+    let d = qpc() - q0;
+    if per > 0 {
+        return v0 + d * per;
+    }
+    let mut f = 0i64;
+    unsafe { QueryPerformanceFrequency(&mut f) };
+    v0 + ((d as i128 * 1_000_000_000i128) / (f.max(1) as i128)) as i64
+}
+
+#[cfg(not(windows))]
+fn now_nanos() -> i64 {
+    static BASE: std::sync::OnceLock<(std::time::Instant, i64)> = std::sync::OnceLock::new();
+    let (t0, v0) = BASE.get_or_init(|| {
+        let e = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as i64)
+            .unwrap_or(0);
+        (std::time::Instant::now(), e)
+    });
+    v0 + t0.elapsed().as_nanos() as i64
 }
 
 // ---- 系统属性：JNI（以及整个真 java.base 路径）的前置条件 ----

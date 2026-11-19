@@ -124,16 +124,24 @@ fn get_mem(vm: &Vm, obj: i32, off: i64, width: usize) -> u64 {
     if obj == 0 {
         return trunc_width(arena::read(off as u64, width), width);
     }
-    if let (RefKind::Obj(cls), true) = (vm.ref_kind(obj), off >= 0) {
-        if let Some(ft) = field_type(vm, &cls, off as usize) {
-            if desc_width(&ft) == width {
-                let s = super::unsafe_slot(vm, obj, off).unwrap_or(Slot::I(0));
-                let raw = match ft.as_str() {
-                    "D" => s.as_f64().to_bits(),
-                    "F" => s.as_f32().to_bits() as u64,
-                    _ => s.as_i64() as u64,
-                };
-                return trunc_width(raw, width);
+    // 宽度 ≤ 2 的快路：`Z`/`B`/`C`/`S` 四种声明类型进槽后都是 `Slot::I`，所以
+    // 问不到声明类型也不改变结果 —— 而 `field_type` 每次分配一个 String、还要
+    // 走一遍继承链，是对象路径上最贵的一步（见 `nat_intrinsics` 头上那条注释）。
+    if width <= 2 {
+        return trunc_width(super::read_mem(vm, obj, off.max(0) as usize, width), width);
+    }
+    if obj > 0 && obj < crate::vm::heap::STR_BASE && off >= 0 {
+        if let Some(cls) = vm.sh.heap.class_of(obj) {
+            if let Some(ft) = field_type(vm, &cls, off as usize) {
+                if desc_width(&ft) == width {
+                    let s = super::unsafe_slot(vm, obj, off).unwrap_or(Slot::I(0));
+                    let raw = match ft.as_str() {
+                        "D" => s.as_f64().to_bits(),
+                        "F" => s.as_f32().to_bits() as u64,
+                        _ => s.as_i64() as u64,
+                    };
+                    return trunc_width(raw, width);
+                }
             }
         }
     }
@@ -146,18 +154,24 @@ fn put_mem(vm: &mut Vm, obj: i32, off: i64, width: usize, v: u64) {
         arena::write(off as u64, width, v);
         return;
     }
-    if let (RefKind::Obj(cls), true) = (vm.ref_kind(obj), off >= 0) {
-        if let Some(ft) = field_type(vm, &cls, off as usize) {
-            if desc_width(&ft) == width {
-                let cell = match ft.as_str() {
-                    "D" => Slot::F(f64::from_bits(v)),
-                    "F" => Slot::Fl(f32::from_bits(v as u32)),
-                    "J" => Slot::L(v as i64),
-                    "Z" => Slot::I(i32::from(v != 0)),
-                    _ => Slot::I(v as u32 as i32),
-                };
-                super::unsafe_put_impl(vm, obj, off, cell);
-                return;
+    if width <= 2 {
+        super::write_mem(vm, obj, off.max(0) as usize, width, v);
+        return;
+    }
+    if obj > 0 && obj < crate::vm::heap::STR_BASE && off >= 0 {
+        if let Some(cls) = vm.sh.heap.class_of(obj) {
+            if let Some(ft) = field_type(vm, &cls, off as usize) {
+                if desc_width(&ft) == width {
+                    let cell = match ft.as_str() {
+                        "D" => Slot::F(f64::from_bits(v)),
+                        "F" => Slot::Fl(f32::from_bits(v as u32)),
+                        "J" => Slot::L(v as i64),
+                        "Z" => Slot::I(i32::from(v != 0)),
+                        _ => Slot::I(v as u32 as i32),
+                    };
+                    super::unsafe_put_impl(vm, obj, off, cell);
+                    return;
+                }
             }
         }
     }
@@ -1326,3 +1340,4 @@ fn constant_pool_reg(r: &mut NativeRegistry) {
     r.add(P, "getMemberRefInfoAt0", "(Ljava/lang/Object;I)[Ljava/lang/String;", cp_null);
     r.add(P, "getNameAndTypeRefInfoAt0", "(Ljava/lang/Object;I)[Ljava/lang/String;", cp_null);
 }
+

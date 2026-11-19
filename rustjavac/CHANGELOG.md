@@ -2,6 +2,34 @@
 
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
+## 0.77.0
+
+**为什么**：rdtsc 打点实测出四条 native/分配热点，其中 `Unsafe.putByte` 的 native 体要 678 ns。
+
+**改了什么**
+
+- **`Unsafe` 标量读写去掉 `Vm::ref_kind`**（`native_reg.rs`）。`ref_kind` **每次分配一个 String 类名**，
+  一次 `putByte` 调了 4 次。新增 `ARR_W`（class_id → 元素宽度，无锁直连表）+ `arr_kind()`；
+  数组句柄是负数，一次符号判断就分流；`unsafe_put_impl` 加数组快路，跳过 `class_obj_name`
+  的互斥量 + clone。宽度 ≤2 时直接走 `read_mem/write_mem`，跳过 `field_type`（那也要分配 String + 走继承链）。
+  **native 体 678 → 45.6 ns（15×）**。
+- **`System.nanoTime`** 换成裸 `QueryPerformanceCounter` + 一次乘法（频率整除 1e9 时 ns = 刻度 × 100）。
+  **47.6 → 28.3 ns**，且由「系统时间、可回拨」改成**单调**。
+- **`Reference.waitForReferencePendingList`** 从 `sleep(1ms)` 死循环改成
+  `Condvar::wait_timeout(1s)`。6 秒内 **4096+ 次 → <512 次**（原来白烧一个核）。
+
+**结果**：Mb4 `toString` 462→429 ms、`valueOf` 491→446 ms；真程序 R3 2030→1911 ms。
+真程序样张 5/5、`cargo test` 124 passed、GC_STRESS 10 样例 × 15 次 = 150/150。
+
+**一条重要的归因纠正**（推翻 0.72–0.75 期间的假设）：这四条热点合起来只占 Mb4/R1 的**个位数百分比**。
+真正的瓶颈是 **`execute`/`execute_body` 的每次调用固定开销 ≈1.45 µs**。证据链：
+空循环 102 ns；**空静态 Java 方法 1523 ns**；带参静态调用 1659 ns；
+**native 调用 1534 ns 而 native 体只有 47.6 ns** → 派发 + 帧 = 1486 ns。
+把 `putByte` 体砍 15 倍，Mb4 `toString` 只动 5% —— 因为一次 `toString` 有 ~25 次调用。
+
+**另发现一处死代码**：`exec.rs:142` 声明了 `NewSite`（`new` 调用点缓存）但从未接上；
+`exec.rs:1218` 的 `new` 仍每次都做 `class_name_of`（String 分配）+ `ensure_init` + `field_count` + `vec!`。
+
 ## 0.76.0
 
 **为什么**：自研 javac 编 `java.base` 停在 81.5%，剩下的都是「名字/类型解析」这一层不够。
