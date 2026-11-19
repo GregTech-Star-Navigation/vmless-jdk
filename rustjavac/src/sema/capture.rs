@@ -1,9 +1,9 @@
-//! 匿名类的**局部变量捕获**（JLS 8.1.3 / 15.9.5）。
+//! 匿名类的**捕获**（JLS 8.1.3 / 15.9.5）：外层局部变量（`val$`）与外层实例（`this$0`）。
 //!
 //! `new X(args){ … }` 在解析阶段被合成成一个嵌套类型 `Outer$AnonN`（见
 //! `front::parser::expr`），`sema::nested::flatten` 再把它拍平成顶层类型。
-//! 拍平之后，匿名类体是一个**独立的类**，看不见外层方法的局部变量 —— 所以要在
-//! 拍平之后补上 javac 的那一步（本题只做局部变量，`this$0` 不在范围内）：
+//! 拍平之后，匿名类体是一个**独立的类**，看不见外层方法的局部变量与 `this` —— 所以要
+//! 在拍平之后补上 javac 的那一步：
 //!
 //! 1. 合成类里加 `val$x` 字段（类型取自局部变量的声明类型），
 //! 2. 构造器最前面加形参 `$c0…$cN`，字段初始化式写成 `val$x = $cN`（字段初始化式由
@@ -12,14 +12,19 @@
 //! 3. 创建点 `new Outer$AnonN(a…)` 改成 `new Outer$AnonN(caps…, a…)`，
 //! 4. 匿名类体里的 `Ident(x)` 改写成 `this.val$x`。
 //!
+//! **外层实例（`this$0`）**：体里用到直接外层的实例字段/实例方法，或写了 `Outer.this`
+//! 时，合成类再加一个 `this$0` 字段 + 构造器第一个形参 `$this`，创建点把外层 `this`
+//! 传进去；体里对应的名字改写成 `this.this$0.f` / `this.this$0.m(…)` / `this.this$0`。
+//! 只支持**直接外层**（`A$Anon0` → A）：多层 `this$0` 与 `Outer.super.m()` 仍然明确报错，
+//! 静态上下文里拿不到 `this` 也报错（都不猜）。
+//!
 //! 作用域栈按**程序顺序**走语句树：`Block` 压栈/出栈，`LocalVar` / `For` 初值 /
 //! `ForEach` / `catch` 变量入栈。走到创建点时，`自由名 ∩ 活跃局部变量` 就是捕获集。
 //!
 //! **effectively final 是硬要求**：被捕获的局部变量只要在方法里被重新赋值过，就明确
 //! 报错（javac 同样的措辞），绝不放宽 —— 放宽的后果是「编译通过、运行时读到旧值」，
-//! 比明确失败难查得多。
-//!
-//! 外层的 `this`（`this$0`）**不支持**：那要求把所有 `this` 改写，是另一条路。真的
+//! 比明确失败难查得多。判定内层用的名字是不是外层的**实例成员**只看本编译单元里
+//! 声明的类型（字段表/方法表）；继承来的成员看不到，宁可报错也不猜。
 //! 用到时报明确的错（错误消息里带合成类名，能一眼看出是匿名类这一路）。
 
 use crate::ast::*;
@@ -55,6 +60,10 @@ pub fn capture_unit(cu: &mut CompilationUnit) -> Result<(), String> {
             anon.insert(td.name.clone(), td);
         }
     }
+    // `this$0` 支持：要认出「这个名字是外层类的实例成员」，得先有全部类型的方法表
+    // （字段表 `fields` 上面已经收集了，静态性也在里面）。
+    let methods = collect_methods(cu);
+    let mut outer: HashMap<String, String> = HashMap::new();
 
     let mut w = Cap {
         anon: &mut anon,
@@ -66,6 +75,9 @@ pub fn capture_unit(cu: &mut CompilationUnit) -> Result<(), String> {
         pending: Vec::new(),
         next_id: 0,
         class: String::new(),
+        outer: &mut outer,
+        methods: &methods,
+        in_static: false,
     };
     for i in 0..cu.types.len() {
         if cu.types[i].name.is_empty() {
@@ -122,8 +134,23 @@ fn collect_fields(cu: &CompilationUnit) -> HashMap<String, HashMap<String, (Type
     out
 }
 
-// ---------------------------------------------------------------- 作用域栈
+/// 全部类型的方法表：类名 → (方法名 → 是否 static)
+fn collect_methods(cu: &CompilationUnit) -> HashMap<String, HashMap<String, bool>> {
+    let mut out = HashMap::new();
+    for t in &cu.types {
+        let mut m = HashMap::new();
+        for mem in &t.members {
+            if let Member::Method(md) = mem {
+                let st = md.modifiers.iter().any(|x| x == "static");
+                m.insert(md.name.clone(), st);
+            }
+        }
+        out.insert(t.name.clone(), m);
+    }
+    out
+}
 
+// ---------------------------------------------------------------- 作用域栈
 struct Local {
     name: String,
     ty: Type,
@@ -153,6 +180,12 @@ struct Cap<'a> {
     next_id: u32,
     /// 当前正在走的类型（创建点的外层类 = 匿名类的直接外层）
     class: String,
+    /// 需要 `this$0` 的合成类：类名 → 直接外层类型
+    outer: &'a mut HashMap<String, String>,
+    /// 全部类型的方法表：类名 → (方法名 → 是否 static)
+    methods: &'a HashMap<String, HashMap<String, bool>>,
+    /// 当前在 static 上下文里（静态方法 / 静态初始化块）：`this` 不可用
+    in_static: bool,
 }
 
 impl<'a> Cap<'a> {
@@ -233,10 +266,29 @@ impl<'a> Cap<'a> {
         None
     }
 
+    /// 这个名字是不是 `owner` 上**声明的实例字段**（不含继承）
+    fn is_instance_field(&self, owner: &str, name: &str) -> bool {
+        self.fields.get(owner).and_then(|m| m.get(name)).map_or(false, |(_, st)| !st)
+    }
+
+    /// 这个名字是不是 `owner` 上**声明的实例方法**
+    fn is_instance_method(&self, owner: &str, name: &str) -> bool {
+        self.methods.get(owner).and_then(|m| m.get(name)).copied().unwrap_or(false) == false
+            && self.methods.get(owner).map_or(false, |m| m.contains_key(name))
+    }
+
+    /// 静态字段 / 静态方法：codegen 自己解析得到，不需要 this$0
+    fn is_static_member(&self, owner: &str, name: &str) -> bool {
+        self.fields.get(owner).and_then(|m| m.get(name)).map_or(false, |(_, st)| *st)
+            || self.methods.get(owner).and_then(|m| m.get(name)).copied().unwrap_or(false)
+    }
+
     // ------------------------------------------------------------ 类型 / 方法
 
     fn walk_type(&mut self, td: &mut TypeDecl) -> Result<(), String> {
         let saved = std::mem::replace(&mut self.class, td.name.clone());
+        let saved_static = self.in_static;
+        self.in_static = false;
         let mut err = None;
         for m in td.members.iter_mut() {
             let r = match m {
@@ -248,7 +300,12 @@ impl<'a> Cap<'a> {
                     Some(b) => {
                         let ps: Vec<(String, Type)> =
                             md.params.iter().map(|p| (p.name.clone(), p.ty.clone())).collect();
-                        self.method_body(b, &ps)
+                        let st = md.modifiers.iter().any(|x| x == "static");
+                        let prev = self.in_static;
+                        self.in_static = st;
+                        let r = self.method_body(b, &ps);
+                        self.in_static = prev;
+                        r
                     }
                     None => Ok(()),
                 },
@@ -268,6 +325,7 @@ impl<'a> Cap<'a> {
                 break;
             }
         }
+        self.in_static = saved_static;
         self.class = saved;
         match err {
             Some(e) => Err(e),
@@ -440,8 +498,47 @@ impl<'a> Cap<'a> {
             let field = format!("{CAP}{n}");
             if self.fields.get(&self.class).map_or(false, |m| m.contains_key(&field)) {
                 *e = Expr::Field(Box::new(Expr::This), field);
+                return Ok(());
+            }
+            // 外层实例字段（`fd` 在 `FileInputStream` 里）→ `this.this$0.fd`
+            if let Some(o) = self.outer.get(&self.class).cloned() {
+                if self.is_instance_field(&o, n) && !self.is_instance_field(&self.class, n) {
+                    *e = Expr::Field(Box::new(this_outer()), n.clone());
+                }
             }
             return Ok(());
+        }
+        // `Outer.this` / 裸实例方法调用 —— 需要 this$0 的合成类里都要挂到外层实例上
+        {
+            let cur_class = self.class.clone();
+            if let Some(o) = self.outer.get(&cur_class).cloned() {
+                let mut rewrite_this = false;
+                let mut outer_call = false;
+                match &*e {
+                    Expr::Field(recv, name) if name == "this" => {
+                        let simple =
+                            o.rsplit(|c| c == '$' || c == '/').next().unwrap_or("").to_string();
+                        if let Expr::Ident(x) = &**recv {
+                            if *x == simple || *x == o {
+                                rewrite_this = true;
+                            }
+                        }
+                    }
+                    Expr::Call { recv: None, name, .. }
+                        if !self.is_instance_method(&cur_class, name)
+                            && self.is_instance_method(&o, name) => outer_call = true,
+                    _ => {}
+                }
+                if rewrite_this {
+                    *e = this_outer();
+                    return Ok(());
+                }
+                if outer_call {
+                    if let Expr::Call { recv, .. } = e {
+                        *recv = Some(Box::new(this_outer()));
+                    }
+                }
+            }
         }
         match e {
             Expr::New { ty, args } => {
@@ -552,11 +649,18 @@ impl<'a> Cap<'a> {
             return Ok(());
         }
         let fr = free_names(&self.anon[ty_name], self.type_names);
-        if fr.outer_this {
-            return Err(format!(
-                "匿名类暂时不支持捕获外层 this（合成类 `{ty_name}` 里用了 `X.this` / `X.super`）：\
-                 把要用的值先赋给一个局部变量再捕获，或改用 lambda"
-            ));
+        let outer = enclosing_type(ty_name);
+        // 外层实例成员：匿名类体里用到外层的实例字段/实例方法，或 `X.this` ——
+        // javac 的做法是给合成类加一个 `this$0` 字段，创建点把外层 `this` 传进去。
+        // 只支持**直接外层**（`A$Anon0` 里的 A）：再往上的外层要多层 this$0，
+        // 那类写法在 java.base 里几乎没有，遇到就继续明确报错（不猜）。
+        let mut need_outer = false;
+        if let Some(o) = &outer {
+            if fr.outer_this {
+                need_outer = true;
+            }
+        } else if fr.outer_this {
+            return Err(unsupported_outer_this(ty_name, "`X.this` / `X.super`"));
         }
         // 捕获集：自由名里、当前作用域下活跃的局部变量
         let mut caps: Vec<(String, Type)> = Vec::new();
@@ -583,15 +687,29 @@ impl<'a> Cap<'a> {
             if self.type_names.contains(n) {
                 continue;
             }
-            // 外层实例字段 → 需要 this$0
+            // 直接外层的**实例**成员 → 走 this$0（不再报错）
+            if let Some(o) = &outer {
+                if self.is_instance_field(o, n) || self.is_instance_method(o, n) {
+                    need_outer = true;
+                    continue;
+                }
+                // 静态成员：codegen 能按名字解析，不用 this$0
+                if self.is_static_member(o, n) {
+                    continue;
+                }
+            }
+            // 更外层（祖父级）的实例字段：多层 this$0 不支持，仍明确报错
             if let Some((_, is_static)) = self.chain_field(n) {
                 if !is_static {
-                    return Err(format!(
-                        "匿名类暂时不支持捕获外层 this（合成类 `{ty_name}` 用了外层实例字段 `{n}`，\
-                         需要合成 `this$0`）：把它的值先赋给一个局部变量再捕获"
+                    return Err(unsupported_outer_this(
+                        ty_name,
+                        &format!("外层实例字段 `{n}`（不在直接外层 `{}` 上）", outer.as_deref().unwrap_or("?")),
                     ));
                 }
             }
+        }
+        if need_outer && self.in_static {
+            return Err(unsupported_outer_this(ty_name, "创建点在一个 static 上下文里，拿不到外层 this"));
         }
 
         let Some(mut td) = self.anon.remove(ty_name) else { return Ok(()) };
@@ -602,17 +720,87 @@ impl<'a> Cap<'a> {
                 fm.insert(format!("{CAP}{n}"), (ty.clone(), false));
             }
         }
+        if need_outer {
+            let o = outer.clone().unwrap_or_default();
+            add_outer_this(&mut td, &o)?;
+            let fm = self.fields.entry(ty_name.to_string()).or_default();
+            fm.insert("this$0".to_string(), (named_ty(&o), false));
+            // 体里的改写（`Ident(外层字段)` / `X.this` / 裸调用）靠这张表
+            self.outer.insert(ty_name.to_string(), o);
+        }
         // 走合成类的体：改 `Ident(cap)` → `this.val$cap`，以及里面的嵌套匿名类创建点
         let r = self.walk_type(&mut td);
+        self.outer.remove(ty_name);
         self.anon.insert(ty_name.to_string(), td);
         r?;
 
-        if !caps.is_empty() {
-            args2.extend(args.drain(..));
-            *args = args2;
+        let mut new_args: Vec<Expr> = Vec::new();
+        if need_outer {
+            new_args.push(Expr::This); // 参数顺序：$this, $c0…, 用户实参
+        }
+        new_args.extend(args2);
+        if !new_args.is_empty() {
+            new_args.extend(args.drain(..));
+            *args = new_args;
         }
         Ok(())
     }
+}
+
+fn unsupported_outer_this(ty_name: &str, what: &str) -> String {
+    format!(
+        "匿名类暂时不支持捕获外层 this（合成类 `{ty_name}` 用了 {what}）：\
+         把要用的值先赋给一个局部变量再捕获，或改用 lambda"
+    )
+}
+
+/// `A$B$Anon0` → `A$B`（直接外层类型的二进制名）
+fn enclosing_type(name: &str) -> Option<String> {
+    name.rsplit_once('$').map(|(p, _)| p.to_string())
+}
+
+/// `this.this$0`（外层实例）
+fn this_outer() -> Expr {
+    Expr::Field(Box::new(Expr::This), "this$0".to_string())
+}
+
+fn named_ty(internal: &str) -> Type {
+    Type::Named {
+        path: internal.split('/').map(|s| s.to_string()).collect(),
+        args: Vec::new(),
+    }
+}
+
+/// 给合成类加 `this$0` 字段与构造器形参（形参在最前面，字段初始化式就是那个形参）
+fn add_outer_this(td: &mut TypeDecl, outer: &str) -> Result<(), String> {
+    let cname = td.name.clone();
+    let ty = named_ty(outer);
+    let mut found = false;
+    for m in td.members.iter_mut() {
+        if let Member::Method(md) = m {
+            if md.ret.is_none() && md.name == cname {
+                md.params.insert(
+                    0,
+                    Param { ty: ty.clone(), name: "$this".to_string(), varargs: false },
+                );
+                found = true;
+                break;
+            }
+        }
+    }
+    if !found {
+        return Err(format!("合成类 `{cname}` 找不到构造器（匿名类应有解析阶段生成的构造器）"));
+    }
+    td.members.insert(
+        0,
+        Member::Field(FieldDecl {
+            modifiers: Vec::new(),
+            ty,
+            name: "this$0".to_string(),
+            init: Some(Expr::Ident("$this".to_string())),
+        }),
+    );
+    Ok(())
 }
 
 /// 给合成类加 `val$x` 字段 + 构造器形参（字段初始化式就是形参，见模块注释）
@@ -1080,8 +1268,10 @@ mod tests {
     }
 
     #[test]
-    fn rejects_outer_this_field() {
-        let err = run(
+    fn synthesizes_outer_this_for_field_access() {
+        // `count = 1` 在外层实例上：合成 `this$0` 字段 + 构造器形参，
+        // 创建点补一个 `this`，体里改写成 `this.this$0.count = 1`
+        let cu = run(
             r#"
             class A {
                 int count;
@@ -1094,8 +1284,12 @@ mod tests {
             }
         "#,
         )
-        .expect_err("应报错");
-        assert!(err.contains("外层 this"), "{err}");
+        .expect("应支持外层实例字段（this$0）");
+        let anon = cu.types.iter().find(|t| t.name == "A$Anon0").expect("合成类");
+        let has_this0 = anon.members.iter().any(|m| matches!(m, Member::Field(f) if f.name == "this$0"));
+        assert!(has_this0, "合成类应有 this$0 字段");
+        let Member::Method(md) = anon.members.iter().find(|m| matches!(m, Member::Method(md) if md.ret.is_none())).expect("构造器") else { panic!("构造器") };
+        assert_eq!(md.params.first().map(|p| p.name.as_str()), Some("$this"), "构造器第一个形参应是 $this");
     }
 
     #[test]

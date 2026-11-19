@@ -327,20 +327,42 @@ impl Parser {
 
     pub(crate) fn parse_try(&mut self) -> Result<Stmt, ParseError> {
         self.expect_kw("try")?;
-        let mut resources: Vec<Stmt> = Vec::new();
+        /// 资源：`R r = e` 是新声明的局部变量；`v`（Java 9+）是**已存在**的变量
+        /// —— 只负责在 finally 里 close，不能再声明一遍（那会遮蔽原变量）。
+        enum Res {
+            Decl(Stmt),
+            Existing(String),
+        }
+        let mut resources: Vec<Res> = Vec::new();
         if matches!(self.cur(), Tok::LParen) {
-            // try-with-resources：`try (R r = e; S s = f) { ... }`
+            // try-with-resources：`try (R r = e; S s = f)` / `try (v; out)`
             self.advance();
             if !matches!(self.cur(), Tok::RParen) {
                 loop {
                     self.skip_annotations()?;
                     let _ = self.eat_kw("final");
+                    // 已存在的变量：`try (v)`。判据是「标识符后面直接跟 `)` 或 `;`」
+                    // —— 声明形态在这两个位置之前一定还有别的 token。
+                    if let Tok::Ident(n) = self.cur().clone() {
+                        let save = self.pos;
+                        self.advance();
+                        let after = self.cur();
+                        self.pos = save;
+                        if matches!(after, Tok::RParen | Tok::Semi) {
+                            self.advance();
+                            resources.push(Res::Existing(n));
+                            if !self.eat(&Tok::Semi) {
+                                break;
+                            }
+                            continue;
+                        }
+                    }
                     let ty = self.parse_type()?;
                     let name = self.expect_ident()?;
                     self.expect(&Tok::Assign)?;
                     // 资源初始化式里可能有 `,`（`new X(a, b)`）—— parse_expr 会自己吃干净
                     let init = self.parse_expr()?;
-                    resources.push(Stmt::LocalVar { ty, name, init: Some(init) });
+                    resources.push(Res::Decl(Stmt::LocalVar { ty, name, init: Some(init) }));
                     if !self.eat(&Tok::Semi) {
                         break;
                     }
@@ -374,7 +396,8 @@ impl Parser {
         let mut fin_stmts: Vec<Stmt> = Vec::new();
         for r in resources.iter().rev() {
             let name = match r {
-                Stmt::LocalVar { name, .. } => name.clone(),
+                Res::Decl(Stmt::LocalVar { name, .. }) => name.clone(),
+                Res::Existing(n) => n.clone(),
                 _ => unreachable!(),
             };
             fin_stmts.push(Stmt::If {
@@ -395,7 +418,12 @@ impl Parser {
         if let Some(f) = finally {
             fin_stmts.push(*f);
         }
-        let mut block = resources;
+        let mut block: Vec<Stmt> = Vec::new();
+        for r in resources {
+            if let Res::Decl(s) = r {
+                block.push(s);
+            }
+        }
         block.push(Stmt::Try {
             body,
             catches,

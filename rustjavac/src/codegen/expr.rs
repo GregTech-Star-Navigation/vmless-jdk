@@ -921,6 +921,11 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
                 }
                 let cls = ver_type(cp, ty);
                 em.op_u2(0xC0, cls); // checkcast
+            } else if from == K_REF {
+                // 引用 → 基本类型：**拆箱转换**（`(int) obj`、`(byte) (Object) n`）。
+                // 先 checkcast 到包装类（失败抛 ClassCastException，与 java 一致），
+                // 再调 xxxValue()。少了这条，`(int) x` 直接报「暂不支持的类型转换」。
+                unbox_to(ty, em, cp)?;
             } else {
                 coerce(from, to, em)?;
             }
@@ -1106,6 +1111,43 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             emit_call_args(args, &desc, &sp, em, ctx, cp)?;
             let idx = cp.method_ref(&ctx.super_name, name, &desc);
             em.op_u2(0xB7, idx); // invokespecial
+            em.pop(desc_slots(&desc) + 1);
+            if !desc.ends_with(")V") {
+                em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
+            }
+            Ok(())
+        }
+        // `Iface.super.m(...)` —— 接口 default 方法的 super 调用
+        // （`return Temporal.super.range(field);`）。必须 invokespecial，且 owner 是
+        // **那个接口**：按本类发 invokevirtual 会重新分派回自己，写成死循环。
+        // parser 把它记成 `Call { recv: Field(Ident(Iface), "super") }`。
+        Expr::Call { recv: Some(r), name, args, .. }
+            if matches!(&**r, Expr::Field(_, f) if f == "super") =>
+        {
+            let Expr::Field(inner, _) = &**r else { unreachable!() };
+            let mut owner: Option<String> = None;
+            for o in class_owner_forms(inner, ctx) {
+                if ctx.iface_types.contains(&o) || is_builtin_iface(&o) {
+                    owner = Some(o);
+                    break;
+                }
+            }
+            let owner = owner.ok_or_else(|| CompileError {
+                msg: format!("`X.super.m()` 里的 X 不是已知接口：{inner:?}"),
+            })?;
+            let desc = ctx
+                .type_methods
+                .get(&owner)
+                .and_then(|m| m.get(name))
+                .and_then(|c| pick_desc(c, args, ctx))
+                .ok_or_else(|| CompileError {
+                    msg: format!("接口 `{}` 里未找到方法 `{name}`", owner.replace('/', ".")),
+                })?;
+            let sp = hoist_args(args, em, ctx, cp)?;
+            em.insn(0x2A, 0, 1); // aload_0
+            emit_call_args(args, &desc, &sp, em, ctx, cp)?;
+            let idx = cp.interface_method_ref(&owner, name, &desc);
+            em.op_u2(0xB7, idx); // invokespecial（InterfaceMethodref 合法）
             em.pop(desc_slots(&desc) + 1);
             if !desc.ends_with(")V") {
                 em.push(if kind_wide(kind_from_ret(&desc)) { 2 } else { 1 });
@@ -2204,8 +2246,10 @@ fn assign_expr_this_field(
         kind = kind_from_desc(&desc);
         w = if kind_wide(kind) { 2 } else { 1 };
         let fref = cp.field_ref(&ctx.class_name, name, &desc);
+        // 同上：rhs 带跳转时先落脏槽，避免 `this` 压栈后再撞跳转点
+        let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
         em.insn(0x2A, 0, 1); // aload_0
-        compile_expr(rhs, em, ctx, cp)?;
+        emit_val(rhs, &sr, em, ctx, cp)?;
         coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
         em.op(if w == 2 { 0x5D } else { 0x5A }); // dup2_x1 / dup_x1
         em.push(w);
@@ -2286,6 +2330,30 @@ struct PolyCall {
 /// 「实参静态类型 + 期望返回类型」拼出来，期望返回类型就来自这层 cast。
 ///
 /// 静态的四个 `linkTo*` 同理（`(int) MethodHandle.linkToStatic(handle, arg0, mn)`）。
+/// 引用 → 基本类型：`checkcast 包装类; xxxValue()`（Java 的拆箱转换）
+fn unbox_to(ty: &Type, em: &mut Emit, cp: &mut CpBuilder) -> Result<(), CompileError> {
+    // 描述符必须与包装类的**真实**返回类型一致：`Byte.byteValue()` 是 `()B`，
+    // 写成 `()I` 真 JVM 报 NoSuchMethodError（验证器不管这个，只有端到端跑才暴露）
+    let (wrapper, m, desc, wide) = match ty {
+        Type::Prim("int") => ("java/lang/Integer", "intValue", "()I", 1u16),
+        Type::Prim("long") => ("java/lang/Long", "longValue", "()J", 2),
+        Type::Prim("short") => ("java/lang/Short", "shortValue", "()S", 1),
+        Type::Prim("byte") => ("java/lang/Byte", "byteValue", "()B", 1),
+        Type::Prim("char") => ("java/lang/Character", "charValue", "()C", 1),
+        Type::Prim("boolean") => ("java/lang/Boolean", "booleanValue", "()Z", 1),
+        Type::Prim("float") => ("java/lang/Float", "floatValue", "()F", 1),
+        Type::Prim("double") => ("java/lang/Double", "doubleValue", "()D", 2),
+        _ => return err(format!("引用值不能转成 `{ty:?}`")),
+    };
+    let cls = cp.class(wrapper);
+    em.op_u2(0xC0, cls); // checkcast
+    let mref = cp.method_ref(wrapper, m, desc);
+    em.op_u2(0xB6, mref); // invokevirtual
+    em.pop(1);
+    em.push(wide);
+    Ok(())
+}
+
 fn poly_call_desc(expr: &Expr, want: &Type, ctx: &Ctx) -> Option<PolyCall> {
     let Expr::Call { recv: Some(r), name, args, .. } = expr else { return None };
     let desc = format!("({}){}", args_desc(args, ctx), descriptor(want));

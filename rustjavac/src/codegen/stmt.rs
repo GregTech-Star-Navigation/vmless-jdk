@@ -110,6 +110,18 @@ fn finish_switch(
 
 
 pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
+    // 记账自检：VMLESS_STMT_DEPTH=1 时，每编译完一条语句就核对栈深是否回到 0。
+    // 栈深漏记一次就会让**之后**所有带跳转的表达式报「前面不能有未消费的操作数」
+    // —— 症状离根因很远，这个开关是定位它的最省事办法。
+    let before = em.depth;
+    let r = compile_stmt_inner(s, em, ctx, cp);
+    if std::env::var_os("VMLESS_STMT_DEPTH").is_some() && em.depth != before {
+        eprintln!("[深度泄漏] {:?} → depth {before} → {}", s, em.depth);
+    }
+    r
+}
+
+fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
     match s {
         Stmt::Block(items) => {
             // 块内声明的局部变量出了块就不可见：验证类型要退回入口快照，
@@ -375,8 +387,11 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
                 let Some(_) = ctx.fields.get(&name) else {
                     return err(format!("未定义的变量 `{name}`"));
                 };
+                // rhs 会分叉时（`flag = a && b;` / `b = (x >= 12);`）必须先算进脏槽：
+                // 接收者 `this` 已经压栈，跳转点上栈就不空了（栈图一律声明栈为 0）
+                let sr = if needs_scratch(rhs) { Some(spill(rhs, em, ctx, cp)?) } else { None };
                 em.insn(0x2A, 0, 1); // aload_0
-                compile_expr_mut(rhs, em, ctx, cp)?;
+                emit_val(rhs, &sr, em, ctx, cp)?;
                 coerce_to(&type_from_desc(&desc), rhs, ctx, em, cp)?;
                 let f = cp.field_ref(&owner, &name, &desc);
                 em.op_u2(0xB5, f); // putfield

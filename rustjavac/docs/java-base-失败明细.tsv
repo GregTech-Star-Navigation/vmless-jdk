@@ -1,0 +1,501 @@
+com/sun/crypto/provider/ChaCha20Cipher.java	compile	未定义的变量 `initialized`（方法 `ChaCha20Cipher$EngineStreamOnly.doUpdate([BII[BI)I`）
+com/sun/crypto/provider/CounterMode.java	compile	自增/自减作为表达式时只支持局部变量：ArrayAccess { array: Ident("b"), index: Ident("n") }（方法 `CounterMode.increment([B)V`）
+com/sun/crypto/provider/DHKEM.java	compile	找不到类 `DecapsulatorSpi`（cannot find symbol: class DecapsulatorSpi）
+com/sun/crypto/provider/GHASH.java	compile	整数字面量 `0xe100000000000000L` 解析失败（方法 `GHASH.blockMult([J[J)V`）
+com/sun/crypto/provider/GaloisCounterMode.java	compile	自增/自减作为表达式时只支持局部变量：ArrayAccess { array: Ident("value"), index: Ident("n") }（方法 `GaloisCounterMode.increment32([B)V`）
+com/sun/crypto/provider/PBES2Parameters.java	compile	未找到实例方法 `getInteger`（接收者 java/lang/Object `ksDer.get()` / 0 参）（方法 `PBES2Parameters.parseKDF(Lsun/security/util/DerValue;)Ljava/lang/String;`）
+java/io/BufferedReader.java	compile	未找到方法 `readLine`（方法 `BufferedReader$Anon0.hasNext()Z`）
+java/io/Console.java	compile	未找到实例方法 `console`（接收者 ? `jcp` / 3 参）（方法 `Console.instantiateConsole()Ljava/io/Console;`）
+java/io/ObjectInputFilter.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `ObjectInputFilter$Config$Global.ObjectInputFilter$Config$Global(Ljava/lang/String;Z)V`）
+java/io/ObjectInputStream.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `ObjectInputStream.filterCheck(Ljava/lang/Class;I)V`）
+java/io/ObjectOutputStream.java	compile	未定义的变量 `ObjectOutputStream`（方法 `ObjectOutputStream$PutFieldImpl.write(Ljava/io/ObjectOutput;)V`）
+java/io/ObjectStreamClass.java	parse	L1331 无法解析的表达式，实际 Question
+java/io/OutputStreamWriter.java	compile	未找到实例方法 `charset`（接收者 ? `ps` / 0 参）（方法 `OutputStreamWriter.OutputStreamWriter(Ljava/io/OutputStream;)V`）
+java/io/PrintWriter.java	compile	未找到实例方法 `charset`（接收者 ? `ps` / 0 参）（方法 `PrintWriter.PrintWriter(Ljava/io/OutputStream;Z)V`）
+java/lang/CharSequence.java	compile	未找到方法 `length`（方法 `CharSequence$CharIterator.hasNext()Z`）
+java/lang/Class.java	compile	未定义的变量 `Class`（方法 `Class.getClasses()[Ljava/lang/Class;`）
+java/lang/ClassLoader.java	compile	未找到实例方法 `packageName`（接收者 java/lang/Object `p` / 0 参）（lambda `lambda$packages$4`）
+java/lang/ClassValue.java	compile	未定义的变量 `err`（方法 `ClassValue.getFromHashMap(Ljava/lang/Class;)Ljava/lang/Object;`）
+java/lang/Double.java	compile	浮点字面量 `0x1.fffffffffffffP+1023` 解析失败
+java/lang/FdLibm.java	compile	整数字面量 `0xFFFF_FFFF_0000_0000L` 解析失败（方法 `FdLibm.__LO(DI)D`）
+java/lang/Float.java	compile	float 字面量 `0x1p-24f` 解析失败（方法 `Float.float16ToFloat(S)F`）
+java/lang/LiveStackFrameInfo.java	compile	找不到类 `PrimitiveSlot`（cannot find symbol: class PrimitiveSlot）
+java/lang/Long.java	compile	整数字面量 `0x8000000000000000L` 解析失败
+java/lang/Math.java	compile	浮点字面量 `0x1p1023` 解析失败
+java/lang/Module.java	parse	L1580 期望 Colon，实际 标识符 `af`
+java/lang/NamedPackage.java	compile	未找到实例方法 `reference`（接收者 java/lang/Object `cf.findModule().get()` / 0 参）（方法 `NamedPackage.location()Ljava/net/URI;`）
+java/lang/Object.java	compile	继承环: java/lang/Object → java/lang/Object
+java/lang/Process.java	compile	未找到方法 `waitFor`（方法 `Process$Anon0.block()Z`）
+java/lang/ProcessBuilder.java	compile	未找到实例方法 `waitFor`（接收者 java/lang/Object `p` / 0 参）（lambda `lambda$startPipeline$1`）
+java/lang/ProcessImpl.java	compile	`cmd.length` 不是数组：接收者静态类型是 java/lang/String（String 要写 `length()`）（方法 `ProcessImpl.createCommandLine(ILjava/lang/String;Ljava/lang/String;)Ljava/lang/String;`）
+java/lang/PublicMethods.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("tail"), "next")（方法 `PublicMethods$MethodList.filter([Ljava/lang/reflect/Method;Ljava/lang/String;[Ljava/lang/Class;Z)Ljava/lang/PublicMethods$MethodList;`）
+java/lang/Runtime.java	compile	未找到实例方法 `get`（接收者 java/lang/Runtime$Version `version` / 1 参）（方法 `Runtime$Version.feature()I`）
+java/lang/SecurityManager.java	compile	未找到实例方法 `toArray`（接收者 ? `s.map().skip()` / 1 参）（lambda `lambda$getClassContext$0`）
+java/lang/String.java	compile	暂不支持的表达式: Assign { op: Some(Shl), lhs: Ident("len"), rhs: Ident("coder") }（方法 `String.join(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;[Ljava/lang/String;I)Ljava/lang/String;`）
+java/lang/System.java	compile	未找到实例方法 `getKey`（接收者 ? `entry` / 0 参）（方法 `System.createProperties(Ljava/util/Map;)Ljava/util/Properties;`）
+java/lang/Thread.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("holder"), "priority")（方法 `Thread.priority(I)V`）
+java/lang/ThreadLocal.java	compile	for-each 的被迭代表达式不是数组，也找不到 `iterator()` 方法（元素类型 `Named { path: ["java", "lang", "StackWalker$StackFrame"], args: [] }`）（方法 `ThreadLocal.printStackTrace()V`）
+java/lang/VirtualThread.java	compile	推断不出方法引用的目标类型（功能性接口）（方法 `VirtualThread.VirtualThread(Ljava/util/concurrent/Executor;Ljava/lang/String;ILjava/lang/Runnable;)V`）
+java/lang/WeakPairMap.java	compile	未找到实例方法 `first`（接收者 java/lang/Object `pair` / 0 参）（lambda `lambda$computeIfAbsent$0`）
+java/lang/classfile/AnnotationValue.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `AnnotationValue.of(Ljava/lang/Object;)Ljava/lang/classfile/AnnotationValue;`）
+java/lang/classfile/AttributedElement.java	compile	未找到实例方法 `attributeMapper`（接收者 ? `a` / 0 参）（方法 `AttributedElement.findAttributes(Ljava/lang/classfile/AttributeMapper;)Ljava/util/List;`）
+java/lang/classfile/Attributes.java	compile	未定义的变量 `AnnotationDefaultMapper`（方法 `Attributes.annotationDefault()Ljava/lang/classfile/AttributeMapper;`）
+java/lang/classfile/ClassFile.java	compile	未找到实例方法 `withFlags`（接收者 java/lang/Object `clb` / 1 参）（lambda `lambda$buildModule$1`）
+java/lang/classfile/ClassTransform.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `ClassTransform.dropping(Ljava/util/function/Predicate;)Ljava/lang/classfile/ClassTransform;`）
+java/lang/classfile/CodeBuilder.java	compile	未找到实例方法 `caseValue`（接收者 ? `c` / 0 参）（方法 `CodeBuilder.tableswitch(Ljava/lang/classfile/Label;Ljava/util/List;)Ljava/lang/classfile/CodeBuilder;`）
+java/lang/classfile/FieldTransform.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `FieldTransform.dropping(Ljava/util/function/Predicate;)Ljava/lang/classfile/FieldTransform;`）
+java/lang/classfile/MethodTransform.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `MethodTransform.dropping(Ljava/util/function/Predicate;)Ljava/lang/classfile/MethodTransform;`）
+java/lang/classfile/attribute/ConstantValueAttribute.java	parse	L80 期望 Colon，实际 标识符 `i`
+java/lang/classfile/attribute/snippet-files/PackageSnippets.java	compile	for-each 的被迭代表达式不是数组，也找不到 `iterator()` 方法（元素类型 `Var`）（方法 `PackageSnippets.hasDeprecated(Ljava/lang/classfile/AttributedElement;)Z`）
+java/lang/classfile/constantpool/ConstantPool.java	compile	未找到方法 `size`（方法 `ConstantPool$Anon0.hasNext()Z`）
+java/lang/classfile/constantpool/ConstantPoolBuilder.java	compile	未找到实例方法 `isPrimitive`（接收者 java/lang/Object `requireNonNull()` / 0 参）（方法 `ConstantPoolBuilder.classEntry(Ljava/lang/constant/ClassDesc;)Ljava/lang/classfile/constantpool/ClassEntry;`）
+java/lang/classfile/snippet-files/PackageSnippets.java	parse	L56 期望 Colon，实际 标识符 `mm`
+java/lang/constant/DynamicConstantDesc.java	compile	推断不出方法引用的目标类型（功能性接口）
+java/lang/foreign/snippet-files/Snippets.java	compile	未找到实例方法 `invokeExact`（接收者 ? `malloc` / 1 参）（方法 `Snippets$LinkerSnippets$AllocateMemory.allocateMemory(JLjava/lang/foreign/Arena;)Ljava/lang/foreign/MemorySegment;`）
+java/lang/invoke/AbstractValidatingLambdaMetafactory.java	compile	未找到实例方法 `isPrimitive`（接收者 ? `?.primitiveType()` / 0 参）（方法 `AbstractValidatingLambdaMetafactory.isAdaptableTo(Ljava/lang/Class;Ljava/lang/Class;Z)Z`）
+java/lang/invoke/BoundMethodHandle.java	parse	L322 期望 Semi，实际 LParen
+java/lang/invoke/ClassSpecializer.java	compile	匿名类暂时不支持捕获外层 this（合成类 `ClassSpecializer$Factory$Anon1` 用了 外层实例字段 `sdFieldName`（不在直接外层 `ClassSpecializer$Factory` 上））：把要用的值先赋给一个局部变量再捕获，或改用 lambda
+java/lang/invoke/ConstantBootstraps.java	compile	未找到实例方法 `isPrimitive`（接收者 java/lang/Object `requireNonNull()` / 0 参）（方法 `ConstantBootstraps.nullConstant(Ljava/lang/invoke/MethodHandles$Lookup;Ljava/lang/String;Ljava/lang/Class;)Ljava/lang/Object;`）
+java/lang/invoke/ConstantGroup.java	compile	未定义的变量 `constants`（方法 `ConstantGroup$Impl.ConstantGroup$Impl()V`）
+java/lang/invoke/DirectMethodHandle.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `DirectMethodHandle.makePreparedFieldLambdaForm(BZI)Ljava/lang/invoke/LambdaForm;`）
+java/lang/invoke/GenerateJLIClassesHelper.java	compile	未找到实例方法 `split`（接收者 java/lang/Object `line` / 1 参）（lambda `lambda$generateHolderClasses$0`）
+java/lang/invoke/InnerClassLambdaMetafactory.java	compile	未找到实例方法 `parameterCount`（接收者 ? `factoryType` / 0 参）（方法 `InnerClassLambdaMetafactory$Anon0.accept(Ljava/lang/classfile/ClassBuilder;)V`）
+java/lang/invoke/InvokerBytecodeGenerator.java	parse	L1267 无法解析的表达式，实际 Question
+java/lang/invoke/LambdaForm.java	compile	类 `LambdaForm$Kind` 的构造器里 super(...)/this(...) 必须是第一条语句
+java/lang/invoke/LambdaFormEditor.java	compile	未找到实例方法 `getKey`（接收者 ? `entry` / 0 参）（方法 `LambdaFormEditor.makeRepeatedFilterForm(Ljava/lang/invoke/MethodType;[I)Ljava/lang/invoke/LambdaForm;`）
+java/lang/invoke/MemberName.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `MemberName.MemberName(Ljava/lang/reflect/Method;Z)V`）
+java/lang/invoke/MethodHandle.java	compile	未找到实例方法 `uncustomize`（接收者 java/lang/Object `java/util/Objects.requireNonNull()` / 0 参）（方法 `MethodHandle.MethodHandle(Ljava/lang/invoke/MethodType;Ljava/lang/invoke/LambdaForm;)V`）
+java/lang/invoke/MethodHandleImpl.java	compile	未找到实例方法 `getKey`（接收者 ? `entry` / 0 参）（方法 `MethodHandleImpl.makePairwiseConvertByEditor(Ljava/lang/invoke/MethodHandle;Ljava/lang/invoke/MethodType;ZZ)Ljava/lang/invoke/MethodHandle;`）
+java/lang/invoke/MethodHandleProxies.java	compile	未找到实例方法 `withField`（接收者 ? `clb.withSuperclass().withFlags().withInterfaceSymbols().withField()` / 3 参）（lambda `lambda$createTemplate$1`）
+java/lang/invoke/MethodHandles.java	parse	L2324 期望标识符，实际 LBrace
+java/lang/invoke/MethodType.java	compile	未找到实例方法 `isPrimitive`（接收者 ? `?` / 0 参）（方法 `MethodType.leadingReferenceParameter()Ljava/lang/Class;`）
+java/lang/invoke/StringConcatFactory.java	compile	未定义的变量 `forceInline`（方法 `StringConcatFactory$InlineHiddenClassStrategy$Anon3.accept(Ljava/lang/classfile/MethodBuilder;)V`）
+java/lang/invoke/VarHandles.java	compile	未找到实例方法 `getExceptionTypes`（接收者 java/lang/reflect/Member `info.reflectAs()` / 0 参）（方法 `VarHandles.exceptionTypes(Ljava/lang/invoke/MethodHandle;)[Ljava/lang/Class;`）
+java/lang/module/ModuleDescriptor.java	compile	未找到实例方法 `mask`（接收者 ? `modifier` / 0 参）（方法 `ModuleDescriptor.accessFlags()Ljava/util/Set;`）
+java/lang/module/ModuleFinder.java	compile	未找到实例方法 `name`（接收者 ? `mref.descriptor()` / 0 参）（lambda `lambda$findAll$4`）
+java/lang/module/Resolver.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `Resolver.resolve(Ljava/util/Deque;)Ljava/util/Set;`）
+java/lang/ref/FinalizerHistogram.java	compile	未找到实例方法 `get`（接收者 java/lang/Object `r` / 0 参）（lambda `lambda$getFinalizerHistogram$0`）
+java/lang/reflect/AccessFlag.java	compile	未找到实例方法 `getKey`（接收者 ? `e` / 0 参）（方法 `AccessFlag$Location.ensureHistoryOrdered(Ljava/util/List;)Ljava/util/List;`）
+java/lang/reflect/ClassFileFormatVersion.java	compile	未找到实例方法 `compareTo`（接收者 ? `?` / 1 参）（方法 `ClassFileFormatVersion.runtimeVersion()Ljava/lang/Runtime$Version;`）
+java/lang/reflect/Proxy.java	parse	L424 期望标识符，实际 LBrace
+java/lang/reflect/ProxyGenerator.java	compile	未找到实例方法 `getName`（接收者 ? `t` / 0 参）（方法 `ProxyGenerator.toClassEntries(Ljava/lang/classfile/constantpool/ConstantPoolBuilder;Ljava/util/List;)Ljava/util/List;`）
+java/lang/reflect/Type.java	compile	未找到方法 `toString`（方法 `Type.getTypeName()Ljava/lang/String;`）
+java/lang/runtime/Carriers.java	compile	未找到实例方法 `asType`（接收者 java/lang/Object `c` / 1 参）（lambda `lambda$components$0`）
+java/lang/runtime/ExactConversionsSupport.java	compile	float 字面量 `0x1p31f` 解析失败（方法 `ExactConversionsSupport.isFloatToIntExact(F)Z`）
+java/lang/runtime/SwitchBootstraps.java	compile	未找到实例方法 `aload`（接收者 ? `cb.iload().loadConstant().invokestatic().pop()` / 1 参）（lambda `lambda$generateTypeSwitchSkeleton$0`）
+java/math/BigDecimal.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `BigDecimal.compareMagnitude(Ljava/math/BigDecimal;)I`）
+java/math/BigInteger.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("cursor"), rhs: Ident("firstGroupLen") }（方法 `BigInteger.BigInteger(Ljava/lang/String;I)V`）
+java/math/MutableBigInteger.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("quotient"), "offset")（方法 `MutableBigInteger.divideKnuth(Ljava/math/MutableBigInteger;Ljava/math/MutableBigInteger;Z)Ljava/math/MutableBigInteger;`）
+java/net/Inet6Address.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `Inet6Address$Inet6AddressHolder.isIPv4CompatibleAddress()Z`）
+java/net/InetAddress.java	compile	未找到实例方法 `get`（接收者 java/lang/Object `nsp` / 1 参）（lambda `lambda$loadResolver$0`）
+java/net/SocketPermission.java	compile	未找到实例方法 `getMask`（接收者 java/lang/Object `hit` / 0 参）（方法 `SocketPermissionCollection.implies(Ljava/security/Permission;)Z`）
+java/net/URI.java	compile	整数字面量 `0xAC00985000000000L` 解析失败
+java/net/URLConnection.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `URLConnection.guessContentTypeFromStream(Ljava/io/InputStream;)Ljava/lang/String;`）
+java/nio/DirectByteBuffer.java	parse	L76 期望标识符，实际 LBrace
+java/nio/MappedByteBuffer.java	compile	未定义的变量 `address`（方法 `MappedByteBuffer$Anon0.MappedByteBuffer$Anon0(Ljava/nio/MappedByteBuffer;)V`）
+java/nio/channels/Channels.java	compile	暂不支持的类型转换（种类 2 → 0）（方法 `Channels$Anon0.read([BII)I`）
+java/nio/file/FileTreeWalker.java	compile	未找到实例方法 `skip`（接收者 java/lang/Object `stack.peek()` / 0 参）（方法 `FileTreeWalker.skipRemainingSiblings()V`）
+java/nio/file/Files.java	compile	未找到实例方法 `permissions`（接收者 java/nio/file/attribute/BasicFileAttributes `readAttributes()` / 0 参）（方法 `Files.getPosixFilePermissions(Ljava/nio/file/Path;[Ljava/nio/file/LinkOption;)Ljava/util/Set;`）
+java/nio/file/Path.java	compile	未找到方法 `getNameCount`（方法 `Path$Anon0.hasNext()Z`）
+java/security/DomainLoadStoreParameter.java	compile	找不到类 `LoadStoreParameter`（cannot find symbol: class LoadStoreParameter）
+java/security/KeyFactory.java	compile	只能把引用值转成引用类型（方法 `KeyFactory.getInstance(Ljava/lang/String;Ljava/lang/String;)Ljava/security/KeyFactory;`）
+java/security/KeyPairGenerator.java	compile	只能把引用值转成引用类型（方法 `KeyPairGenerator.getInstance(Lsun/security/jca/GetInstance/Instance;Ljava/lang/String;)Ljava/security/KeyPairGenerator;`）
+java/security/KeyStoreSpi.java	compile	未找到实例方法 `getPassword`（接收者 PasswordProtection `(LPasswordProtection;)protection` / 0 参）（方法 `KeyStoreSpi.engineLoad(Ljava/io/InputStream;Ljava/security/KeyStore$LoadStoreParameter;)V`）
+java/security/PEMEncoder.java	parse	L174 期望 Colon，实际 标识符 `pu`
+java/security/PEMRecord.java	parse	L82 期望标识符，实际 LBrace
+java/security/Provider.java	compile	未找到实例方法 `isValid`（接收者 ? `entry.getValue()` / 0 参）（lambda `lambda$getServices$0`）
+java/security/SecureRandom.java	compile	只能把引用值转成引用类型（方法 `SecureRandom.getInstance(Ljava/lang/String;)Ljava/security/SecureRandom;`）
+java/security/Security.java	compile	未找到实例方法 `getKey`（接收者 ? `e` / 0 参）（方法 `Security.getProviders(Ljava/util/Map;)[Ljava/security/Provider;`）
+java/security/Signature.java	compile	只能把引用值转成引用类型（方法 `Signature.getInstance(Lsun/security/jca/GetInstance/Instance;Ljava/lang/String;)Ljava/security/Signature;`）
+java/security/cert/CertPathBuilder.java	compile	只能把引用值转成引用类型（方法 `CertPathBuilder.getInstance(Ljava/lang/String;)Ljava/security/cert/CertPathBuilder;`）
+java/security/cert/CertPathValidator.java	compile	只能把引用值转成引用类型（方法 `CertPathValidator.getInstance(Ljava/lang/String;)Ljava/security/cert/CertPathValidator;`）
+java/security/cert/CertStore.java	compile	只能把引用值转成引用类型（方法 `CertStore.getInstance(Ljava/lang/String;Ljava/security/cert/CertStoreParameters;)Ljava/security/cert/CertStore;`）
+java/security/cert/CertificateFactory.java	compile	只能把引用值转成引用类型（方法 `CertificateFactory.getInstance(Ljava/lang/String;)Ljava/security/cert/CertificateFactory;`）
+java/text/AttributedString.java	compile	未找到方法 `length`（方法 `AttributedString$AttributedStringIterator.AttributedString$AttributedStringIterator([Ljava/text/AttributedCharacterIterator/Attribute;II)V`）
+java/text/ChoiceFormat.java	compile	未找到实例方法 `formatted`（接收者 ? `?` / 1 参）（方法 `ChoiceFormat.toString()Ljava/lang/String;`）
+java/text/CollationElementIterator.java	compile	暂不支持的表达式: Assign { op: Some(BitAnd), lhs: Ident("order"), rhs: Field(Ident("RBCollationTables"), "TERTIARYORDERMASK") }（方法 `CollationElementIterator.tertiaryOrder(I)S`）
+java/text/CompactNumberFormat.java	parse	L548 期望 Colon，实际 标识符 `l`
+java/text/DateFormatSymbols.java	compile	`eras.length` 不是数组：接收者静态类型是 java/lang/String（String 要写 `length()`）（方法 `DateFormatSymbols.getEras()[Ljava/lang/String;`）
+java/text/DecimalFormat.java	parse	L555 期望 Colon，实际 标识符 `l`
+java/text/DecimalFormatSymbols.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `DecimalFormatSymbols.equals(Ljava/lang/Object;)Z`）
+java/text/FieldPosition.java	compile	未找到方法 `matchesField`（方法 `FieldPosition$Delegate.formatted(Ljava/text/Format$Field;Ljava/lang/Object;IILjava/text/Format$StringBuf;)V`）
+java/text/ListFormat.java	compile	未找到实例方法 `formatted`（接收者 ? `?` / 6 参）（方法 `ListFormat.toString()Ljava/lang/String;`）
+java/text/MessageFormat.java	parse	L1736 期望关键字 `case`，实际 Semi
+java/text/NumberFormat.java	parse	L306 期望 Colon，实际 标识符 `l`
+java/text/RBCollationTables.java	compile	未定义的变量 `frenchSec`（方法 `RBCollationTables$BuildAPI.fillInTables(ZZLsun/text/UCompactIntArray;Ljava/util/Vector;Ljava/util/Vector;Lsun/text/IntHashtable;SS)V`）
+java/text/SimpleDateFormat.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("pos"), "endIndex")（方法 `SimpleDateFormat.format(Ljava/util/Date;Ljava/lang/StringBuffer;Ljava/text/FieldPosition;)Ljava/lang/StringBuffer;`）
+java/time/Clock.java	compile	未找到实例方法 `toMillis`（接收者 ? `offset` / 0 参）（方法 `Clock$OffsetClock.millis()J`）
+java/time/LocalDate.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `LocalDate.datesUntil(Ljava/time/LocalDate;Ljava/time/Period;)Ljava/util/stream/Stream;`）
+java/time/chrono/HijrahChronology.java	compile	未找到实例方法 `getFileName`（接收者 java/lang/Object `p` / 0 参）（lambda `lambda$registerCustomChrono$0`）
+java/time/chrono/IsoChronology.java	compile	暂不支持的类型转换（种类 0 → 2）（方法 `IsoChronology.resolveYearOfEra(Ljava/util/Map;Ljava/time/format/ResolverStyle;)Ljava/time/LocalDate;`）
+java/time/format/DateTimeFormatterBuilder.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `DateTimeFormatterBuilder$ReducedPrinterParser.setValue(Ljava/time/format/DateTimeParseContext;JII)I`）
+java/time/format/Parsed.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `Parsed.resolveTimeFields()V`）
+java/time/temporal/ChronoUnit.java	compile	未找到实例方法 `compareTo`（接收者 ? `?` / 1 参）（方法 `ChronoUnit.isDurationEstimated()Z`）
+java/util/AbstractList.java	compile	未定义的变量 `modCount`
+java/util/AbstractMap.java	compile	找不到类 `Entry`（cannot find symbol: class Entry）
+java/util/ArrayDeque.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("head"), rhs: Ident("newSpace") }（方法 `ArrayDeque.grow(I)V`）
+java/util/ArrayList.java	compile	暂不支持的表达式: Assign { op: Some(Sub), lhs: Ident("size"), rhs: Binary { op: Sub, lhs: Ident("hi"), rhs: Ident("lo") } }（方法 `ArrayList.shiftTailOverGap([Ljava/lang/Object;II)V`）
+java/util/ArrayPrefixHelpers.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("t"), "right")（方法 `ArrayPrefixHelpers$CumulateTask.compute()V`）
+java/util/BitSet.java	compile	整数字面量 `0xffffffffffffffffL` 解析失败
+java/util/Calendar.java	compile	for-each 的被迭代表达式不是数组，也找不到 `iterator()` 方法（元素类型 `Prim("int")`）（方法 `Calendar.adjustStamp()V`）
+java/util/Collections.java	compile	未找到实例方法 `compareTo`（接收者 java/lang/Object `next` / 1 参）（方法 `Collections.min(Ljava/util/Collection;)Ljava/lang/Object;`）
+java/util/Currency.java	compile	未找到实例方法 `stream`（接收者 java/lang/Object `available.get()` / 0 参）（方法 `Currency.availableCurrencies()Ljava/util/stream/Stream;`）
+java/util/Date.java	compile	`wtb.length` 不是数组：接收者静态类型是 java/lang/String（String 要写 `length()`）（方法 `Date.parse(Ljava/lang/String;)J`）
+java/util/DoubleSummaryStatistics.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `DoubleSummaryStatistics.DoubleSummaryStatistics(JDDD)V`）
+java/util/DualPivotQuicksort.java	compile	暂不支持的表达式: Assign { op: Some(Shr), lhs: Ident("parallelism"), rhs: IntLit("3") }（方法 `DualPivotQuicksort.getDepth(II)I`）
+java/util/EnumMap.java	compile	未找到实例方法 `getDeclaringClass`（接收者 java/lang/Object `m.keySet().iterator().next()` / 0 参）（方法 `EnumMap.EnumMap(Ljava/util/Map;)V`）
+java/util/Enumeration.java	compile	未找到方法 `hasMoreElements`（方法 `Enumeration$Anon0.hasNext()Z`）
+java/util/Formatter.java	compile	未找到方法 `trailingZeros`（方法 `Formatter$FormatSpecifier$BigDecimalLayout.layout(Ljava/math/BigInteger;ILjava/util/Formatter$BigDecimalLayoutForm;)V`）
+java/util/HashMap.java	compile	未找到实例方法 `getRawType`（接收者 ? `?` / 0 参）（方法 `HashMap.comparableClassFor(Ljava/lang/Object;)Ljava/lang/Class;`）
+java/util/Hashtable.java	compile	未找到方法 `getIterator`（方法 `Hashtable$KeySet.iterator()Ljava/util/Iterator;`）
+java/util/IdentityHashMap.java	compile	未定义的变量 `size`
+java/util/ImmutableCollections.java	compile	未定义的变量 `c`（方法 `ImmutableCollections.listCopy(Ljava/util/Collection;)Ljava/util/List;`）
+java/util/JumboEnumSet.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `JumboEnumSet.contains(Ljava/lang/Object;)Z`）
+java/util/LinkedHashMap.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("dst"), "before")（方法 `LinkedHashMap.transferLinks(Ljava/util/LinkedHashMap$Entry;Ljava/util/LinkedHashMap$Entry;)V`）
+java/util/LinkedHashSet.java	compile	未定义的变量 `LinkedHashSet`（方法 `LinkedHashSet$ReverseLinkedHashSetView.size()I`）
+java/util/LinkedList.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("clone"), "last")（方法 `LinkedList.clone()Ljava/lang/Object;`）
+java/util/Locale.java	compile	未找到实例方法 `isEmpty`（接收者 java/lang/Object `s1` / 0 参）（lambda `lambda$formatList$5`）
+java/util/Map.java	compile	未找到实例方法 `compareTo`（接收者 java/lang/Object `c1.getKey()` / 1 参）（lambda `lambda$comparingByKey$0`）
+java/util/Objects.java	compile	未找到实例方法 `get`（接收者 java/lang/Object `requireNonNull()` / 0 参）（方法 `Objects.requireNonNullElseGet(Ljava/lang/Object;Ljava/util/function/Supplier;)Ljava/lang/Object;`）
+java/util/PriorityQueue.java	compile	未定义的变量 `modCount`（方法 `PriorityQueue$Itr.PriorityQueue$Itr()V`）
+java/util/PropertyPermission.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `PropertyPermissionCollection.add(Ljava/security/Permission;)V`）
+java/util/Random.java	compile	浮点字面量 `0x1.0p-53` 解析失败
+java/util/RegularEnumSet.java	compile	未定义的变量 `elements`（方法 `RegularEnumSet$EnumSetIterator.RegularEnumSet$EnumSetIterator()V`）
+java/util/ResourceBundle.java	compile	未找到实例方法 `getCallerModule`（接收者 java/lang/Object `key` / 0 参）（lambda `lambda$clearCache$0`）
+java/util/ReverseOrderListView.java	compile	未找到实例方法 `listIterator`（接收者 ? `base` / 1 参）
+java/util/ReverseOrderSortedMapView.java	compile	匿名类暂时不支持捕获外层 this（合成类 `ReverseOrderSortedMapView$Submap$Anon6` 用了 外层实例字段 `base`（不在直接外层 `ReverseOrderSortedMapView$Submap` 上））：把要用的值先赋给一个局部变量再捕获，或改用 lambda
+java/util/ReverseOrderSortedSetView.java	compile	匿名类暂时不支持捕获外层 this（合成类 `ReverseOrderSortedSetView$Subset$Anon1` 用了 外层实例字段 `base`（不在直接外层 `ReverseOrderSortedSetView$Subset` 上））：把要用的值先赋给一个局部变量再捕获，或改用 lambda
+java/util/Scanner.java	compile	未定义的变量 `modCount`（方法 `Scanner$TokenSpliterator.tryAdvance(Ljava/util/function/Consumer;)Z`）
+java/util/SequencedMap.java	compile	未找到实例方法 `keySet`（接收者 ? `SequencedMap.this` / 0 参）（方法 `SequencedMap$SeqKeySet.view()Ljava/util/Collection;`）
+java/util/ServiceLoader.java	compile	未定义的变量 `layer`（方法 `ServiceLoader$LayerLookupIterator.ServiceLoader$LayerLookupIterator()V`）
+java/util/SimpleTimeZone.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `SimpleTimeZone.hasSameRules(Ljava/util/TimeZone;)Z`）
+java/util/Spliterator.java	compile	未找到方法 `getClass`（方法 `Spliterator$OfInt.tryAdvance(Ljava/util/function/Consumer;)Z`）
+java/util/Spliterators.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `Spliterators$IteratorSpliterator.trySplit()Ljava/util/Spliterator;`）
+java/util/SplittableRandom.java	compile	整数字面量 `0xbf58476d1ce4e5b9L` 解析失败（方法 `SplittableRandom.mix64(J)J`）
+java/util/TreeMap.java	compile	暂不支持的类型转换（种类 0 → 2）（方法 `TreeMap.navigableKeySet()Ljava/util/NavigableSet;`）
+java/util/Vector.java	compile	暂不支持的表达式: Assign { op: Some(Sub), lhs: Ident("elementCount"), rhs: Binary { op: Sub, lhs: Ident("hi"), rhs: Ident("lo") } }（方法 `Vector.shiftTailOverGap([Ljava/lang/Object;II)V`）
+java/util/WeakHashMap.java	compile	暂不支持的类型转换（种类 0 → 2）（方法 `WeakHashMap.entrySet()Ljava/util/Set;`）
+java/util/concurrent/ArrayBlockingQueue.java	compile	暂不支持的表达式: Assign { op: Some(Sub), lhs: Ident("j"), rhs: Ident("i") }（方法 `ArrayBlockingQueue.distanceNonEmpty(II)I`）
+java/util/concurrent/CompletableFuture.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `CompletableFuture$Signaller.isReleasable()Z`）
+java/util/concurrent/ConcurrentHashMap.java	compile	未找到实例方法 `getRawType`（接收者 ? `?` / 0 参）（方法 `ConcurrentHashMap.comparableClassFor(Ljava/lang/Object;)Ljava/lang/Class;`）
+java/util/concurrent/ConcurrentLinkedDeque.java	compile	未找到方法 `unlink`（方法 `ConcurrentLinkedDeque$AbstractItr.remove()V`）
+java/util/concurrent/ConcurrentLinkedQueue.java	compile	未定义的变量 `head`（方法 `ConcurrentLinkedQueue$Itr.ConcurrentLinkedQueue$Itr()V`）
+java/util/concurrent/ConcurrentSkipListMap.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `ConcurrentSkipListMap.buildFromSorted(Ljava/util/SortedMap;)V`）
+java/util/concurrent/CopyOnWriteArrayList.java	compile	未找到方法 `getArray`（方法 `CopyOnWriteArrayList$COWSubList.checkForComodification()V`）
+java/util/concurrent/CopyOnWriteArraySet.java	compile	未找到实例方法 `addAllAbsent`（接收者 ? `?` / 1 参）（方法 `CopyOnWriteArraySet.readObject(Ljava/io/ObjectInputStream;)V`）
+java/util/concurrent/DelayQueue.java	compile	未找到方法 `removeEQ`（方法 `DelayQueue$Itr.remove()V`）
+java/util/concurrent/DelayScheduler.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("task"), "nextPending")（方法 `DelayScheduler.pend(Ljava/util/concurrent/DelayScheduler$ScheduledForkJoinTask;)V`）
+java/util/concurrent/Exchanger.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("p"), "index")（方法 `Exchanger.xchg(Ljava/lang/Object;J)Ljava/lang/Object;`）
+java/util/concurrent/ForkJoinPool.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `ForkJoinPool.lockRunState()J`）
+java/util/concurrent/ForkJoinTask.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("node"), "next")（方法 `ForkJoinTask.awaitDone(Ljava/util/concurrent/ForkJoinPool;IZJ)I`）
+java/util/concurrent/FutureTask.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("q"), "next")（方法 `FutureTask.awaitDone(ZJ)I`）
+java/util/concurrent/Helpers.java	compile	未找到实例方法 `length`（接收者 ? `?` / 0 参）（方法 `Helpers.mapEntryToString(Ljava/lang/Object;Ljava/lang/Object;)Ljava/lang/String;`）
+java/util/concurrent/Joiners.java	compile	未找到实例方法 `ordinal`（接收者 Subtask/State `s` / 0 参）（方法 `Joiners$AnySuccessful.stateToInt(LSubtask/State;)I`）
+java/util/concurrent/LinkedBlockingDeque.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `LinkedBlockingDeque.forEachFrom(Ljava/util/function/Consumer;Ljava/util/concurrent/LinkedBlockingDeque$Node;)V`）
+java/util/concurrent/LinkedBlockingQueue.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("last"), "next")（方法 `LinkedBlockingQueue.enqueue(Ljava/util/concurrent/LinkedBlockingQueue$Node;)V`）
+java/util/concurrent/LinkedTransferQueue.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `LinkedTransferQueue$DualNode.await(Ljava/lang/Object;JLjava/lang/Object;Z)Ljava/lang/Object;`）
+java/util/concurrent/Phaser.java	parse	L498 无法解析的表达式，实际 Colon
+java/util/concurrent/PriorityBlockingQueue.java	compile	未找到方法 `removeEq`（方法 `PriorityBlockingQueue$Itr.remove()V`）
+java/util/concurrent/ScheduledThreadPoolExecutor.java	compile	未找到方法 `triggerTime`（方法 `ScheduledThreadPoolExecutor$ScheduledFutureTask.setNextRunTime()V`）
+java/util/concurrent/StructuredTaskScopeImpl.java	compile	未找到实例方法 `interrupt`（接收者 java/lang/Object `t` / 0 参）（lambda `lambda$interruptAll$1`）
+java/util/concurrent/SubmissionPublisher.java	compile	找不到类 `Publisher`（cannot find symbol: class Publisher）
+java/util/concurrent/ThreadLocalRandom.java	compile	整数字面量 `0xff51afd7ed558ccdL` 解析失败（方法 `ThreadLocalRandom.mix32(J)I`）
+java/util/concurrent/ThreadPerTaskExecutor.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `ThreadPerTaskExecutor.invokeAny(Ljava/util/Collection;ZJLjava/util/concurrent/TimeUnit;)Ljava/lang/Object;`）
+java/util/concurrent/ThreadPoolExecutor.java	compile	未找到实例方法 `newThread`（接收者 ? `getThreadFactory()` / 1 参）（方法 `ThreadPoolExecutor$Worker.ThreadPoolExecutor$Worker(Ljava/lang/Runnable;)V`）
+java/util/concurrent/TimeUnit.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `TimeUnit.convert(Ljava/time/Duration;)J`）
+java/util/concurrent/atomic/AtomicLong.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `AtomicLong.getAndUpdate(Ljava/util/function/LongUnaryOperator;)J`）
+java/util/concurrent/atomic/AtomicLongArray.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `AtomicLongArray.getAndUpdate(ILjava/util/function/LongUnaryOperator;)J`）
+java/util/concurrent/atomic/DoubleAccumulator.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `DoubleAccumulator.accumulate(D)V`）
+java/util/concurrent/atomic/DoubleAdder.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `DoubleAdder.add(D)V`）
+java/util/concurrent/atomic/LongAccumulator.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `LongAccumulator.accumulate(J)V`）
+java/util/concurrent/atomic/LongAdder.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `LongAdder.add(J)V`）
+java/util/concurrent/atomic/Striped64.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `Striped64.longAccumulate(JLjava/util/function/LongBinaryOperator;ZI)V`）
+java/util/concurrent/locks/AbstractQueuedLongSynchronizer.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `AbstractQueuedLongSynchronizer.acquire(Ljava/util/concurrent/locks/AbstractQueuedLongSynchronizer$Node;JZZZJ)I`）
+java/util/concurrent/locks/AbstractQueuedSynchronizer.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `AbstractQueuedSynchronizer.acquire(Ljava/util/concurrent/locks/AbstractQueuedSynchronizer$Node;IZZZJ)I`）
+java/util/concurrent/locks/StampedLock.java	parse	L624 无法解析的表达式，实际 Colon
+java/util/function/Predicate.java	parse	L117 期望 Semi，实际 Arrow
+java/util/jar/JarFile.java	compile	未找到实例方法 `getManifest`（接收者 ? `JarFile.this` / 0 参）（方法 `JarFile$JarFileEntry.getAttributes()Ljava/util/jar/Attributes;`）
+java/util/random/RandomGenerator.java	compile	未找到实例方法 `isAnnotationPresent`（接收者 ? `?.getClass()` / 1 参）（方法 `RandomGenerator.isDeprecated()Z`）
+java/util/random/RandomGeneratorFactory.java	compile	未找到实例方法 `isInstantiable`（接收者 java/lang/Object `p` / 0 参）（lambda `lambda$all$0`）
+java/util/regex/CharPredicates.java	parse	L407 期望 Semi，实际 Arrow
+java/util/regex/Matcher.java	compile	未定义的变量 `modCount`（方法 `Matcher$MatchResultIterator.next()Ljava/util/regex/MatchResult;`）
+java/util/regex/Pattern.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `Pattern.normalizeSlice(Ljava/lang/String;IILjava/lang/StringBuilder;)V`）
+java/util/regex/PrintPattern.java	compile	暂不支持的类型转换（种类 0 → 2）（方法 `PrintPattern.print(Ljava/util/regex/Pattern$Node;Ljava/lang/String;I)V`）
+java/util/stream/AbstractPipeline.java	parse	L478 期望 Semi，实际 标识符 `u`
+java/util/stream/AbstractShortCircuitTask.java	parse	L223 期望 Semi，实际 标识符 `parent`
+java/util/stream/Collectors.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `Collectors.groupingByConcurrent(Ljava/util/function/Function;Ljava/util/function/Supplier;Ljava/util/stream/Collector;)Ljava/util/stream/Collector;`）
+java/util/stream/DoublePipeline.java	compile	暂不支持的类型转换（种类 2 → 1）（方法 `DoublePipeline.count()J`）
+java/util/stream/FindOps.java	parse	L201 期望标识符，实际 关键字 `new`
+java/util/stream/ForEachOps.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `ForEachOps$ForEachTask.compute()V`）
+java/util/stream/GathererOp.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `GathererOp.collect(Ljava/util/function/Supplier;Ljava/util/function/BiConsumer;Ljava/util/function/BiConsumer;)Ljava/lang/Object;`）
+java/util/stream/Gatherers.java	parse	L621 期望 RParen，实际 Comma
+java/util/stream/IntPipeline.java	compile	暂不支持的类型转换（种类 2 → 1）（方法 `IntPipeline.count()J`）
+java/util/stream/LongPipeline.java	compile	暂不支持的类型转换（种类 2 → 1）（方法 `LongPipeline.count()J`）
+java/util/stream/MatchOps.java	compile	未找到实例方法 `getAndClearState`（接收者 java/util/stream/Sink `helper.wrapAndCopyInto()` / 0 参）（方法 `MatchOps$MatchOp.evaluateSequential(Ljava/util/stream/PipelineHelper;Ljava/util/Spliterator;)Ljava/lang/Boolean;`）
+java/util/stream/Node.java	parse	L366 期望 RParen，实际 Arrow
+java/util/stream/Nodes.java	parse	L2215 期望标识符，实际 关键字 `new`
+java/util/stream/ReduceOps.java	compile	未找到实例方法 `supplier`（接收者 java/lang/Object `java/util/Objects.requireNonNull()` / 0 参）（方法 `ReduceOps.makeRef(Ljava/util/stream/Collector;)Ljava/util/stream/TerminalOp;`）
+java/util/stream/ReferencePipeline.java	compile	暂不支持的类型转换（种类 2 → 4）（方法 `ReferencePipeline.anyMatch(Ljava/util/function/Predicate;)Z`）
+java/util/stream/SliceOps.java	compile	switch 表达式只支持语句/赋值/返回位置（方法 `SliceOps.sliceSpliterator(Ljava/util/stream/StreamShape;Ljava/util/Spliterator;JJ)Ljava/util/Spliterator;`）
+java/util/stream/SpinedBuffer.java	compile	未定义的变量 `spine`（方法 `SpinedBuffer$OfPrimitive$BaseSpliterator.SpinedBuffer$OfPrimitive$BaseSpliterator(IIII)V`）
+java/util/stream/StreamOpFlag.java	compile	引用类型只能比较 == / !=（方法 `StreamOpFlag.isStreamFlag()Z`）
+java/util/stream/StreamSpliterators.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `StreamSpliterators$WrappingSpliterator.initPartialTraversalState()V`）
+java/util/stream/Streams.java	compile	找不到类 `ConcatSpliterator.OfPrimitive`（cannot find symbol: class ConcatSpliterator.OfPrimitive）
+java/util/stream/TerminalOp.java	compile	未找到方法 `getClass`（方法 `TerminalOp.evaluateParallel(Ljava/util/stream/PipelineHelper;Ljava/util/Spliterator;)Ljava/lang/Object;`）
+java/util/stream/WhileOps.java	compile	找不到类 `UnorderedWhileSpliterator.OfInt`（cannot find symbol: class UnorderedWhileSpliterator.OfInt）
+java/util/zip/ZipFile.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `ZipFile.stream()Ljava/util/stream/Stream;`）
+javax/crypto/Cipher.java	compile	自增/自减的目标不是局部变量也不是字段：`warnCount`（方法 `Cipher.chooseFirstProvider()V`）
+javax/crypto/ExemptionMechanism.java	compile	只能把引用值转成引用类型（方法 `ExemptionMechanism.getInstance(Ljava/lang/String;)Ljavax/crypto/ExemptionMechanism;`）
+javax/crypto/JceSecurityManager.java	compile	未定义的变量 `Option`
+javax/crypto/KDF.java	compile	只能把引用值转成引用类型（方法 `KDF.getInstance(Ljava/lang/String;Ljavax/crypto/KDFParameters;Ljava/lang/String;)Ljavax/crypto/KDF;`）
+javax/crypto/KeyAgreement.java	compile	只能把引用值转成引用类型（方法 `KeyAgreement.getInstance(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyAgreement;`）
+javax/crypto/KeyGenerator.java	compile	只能把引用值转成引用类型（方法 `KeyGenerator.getInstance(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/KeyGenerator;`）
+javax/crypto/Mac.java	compile	只能把引用值转成引用类型（方法 `Mac.getInstance(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/Mac;`）
+javax/crypto/SecretKeyFactory.java	compile	只能把引用值转成引用类型（方法 `SecretKeyFactory.getInstance(Ljava/lang/String;Ljava/lang/String;)Ljavax/crypto/SecretKeyFactory;`）
+javax/net/ssl/SNIHostName.java	compile	未找到实例方法 `getBytes`（接收者 ? `?` / 1 参）（方法 `SNIHostName.SNIHostName(Ljava/lang/String;)V`）
+javax/security/auth/Subject.java	compile	未定义的变量 `principals`（方法 `Subject$ClassSet.Subject$ClassSet(ILjava/lang/Class;)V`）
+javax/security/auth/login/LoginContext.java	compile	未找到实例方法 `println`（接收者 java/lang/System `(Ljava/lang/System;)$p0` / 0 参）（lambda `lambda$invoke$0`）
+jdk/internal/classfile/components/CodeRelabeler.java	compile	未找到实例方法 `newLabel`（接收者 java/lang/Object `cob` / 0 参）（lambda `lambda$lambda$of$0$1`）
+jdk/internal/classfile/components/snippet-files/PackageSnippets.java	parse	L59 期望 Colon，实际 标识符 `mn`
+jdk/internal/classfile/impl/AbstractInstruction.java	parse	L221 期望标识符，实际 LBrace
+jdk/internal/classfile/impl/AbstractPoolEntry.java	compile	未找到实例方法 `stringValue`（接收者 java/lang/classfile/constantpool/PoolEntry `ref1` / 0 参）（方法 `AbstractPoolEntry$AbstractNamedEntry.asInternalName()Ljava/lang/String;`）
+jdk/internal/classfile/impl/AbstractUnboundModel.java	compile	未找到实例方法 `accept`（接收者 java/lang/Object `sink` / 1 参）（lambda `lambda$attributes$0`）
+jdk/internal/classfile/impl/AnnotationImpl.java	parse	L41 期望标识符，实际 LBrace
+jdk/internal/classfile/impl/AnnotationReader.java	parse	L311 期望 Colon，实际 标识符 `tpt`
+jdk/internal/classfile/impl/BufferedCodeBuilder.java	compile	未定义的变量 `BufferedCodeBuilder`（方法 `BufferedCodeBuilder$Model.BufferedCodeBuilder$Model()V`）
+jdk/internal/classfile/impl/BufferedFieldBuilder.java	compile	未定义的变量 `BufferedFieldBuilder`（方法 `BufferedFieldBuilder$Model.BufferedFieldBuilder$Model()V`）
+jdk/internal/classfile/impl/BufferedMethodBuilder.java	compile	未定义的变量 `BufferedMethodBuilder`（方法 `BufferedMethodBuilder$Model.BufferedMethodBuilder$Model()V`）
+jdk/internal/classfile/impl/BytecodeHelpers.java	parse	L375 期望关键字 `case`，实际 Semi
+jdk/internal/classfile/impl/ClassFileImpl.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `ClassFileImpl.withOptions([LOption;)Ljdk/internal/classfile/impl/ClassFileImpl;`）
+jdk/internal/classfile/impl/ClassHierarchyImpl.java	compile	未找到实例方法 `getKey`（接收者 ? `e` / 0 参）（方法 `ClassHierarchyImpl$StaticClassHierarchyResolver.ClassHierarchyImpl$StaticClassHierarchyResolver(Ljava/util/Collection;Ljava/util/Map;)V`）
+jdk/internal/classfile/impl/ClassImpl.java	compile	表达式嵌套过深：脏槽池只有 10 个（lambda `lambda$verifyModuleAttributes$0`）
+jdk/internal/classfile/impl/ClassPrinterImpl.java	parse	L277 期望 Colon，实际 标识符 `leaf`
+jdk/internal/classfile/impl/ClassReaderImpl.java	compile	未找到实例方法 `stringValue`（接收者 java/lang/classfile/constantpool/PoolEntry `readEntry()` / 0 参）（方法 `ClassReaderImpl.skipAttributeHolder(I)I`）
+jdk/internal/classfile/impl/ClassRemapperImpl.java	parse	L42 期望 Colon，实际 标识符 `fm`
+jdk/internal/classfile/impl/CodeImpl.java	compile	未定义的变量 `CodeImpl`（方法 `CodeImpl.bcToInstruction(II)Ljava/lang/classfile/Instruction;`）
+jdk/internal/classfile/impl/CodeLocalsShifterImpl.java	parse	L51 期望 Colon，实际 标识符 `li`
+jdk/internal/classfile/impl/CodeRelabelerImpl.java	parse	L43 期望 Colon，实际 标识符 `bi`
+jdk/internal/classfile/impl/CodeStackTrackerImpl.java	parse	L145 期望 Colon，实际 标识符 `i`
+jdk/internal/classfile/impl/DirectCodeBuilder.java	compile	未找到实例方法 `caseValue`（接收者 ? `c` / 0 参）（方法 `DirectCodeBuilder.writeLookupSwitch(Ljava/lang/classfile/Label;Ljava/util/List;)V`）
+jdk/internal/classfile/impl/InterfacesImpl.java	compile	未找到实例方法 `stringValue`（接收者 ? `iface.name()` / 0 参）（lambda `lambda$toString$0`）
+jdk/internal/classfile/impl/RawBytecodeHelper.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("nextBci"), rhs: Ident("len") }（方法 `RawBytecodeHelper.next()Z`）
+jdk/internal/classfile/impl/SignaturesImpl.java	parse	L290 期望 Colon，实际 标识符 `b`
+jdk/internal/classfile/impl/SplitConstantPool.java	compile	未找到实例方法 `equalsString`（接收者 java/lang/classfile/constantpool/PoolEntry `ce.ref1` / 1 参）（方法 `SplitConstantPool.tryFindClassOrInterface(ILjava/lang/constant/ClassDesc;)Ljdk/internal/classfile/impl/AbstractPoolEntry$ClassEntryImpl;`）
+jdk/internal/classfile/impl/StackCounter.java	compile	未找到实例方法 `size`（接收者 ? `smfi.stack()` / 0 参）（方法 `StackCounter.StackCounter(Ljdk/internal/classfile/impl/LabelContext;Ljava/lang/classfile/attribute/StackMapTableAttribute;Ljava/lang/constant/ClassDesc;Ljava/lang/String;Ljava/lang/constant/MethodTypeDesc;ZLjdk/internal/classfile/impl/RawBytecodeHelper$CodeRange;Ljdk/internal/classfile/impl/SplitConstantPool;Ljava/util/List;)V`）
+jdk/internal/classfile/impl/StackMapDecoder.java	parse	L252 期望标识符，实际 LBrace
+jdk/internal/classfile/impl/StackMapGenerator.java	compile	未找到实例方法 `tryStart`（接收者 java/lang/Object `exhandler` / 0 参）（方法 `StackMapGenerator.generateHandlers()V`）
+jdk/internal/classfile/impl/TargetInfoImpl.java	parse	L107 期望标识符，实际 LBrace
+jdk/internal/classfile/impl/UnboundAttribute.java	parse	L898 期望标识符，实际 LBrace
+jdk/internal/classfile/impl/Util.java	compile	未找到实例方法 `get`（接收者 ? `clm.methods().get().code()` / 0 参）（方法 `Util.dumpMethod(Ljdk/internal/classfile/impl/SplitConstantPool;Ljava/lang/constant/ClassDesc;Ljava/lang/String;Ljava/lang/constant/MethodTypeDesc;ILjdk/internal/classfile/impl/RawBytecodeHelper$CodeRange;Ljava/util/function/Consumer;)V`）
+jdk/internal/classfile/impl/verifier/ParserVerifier.java	parse	L69 期望 Colon，实际 标识符 `de`
+jdk/internal/classfile/impl/verifier/VerificationWrapper.java	compile	未找到实例方法 `stringValue`（接收者 ? `f.fieldName()` / 0 参）（方法 `VerificationWrapper.findField(Ljava/lang/String;Ljava/lang/String;)Z`）
+jdk/internal/classfile/impl/verifier/VerifierImpl.java	compile	未找到实例方法 `startPc`（接收者 ? `lvte` / 0 参）（方法 `VerifierImpl.verify_local_variable_table(I[B)V`）
+jdk/internal/event/EventHelper.java	compile	浮点字面量 `1_000.0` 解析失败（方法 `EventHelper.getDurationString(Ljava/time/Instant;)Ljava/lang/String;`）
+jdk/internal/foreign/AbstractMemorySegmentImpl.java	parse	L306 期望标识符，实际 关键字 `new`
+jdk/internal/foreign/BufferStack.java	compile	未找到实例方法 `currentOffset`（接收者 ? `stack` / 0 参）（方法 `BufferStack$PerThread$Frame.BufferStack$PerThread$Frame(ZJJ)V`）
+jdk/internal/foreign/CaptureStateUtil.java	compile	未找到实例方法 `bindTo`（接收者 java/lang/Object `HANDLES_CACHE.apply()` / 1 参）（方法 `CaptureStateUtil.makeSegmentExtractionHandle(Ljdk/internal/foreign/CaptureStateUtil$SegmentExtractorKey;)Ljava/lang/invoke/MethodHandle;`）
+jdk/internal/foreign/ConfinedSession.java	compile	找不到类 `ResourceList`（cannot find symbol: class ResourceList）
+jdk/internal/foreign/LayoutPath.java	parse	L364 期望标识符，实际 LBrace
+jdk/internal/foreign/MemorySessionImpl.java	compile	未找到实例方法 `cleanup`（接收者 ResourceList/ResourceCleanup `resource` / 0 参）（方法 `MemorySessionImpl.addOrCleanupIfFail(LResourceList/ResourceCleanup;)V`）
+jdk/internal/foreign/SharedSession.java	compile	找不到类 `ResourceList`（cannot find symbol: class ResourceList）
+jdk/internal/foreign/StringSupport.java	compile	整数字面量 `0x8080_8080_8080_8080L` 解析失败
+jdk/internal/foreign/SystemLookup.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `SystemLookup.makeWindowsLookup()Ljava/lang/foreign/SymbolLookup;`）
+jdk/internal/foreign/Utils.java	parse	L346 期望 Colon，实际 标识符 `_`
+jdk/internal/foreign/abi/AbstractLinker.java	parse	L321 期望 Colon，实际 标识符 `sl`
+jdk/internal/foreign/abi/BindingSpecializer.java	parse	L473 期望 Colon，实际 标识符 `vmStore`
+jdk/internal/foreign/abi/CallingSequenceBuilder.java	parse	L164 无法解析的表达式，实际 Question
+jdk/internal/foreign/abi/CapturableState.java	compile	暂不支持的类型转换（种类 2 → 0）（方法 `CapturableState.maskFromName(Ljava/lang/String;)I`）
+jdk/internal/foreign/abi/DowncallLinker.java	compile	未找到实例方法 `storage`（接收者 jdk/internal/foreign/abi/Binding `(Ljdk/internal/foreign/abi/Binding;)$p0` / 0 参）（lambda `lambda$toStorageArray$6`）
+jdk/internal/foreign/abi/LinkerOptions.java	compile	未找到实例方法 `index`（接收者 java/lang/foreign/Linker$Option `getOption()` / 0 参）（方法 `LinkerOptions.firstVariadicArgIndex()I`）
+jdk/internal/foreign/abi/SharedUtils.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `SharedUtils.arrangeUpcallHelper(Ljava/lang/invoke/MethodType;ZZLjdk/internal/foreign/abi/ABIDescriptor;Ljdk/internal/foreign/abi/CallingSequence;)Ljdk/internal/foreign/abi/AbstractLinker/UpcallStubFactory;`）
+jdk/internal/foreign/abi/UpcallLinker.java	compile	推断不出 lambda 的目标类型（功能性接口）（方法 `UpcallLinker.makeFactory(Ljava/lang/invoke/MethodType;Ljdk/internal/foreign/abi/ABIDescriptor;Ljdk/internal/foreign/abi/CallingSequence;)Ljdk/internal/foreign/abi/AbstractLinker/UpcallStubFactory;`）
+jdk/internal/foreign/abi/aarch64/CallArranger.java	compile	未找到方法 `requiresSubSlotStackPacking`（方法 `CallArranger$StorageCalculator.structStorages(Ljava/lang/foreign/GroupLayout;Z)[Ljdk/internal/foreign/abi/aarch64/CallArranger$StorageCalculator$StructStorage;`）
+jdk/internal/foreign/abi/fallback/FallbackLinker.java	parse	L246 期望 Colon，实际 标识符 `bl`
+jdk/internal/foreign/abi/ppc64/CallArranger.java	compile	未定义的变量 `C`（方法 `CallArranger$StorageCalculator.regAlloc(I)Ljdk/internal/foreign/abi/VMStorage;`）
+jdk/internal/foreign/abi/riscv64/linux/TypeClass.java	parse	L89 期望 Colon，实际 标识符 `valueLayout`
+jdk/internal/foreign/abi/x64/sysv/TypeClass.java	parse	L216 期望 Colon，实际 标识符 `group`
+jdk/internal/foreign/abi/x64/windows/CallArranger.java	compile	未定义的变量 `forUpcall`
+jdk/internal/foreign/layout/AbstractGroupLayout.java	compile	未定义的变量 `otherGroup`（方法 `AbstractGroupLayout.equals(Ljava/lang/Object;)Z`）
+jdk/internal/foreign/layout/AbstractLayout.java	compile	暂不支持的类型转换（种类 2 → 1）（方法 `AbstractLayout.byteOffset([Ljava/lang/foreign/MemoryLayout/PathElement;)J`）
+jdk/internal/foreign/layout/PaddingLayoutImpl.java	compile	未定义的变量 `otherPadding`（方法 `PaddingLayoutImpl.equals(Ljava/lang/Object;)Z`）
+jdk/internal/foreign/layout/SequenceLayoutImpl.java	compile	未定义的变量 `elemSeq`（方法 `SequenceLayoutImpl.flatten()Ljava/lang/foreign/SequenceLayout;`）
+jdk/internal/foreign/layout/ValueLayouts.java	compile	未定义的变量 `otherValue`（方法 `ValueLayouts$AbstractValueLayout.equals(Ljava/lang/Object;)Z`）
+jdk/internal/icu/impl/ICUBinary.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `ICUBinary.readHeader(Ljava/io/InputStream;BLjdk/internal/icu/impl/ICUBinary$Authenticate;)[B`）
+jdk/internal/icu/impl/NormalizerImpl.java	compile	自增/自减作为表达式时只支持局部变量：Field(Ident("ncArgs"), "next")（方法 `NormalizerImpl.mergeOrdered([CII[CII)I`）
+jdk/internal/icu/impl/Trie2.java	compile	未找到方法 `get`（方法 `Trie2$Trie2Iterator.next()Ljdk/internal/icu/impl/Trie2$Range;`）
+jdk/internal/icu/impl/UCharacterProperty.java	compile	未找到方法 `getAdditional`（方法 `UCharacterProperty$IntProperty.getValue(I)I`）
+jdk/internal/icu/text/BidiBase.java	compile	赋值作为表达式时只支持局部变量：Field(ArrayAccess { array: Field(Ident("bd"), "isoRuns"), index: IntLit("0") }, "lastBase")（方法 `BidiBase.bracketInit(Ljdk/internal/icu/text/BidiBase$BracketData;)V`）
+jdk/internal/icu/text/BidiLine.java	compile	赋值作为表达式时只支持局部变量：Field(Ident("lineBidi"), "length")（方法 `BidiLine.setLine(Ljdk/internal/icu/text/BidiBase;Ljava/text/Bidi;Ljdk/internal/icu/text/BidiBase;II)Ljava/text/Bidi;`）
+jdk/internal/icu/util/CodePointMap.java	compile	未找到方法 `getRange`（方法 `CodePointMap$RangeIterator.next()Ljdk/internal/icu/util/CodePointMap$Range;`）
+jdk/internal/icu/util/CodePointTrie.java	compile	找不到类 `StringIterator`（cannot find symbol: class StringIterator）
+jdk/internal/io/JdkConsoleImpl.java	compile	未定义的变量 `readLock`（方法 `JdkConsoleImpl$LineReader.read([CII)I`）
+jdk/internal/jimage/BasicImageReader.java	compile	暂不支持的类型转换（种类 2 → 4）（方法 `BasicImageReader.isSystemProperty(Ljava/lang/String;Ljava/lang/String;Ljava/lang/String;)Z`）
+jdk/internal/jimage/ImageBufferCache.java	compile	暂不支持的类型转换（种类 0 → 2）（方法 `ImageBufferCache.getCapacity(Ljava/util/Map$Entry;)I`）
+jdk/internal/jimage/ImageReader.java	compile	未找到实例方法 `substring`（接收者 java/lang/Object `s` / 2 参）（lambda `lambda$getModuleNames$1`）
+jdk/internal/jrtfs/ExplodedImage.java	compile	未定义的变量 `modulesDirAttrs`（方法 `ExplodedImage$PathNode.ExplodedImage$PathNode(Ljava/lang/String;Ljava/util/List;)V`）
+jdk/internal/jrtfs/JrtFileSystem.java	compile	未找到实例方法 `getNameString`（接收者 java/lang/Object `child` / 0 参）（lambda `lambda$iteratorOf$1`）
+jdk/internal/jrtfs/JrtPath.java	compile	未找到方法 `getNameCount`（方法 `JrtPath$Anon0.hasNext()Z`）
+jdk/internal/lang/stable/StableUtil.java	compile	未找到实例方法 `wrappedContentsAcquire`（接收者 ? `e.getValue()` / 0 参）（方法 `StableUtil.renderMappings(Ljava/lang/Object;Ljava/lang/String;Ljava/lang/Iterable;Z)Ljava/lang/String;`）
+jdk/internal/loader/AbstractClassLoaderValue.java	compile	未定义的变量 `AbstractClassLoaderValue`（方法 `AbstractClassLoaderValue$Sub.parent()Ljdk/internal/loader/AbstractClassLoaderValue;`）
+jdk/internal/loader/BootLoader.java	compile	未找到实例方法 `replace`（接收者 java/lang/Object `name` / 2 参）（lambda `lambda$packages$0`）
+jdk/internal/loader/Loader.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `Loader.initRemotePackageMap(Ljava/lang/module/Configuration;Ljava/util/List;)Ljdk/internal/loader/Loader;`）
+jdk/internal/loader/LoaderPool.java	compile	未找到实例方法 `initRemotePackageMap`（接收者 java/lang/Object `l` / 2 参）（lambda `lambda$LoaderPool$0`）
+jdk/internal/loader/NativeLibraries.java	compile	未找到实例方法 `lock`（接收者 java/lang/Object `nativeLibraryLockMap.compute()` / 0 参）（方法 `NativeLibraries.acquireNativeLibraryLock(Ljava/lang/String;)V`）
+jdk/internal/loader/URLClassPath.java	compile	未找到方法 `getBaseURL`（方法 `URLClassPath$FileLoader$Anon4.getCodeSourceURL()Ljava/net/URL;`）
+jdk/internal/logger/SimpleConsoleLogger.java	compile	未找到实例方法 `findFirst`（接收者 ? `s.filter()` / 0 参）（lambda `lambda$get$0`）
+jdk/internal/math/FloatingDecimal.java	compile	暂不支持的表达式: Assign { op: Some(Shr), lhs: Ident("exp"), rhs: IntLit("4") }（方法 `FloatingDecimal$ASCIIToBinaryBuffer.doubleValue()D`）
+jdk/internal/misc/CDS.java	compile	for-each 的被迭代表达式不是数组，也找不到 `iterator()` 方法（元素类型 `Named { path: ["String"], args: [] }`）（方法 `CDS$ProcessLauncher.execWithJavaToolOptions(Ljava/lang/String;Ljava/lang/String;)I`）
+jdk/internal/misc/TerminatingThreadLocal.java	compile	for-each 的被迭代表达式不是数组，也找不到 `iterator()` 方法（元素类型 `Named { path: ["jdk/internal/misc", "TerminatingThreadLocal"], args: [Named { path: ["?"], args: [] }] }`）（方法 `TerminatingThreadLocal.threadTerminated()V`）
+jdk/internal/module/DefaultRoots.java	compile	未找到实例方法 `name`（接收者 java/lang/Object `descriptor` / 0 参）（lambda `lambda$compute$2`）
+jdk/internal/module/ModuleBootstrap.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `ModuleBootstrap.boot2()Ljava/lang/ModuleLayer;`）
+jdk/internal/module/ModuleHashes.java	compile	未找到实例方法 `getBytes`（接收者 java/lang/Object `rn` / 1 参）（lambda `lambda$computeHash$0`）
+jdk/internal/module/ModuleHashesBuilder.java	compile	未找到实例方法 `addNode`（接收者 Graph/Builder `builder` / 1 参）（方法 `ModuleHashesBuilder.computeHashes(Ljava/util/Set;)Ljava/util/Map;`）
+jdk/internal/module/ModuleInfoExtender.java	compile	未定义的变量 `ModuleInfoExtender`（方法 `ModuleInfoExtender.toByteArray()[B`）
+jdk/internal/module/ModulePatcher.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `ModulePatcher.patchIfNeeded(Ljava/lang/module/ModuleReference;)Ljava/lang/module/ModuleReference;`）
+jdk/internal/module/ModulePath.java	compile	未找到实例方法 `section`（接收者 java/lang/Object `e` / 0 参）（lambda `lambda$jmodPackages$0`）
+jdk/internal/module/ModuleReferences.java	compile	未找到实例方法 `section`（接收者 java/lang/Object `e` / 0 参）（lambda `lambda$implList$0`）
+jdk/internal/module/Modules.java	compile	未找到实例方法 `isQualified`（接收者 java/lang/module/ModuleDescriptor `(Ljava/lang/module/ModuleDescriptor;)$p0` / 0 参）（lambda `lambda$loadModule$1`）
+jdk/internal/random/L128X1024MixRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `L128X1024MixRandom.L128X1024MixRandom(JJJJJJJJJJJJJJJJJJJJ)V`）
+jdk/internal/random/L128X128MixRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `L128X128MixRandom.L128X128MixRandom(JJJJJJ)V`）
+jdk/internal/random/L128X256MixRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `L128X256MixRandom.L128X256MixRandom(JJJJJJJJ)V`）
+jdk/internal/random/L32X64MixRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_32") }（方法 `L32X64MixRandom.L32X64MixRandom(IIII)V`）
+jdk/internal/random/L64X1024MixRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `L64X1024MixRandom.L64X1024MixRandom(JJJJJJJJJJJJJJJJJJ)V`）
+jdk/internal/random/L64X128MixRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `L64X128MixRandom.L64X128MixRandom(JJJJ)V`）
+jdk/internal/random/L64X128StarStarRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `L64X128StarStarRandom.L64X128StarStarRandom(JJJJ)V`）
+jdk/internal/random/L64X256MixRandom.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `L64X256MixRandom.L64X256MixRandom(JJJJJJ)V`）
+jdk/internal/random/Xoroshiro128PlusPlus.java	compile	暂不支持的表达式: Assign { op: Some(BitXor), lhs: Ident("seed"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "SILVER_RATIO_64") }（方法 `Xoroshiro128PlusPlus.Xoroshiro128PlusPlus(J)V`）
+jdk/internal/random/Xoshiro256PlusPlus.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("x0"), rhs: Field(Ident("jdk/internal/util/random/RandomSupport"), "GOLDEN_RATIO_64") }（方法 `Xoshiro256PlusPlus.Xoshiro256PlusPlus(JJJJ)V`）
+jdk/internal/util/random/RandomSupport.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("v"), rhs: Ident("SILVER_RATIO_64") }（方法 `RandomSupport.convertSeedBytesToLongs([BII)[J`）
+jdk/internal/util/regex/Grapheme.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `Grapheme.isExcludedSpacingMark(I)Z`）
+jdk/internal/util/regex/IndicConjunctBreak.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `IndicConjunctBreak.isExtend(I)Z`）
+jdk/internal/vm/Continuation.java	compile	未找到实例方法 `toArray`（接收者 ? `s.map()` / 1 参）（lambda `lambda$getStackTrace$0`）
+jdk/internal/vm/ThreadContainers.java	compile	未找到实例方法 `parent`（接收者 java/lang/Object `c` / 0 参）（lambda `lambda$children$1`）
+jdk/internal/vm/ThreadDumper.java	parse	L473 期望 Colon，实际 标识符 `_`
+jdk/internal/vm/ThreadSnapshot.java	compile	未找到实例方法 `depth`（接收者 java/lang/Object `lock` / 0 参）（lambda `lambda$ownedMonitorsAt$1`）
+jdk/internal/vm/VMSupport.java	compile	switch 表达式只支持语句/赋值/返回位置（方法 `VMSupport.decodeAnnotation(Ljava/io/DataInputStream;Ljdk/internal/vm/VMSupport$AnnotationDecoder;)Ljava/lang/Object;`）
+module-info.java	parse	L77 期望类型声明，实际 标识符 `module`
+sun/invoke/util/BytecodeDescriptor.java	compile	自增/自减作为表达式时只支持局部变量：ArrayAccess { array: Ident("i"), index: IntLit("0") }（方法 `BytecodeDescriptor.parseSig(Ljava/lang/String;[IILjava/lang/ClassLoader;)Ljava/lang/Class;`）
+sun/invoke/util/ValueConversions.java	compile	暂不支持的类型转换（种类 2 → 0）（方法 `ValueConversions.unboxByte(Ljava/lang/Byte;)B`）
+sun/invoke/util/Wrapper.java	compile	未找到实例方法 `compareTo`（接收者 ? `?` / 1 参）（方法 `Wrapper.isConvertibleFrom(Lsun/invoke/util/Wrapper;)Z`）
+sun/launcher/LauncherHelper.java	compile	未找到实例方法 `ordinal`（接收者 ? `sun/launcher/LauncherHelper$Option.jdk/internal/misc/VM` / 0 参）（方法 `LauncherHelper.showSettings(ZLjava/lang/String;JJJ)V`）
+sun/launcher/SecuritySettings.java	compile	未找到实例方法 `trim`（接收者 java/lang/Object `s` / 0 参）（lambda `lambda$splitLongPropertyLines$0`）
+sun/net/InetAddressCachePolicy.java	compile	暂不支持的类型转换（种类 0 → 2）
+sun/net/ftp/impl/FtpClient.java	compile	未找到实例方法 `parse`（接收者 ? `df` / 1 参）（方法 `FtpClient$DefaultParser.parseLine(Ljava/lang/String;)Lsun/net/ftp/FtpDirEntry;`）
+sun/net/util/IPAddressUtil.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `IPAddressUtil.isIPv4MappedAddress([B)Z`）
+sun/net/www/HeaderParser.java	compile	未定义的变量 `nkeys`（方法 `HeaderParser$ParserIterator.hasNext()Z`）
+sun/net/www/MessageHeader.java	compile	未定义的变量 `nkeys`（方法 `MessageHeader$HeaderIterator.hasNext()Z`）
+sun/net/www/MimeEntry.java	compile	`fileExtensions.length` 不是数组：接收者静态类型是 java/lang/String（String 要写 `length()`）（方法 `MimeEntry.getExtensionsAsList()Ljava/lang/String;`）
+sun/net/www/MimeTable.java	compile	未找到实例方法 `exists`（接收者 ? `?` / 0 参）（方法 `MimeTable.load()V`）
+sun/net/www/ParseUtil.java	compile	整数字面量 `0xAC00985000000000L` 解析失败
+sun/net/www/http/KeepAliveStream.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `KeepAliveStream.close()V`）
+sun/net/www/protocol/http/DigestAuthentication.java	compile	未找到实例方法 `add`（接收者 java/lang/Object `set` / 1 参）（lambda `lambda$$0`）
+sun/net/www/protocol/http/HttpURLConnection.java	compile	未找到实例方法 `getHttpProxy`（接收者 sun/net/www/http/HttpClient `http` / 0 参）（方法 `HttpURLConnection.getInputStream0()Ljava/io/InputStream;`）
+sun/net/www/protocol/http/NegotiateAuthentication.java	compile	暂不支持的类型转换（种类 2 → 4）（方法 `NegotiateAuthentication.isSupported(Lsun/net/www/protocol/http/HttpCallerInfo;)Z`）
+sun/net/www/protocol/jar/JarURLConnection.java	compile	未找到方法 `getUseCaches`（方法 `JarURLConnection$JarURLInputStream.close()V`）
+sun/net/www/protocol/jar/URLJarFile.java	compile	未找到实例方法 `isSuperMan`（接收者 ? `URLJarFile.this` / 0 参）（方法 `URLJarFile$URLJarFileEntry.getAttributes()Ljava/util/jar/Attributes;`）
+sun/nio/ch/AsynchronousSocketChannelImpl.java	compile	只能把引用值转成引用类型（方法 `AsynchronousSocketChannelImpl.write(ZLjava/nio/ByteBuffer;[Ljava/nio/ByteBuffer;JLjava/util/concurrent/TimeUnit;Ljava/lang/Object;Ljava/nio/channels/CompletionHandler;)Ljava/util/concurrent/Future;`）
+sun/nio/ch/ChannelInputStream.java	compile	未找到实例方法 `size`（接收者 ? `sbc` / 0 参）（方法 `ChannelInputStream.readAllBytes()[B`）
+sun/nio/ch/DatagramSocketAdaptor.java	compile	未找到实例方法 `booleanValue`（接收者 java/lang/Object `dc.getOption()` / 0 参）（方法 `DatagramSocketAdaptor.getBooleanOption(Ljava/net/SocketOption;)Z`）
+sun/nio/ch/DummySocketImpl.java	compile	暂不支持的类型转换（种类 2 → 0）（方法 `DummySocketImpl.available()I`）
+sun/nio/ch/FileChannelImpl.java	parse	L795 期望 Colon，实际 标识符 `fci`
+sun/nio/ch/IOUtil.java	parse	L521 期望标识符，实际 LBrace
+sun/nio/ch/Iocp.java	compile	未找到实例方法 `close`（接收者 ? `channels[…]` / 0 参）（方法 `Iocp.closeAllChannels()V`）
+sun/nio/ch/Net.java	compile	暂不支持的类型转换（种类 2 → 4）（方法 `Net.shouldShutdownWriteBeforeClose()Z`）
+sun/nio/ch/PipeImpl.java	compile	未定义的变量 `preferUnixDomain`（方法 `PipeImpl$Initializer$LoopbackConnector.run()V`）
+sun/nio/ch/Poller.java	compile	未绑定实例方法引用要求 SAM 至少有一个参数（方法 `Poller$Pollers.start()V`）
+sun/nio/ch/ServerSocketAdaptor.java	compile	未找到实例方法 `booleanValue`（接收者 java/lang/Object `ssc.getOption()` / 0 参）（方法 `ServerSocketAdaptor.getReuseAddress()Z`）
+sun/nio/ch/SimpleAsynchronousFileChannelImpl.java	compile	未找到方法 `begin`（方法 `SimpleAsynchronousFileChannelImpl$Anon0.run()V`）
+sun/nio/ch/SocketAdaptor.java	compile	未找到实例方法 `booleanValue`（接收者 java/lang/Object `sc.getOption()` / 0 参）（方法 `SocketAdaptor.getBooleanOption(Ljava/net/SocketOption;)Z`）
+sun/nio/ch/WindowsAsynchronousFileChannelImpl.java	compile	未找到方法 `begin`（方法 `WindowsAsynchronousFileChannelImpl$LockTask.run()V`）
+sun/nio/ch/WindowsAsynchronousServerSocketChannelImpl.java	compile	未找到实例方法 `set`（接收者 ? `accepting` / 1 参）（方法 `WindowsAsynchronousServerSocketChannelImpl$AcceptTask.enableAccept()V`）
+sun/nio/ch/WindowsAsynchronousSocketChannelImpl.java	compile	未找到方法 `close`（方法 `WindowsAsynchronousSocketChannelImpl$ConnectTask.closeChannel()V`）
+sun/nio/ch/WindowsSelectorImpl.java	compile	未找到实例方法 `makeZombie`（接收者 java/lang/Object `threads.remove()` / 0 参）（方法 `WindowsSelectorImpl.adjustThreadsCount()V`）
+sun/nio/cs/GB18030.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `GB18030.contains(Ljava/nio/charset/Charset;)Z`）
+sun/nio/cs/StandardCharsets.java	compile	未找到方法 `lookup`（方法 `StandardCharsets$Anon0.next()Ljava/nio/charset/Charset;`）
+sun/nio/cs/Unicode.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `Unicode.contains(Ljava/nio/charset/Charset;)Z`）
+sun/nio/fs/PollingWatchService.java	compile	未找到方法 `poll`（方法 `PollingWatchService$PollingWatchKey$Anon1.run()V`）
+sun/nio/fs/WindowsDirectoryStream.java	compile	未找到实例方法 `needsSlashWhenResolving`（接收者 ? `dir` / 0 参）（方法 `WindowsDirectoryStream$WindowsDirectoryIterator.WindowsDirectoryStream$WindowsDirectoryIterator(Ljava/lang/String;)V`）
+sun/nio/fs/WindowsFileSystem.java	compile	未找到实例方法 `iterator`（接收者 ? `getRootDirectories()` / 0 参）（方法 `WindowsFileSystem$FileStoreIterator.WindowsFileSystem$FileStoreIterator()V`）
+sun/reflect/annotation/AnnotatedTypeFactory.java	compile	未找到实例方法 `popLocation`（接收者 ocationInfo `getLocation()` / 1 参）（方法 `AnnotatedTypeFactory$AnnotatedTypeBaseImpl.getAnnotatedOwnerType()Ljava/lang/reflect/AnnotatedType;`）
+sun/reflect/annotation/AnnotationParser.java	compile	暂不支持的类型转换（种类 0 → 2）（方法 `AnnotationParser.exceptionProxy(I)Lsun/reflect/annotation/ExceptionProxy;`）
+sun/reflect/annotation/AnnotationSupport.java	compile	未找到实例方法 `value`（接收者 java/lang/annotation/Annotation `annoClass.getDeclaredAnnotation()` / 0 参）（方法 `AnnotationSupport.containerBeforeContainee(Ljava/util/Map;Ljava/lang/Class;)Z`）
+sun/reflect/generics/repository/ClassRepository.java	compile	未找到实例方法 `accept`（接收者 java/lang/reflect/Type `getTree().getSuperclass()` / 1 参）（方法 `ClassRepository.computeSuperclass()Ljava/lang/reflect/Type;`）
+sun/reflect/generics/repository/FieldRepository.java	compile	未找到实例方法 `accept`（接收者 sun/reflect/generics/tree/Tree `getTree()` / 1 参）（方法 `FieldRepository.computeGenericType()Ljava/lang/reflect/Type;`）
+sun/reflect/generics/repository/GenericDeclRepository.java	compile	未找到实例方法 `getFormalTypeParameters`（接收者 sun/reflect/generics/tree/Tree `getTree()` / 0 参）（方法 `GenericDeclRepository.computeTypeParameters()[Ljava/lang/reflect/TypeVariable;`）
+sun/reflect/generics/repository/MethodRepository.java	compile	未找到实例方法 `accept`（接收者 java/lang/reflect/Type `getTree().getReturnType()` / 1 参）（方法 `MethodRepository.computeReturnType()Ljava/lang/reflect/Type;`）
+sun/reflect/generics/scope/ConstructorScope.java	compile	未找到实例方法 `getDeclaringClass`（接收者 java/lang/reflect/GenericDeclaration `getRecvr()` / 0 参）（方法 `ConstructorScope.getEnclosingClass()Ljava/lang/Class;`）
+sun/reflect/generics/scope/MethodScope.java	compile	未找到实例方法 `getDeclaringClass`（接收者 java/lang/reflect/GenericDeclaration `getRecvr()` / 0 参）（方法 `MethodScope.getEnclosingClass()Ljava/lang/Class;`）
+sun/security/ec/ECDSASignature.java	compile	比较结果作为表达式时，前面不能有未消费的操作数（操作数栈必须为空）（方法 `ECDSASignature.engineVerify([B)Z`）
+sun/security/ec/ECKeyFactory.java	parse	L212 期望 Colon，实际 标识符 `x`
+sun/security/ec/ECOperations.java	compile	未找到实例方法 `setProduct`（接收者 sun/security/util/math/IntegerModuloP `p.getZ()` / 1 参）（方法 `ECOperations.setDouble(Lsun/security/ec/point/ProjectivePoint$Mutable;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;)V`）
+sun/security/ec/XDHKeyFactory.java	parse	L148 期望 Colon，实际 标识符 `x509Spec`
+sun/security/ec/ed/Ed25519Operations.java	compile	未找到实例方法 `setDifference`（接收者 ? `p1.getX().setValue()` / 1 参）（方法 `Ed25519Operations.setSum(Lsun/security/ec/point/ExtendedHomogeneousPoint$Mutable;Lsun/security/ec/point/ExtendedHomogeneousPoint$Mutable;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;)Lsun/security/ec/point/ExtendedHomogeneousPoint$Mutable;`）
+sun/security/ec/ed/Ed448Operations.java	compile	未找到实例方法 `setDifference`（接收者 ? `p1.getX().setDifference()` / 1 参）（方法 `Ed448Operations.setSum(Lsun/security/ec/point/ProjectivePoint$Mutable;Lsun/security/ec/point/ProjectivePoint$Mutable;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;Lsun/security/util/math/MutableIntegerModuloP;)Lsun/security/ec/point/ProjectivePoint$Mutable;`）
+sun/security/ec/ed/EdDSAKeyFactory.java	parse	L141 期望 Colon，实际 标识符 `x509Spec`
+sun/security/ec/point/ExtendedHomogeneousPoint.java	compile	未找到实例方法 `setProduct`（接收者 sun/security/ec/point/ExtendedHomogeneousPoint$Mutable `t.setValue()` / 1 参）（方法 `ExtendedHomogeneousPoint$Mutable.setValue(Lsun/security/ec/point/AffinePoint;)Lsun/security/ec/point/ExtendedHomogeneousPoint$Mutable;`）
+sun/security/jca/ProviderConfig.java	compile	未定义的变量 `ProviderConfig`（方法 `ProviderConfig.doLoadProvider()Ljava/security/Provider;`）
+sun/security/jca/ProviderList.java	compile	未找到实例方法 `isEmpty`（接收者 ? `?` / 0 参）（方法 `ProviderList.ProviderList()V`）
+sun/security/pkcs/PKCS7.java	compile	未找到实例方法 `subs`（接收者 java/lang/Object `certDer.get()` / 2 参）（方法 `PKCS7.parseSignedData(Lsun/security/util/DerValue;)V`）
+sun/security/pkcs/PKCS9Attribute.java	parse	L84 期望标识符，实际 Ellipsis
+sun/security/pkcs/SignerInfo.java	compile	未找到实例方法 `getValue`（接收者 ? `algEntry` / 0 参）（方法 `SignerInfo.verifyAlgorithms([Lsun/security/pkcs/SignerInfo;Lsun/security/util/JarConstraintsParameters;Ljava/lang/String;)Ljava/util/Set;`）
+sun/security/pkcs12/PKCS12KeyStore.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `PKCS12KeyStore.engineLoad(Ljava/io/InputStream;[C)V`）
+sun/security/provider/AbstractDrbg.java	compile	推断不出 lambda 的目标类型（功能性接口）
+sun/security/provider/ConfigFile.java	compile	未找到实例方法 `get`（接收者 javax/security/auth/login/Configuration `configuration` / 1 参）（方法 `ConfigFile$Spi.engineGetAppConfigurationEntry(Ljava/lang/String;)[Ljavax/security/auth/login/AppConfigurationEntry;`）
+sun/security/provider/DomainKeyStore.java	compile	未找到实例方法 `store`（接收者 java/lang/Object `keystores.values().iterator().next()` / 2 参）（方法 `DomainKeyStore.engineStore(Ljava/io/OutputStream;[C)V`）
+sun/security/provider/MD2.java	compile	暂不支持的表达式: Assign { op: Some(BitXor), lhs: ArrayAccess { array: Ident("C"), index: Ident("i") }, rhs: ArrayAccess { array: Ident("S"), index: Binary { op: BitXor, lhs: ArrayAccess { array: Ident("X"), index: Binary { op: Add, lhs: IntLit("16"), rhs: Ident("i") } }, rhs: Ident("t") } } }（方法 `MD2.implCompress([BI)V`）
+sun/security/provider/NamedKeyFactory.java	parse	L94 期望 Colon，实际 标识符 `xspec`
+sun/security/provider/SHA3.java	compile	整数字面量 `0x800000000000808aL` 解析失败
+sun/security/provider/SHA5.java	compile	整数字面量 `0xB5C0FBCFEC4D3B2FL` 解析失败
+sun/security/provider/SeedGenerator.java	compile	未定义的变量 `SeedGenerator$ThreadedSeedGenerator`（方法 `SeedGenerator$ThreadedSeedGenerator.SeedGenerator$ThreadedSeedGenerator()V`）
+sun/security/provider/certpath/URICertStore.java	compile	未找到实例方法 `isEmpty`（接收者 java/lang/Object `p` / 0 参）（lambda `lambda$isRootOf$0`）
+sun/security/provider/certpath/ssl/SSLServerCertStore.java	compile	推断不出 lambda 的目标类型（功能性接口）
+sun/security/rsa/MGF1.java	compile	自增/自减作为表达式时只支持局部变量：ArrayAccess { array: Ident("C"), index: Ident("i") }（方法 `MGF1.generateAndXor([BIII[BI)V`）
+sun/security/rsa/RSAKeyFactory.java	parse	L324 期望 Colon，实际 标识符 `x509`
+sun/security/ssl/Authenticator.java	compile	自增/自减作为表达式时只支持局部变量：ArrayAccess { array: Ident("block"), index: Ident("k") }（方法 `Authenticator.increaseSequenceNumber()V`）
+sun/security/ssl/CertificateMessage.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `CertificateMessage$T13CertificateProducer.choosePossession(Lsun/security/ssl/HandshakeContext;Lsun/security/ssl/ClientHello/ClientHelloMessage;)Lsun/security/ssl/SSLPossession;`）
+sun/security/ssl/CertificateRequest.java	compile	类 `CertificateRequest$ClientCertificateType` 的构造器里 super(...)/this(...) 必须是第一条语句
+sun/security/ssl/CipherSuite.java	compile	类 `CipherSuite` 的构造器里 super(...)/this(...) 必须是第一条语句
+sun/security/ssl/DTLSInputRecord.java	compile	未定义的变量 `tc`（方法 `DTLSInputRecord$DTLSReassembler.valHello(Lsun/security/ssl/DTLSInputRecord$HandshakeFragment;Z)Lsun/security/ssl/DTLSInputRecord$HandshakeFragment;`）
+sun/security/ssl/DTLSOutputRecord.java	compile	未定义的变量 `protocolVersion`（方法 `DTLSOutputRecord$DTLSFragmenter.queueUpHandshake([BII)V`）
+sun/security/ssl/DTLSRecord.java	compile	未定义的变量 `maxIVLength`
+sun/security/ssl/KeyManagerFactoryImpl.java	compile	未找到实例方法 `newInstance`（接收者 ? `Builder` / 2 参）（方法 `KeyManagerFactoryImpl$X509.engineInit(Ljava/security/KeyStore;[C)V`）
+sun/security/ssl/SSLConfiguration.java	compile	暂不支持的类型转换（种类 0 → 2）
+sun/security/ssl/SSLEngineOutputRecord.java	compile	未定义的变量 `protocolVersion`（方法 `SSLEngineOutputRecord$HandshakeFragment.queueUpFragment([BII)V`）
+sun/security/ssl/SSLHandshake.java	compile	类 `SSLHandshake` 的构造器里 super(...)/this(...) 必须是第一条语句
+sun/security/ssl/SSLLogger.java	compile	未找到实例方法 `getName`（接收者 java/lang/System/Logger/Level `level` / 0 参）（方法 `SSLLogger$SSLSimpleFormatter.format(Lsun/security/ssl/SSLLogger$SSLConsoleLogger;Ljava/lang/System/Logger/Level;Ljava/lang/String;[Ljava/lang/Object;)Ljava/lang/String;`）
+sun/security/ssl/SSLRecord.java	compile	未定义的变量 `maxIVLength`
+sun/security/ssl/SSLSessionContextImpl.java	compile	未找到方法 `isTimedout`（方法 `SSLSessionContextImpl$SessionCacheVisitor.visit(Ljava/util/Map;)V`）
+sun/security/ssl/SSLSocketImpl.java	parse	L806 期望标识符，实际 RParen
+sun/security/ssl/SignatureScheme.java	compile	类 `SignatureScheme` 的构造器里 super(...)/this(...) 必须是第一条语句
+sun/security/ssl/StatusResponseManager.java	compile	只能把引用值转成引用类型（方法 `StatusResponseManager.processStapling(Lsun/security/ssl/ServerHandshakeContext;)Lsun/security/ssl/StatusResponseManager$StaplingParameters;`）
+sun/security/tools/keytool/Main.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `Main.doCommands(Ljava/io/PrintStream;)V`）
+sun/security/util/Cache.java	parse	L442 无法解析的表达式，实际 关键字 `default`
+sun/security/util/CryptoAlgorithmConstraints.java	compile	未找到实例方法 `equalsIgnoreCase`（接收者 java/lang/Object `e` / 1 参）（lambda `lambda$CryptoAlgorithmConstraints$0`）
+sun/security/util/Debug.java	compile	未找到实例方法 `orElse`（接收者 ? `s.dropWhile().map().findFirst()` / 1 参）（lambda `lambda$formatCaller$0`）
+sun/security/util/DerInputStream.java	compile	暂不支持的类型转换（种类 2 → 0）（lambda `lambda$seeOptionalContextSpecific$1`）
+sun/security/util/DisabledAlgorithmConstraints.java	parse	L277 期望 Colon，实际 标识符 `ecKey`
+sun/security/util/HostnameChecker.java	compile	未找到实例方法 `type`（接收者 java/lang/Object `d` / 0 参）（lambda `lambda$hasIllegalWildcard$0`）
+sun/security/util/ManifestDigester.java	compile	未找到实例方法 `addSection`（接收者 java/lang/Object `entries.computeIfAbsent()` / 1 参）（方法 `ManifestDigester.ManifestDigester([B)V`）
+sun/security/util/SignatureUtil.java	compile	未找到实例方法 `getDigestAlgorithm`（接收者 java/security/spec/AlgorithmParameterSpec `signer.getParameters().getParameterSpec()` / 0 参）（方法 `SignatureUtil.getDigestAlgInPkcs7SignerInfo(Ljava/security/Signature;Ljava/lang/String;Ljava/security/PrivateKey;Ljava/security/PublicKey;Z)Lsun/security/x509/AlgorithmId;`）
+sun/security/util/math/intpoly/IntegerPolynomial.java	compile	未定义的变量 `numLimbs`（方法 `IntegerPolynomial$Element.IntegerPolynomial$Element(Ljava/math/BigInteger;)V`）
+sun/security/validator/PKIXValidator.java	compile	未找到实例方法 `contains`（接收者 java/lang/Object `trustedSubjects.get()` / 1 参）（方法 `PKIXValidator.engineValidate([Ljava/security/cert/X509Certificate;Ljava/util/Collection;Ljava/util/List;Ljava/security/AlgorithmConstraints;Ljava/lang/Object;)[Ljava/security/cert/X509Certificate;`）
+sun/security/x509/AlgorithmId.java	compile	表达式嵌套过深：脏槽池只有 10 个（方法 `AlgorithmId.encode(Lsun/security/util/DerOutputStream;)V`）
+sun/security/x509/CertificateExtensions.java	compile	未找到实例方法 `getExtensionId`（接收者 java/lang/Object `map.get()` / 0 参）（方法 `CertificateExtensions.getNameByOid(Lsun/security/util/ObjectIdentifier;)Ljava/lang/String;`）
+sun/security/x509/URIName.java	compile	未定义的变量 `otherDNS`（方法 `URIName.constrains(Lsun/security/x509/GeneralNameInterface;)I`）
+sun/security/x509/X509CRLImpl.java	compile	未定义的变量 `xcert`（方法 `X509CRLImpl.isRevoked(Ljava/security/cert/Certificate;)Z`）
+sun/text/CompactByteArray.java	parse	L121 无法解析的表达式，实际 RBracket
+sun/text/RuleBasedBreakIterator.java	compile	暂不支持的表达式: Assign { op: Some(Add), lhs: Ident("index"), rhs: Call { recv: None, name: "getCurrentCodePointCount", args: [], type_args: [] } }（方法 `RuleBasedBreakIterator.getNext()I`）
+sun/text/UCompactIntArray.java	parse	L57 无法解析的表达式，实际 RBracket
+sun/util/PreHashedMap.java	compile	匿名类暂时不支持捕获外层 this（合成类 `PreHashedMap$Anon4` 用了 外层实例字段 `i`（不在直接外层 `PreHashedMap` 上））：把要用的值先赋给一个局部变量再捕获，或改用 lambda
+sun/util/PropertyResourceBundleCharset.java	compile	未定义的变量 `PropertyResourceBundleCharset`（方法 `PropertyResourceBundleCharset$PropertiesFileDecoder.decodeLoop(Ljava/nio/ByteBuffer;Ljava/nio/CharBuffer;)Ljava/nio/charset/CoderResult;`）
+sun/util/calendar/ZoneInfo.java	parse	L266 无法解析的表达式，实际 RBracket
+sun/util/cldr/CLDRLocaleProviderAdapter.java	compile	未找到实例方法 `toLanguageTag`（接收者 java/lang/Object `l` / 0 参）（lambda `lambda$applyAliases$2`）
+sun/util/cldr/CLDRTimeZoneNameProviderImpl.java	compile	`&&`/`||` 前面不能有未消费的操作数（操作数栈必须为空）（方法 `CLDRTimeZoneNameProviderImpl.deriveFallbackName([Ljava/lang/String;ILjava/util/Locale;Z)V`）
+sun/util/locale/LocaleMatcher.java	compile	未找到实例方法 `getRange`（接收者 LanguageRange `lr` / 0 参）（方法 `LocaleMatcher.filterTags(Ljava/util/List;Ljava/util/Collection;LFilteringMode;)Ljava/util/List;`）
+sun/util/locale/provider/BreakIteratorProviderImpl.java	compile	引用类型只能比较 == / !=（方法 `BreakIteratorProviderImpl$GraphemeBreakIterator.following(I)I`）
+sun/util/locale/provider/CalendarDataUtility.java	compile	暂不支持的类型转换（种类 0 → 2）（方法 `CalendarDataUtility.retrieveFirstDayOfWeek(Ljava/util/Locale;)I`）
+sun/util/locale/provider/JRELocaleProviderAdapter.java	compile	未找到实例方法 `ordinal`（接收者 java/lang/Object `t` / 0 参）（lambda `lambda$createAvailableLocales$0`）
+sun/util/locale/provider/JavaTimeDateTimePatternImpl.java	compile	未找到实例方法 `getLocalizedPattern`（接收者 java/lang/Object `lr` / 2 参）（lambda `lambda$getJavaTimeDateTimePattern$1`）
+sun/util/locale/provider/LocaleProviderAdapter.java	compile	未找到实例方法 `ordinal`（接收者 java/lang/Object `t` / 0 参）（lambda `lambda$toLocaleArray$0`）
+sun/util/locale/provider/LocaleResources.java	compile	未找到实例方法 `ordinal`（接收者 java/lang/Object `java/util/Objects.requireNonNull()` / 0 参）（方法 `LocaleResources.getDateTimePattern(Ljava/lang/String;IILjava/lang/String;)Ljava/lang/String;`）
+sun/util/logging/PlatformLogger.java	compile	未找到实例方法 `getPlatformLevel`（接收者 ConfigurableBridge/LoggerConfiguration `spi` / 0 参）（方法 `PlatformLogger.level()Lsun/util/logging/PlatformLogger$Level;`）

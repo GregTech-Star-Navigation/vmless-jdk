@@ -132,10 +132,10 @@ impl Lexer {
             let t = self.number();
             return Ok(Token { tok: t, line });
         }
-        if c == '_' || c.is_alphabetic() {
+        if c == '_' || c == '$' || c.is_alphabetic() {
             let start = self.pos;
             while let Some(ch) = self.peek() {
-                if ch == '_' || ch.is_alphanumeric() {
+                if ch == '_' || ch == '$' || ch.is_alphanumeric() {
                     self.bump();
                 } else {
                     break;

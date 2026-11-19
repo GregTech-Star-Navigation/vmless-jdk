@@ -2,6 +2,36 @@
 
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
+## 0.76.0
+
+**为什么**：自研 javac 编 `java.base` 停在 81.5%，剩下的都是「名字/类型解析」这一层不够。
+
+**改了什么**（每批都全量重测 3381 个文件）
+
+- **字段赋值的 RHS 带跳转时先落脏槽**（`codegen/stmt.rs`、`expr.rs`）：
+  `flag = (n >= 12);` 之前要先压 `aload_0`，而跳转点上栈必须为空。
+- **裸名补齐「成员类型作用域」**（`codegen/types.rs::member_type_candidates`）：
+  外层类链 `Outer$X`、父类型 `Super$X`、`import static p.Outer.T` 里的类型。
+- **`Iface.super.m(...)`** → invokespecial 到 `InterfaceMethodref`。
+- **标识符允许 `$`**（`front/lexer/mod.rs`）；**try-with-resources 支持已声明变量**
+  （`try (in)`、`try (out; var w = …)`）。
+- **匿名类支持外层实例 `this$0`**（`sema/capture.rs::add_outer_this`）：外层实例字段、
+  外层实例方法、`Outer.this` 都能解析。
+- **引用→基本类型的 cast 补拆箱**（`codegen/expr.rs::unbox_to`，描述符按 `()B/()S/()C`），
+  以及 `System.Logger` 这类 java.lang 简写 + 嵌套类型。
+
+**结果**：81.5% → **85.2%**（2880/3381）。真程序 5/5、`verify.sh` 103/0、`cargo test` 124 passed。
+同一批 24 个文件里两边都能编的 67 个 class 中 **66 个与基线逐字节相同**。
+
+**一条必须记住的既有缺陷**：用真 JVM `-Xverify:all` 装载 386 个新编出的类，
+**60 个被拒载**（`Inconsistent stackmap frames at branch target` 一类）。用改动前的基线二进制
+编同样的文件**复现同一批错误** —— 也就是说「编过了 ≠ class 是对的」在这个仓库里是
+**系统性**的（栈图/帧生成缺口），不是这批改动引入的。需要单开一条线修。
+
+**剩余桶**：未找到实例方法 153（泛型返回不代回）、未定义的变量 44（非匿名内层类的 `this$0`）、
+parse 32+13+8（`case Type var ->`、record、`Class<?>[]::new`）、栈深泄漏 21+18
+（某条语句漏记账后，其后所有带跳转的表达式全红 —— 已加 `VMLESS_STMT_DEPTH=1` 可定位）。
+
 ## 0.75.0
 
 **为什么**：真实程序 R1/R3 比 HotSpot 慢 10 倍，而瓶颈不是解释器循环（实测 8.5 ns/字节码，正常水平），

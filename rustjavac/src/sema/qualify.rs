@@ -169,19 +169,28 @@ impl Qualifier<'_> {
         }
         // 找「最长的类型前缀」：前缀 = 包名 + 一个类名，其余段全部按嵌套类型拼 `$`
         for split in 1..path.len() {
-            let head = if split == 1 {
+            let mut heads: Vec<String> = Vec::new();
+            if split == 1 {
                 match self.package_of(&path[0]) {
-                    Some(p) => format!("{p}/{}", path[0]),
-                    None => path[0].clone(),
+                    Some(p) => heads.push(format!("{p}/{}", path[0])),
+                    None => heads.push(path[0].clone()),
+                }
+                // `System.Logger` / `Thread.State` 这类 **java.lang 简写 + 嵌套类型**：
+                // java.lang 的名字故意保持原样（`is_java_lang` 白名单），所以前缀只拼
+                // `System$Logger` 永远找不到 —— 它其实是 `java/lang/System$Logger`。
+                if is_java_lang(&path[0]) {
+                    heads.push(format!("java/lang/{}", path[0]));
                 }
             } else {
-                path[..split].join("/")
-            };
-            let joined = format!("{head}${}", path[split..].join("$"));
-            if class_file_exists(self.dirs, &format!("{joined}.class")) {
-                let segs: Vec<String> = joined.split('/').map(|s| s.to_string()).collect();
-                *path = segs;
-                return;
+                heads.push(path[..split].join("/"));
+            }
+            for head in heads {
+                let joined = format!("{head}${}", path[split..].join("$"));
+                if class_file_exists(self.dirs, &format!("{joined}.class")) {
+                    let segs: Vec<String> = joined.split('/').map(|s| s.to_string()).collect();
+                    *path = segs;
+                    return;
+                }
             }
         }
         if path.len() == 1 {

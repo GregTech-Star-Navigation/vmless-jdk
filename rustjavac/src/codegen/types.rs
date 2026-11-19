@@ -1162,6 +1162,59 @@ pub(crate) fn call_desc(recv: Option<&Expr>, name: &str, args: &[Expr], ctx: &Ct
 /// ⚠️ 别在开头用 `internal_name([cls])`：它会把裸名 `Record` 直接翻成
 /// `java/lang/Record`（java.lang 名字表），于是 `sun/security/ssl/Record` 这种
 /// **同包同名类**永远轮不到（SSL 那一大片 `Record.getInt16(...)` 就是这么挂的）。
+/// 裸名 `X` 落在「成员类型」位置时的候选：外层类链上的 `Outer$X`，以及
+/// **继承来的** `Super$X`（JLS 6.5.5.1 的成员类型作用域）。
+///
+/// java.base 里这两种写法到处都是，而 Ctx 之前只认「本类自己的嵌套类型」：
+/// - `CallArranger$StorageCalculator` 里写 `StorageType` —— 兄弟嵌套类；
+/// - `Client extends NTLM` 里写 `Writer` —— 继承来的 `NTLM$Writer`；
+/// - 匿名类 `new ObjectInputFilter(){ … Status.REJECTED … }` —— 接口里的 `$Status`。
+///
+/// 顺序：先外层类链（由近及远），再父类型 BFS。名字不存在时下游查表自然落空。
+pub(crate) fn member_type_candidates(ctx: &Ctx, name: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    let mut push = |s: String| {
+        if !out.contains(&s) {
+            out.push(s);
+        }
+    };
+    let mut cur = ctx.class_name.clone();
+    while let Some(i) = cur.rfind('$') {
+        cur.truncate(i);
+        push(format!("{cur}${name}"));
+    }
+    let mut seen: HashSet<String> = HashSet::new();
+    let mut queue: Vec<String> = Vec::new();
+    if !ctx.super_name.is_empty() {
+        queue.push(ctx.super_name.clone());
+    }
+    if let Some(ss) = ctx.type_supers.get(&ctx.class_name) {
+        queue.extend(ss.iter().cloned());
+    }
+    while let Some(cur) = queue.pop() {
+        if !seen.insert(cur.clone()) || seen.len() > 256 {
+            continue;
+        }
+        push(format!("{cur}${name}"));
+        if let Some(ss) = ctx.type_supers.get(&cur) {
+            queue.extend(ss.iter().cloned());
+        }
+    }
+    // `import static p.Outer.T;` / `import static p.Outer.*;` 之后裸名 `T` 是 `p/Outer$T`
+    // （AArch64Architecture.StorageType 这种「枚举/类型被静态导入」的写法）
+    if let Some(owners) = ctx.static_imports.get(name) {
+        for o in owners {
+            if o != "*" {
+                push(format!("{o}${name}"));
+            }
+        }
+    }
+    for o in ctx.static_imports.get("*").into_iter().flatten() {
+        push(format!("{o}${name}"));
+    }
+    out
+}
+
 pub(crate) fn class_name_forms(cls: &str, ctx: &Ctx) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
     let mut push = |out: &mut Vec<String>, s: String| {
@@ -1192,6 +1245,10 @@ pub(crate) fn class_name_forms(cls: &str, ctx: &Ctx) -> Vec<String> {
     // 同包
     if let Some((pkg, _)) = ctx.class_name.rsplit_once('/') {
         push(&mut out, format!("{pkg}/{cls}"));
+    }
+    // 外层类链 / 继承来的成员类型（`StorageType`、`Writer`、`Status` 这类）
+    for s in member_type_candidates(ctx, cls) {
+        push(&mut out, s);
     }
     // 裸名本身：默认包（无 package）里的类就叫 `Float2`；`qualify` 已经把
     // 嵌套类型写成 `Mix2$Kind` 这种内部名形态，那时裸名就是符号表里的键
@@ -1232,6 +1289,10 @@ pub(crate) fn type_name_candidates(ty: &Type, ctx: &Ctx) -> Vec<String> {
         let n = path[0].clone();
         if let Some((pkg, _)) = ctx.class_name.rsplit_once('/') {
             push(&mut out, format!("{pkg}/{n}"));
+        }
+        // 外层类链 / 继承来的成员类型（`StorageType`、`Writer`、`Status` 这类）
+        for s in member_type_candidates(ctx, &n) {
+            push(&mut out, s);
         }
         // 隐式导入的 `java.lang`
         push(&mut out, format!("java/lang/{n}"));
