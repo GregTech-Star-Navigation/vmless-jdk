@@ -10,6 +10,44 @@
 >
 > 历史注记：0.70.0 → 0.79.0 这十个 minor 里大部分其实是 perf/fix，按这条规则只该有 2–3 个 minor。
 
+## 0.79.2
+
+**为什么**：真 JVM 装载我们编出来的 class，425 个抽样里有 84 个被 `-Xverify:all` 拒载
+（`Inconsistent stackmap frames at branch target`、`Bad type on operand stack`）。
+这是「编过了 ≠ class 是对的」这个系统性缺口的最大一块。
+
+**先纠正验证方法**：`-cp <out>` 装 `java.*`/`sun.*` 会被 bootstrap loader 抢先解析到
+JDK 自己的类 → `verified=0 rejected=0` 的假绿。唯一忠实的方法是
+`--patch-module java.base=<只放这一类>` 单类单 JVM。
+（这和「`Class.forName` 永远从 jrt 拿」是同一个坑。）
+
+**四个系统性根因**
+
+1. **帧的 locals 没有按前驱合并**（结构性）：原来 `dedup_by_key` 在同一偏移上随机丢一份帧 ——
+   `AESCipher` 那种「早期 return 跳到方法末尾、那一帧却带着后面才声明的局部变量类型」就是这么来的。
+   现在每个前驱分支取交集，同偏移多帧改为合并。
+2. **未初始化的局部变量被提前声明成真实类型**：`int x; if (c) x = 1;` 的汇合帧声明 `Integer`，
+   而另一条路径上是 `Top` → `top is not assignable to integer`。改成声明时登记 `Top`、赋值后才升级。
+3. **构造器里 `this` 的类型**：`super(x == null ? null : x.f())` 这类「实参里有分支」的构造器，
+   跳转点上 `this` 还是 `uninitializedThis`，帧里却写成类类型。改成落地前声明
+   `ITEM_UninitializedThis`、落地后升级。
+4. **数组元素赋值当表达式用时多记 2 槽栈深**：`c[0] = c[1] = 'x'` 之后 `depth` 恒为 +2，
+   之后每个跳转点的帧都说「栈为空」而验证器算出栈里有东西。这是历史 `monitorenter` 记账 bug 的第 5 例。
+5. 顺带修：`try` 的汇合帧改用真正会落到 end 的前驱；`for (i = 0; …)` 的入口状态改在 init 之后取。
+
+**结果**：425 类抽样拒载 **84 → 46**（修好 38 个，0 新引入，发射类集合逐字相同）。
+真程序 5/5、`cargo test` 124 passed、`verify.sh` 102/1
+（`DblCorpus` 是负载下解释器输出被截断的假失败，人工重跑 3/3 逐字节一致）。
+
+**剩下 46 个为什么难**：23 个是 `Bad type on operand stack`，多为类型推断缺失导致发出了错的指令
+（`DataInputStream.readLine` 里 `buf = lineBuffer = new char[128]` 被 `coerce_to` 当成 int，
+插了一条 `Integer.valueOf(I)` 而栈上是 `char[]`）——要补 `expr_type/expr_kind` 对
+「字段访问当赋值表达式」的推断；10 个是 `Bad local variable type`，合并仍偏保守
+（`try` 的 handler、`switch` 的 break 路径）；其余是 `Bad return type`、不可达代码块等个别形态。
+
+**另一条并行线的合并**：`class.rs` 被换成了新 arena 常量池（`CpEntry::Utf8(off,len)`），
+本线的 `fix_self_refs` 已移植到新 API，没有回退那条改动。
+
 ## 0.79.1
 
 **为什么**：解释器每条 `getstatic`/`putstatic` 都要克隆两个 String 再哈希，`putstatic` 还要每次重走

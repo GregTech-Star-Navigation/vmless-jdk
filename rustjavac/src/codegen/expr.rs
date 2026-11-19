@@ -320,6 +320,32 @@ pub(crate) struct Spilled {
     saved: u16,
 }
 
+/// `super(...)`/`this(...)` 一落地，`this` 就从 uninitializedThis 变成已初始化的对象。
+///
+/// 不升级的话，构造器体（以及字段初始化式）里后面每一个栈图帧都会声明
+/// uninitializedThis，而验证器算出的是初始化过的类型，判定
+/// `Type uninitializedThis (current frame) is not assignable to 'X'`。
+fn mark_this_initialized(em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder) {
+    let this_cp = cp.class(&ctx.class_name);
+    em.set_local_type(0, this_cp);
+}
+
+/// 把某个局部变量槽的验证类型登记成它**声明的类型** —— 即这个槽此刻已经确实有值了。
+///
+/// 声明时（`int x;`）槽里是 Top，赋值之后才升级成真实类型。栈图帧里「声明得比实际多」
+/// 会被验证器拒（top 不可赋给 integer），「声明 Top 而代码照样读」同样会被拒
+/// （Bad type on operand stack），所以这一步与赋值严格配对。
+pub(crate) fn mark_local_assigned(em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilder, name: &str, slot: u8) {
+    if let Some(t) = ctx.local_ty.get(name).cloned() {
+        let vt = ver_type(cp, &t);
+        em.set_local_type(slot as usize, vt);
+        if kind_wide(kind_of(&t)) {
+            // 宽类型的第 2 槽永远没有自己的类型
+            em.set_local_type(slot as usize + 1, u16::MAX);
+        }
+    }
+}
+
 /// 把表达式算进脏槽（要求当前操作数栈为空），返回取回用的句柄
 pub(crate) fn spill(
     e: &Expr,
@@ -1085,6 +1111,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             let idx = cp.method_ref(&ctx.class_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
             em.pop(desc_slots(&desc) + 1);
+            mark_this_initialized(em, ctx, cp);
             Ok(())
         }
         // super(...) → invokespecial 父类 <init>（父类构造器）
@@ -1100,6 +1127,7 @@ pub(crate) fn compile_expr(e: &Expr, em: &mut Emit, ctx: &Ctx, cp: &mut CpBuilde
             let idx = cp.method_ref(&ctx.super_name, "<init>", &desc);
             em.op_u2(0xB7, idx); // invokespecial
             em.pop(desc_slots(&desc) + 1);
+            mark_this_initialized(em, ctx, cp);
             Ok(())
         }
         // super.m() → invokespecial 父类实现（owner 必须是父类，否则解析到自己）
@@ -2288,10 +2316,12 @@ fn assign_expr_array(
         Some(Type::Array(inner)) => *inner,
         _ => Type::Prim("int"),
     };
+    // 三个子表达式各自已经把压栈记账做过了（`aload`/`iload` 里 push），
+    // 这里再 push 一次就会多算 2 槽 —— 症状是这条语句之后 depth 非 0，
+    // 下一个跳转点的栈图声明「栈为空」而验证器算出栈里有东西，
+    // 报 `Bad type on operand stack` / `Operand stack underflow`。
     compile_expr(array, em, ctx, cp)?;
-    em.push(1);
     compile_expr(index, em, ctx, cp)?;
-    em.push(1);
     compile_expr(rhs, em, ctx, cp)?;
     coerce_to(&elem, rhs, ctx, em, cp)?;
     let w = if kind_wide(kind_of(&elem)) { 2u16 } else { 1u16 };

@@ -82,11 +82,14 @@ fn finish_switch(
     cp: &mut CpBuilder,
 ) -> Result<bool, CompileError> {
     // 依次发射各 case 体（自然贯穿）
-    let scope = em.local_types.clone();
+    let scope = em.snapshot();
+    // 汇合状态从入口快照起步：没有 case 命中（或某个 case 里 break）的路径就带着
+    // 这份状态落到 end，合并时它必须算一路 —— 只有两条路径都赋过值的槽才保留类型。
+    let mut joined = scope.clone();
     let lbl = ctx.pending_label.take();
     ctx.break_labels.push(JumpTarget { label: lbl, target: end_label });
     for (i, c) in cases.iter().enumerate() {
-        em.local_types = scope.clone();
+        em.restore(scope.clone());
         em.bind(body_labels[i]);
         let mut term = false;
         for s in &c.body {
@@ -99,9 +102,13 @@ fn finish_switch(
         if c.arrow && !term {
             em.goto(end_label);
         }
+        if !term {
+            em.merge(&joined);
+            joined = em.snapshot();
+        }
     }
     // end_label 是 break 的落点（也可能没有任何 break 跳到它，照样要绑定）
-    em.local_types = scope.clone();
+    em.restore(joined);
     em.bind(end_label);
     ctx.break_labels.pop();
     // 不声明「已终结」：switch 之后可能还有语句（case 里 break 出来后要接着执行）
@@ -124,15 +131,16 @@ pub(crate) fn compile_stmt(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBu
 fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder) -> Result<bool, CompileError> {
     match s {
         Stmt::Block(items) => {
-            // 块内声明的局部变量出了块就不可见：验证类型要退回入口快照，
-            // 否则后续合并帧会声明一个「别处是 top」的槽（VerifyError）
-            let scope = em.local_types.clone();
+            // 块内声明的局部变量出了块就不可见：把它们从验证类型表里剥掉，
+            // 否则后续合并帧会声明一个「别处是 top」的槽（VerifyError）。
+            // **只剥块内新开的槽**：外层变量在块里被赋值过，出块后仍然算已赋值。
+            let base = ctx.next_slot as usize;
             for it in items {
                 if compile_stmt(it, em, ctx, cp)? {
                     return Ok(true);
                 }
             }
-            em.local_types = scope;
+            em.chop_from(base);
             Ok(false)
         }
         // 语句位置的 `i++` / `--n` / `s += x` 的值没人要 —— 直接改写成等价的赋值语句，
@@ -296,17 +304,20 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
                 // 泛型擦除后 `String s = box.get();` 的右值是 Object：补 checkcast
                 coerce_to(ty, e, ctx, em, cp)?;
             }
-            // 槽的验证类型必须在**初始化表达式编译完之后**才登记：
+            // 槽的验证类型只在这个槽**确实赋过值**之后才登记成真实类型：
             // 初始化式里如果带跳转（如 `boolean f = x == null;`），那时候这个槽还没赋值，
-            // 帧里抢先写 ITEM_Integer 会被 HotSpot 判成 VerifyError（top 不可赋给 integer）。
+            // 帧里抢先写 ITEM_Integer 会被 HotSpot 判成 VerifyError（top 不可赋给 integer）；
+            // 而 `int x;` 这种压根没有初始化式的声明，槽里此刻就是 Top（未赋值），
+            // 提前写 Integer 会让「另一条路径没赋值」的汇合帧同样被拒
+            // （`Type top (current frame) is not assignable to integer (stack map)`）。
             let vt = ver_type(&mut *cp, ty);
-            em.set_local_type(slot as usize, vt);
+            let has_init = init.is_some();
+            em.set_local_type(slot as usize, if has_init { vt } else { u16::MAX });
             if wide_local {
                 // 第 2 槽没有自己的类型，写「空」占位
                 em.set_local_type(slot as usize + 1, u16::MAX);
             }
-            if let Some(e) = init {
-                let _ = e;
+            if has_init {
                 em.store_slot(slot, kind)?;
             }
             Ok(false)
@@ -404,6 +415,10 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
                 coerce_to(&t, rhs, ctx, em, cp)?;
             }
             em.store_slot(slot, kind)?;
+            // 赋值之后这个槽才「确实有值」：汇合帧里可以声明真实类型了。
+            // 不补这一句的话，`int x; if (c) x = 1; x = 2; use(x);` 后面那段
+            // 一旦有帧，就会声明 Top 而代码照样 iload，验证器判 Bad type。
+            mark_local_assigned(em, ctx, cp, &name, slot);
             Ok(false)
         }
         Stmt::Switch { selector, cases } => {
@@ -568,10 +583,15 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             Ok(false)
         }
         Stmt::For { init, cond, update, body } => {
-            let scope = em.local_types.clone();
             for s in init {
                 compile_stmt(s, em, ctx, cp)?;
             }
+            // 入口状态要在 **init 之后**取：`int i; for (i = 0; …)` 的退出状态必须
+            // 包含 init 里的赋值，否则循环出口那一帧把 `i` 声明成 Top，之后 iload 它
+            // 就报 `Bad local variable type`（`sun.text.IntHashtable` 就是这么炸的）。
+            let scope = em.local_types.clone();
+            // 循环体里新开的槽从这里起（init 里声明的 `i` 在它下面，出循环也别剥）
+            let base = ctx.next_slot as usize;
             let start = em.new_label();
             let end = em.new_label();
             // continue 跳到更新表达式之前
@@ -591,17 +611,19 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
                 // 更新表达式可能是赋值，交给语句编译器处理
                 compile_stmt(&Stmt::Expr(u.clone()), em, ctx, cp)?;
             }
-            // 循环里声明的变量出了循环就不可见：汇合帧必须 chop 掉它们，
-            // 否则从循环外跳进来的路径会判 "top is not assignable to integer"
-            em.local_types = scope;
+            // 循环体内声明的变量出了循环就不可见：汇合帧必须 chop 掉它们，
+            // 否则从循环外跳进来的路径会判 "top is not assignable to integer"。
+            // 回边的状态先发出去（帧在 start 上按前驱合并），退出路径按入口状态。
+            em.chop_from(base);
             em.goto(start);
+            em.restore(scope);
             em.bind(end);
             Ok(false)
         }
         // `do { … } while (cond);` —— 先跑一遍体，条件为真再来一轮。
         // `continue` 跳到**条件判断**处（不是循环头），否则会跳过条件直接重跑。
         Stmt::DoWhile { body, cond } => {
-            let scope = em.local_types.clone();
+            let base = ctx.next_slot as usize;
             let start = em.new_label();
             let cont = em.new_label();
             let end = em.new_label();
@@ -612,8 +634,10 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             compile_stmt(body, em, ctx, cp)?;
             ctx.break_labels.pop();
             ctx.cont_labels.pop();
-            // 循环体里声明的变量出了体就不可见：汇合帧要 chop 掉它们
-            em.local_types = scope;
+            // 循环体里声明的变量出了体就不可见：只剥循环体内新开的槽。
+            // **不能退回入口快照**：`do{…}while` 的体至少执行一次，体里给外层变量
+            // 赋的值在循环之后依然是已赋值的（JLS 的 definite assignment 也这么算）。
+            em.chop_from(base);
             em.bind(cont);
             compile_cond_false(cond, em, ctx, cp, end)?;
             em.goto(start);
@@ -622,6 +646,7 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
         }
         Stmt::While { cond, body } => {
             let scope = em.local_types.clone();
+            let base = ctx.next_slot as usize;
             let start = em.new_label();
             let end = em.new_label();
             em.bind(start);
@@ -632,8 +657,11 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             compile_stmt(body, em, ctx, cp)?;
             ctx.break_labels.pop();
             ctx.cont_labels.pop();
-            em.local_types = scope;
+            // 回边带的是体末尾的状态（体里赋过的外层变量在这儿算数）；
+            // 退出路径可能一次都没进体，按入口状态算。
+            em.chop_from(base);
             em.goto(start);
+            em.restore(scope);
             em.bind(end);
             Ok(false)
         }
@@ -679,25 +707,40 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             let l_else = em.new_label();
             let l_end = em.new_label();
             compile_cond_false(cond, em, ctx, cp, l_else)?;
-            // 两个分支各自声明的局部变量都不能出现在合并帧里
-            let scope = em.local_types.clone();
+            // 两个分支各自声明的局部变量都不能出现在合并帧里（块作用域退出时已经剥掉），
+            // 但**外层变量在两个分支里的赋值要合流**：只有两条路径都赋了值、且类型一致，
+            // 合并帧才敢声明真实类型 —— 否则声明 Integer 而某条路径上是 Top，
+            // 真 JVM 当场判 `top is not assignable to integer`。
+            let scope = em.snapshot();
             let then_term = compile_stmt(then, em, ctx, cp)?;
+            let then_state = em.snapshot();
             match els {
                 Some(e) => {
-                    em.local_types = scope.clone();
                     // then 分支已经终结（return/throw）时不能再发 goto：那条指令是
                     // 不可达的，而不可达指令要么有栈图帧、要么只能出现在方法末尾，
                     // 否则 HotSpot 报 "Expecting a stack map frame at this location"
+                    //
+                    // goto 必须在 `restore(scope)` **之前**发：这条边的状态是 then 分支
+                    // 末尾的局部变量表（它给 `int x;` 赋的值也算数），先 restore 就成了
+                    // 假分支的入口状态，汇合帧会被错判成 Top（之后 iload 就炸）。
                     if !then_term {
                         em.goto(l_end);
                     }
+                    em.restore(scope);
                     em.bind(l_else);
-                    compile_stmt(e, em, ctx, cp)?;
-                    em.local_types = scope;
+                    let else_term = compile_stmt(e, em, ctx, cp)?;
+                    if !then_term && !else_term {
+                        em.merge(&then_state); // 两条路径都落到这里
+                    } else if !then_term {
+                        em.restore(then_state); // 只有 then 会落到 l_end
+                    }
                     em.bind(l_end);
                 }
                 None => {
-                    em.local_types = scope;
+                    em.restore(scope);
+                    if !then_term {
+                        em.merge(&then_state); // `if (c) {…}` 之后：假路径 = 入口状态
+                    }
                     em.bind(l_else);
                 }
             }
@@ -722,7 +765,7 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
         // 另外 `aload` 之后不能插 null 检查 —— JVMS 规定 null 由 `monitorenter`
         // 自己抛 NPE，提前检查反而改变语义（异常类型/时机都不对）。
         Stmt::Sync { lock, body } => {
-            let entry = em.local_types.clone();
+            let base = ctx.next_slot as usize;
             let lk = bump_slot(ctx, em, false)?;
             let ex = bump_slot(ctx, em, false)?;
             let obj_cls = ver_type(cp, &Type::Named { path: vec!["Object".into()], args: vec![] });
@@ -746,7 +789,11 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             em.place(body_start);
             let terminated = compile_stmt(body, em, ctx, cp)?;
             em.place(body_end);
+            let mut end_state = None;
             if !terminated {
+                // 隐藏槽（锁对象/异常）出了语句就不可见；外层变量在体里赋的值要留住
+                em.chop_from(base);
+                end_state = Some(em.snapshot());
                 em.load_slot(lk, K_REF)?;
                 em.insn(0xC3, 1, 0); // monitorexit
                 em.goto(end);
@@ -762,11 +809,14 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             em.op(0xBF); // athrow
             em.pop(1); // athrow 弹掉异常对象：不记账会让 end 之后的代码从 +1 槽开始算
             em.exc(body_start, body_end, handler, 0);
-            // **先**把隐藏槽的声明退回入口快照，**再**绑定汇合标签：
+            // **先**把隐藏槽的声明退回（chop），**再**绑定汇合标签：
             // 反过来的话（先 bind 再退回）end 那一帧会带着 handler 里刚声明的
             // 异常槽类型，而数据流上那个槽根本没赋值 —— 验证器报
-            // `Inconsistent stackmap frames`。
-            em.local_types = entry;
+            // `Inconsistent stackmap frames`。正常路径的状态就是 goto 发出去那一刻的。
+            match end_state {
+                Some(s) => em.restore(s),
+                None => em.chop_from(base),
+            }
             em.bind(end);
             Ok(false)
         }
@@ -774,6 +824,7 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             // try 入口的局部变量快照：handler / 汇合帧只声明到这一层，多出来的槽按
             // Top 处理 —— 栈图里 Top 接受任何类型，反过来「声明得比实际多」才会 VerifyError。
             let entry = em.local_types.clone();
+            let entry_base = ctx.next_slot as usize;
             let start = em.new_label();
             let body_end = em.new_label();
             let end = em.new_label();
@@ -896,9 +947,20 @@ fn compile_stmt_inner(s: &Stmt, em: &mut Emit, ctx: &mut Ctx, cp: &mut CpBuilder
             // 也必须报「已终结」，否则外层会补一条不可达的默认返回。
             let reaches_end = if fin.is_some() { normal_reaches && !fin_terminated } else { normal_reaches };
             // 汇合点：正常路径、每条 catch 都到这里。
-            // 帧只声明 try 入口那份快照（多出来的槽按 Top：Top 接受任何类型）。
+            //
+            // 帧的 locals 取「所有真的会落到 end 的前驱」的交集（`pending` 里记的就是
+            // 那些 goto 发出时的状态）。不能用「try 入口快照」代替：入口快照会把
+            // try 体里赋过值的外层变量降级成 Top，而 end 之后的代码照样会读它，
+            // 验证器就判 `Bad local variable type`。
             if reaches_end {
-                em.bind_handler(end, entry.clone(), u16::MAX);
+                let st = match em.pending_for(end) {
+                    Some(p) => p,
+                    None => em.local_types.clone(),
+                };
+                em.restore(st);
+                em.chop_from(entry_base);
+                let snap = em.snapshot();
+                em.bind_handler(end, snap, u16::MAX);
             }
             // catch 变量与 try 体内声明的槽出了语句就不可见：把验证类型退回入口快照，
             // 否则下一条 try 的 handler 帧会声明一个「实际未初始化」的槽（VerifyError）。
@@ -957,11 +1019,12 @@ fn compile_string_switch(
     }
     em.goto(default_target);
 
-    let scope = em.local_types.clone();
+    let scope = em.snapshot();
+    let mut joined = scope.clone();
     let lbl = ctx.pending_label.take();
     ctx.break_labels.push(JumpTarget { label: lbl, target: end_label });
     for (i, c) in cases.iter().enumerate() {
-        em.local_types = scope.clone();
+        em.restore(scope.clone());
         em.bind(body_labels[i]);
         let mut term = false;
         for s in &c.body {
@@ -973,8 +1036,12 @@ fn compile_string_switch(
         if c.arrow && !term {
             em.goto(end_label);
         }
+        if !term {
+            em.merge(&joined);
+            joined = em.snapshot();
+        }
     }
-    em.local_types = scope.clone();
+    em.restore(joined);
     em.bind(end_label);
     ctx.break_labels.pop();
     Ok(false)

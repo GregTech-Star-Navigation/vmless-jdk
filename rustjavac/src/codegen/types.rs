@@ -427,6 +427,12 @@ pub(crate) fn method_descriptor(params: &[Param], ret: &Option<Type>) -> String 
 }
 
 
+/// 构造器里 `this` 在 `super(...)`/`this(...)` 之前还不是「已初始化」的对象，
+/// 栈图里必须声明成 ITEM_UninitializedThis（6）—— 声明成类类型的话，
+/// 只要 `super(...)` 的实参里有分支（`super(x == null ? null : x.f())`），
+/// 那个跳转点的帧就和验证器算出的 uninitializedThis 打架。
+pub(crate) const VT_UNINIT_THIS: u16 = 0xFFFB;
+
 /// 类型的验证类型编码：int → 0，float → 0xFFFC，对象/数组 → 常量池里的类索引
 pub(crate) fn ver_type(cp: &mut CpBuilder, ty: &Type) -> u16 {
     match ty {

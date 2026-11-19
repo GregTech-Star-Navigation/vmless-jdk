@@ -25,8 +25,13 @@ pub(crate) struct Emit {
     pub(crate) exc_table: Vec<(usize, usize, usize, u16)>,
     /// 常量池里 "StackMapTable" 的索引
     pub(crate) stack_map_name: u16,
-    /// 每个局部变量槽的验证类型：0 = int，否则是类索引（对象/数组）
+    /// 每个局部变量槽的验证类型：0 = int，否则是类索引（对象/数组）；
+    /// u16::MAX = Top（未赋值/已出作用域）—— 栈图里声明成 Top 才接受任何类型
     pub(crate) local_types: Vec<u16>,
+    /// 标签 id -> 已经按「还没绑定的前驱分支」累积出来的局部变量状态
+    pub(crate) pending: Vec<Option<Vec<u16>>>,
+    /// 标签 id -> 它那一帧在 `frames` 里的下标（回边要就地合并进去）
+    pub(crate) label_frame: Vec<Option<usize>>,
     /// 脏槽池（`SCRATCH_POOL_BASE .. +SCRATCH_POOL_LEN`）里哪些正被占用。
     /// 用位图而不是栈：兄弟表达式（`f(a<b, c<d)`）会同时占着，释放顺序不定。
     pub(crate) scratch_inuse: [bool; SCRATCH_POOL_LEN as usize],
@@ -46,6 +51,8 @@ impl Emit {
             exc_table: Vec::new(),
             stack_map_name: 0,
             local_types: vec![u16::MAX; max_locals as usize],
+            pending: Vec::new(),
+            label_frame: Vec::new(),
             scratch_inuse: [false; SCRATCH_POOL_LEN as usize],
         }
     }
@@ -298,6 +305,8 @@ impl Emit {
 
     pub(crate) fn new_label(&mut self) -> usize {
         self.labels.push(None);
+        self.pending.push(None);
+        self.label_frame.push(None);
         self.labels.len() - 1
     }
 
@@ -306,6 +315,46 @@ impl Emit {
             self.local_types.resize(slot + 1, u16::MAX);
         }
         self.local_types[slot] = ty;
+    }
+
+    /// 留下当前局部变量表的快照（分叉前存，分支结束时拿它合流）。
+    pub(crate) fn snapshot(&self) -> Vec<u16> {
+        self.local_types.clone()
+    }
+
+    /// 某个标签上已经收集到的「前驱状态」（还没绑定时的分支边，已经取交集）。
+    /// 用来在汇合点算出比「入口快照」更准的 locals（入口快照会把 try 体里
+    /// 赋过值的外层变量降级成 Top，之后 iload 它就炸）。
+    pub(crate) fn pending_for(&self, label: usize) -> Option<Vec<u16>> {
+        self.pending.get(label).and_then(|p| p.clone())
+    }
+
+    /// 回到快照（分叉下的另一条路径从同一个起点重新开始累积）。
+    pub(crate) fn restore(&mut self, snap: Vec<u16>) {
+        self.local_types = snap;
+    }
+
+    /// 去掉 `n` 号以后的槽（离开变量的声明作用域）。
+    ///
+    /// **不能**用「回到入口快照」代替：外层变量在块里被赋值过、出块后依然是
+    /// 已赋值（JLS 的 definite assignment 就是这么定义的），退回快照会把它
+    /// 降级成 Top，之后那段代码再 `iload` 它，验证器就判
+    /// `Bad type on operand stack`。
+    pub(crate) fn chop_from(&mut self, n: usize) {
+        for i in n..self.local_types.len() {
+            self.local_types[i] = u16::MAX;
+        }
+    }
+
+    /// 两条控制流路径汇合：每个槽取「两边都声明成同一个类型才算数」。
+    ///
+    /// 这是**栈图正确性的核心**：帧里声明 `Integer` 而未赋值的那条路径上这个槽是
+    /// `top`，验证器当场判 `top is not assignable to integer`
+    /// （`Inconsistent stackmap frames at branch target N`）—— 一批 java.base 类
+    /// 就是这么被真 JVM 拒载的。反向（声明 Top 而实际有值）只在之后的代码**读取**
+    /// 这个槽时才出问题，所以合并必须两边都成立才保留类型。
+    pub(crate) fn merge(&mut self, other: &[u16]) {
+        merge_types(&mut self.local_types, other);
     }
 
     pub(crate) fn bind(&mut self, label: usize) {
@@ -317,16 +366,33 @@ impl Emit {
     /// 脏槽必须先写后读，所以「跳到假分支」那一帧里它还是 Top（未赋值），
     /// 「汇合点」那一帧里才是 Integer —— 全局的 `local_types` 只能有一个值，
     /// 表达不了这种差别，只能在绑定这一帧时单独覆盖。
+    ///
+    /// **locals 按前驱合并**：这个标签可能有若干条已经发出去的分支（它们各自带着
+    /// 自己那一刻的局部变量状态），汇合帧必须同时满足所有前驱 —— 每个槽只有全部
+    /// 前驱都声明成同一个类型才敢保留，否则退成 Top。漏了这一步就会出现
+    /// 「早期 `return` 跳到方法末尾，而那一帧带着后面才声明的局部变量类型」，
+    /// 真 JVM 判 `Inconsistent stackmap frames`。
     pub(crate) fn bind_t(&mut self, label: usize, scratch_ty: Option<u16>) {
         let off = self.bytes.len();
         self.labels[label] = Some(off);
         let mut snap = self.local_types.clone();
+        if let Some(p) = self.pending.get(label).and_then(|p| p.clone()) {
+            merge_types(&mut snap, &p);
+            // 走下来的那条路径也要按合并后的状态继续（否则后面的帧会声明得更多）
+            self.local_types = snap.clone();
+        }
         if let Some(t) = scratch_ty {
             let s = SCRATCH_SLOT as usize;
             if snap.len() <= s {
                 snap.resize(s + 1, u16::MAX);
             }
             snap[s] = t;
+        }
+        if self.label_frame.len() <= label {
+            self.label_frame.resize(label + 1, None);
+        }
+        if self.label_frame[label].is_none() {
+            self.label_frame[label] = Some(self.frames.len());
         }
         self.frames.push((off, snap, u16::MAX));
     }
@@ -362,6 +428,28 @@ impl Emit {
         self.op(opcode);
         self.bytes.extend_from_slice(&[0, 0]);
         self.patches.push((pos, label));
+        self.note_edge(label);
+    }
+
+    /// 记下「有一条控制流带着当前局部变量状态流到这个标签」。
+    ///
+    /// 标签还没绑 -> 存进 `pending`，等 `bind_t` 时参与合并；
+    /// 已经绑过（循环回边、同一标签二次绑定）-> 就地把那一帧的类型降级，
+    /// 因为帧已经写好了，只能回头改。
+    fn note_edge(&mut self, label: usize) {
+        if self.pending.len() <= label {
+            self.pending.resize(label + 1, None);
+            self.label_frame.resize(label + 1, None);
+        }
+        let st = self.local_types.clone();
+        match &mut self.pending[label] {
+            None => self.pending[label] = Some(st.clone()),
+            Some(prev) => merge_types(prev, &st),
+        }
+        if let Some(idx) = self.label_frame[label] {
+            let frame = &mut self.frames[idx].1;
+            merge_types(frame, &st);
+        }
     }
 
     pub(crate) fn goto(&mut self, label: usize) {
@@ -384,6 +472,9 @@ impl Emit {
         for t in targets {
             self.jump4(*t, base);
         }
+        for t in targets.iter().chain(std::iter::once(&default)) {
+            self.note_edge(*t);
+        }
         self.pop(1); // 弹出选择子
     }
 
@@ -399,6 +490,10 @@ impl Emit {
         for (k, t) in pairs {
             self.bytes.extend_from_slice(&k.to_be_bytes());
             self.jump4(*t, base);
+        }
+        self.note_edge(default);
+        for (_, t) in pairs {
+            self.note_edge(*t);
         }
         self.pop(1);
     }
@@ -464,8 +559,26 @@ impl Emit {
                 .map_err(|_| CompileError { msg: "switch 跳转距离超出 32 位".into() })?;
             self.bytes[pos..pos + 4].copy_from_slice(&off.to_be_bytes());
         }
-        self.frames.sort_unstable_by_key(|(o, _, _)| *o);
-        self.frames.dedup_by_key(|(o, _, _)| *o);
+        // 同一个偏移上可能落下好几帧（某个 `if` 的出口、方法末尾的 return、
+        // 内层 if 的出口……它们都在源码末尾，编译出来是同一个偏移）。JVM 在每个
+        // 偏移上只认**一帧**，所以这些帧必须**合并**而不是随便丢掉一份：
+        // 留错那份的表现就是 `Inconsistent stackmap frames at branch target N`
+        // —— 一条早期 `return` 的路径上某个槽还是 top，帧里却写着它后面才声明的类型。
+        self.frames.sort_by_key(|(o, _, _)| *o); // 稳定排序：同偏移保留发射顺序
+        let mut merged: Vec<(usize, Vec<u16>, u16)> = Vec::with_capacity(self.frames.len());
+        for (off, snap, stack_ty) in std::mem::take(&mut self.frames) {
+            match merged.last_mut() {
+                Some((o, prev, prev_stack)) if *o == off => {
+                    merge_types(prev, &snap);
+                    // 栈里那一个引用类型只有 handler 入口才会非空；和普通汇合撞在
+                    // 同一偏移时没法用一个帧表达两种栈，只能保留先出现的那份
+                    // （`place()` 的注释说明了怎么避免这种撞车）。
+                    let _ = (prev_stack, stack_ty);
+                }
+                _ => merged.push((off, snap, stack_ty)),
+            }
+        }
+        self.frames = merged;
         Ok(())
     }
 
@@ -504,6 +617,9 @@ impl Emit {
                     slot += 2;
                 } else if t == 0xFFFC {
                     entries.push(2); // ITEM_Float，占 1 槽
+                    slot += 1;
+                } else if t == VT_UNINIT_THIS {
+                    entries.push(6); // ITEM_UninitializedThis（构造器里 super() 之前的 this）
                     slot += 1;
                 } else if t == u16::MAX {
                     entries.push(0); // ITEM_Top（尚未初始化）
@@ -564,6 +680,19 @@ impl Emit {
             None => info.extend_from_slice(&0u16.to_be_bytes()),
         }
         Attribute { name_index, info }
+    }
+}
+
+/// 两个局部变量状态合流：每个槽只有**两边一致**才保留类型，否则退成 Top。
+fn merge_types(dst: &mut Vec<u16>, src: &[u16]) {
+    let n = dst.len().max(src.len());
+    dst.resize(n, u16::MAX);
+    for i in 0..n {
+        let a = dst[i];
+        let b = *src.get(i).unwrap_or(&u16::MAX);
+        if a != b {
+            dst[i] = u16::MAX;
+        }
     }
 }
 
