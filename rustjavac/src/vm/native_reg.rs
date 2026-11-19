@@ -110,13 +110,21 @@ impl NativeRegistry {
         self.overrides.get(&(class, name, desc)).copied()
     }
 
-    pub(crate) fn lookup(&self, class: &str, name: &str, desc: &str) -> Option<NativeFn> {
-        if let Some(f) = self
-            .map
+    /// 只查**静态注册表**（不含 JNI 动态绑定）。
+    ///
+    /// 之所以单独提出来：这一路的返回值是**纯 `fn` 指针**，同一个方法永远是同一个指针，
+    /// 所以可以按调用点缓存（见 `exec.rs` 的 `NatSite`）。JNI 那条路**不能**缓存 ——
+    /// `jni_lib::lookup` 返回的是共享跳板，真目标放在线程本地 pending 槽里，缓存了跳板，
+    /// 下次别的 JNI 查表之后就会跳到别人的函数上。
+    pub(crate) fn lookup_static(&self, class: &str, name: &str, desc: &str) -> Option<NativeFn> {
+        self.map
             .get(&(class.to_string().as_str(), name, desc))
             .copied()
             .or_else(|| self.map.get(&("", name, desc)).copied())
-        {
+    }
+
+    pub(crate) fn lookup(&self, class: &str, name: &str, desc: &str) -> Option<NativeFn> {
+        if let Some(f) = self.lookup_static(class, name, desc) {
             return Some(f);
         }
         // 静态表里没有 → 问 JNI 的动态绑定表：
@@ -145,13 +153,7 @@ pub(super) fn arg_slot(desc: &str, i: usize) -> usize {
 /// 把 `args` 按 JVM 槽位落进一帧（解释器与 native 共用，规则只能有一份）
 pub(super) fn place_args(frame: &mut Frame, desc: &str, args: &[Slot], receiver: bool) {
     let slots = crate::jit::param_slots(desc);
-    let off = usize::from(receiver);
-    frame.arg_base = off;
-    frame.arg_slots = slots.clone();
-    for (i, a) in args.iter().enumerate() {
-        let slot = if i < off { 0 } else { slots.get(i - off).copied().unwrap_or(i - off) + off };
-        frame.store(slot, *a);
-    }
+    frame.place_args_slots(&slots, args, receiver);
 }
 
 fn si(f: &Frame, i: usize) -> i32 {

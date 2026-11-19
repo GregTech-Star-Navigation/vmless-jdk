@@ -15,7 +15,27 @@ use super::frame::Frame;
 use super::native_reg;
 use super::slot::Slot;
 use super::Vm;
+use super::call::MethodRefInfo;
 use super::VmError;
+
+/// `VMLESS_TRACE` 的常驻判定（诊断开关，进程级，读一次定终身）
+#[inline(always)]
+fn vm_trace_on() -> bool {
+    static B: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *B.get_or_init(|| std::env::var_os("VMLESS_TRACE").is_some())
+}
+
+/// `VMLESS_HANG_DUMP=<秒>` → 探针阈值（0 = 关）
+#[inline(always)]
+fn hang_hz() -> u64 {
+    static B: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *B.get_or_init(|| {
+        std::env::var_os("VMLESS_HANG_DUMP")
+            .and_then(|v| v.to_string_lossy().parse().ok())
+            .map(|s: f64| (s * 25_000_000.0) as u64)
+            .unwrap_or(0)
+    })
+}
 
 /// 方法访问标志：`native`（没有 Code 属性，实现由 VM 提供）
 pub(super) const ACC_NATIVE: u16 = 0x0100;
@@ -39,7 +59,107 @@ fn is_str_handle(h: i32) -> bool {
     h >= STR_BASE
 }
 
+/// 一个 `new` 调用点的缓存：类名 + 字段槽数。
+///
+/// `new` 原来每执行一次就重来一遍：`class_name_of` 分配一个 `String`（类名）、
+/// `ensure_init` 拿一次 `sh.initialized` 的 `Mutex` + 按名字哈希、`field_count` 再哈希一次。
+/// 实测 `new Object()` 1.7 μs，而同样走分配器的 `new char[2]` 只要 350 ns —— 差的就是这三件。
+/// 它们的答案对同一个调用点永远不变（类不重定义、初始化只发生一次，JVMS 5.5）。
+struct NewSite {
+    /// 钉住 ClassFile（键是裸指针，不钉住就可能认成别的类的缓存）
+    _cf: std::sync::Arc<crate::ClassFile>,
+    /// 泄漏成 `'static str`：快路要把它取出来（Copy）之后再去调 `ensure_init`，
+    /// 不能借着一个 `RefCell` 的借用跨过 `&mut self` 的调用。
+    name: &'static str,
+    nslots: usize,
+}
+
+/// 一个 native 方法的派发缓存（键：`(ClassFile 指针, 方法下标)`）。
+///
+/// 派发原来每次调用都要：从常量池 utf8 复制出类名/方法名/描述符三个 `String`，
+/// 交给 `require_native` 再做一次 `class.to_string()` + 三串元组哈希，然后 `param_slots(desc)`
+/// 再解析一遍描述符。实测 645 ns/次，而 JDK 的热路径全是 native
+/// （`Unsafe.putByte` 这类一次 `Integer.toString` 就调四次）。
+struct NatSite {
+    /// 钉住 ClassFile（键是裸指针）
+    _cf: std::sync::Arc<crate::ClassFile>,
+    f: native_reg::NativeFn,
+    /// 参数起始槽（`jit::param_slots`）
+    slots: Vec<usize>,
+    /// 帧要几个槽：最后一个参数槽 + 2（与 `place_args` 的老算法一致）
+    frame_slots: usize,
+}
+
+/// 一个方法的**参数落位**缓存：参数起始槽表 + 「参数里有没有 long/double」。
+///
+/// `place_args` 每次调用都要 `jit::param_slots(desc)`（分配 + 扫描述符）再 `clone`
+/// 一份塞进 `frame.arg_slots`（第二次分配）—— 实测 285 ns/次。绝大多数方法没有宽参数，
+/// 起始槽就是 0,1,2,…，可以直接整段拷贝。
+/// 一个方法**执行期不变**的元数据：Code 属性位置 + 异常表 + 引用位图。
+///
+/// 这三样原来每次调用都要重做：`code_of` 线性扫一遍常量池找 `"Code"` 名字、再扫属性表；
+/// `method_refs` 拿一次 `sh.refmaps` 的读锁 + 哈希。实测这是每次调用里最贵的一格
+/// （~1 μs），而它们的答案对同一个方法永远不变。
+/// 常量池「字段/方法引用」的**按调用点**解析缓存。
+///
+/// `method_ref` 每次都要把类名、方法名、描述符各复制一个 `String`（3 次堆分配）——
+/// 同一条常量池条目的答案恒定，一条 `invokevirtual` 执行一百万次就复制一百万次。
+/// 值里连 `Arc<ClassFile>` 一起存，钉住它，指针不会被复用。
+struct CodeMeta {
+    /// 钉住 ClassFile：`body` 指向它的 Code 属性，这块内存必须与缓存同寿
+    _cf: std::sync::Arc<crate::ClassFile>,
+    max_locals: usize,
+    body: *const u8,
+    body_len: usize,
+    exc: Box<[(u16, u16, u16, u16)]>,
+    refs: std::sync::Arc<super::gc::MethodRefs>,
+}
+
+struct ArgsSite {
+    _cf: std::sync::Arc<crate::ClassFile>,
+    /// 参数起始槽（进 `Frame::place_args_slots` 的老路时要 usize）
+    slots: Vec<usize>,
+    /// 参数里没有 long/double → 起始槽就是下标本身
+    flat: bool,
+}
+
+thread_local! {
+    static SITE_REFS: std::cell::RefCell<
+        std::collections::HashMap<
+            (usize, u16),
+            (std::sync::Arc<crate::ClassFile>, std::rc::Rc<MethodRefInfo>),
+        >,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static CODE_SITE: std::cell::RefCell<
+        std::collections::HashMap<(usize, u32), std::rc::Rc<CodeMeta>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static ARG_SITE: std::cell::RefCell<
+        std::collections::HashMap<(usize, u32), std::rc::Rc<ArgsSite>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static NAT_SITE: std::cell::RefCell<
+        std::collections::HashMap<(usize, u32), std::rc::Rc<NatSite>>,
+    > = std::cell::RefCell::new(std::collections::HashMap::new());
+    static SITE_NEW: std::cell::RefCell<std::collections::HashMap<(usize, u16), NewSite>> =
+        std::cell::RefCell::new(std::collections::HashMap::new());
+}
+
 impl Vm {
+    /// 取（或建）这个调用点的引用解析结果（见 `SITE_REFS`）。
+    #[inline]
+    fn site_ref(
+        &self,
+        cf: &std::sync::Arc<crate::ClassFile>,
+        index: u16,
+    ) -> Result<std::rc::Rc<MethodRefInfo>, VmError> {
+        let key = (std::sync::Arc::as_ptr(cf) as usize, index);
+        if let Some(r) = SITE_REFS.with(|c| c.borrow().get(&key).map(|&(_, ref r)| std::rc::Rc::clone(r))) {
+            return Ok(r);
+        }
+        let r = std::rc::Rc::new(self.method_ref(cf, index)?);
+        SITE_REFS.with(|c| c.borrow_mut().insert(key, (std::sync::Arc::clone(cf), std::rc::Rc::clone(&r))));
+        Ok(r)
+    }
+
     /// 这个方法的引用位图（按 `(ClassFile 地址, 方法下标)` 缓存，第一次执行时算）。
     ///
     /// 缓存里连 `Arc<ClassFile>` 一起存 —— 这样 ClassFile 不会被释放、指针不会被复用，
@@ -291,34 +411,113 @@ impl Vm {
         }
         // native 方法没有 Code 属性：先查注册表，命中就交出去；没命中报 UnsatisfiedLinkError
         if m.access_flags & ACC_NATIVE != 0 {
-            let owner = cf.this_class_name().unwrap_or_default();
-            let name = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
-            let desc = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
-            let f = self.require_native(&owner, &name, &desc)?;
-            let mut frame = Frame::new(crate::jit::param_slots(&desc).last().map(|s| s + 2).unwrap_or(1));
-            native_reg::place_args(&mut frame, &desc, args, receiver);
+            let nkey = (std::sync::Arc::as_ptr(&cf) as usize, method as u32);
+            let cached_nat = NAT_SITE.with(|c| c.borrow().get(&nkey).map(std::rc::Rc::clone));
+            let site = match cached_nat {
+                Some(s) => s,
+                None => {
+                    let owner = cf.this_class_name().unwrap_or_default();
+                    let name = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default())
+                        .into_owned();
+                    let desc =
+                        String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default())
+                            .into_owned();
+                    // **只缓存静态注册表命中的**：JNI 那条路返回的是共享跳板
+                    // （真目标在线程本地 pending 槽），缓存了会串到别人的函数上。
+                    let cacheable = self.sh.natives.lookup_static(&owner, &name, &desc);
+                    let f = match cacheable {
+                        Some(f) => f,
+                        None => self.require_native(&owner, &name, &desc)?,
+                    };
+                    let slots = crate::jit::param_slots(&desc);
+                    let frame_slots = slots.last().map(|s| s + 2).unwrap_or(1);
+                    let s = std::rc::Rc::new(NatSite {
+                        _cf: std::sync::Arc::clone(&cf),
+                        f,
+                        slots,
+                        frame_slots,
+                    });
+                    if cacheable.is_some() {
+                        NAT_SITE.with(|c| c.borrow_mut().insert(nkey, std::rc::Rc::clone(&s)));
+                    }
+                    s
+                }
+            };
+            let f = site.f;
+            let mut frame = Frame::new(site.frame_slots);
+            frame.place_args_slots(&site.slots, args, receiver);
             return f(self, &mut frame);
         }
-        let (max_locals, body, exc_table) = code_of(&cf, m).map_err(|e| VmError {
-            msg: format!(
-                "{}.{}{}: {}",
-                cf.this_class_name().unwrap_or_default(),
-                String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()),
-                String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()),
-                e.msg
-            ),
-            exc: None,
-        })?;
+        let ckey = (std::sync::Arc::as_ptr(&cf) as usize, method as u32);
+        let cached_c = CODE_SITE.with(|c| c.borrow().get(&ckey).map(std::rc::Rc::clone));
+        let cm = match cached_c {
+            Some(m) => m,
+            None => {
+                let (ml, body0, exc0) = code_of(&cf, m).map_err(|e| VmError {
+                    msg: format!(
+                        "{}.{}{}: {}",
+                        cf.this_class_name().unwrap_or_default(),
+                        String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()),
+                        String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()),
+                        e.msg
+                    ),
+                    exc: None,
+                })?;
+                let is_static0 = m.access_flags & 0x0008 != 0;
+                let refs0 = self.method_refs(&cf, method, desc, ml, is_static0, body0, &exc0);
+                let cm = std::rc::Rc::new(CodeMeta {
+                    _cf: std::sync::Arc::clone(&cf),
+                    max_locals: ml,
+                    body: body0.as_ptr(),
+                    body_len: body0.len(),
+                    exc: exc0.into_boxed_slice(),
+                    refs: refs0,
+                });
+                CODE_SITE.with(|c| c.borrow_mut().insert(ckey, std::rc::Rc::clone(&cm)));
+                cm
+            }
+        };
+        let max_locals = cm.max_locals;
+        // SAFETY: `cm` 里钉着 ClassFile，`body` 指向它的 Code 属性，与缓存同寿
+        let body: &[u8] = unsafe { std::slice::from_raw_parts(cm.body, cm.body_len) };
+        let exc_table: &[(u16, u16, u16, u16)] = &cm.exc;
 
         let mut frame = Frame::new(max_locals);
+        // 参数落位：按 (ClassFile, 方法) 缓存槽表（见 `ArgsSite`）
+        let akey = (std::sync::Arc::as_ptr(&cf) as usize, method as u32);
+        let cached_args = ARG_SITE.with(|c| c.borrow().get(&akey).map(std::rc::Rc::clone));
+        let asite = match cached_args {
+            Some(s) => s,
+            None => {
+                let slots = crate::jit::param_slots(desc);
+                let end = desc.as_bytes().iter().position(|b| *b == b')').unwrap_or(desc.len());
+                let flat =
+                    !desc.as_bytes()[..end].iter().any(|b| *b == b'J' || *b == b'D');
+                let s = std::rc::Rc::new(ArgsSite {
+                    _cf: std::sync::Arc::clone(&cf),
+                    slots,
+                    flat,
+                });
+                ARG_SITE.with(|c| c.borrow_mut().insert(akey, std::rc::Rc::clone(&s)));
+                s
+            }
+        };
         // 帧链：进方法压一帧（只有原子量；Drop 时弹）。native 方法不压 —— 与 HotSpot 一样
         // 不把 native 帧暴露给 `getStackTrace`/`StackWalker`。
         let _frame_mark = super::stacktrace::enter(&cf, method);
-        native_reg::place_args(&mut frame, desc, args, receiver);
+        frame.arg_base = usize::from(receiver);
+        let nargs = args.len();
+        if asite.flat && nargs == asite.slots.len() + usize::from(receiver) && nargs <= frame.locals.len()
+        {
+            // 参数槽就是 0,1,2,…（没有宽值）→ 整段拷贝；`this` 本就在 args[0]、槽 0
+            frame.locals[..nargs].copy_from_slice(args);
+        } else {
+            frame.place_args_slots(&asite.slots, args, receiver);
+        }
         // 引用位图：这个方法的每个 pc 上「哪些槽是引用」（GC 找根的唯一依据）。
         // 算一次缓存起来，之后每个调用点只是一次读锁 + 一次哈希。
         let is_static = m.access_flags & 0x0008 != 0;
-        frame.refs = Some(self.method_refs(&cf, method, desc, max_locals, is_static, body, &exc_table));
+        frame.refs = Some(std::sync::Arc::clone(&cm.refs));
         // 登记到本线程的根集（异常/提前返回时由 Drop 摘掉）
         let _frame_guard = super::gc::FrameGuard::push(&frame, self as *const Vm);
 
@@ -344,17 +543,11 @@ impl Vm {
             }};
         }
 
-        // **环境变量每个方法调用都读一次**在 Windows 上要 295 ns（全局 Mutex + 哈希 + OsString 比较），
-        // 而 `execute_body` 是解释器最热的函数 —— `System.initPhase1` 一项就有 9823 次调用。
-        // 缓存成进程级 `OnceLock`，热路径上只剩一次原子读。
-        let trace = *TRACE_ON.get_or_init(|| std::env::var_os("VMLESS_TRACE").is_some());
+        let trace = vm_trace_on();
         // 「卡住时它在哪个方法里」的探针：设了 `VMLESS_HANG_DUMP=<秒>` 后，
         // 解释器每跑约 1600 万条指令就往 stderr 打一次当前 类.方法 描述符@pc。
         // 排查死循环时的唯一入口 —— `VMLESS_TRACE` 打的是每条指令，几秒就把屏刷爆了。
-        let hang_n: u64 = *HANG_US.get_or_init(|| std::env::var_os("VMLESS_HANG_DUMP")
-            .and_then(|v| v.to_string_lossy().parse().ok())
-            .map(|s: f64| (s * 25_000_000.0) as u64)
-            .unwrap_or(0));
+        let hang_n: u64 = hang_hz();
         // 计数器**必须是进程级**的：方法体内是局部量的话，「方法进→native→返回」这种
         // 循环每次调用只有几十条指令，永远到不了阈值 —— 探针就永远不打印。
 
@@ -367,8 +560,6 @@ impl Vm {
         } else {
             None
         };
-        static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        static HANG_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let mut pc = 0usize;
         while pc < body.len() {
             // 让 GC 知道「当前执行到哪条指令」：栈上只多一个 usize，换来的是任何时刻
@@ -1043,7 +1234,7 @@ impl Vm {
                 0xb4 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(&cf, idx)?;
+                    let info = self.site_ref(&cf, idx)?;
                     let obj = frame.pop_i()?;
                     let v = if is_str_handle(obj) {
                         // 字符串堆句柄的字段视图（`ldc "abc"` 的 `value`/`coder`/`hash`）
@@ -1061,7 +1252,7 @@ impl Vm {
                 0xb5 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(&cf, idx)?;
+                    let info = self.site_ref(&cf, idx)?;
                     let value = frame.pop()?;
                     let obj = frame.pop_i()?;
                     if is_str_handle(obj) {
@@ -1194,7 +1385,7 @@ impl Vm {
                 0xb2 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(&cf, idx)?;
+                    let info = self.site_ref(&cf, idx)?;
                     if info.class == "java/lang/System" && info.name == "out" {
                         // 先把 `System` 自己初始化好：`SharedSecrets` 的 `JavaLangAccess`
                         // 就是它 `<clinit>` 里挂上去的（`StringJoiner.toString` 要用）
@@ -1243,14 +1434,14 @@ impl Vm {
                 0xb3 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(&cf, idx)?;
+                    let info = self.site_ref(&cf, idx)?;
                     let value = frame.pop()?;
                     // 写也要落到**声明类**上，并给「用子类名引用」的那把键留镜像
                     let owner = self.static_owner(&info.class, &info.name);
                     self.ensure_init(&owner)?;
                     lk(&self.sh.statics).insert((owner.clone(), info.name.clone()), value);
                     if owner != info.class {
-                        lk(&self.sh.statics).insert((info.class, info.name), value);
+                        lk(&self.sh.statics).insert((info.class.clone(), info.name.clone()), value);
                     }
                 }
                 // invokevirtual / invokeinterface：println 走内建；
@@ -1262,7 +1453,7 @@ impl Vm {
                     if op == 0xb9 {
                         pc += 2; // count + 保留字节
                     }
-                    let info = self.method_ref(&cf, idx)?;
+                    let info = self.site_ref(&cf, idx)?;
                     if Self::is_invoke_api_class(&info.class) {
                         // `java.lang.invoke.*` 的方法在 OpenJDK 里靠 VM 内部原语实现
                         // （`invokeBasic` / `linkToVirtual` / 隐藏类……），执行它们的
@@ -1507,7 +1698,7 @@ impl Vm {
                 0xb7 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(&cf, idx)?;
+                    let info = self.site_ref(&cf, idx)?;
                     let argc = count_args(&info.desc)?;
                     let mut args = Vec::with_capacity(argc + 1);
                     for _ in 0..argc {
@@ -1587,7 +1778,7 @@ impl Vm {
                 0xb8 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.method_ref(&cf, idx)?;
+                    let info = self.site_ref(&cf, idx)?;
                     // `java.lang.invoke` 的静态工厂由 VM 接管 —— **必须在 `<clinit>` 之前**：
                     // 那些类的静态初始化本身就是 VM 内部原语的组合（`MethodType.<clinit>`
                     // 会去碰 `MemberName`），执行它等于把整条 java.lang.invoke 拖进来。

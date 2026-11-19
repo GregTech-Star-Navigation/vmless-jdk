@@ -2,36 +2,39 @@
 
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
-## 0.74.0
+## 0.75.0
 
-**为什么**：启动还要再压一档（上一版 462 ms），并且把「每个方法调用都读环境变量」这个纯浪费去掉。
+**为什么**：真实程序 R1/R3 比 HotSpot 慢 10 倍，而瓶颈不是解释器循环（实测 8.5 ns/字节码，正常水平），
+是**每次 Java 方法调用的固定开销**——`System.initPhase1` 一项就是 9823 次调用。
+
+**先拆分**（`VMLESS_CALLPROF=1`，rdtsc，ns/调用）：`execute_body` 序言共 **1255 ns**，其中
+`var_os("VMLESS_TRACE")` 287 + `var_os("VMLESS_HANG_DUMP")` 294 = **581（46%）**；
+`place_args` 285（每次重算 param_slots + clone 槽位表 = 2 次分配）；`Frame::new` 119；其余 ~200。
 
 **改了什么**
 
-- **类表二进制缓存（CDS 思路）**：`src/load/cds.rs`（新）。缓存 `%TEMP%/vmless-cds/<指纹>.bin`，
-  存**原始类字节** + 每类的「被引用类下标」表。装载改成「纯 id 图走完闭包 → 一次性取字节 →
-  一次性解析」，闭包阶段零字符串分配、不扫常量池。指纹 = VM 版本 + 格式版本 + 每个来源的
-  (path, mtime, len)；坏/不符/读失败一律**静默重建**；写临时文件再 rename。
-  `VMLESS_CDS=0` 可关。
-  **故意不存解析后的结构**：它是字节的 2.5 倍（27MB→60MB），反序列化要逐字段重建
-  String/Vec，与重新 parse 同量级，还会多一种「漏字段 = 静默语义错」的风险。
-- **方法表键 `(String,String,String)` → u64 散列 + 命中后逐字节验**（碰撞退化本类线性扫）：
-  建表快一半、省 10 MB。
-- **解析完立刻 drop 原始字节**（峰值 −22 MB）。
-- **`VMLESS_TRACE` / `VMLESS_HANG_DUMP` 用 `OnceLock` 缓存**：Windows 上 `var_os` 是
-  全局 Mutex + 哈希 + OsString 比较，约 **295 ns/次**，而它们在 `execute_body` 序言里、
-  每次 Java 调用都读一次（`System.initPhase1` 一项就有 9823 次调用）。
+- **环境变量提到 `OnceLock`**：−560 ns/调用（Windows 上 `var_os` 是全局 Mutex + 哈希 + OsString 比较，约 295 ns/次）。
+- **`CodeMeta` 缓存**（按 `(ClassFile, 方法)`）：把「线性扫常量池找 `Code`」+ 异常表 + 引用位图
+  从每次调用变成一次。
+- **`ARG_SITE` 参数槽表 + `copy_from_slice` 落位**：285 → 10 ns。
+- **`SITE_REFS` 方法引用解析缓存**：每次 `invoke` 省 3 次 `String` 分配。
+- **`NAT_SITE` native 派发缓存**：645 → **85 ns/次**（JNI 跳板不缓存）。
+- `frame.rs::place_args_slots`：落位规则搬到 `Frame`，`exec` 与 `native_reg` 共用。
 
-**结果**：hello 启动 **479 → 343 ms**（n=5，[343..356]）；hello 峰值 RSS 105.6 → **86.4 MB**。
+**结果**：MCall 每调用 **2350 → 1630 ns**；Mb4 `toString` 654→456 ms、`concat` 2200→1546 ms。
 
-**一条被修正的判断**（推翻上一版 CHANGELOG 里的说法）：85 MB 的 RSS **确实是类表** ——
-进程内探针实测「进 main 4.8 → 解析完 64.8 → 建表完 89.6 → initPhase1 完 105.2」，
-eden 只占 ~15 MB。上一版「独立模式 111.9 MB 所以不是类表」的结论是因为那次
-`VMLESS_JDK=` 空值仍然落回了默认 jimage。再往下压需要「按需解析」或改 `CpEntry` 表示。
+**两条「缓存改变了语义」的红线**（二分到底，都回退了，写在这里防止后人重犯）
 
-**踩到的坑**（写进注释）：Windows 上**同步句柄的 `ReadFile` 会忽略 `OVERLAPPED` 偏移**，
-`seek_read` 会静默退化成「从当前游标读」，症状是「索引读出来全是 `ca fe ba be`」——
-定位读必须用 `FILE_FLAG_OVERLAPPED` 打开。
+1. **按调用点缓存 `new` 的 `field_count`（nslots）→ `System.out` 变 null**（H.class 20/20 全红）。
+   并行类加载下「类在表里」**不等于**「布局已定稿」，第一次读到的槽数不能当永久答案。
+2. **帧的 locals/stack 缓冲区池化 → `Str1` 偶发丢根**（20 次里 1 次）。GC 的保守栈扫描
+   （`scan_stack_range` + `conservative_frame`）依赖**栈上残留的指针**，复用缓冲区就改变了它看到的根集。
+
+**可安全缓存的**：只读且来自 class 文件的东西 —— 字节码位置/异常表、引用位图、参数槽表、
+native 的 fn 指针、常量池引用的解析结果。
+
+**验证**：GC_STRESS 下 8 个样例 × 15 次 = 120/120；真程序 5/5；Cas1/Mt1/Mx 各 20/20；
+`cargo test` 124 passed；JIT 不退化（P1 18 / P2 64.7 / R4-JIT 22.0 ms）。
 
 
 ## 0.70.0
