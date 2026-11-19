@@ -89,7 +89,32 @@ impl ClassSource {
     }
 }
 
-/// 按顺序排好的类来源列表 = classpath。
+/// 并行读一批 (下标, 路径)，成功的结果直接写进 `out[下标]`。
+///
+/// 读不到（不存在 / 权限 / 名字非法）就留 `None` —— 调用方自己决定是重试还是当「没有」。
+fn read_parallel(jobs: &[(usize, PathBuf)], out: &mut [Option<Vec<u8>>], threads: usize) {
+    if jobs.is_empty() {
+        return;
+    }
+    let chunk = jobs.len().div_ceil(threads.max(1)).max(1);
+    std::thread::scope(|s| {
+        let mut hs = Vec::new();
+        for part in jobs.chunks(chunk) {
+            hs.push(s.spawn(move || {
+                part.iter().map(|(i, p)| (*i, std::fs::read(p).ok())).collect::<Vec<_>>()
+            }));
+        }
+        for h in hs {
+            for (i, bytes) in h.join().unwrap_or_default() {
+                if let Some(b) = bytes {
+                    out[i] = Some(b);
+                }
+            }
+        }
+    });
+}
+
+
 #[derive(Debug, Default)]
 pub struct ClassPath {
     entries: Vec<(PathBuf, ClassSource)>,
@@ -292,6 +317,143 @@ impl ClassPath {
             requester_class,
             target,
         )
+    }
+
+    /// 批量取字节：返回顺序与入参一致，`None` = classpath 里没有这个类。
+    ///
+    /// 为什么要批量：启动时闭包是**按层**展开的（见 `vm::ClassStore::load_path`），
+    /// 一层的名字一次性拿到。单个文件的打开成本在这台机上有 **57 µs**（带外监视器扫
+    /// 每个 open），5421 个类串行读就是 300 ms —— 而 8 线程能把同样的读压到 ~8 µs/文件。
+    /// 所以只要「同层」的读并行起来，启动的 I/O 就从 O(类数) 掉到 O(层数) 量级。
+    ///
+    /// 语义与 `find` 一致，只有两点不同：
+    /// - **不写 `cache`**：预取的字节马上被 `parse` 吃掉，留着只是白占几十 MB 内存；
+    /// - 只有「全是目录来源」时才并行（目录来源是无状态的读盘）；jar/jimage 来源有
+    ///   内部状态，退回逐个 `find`。
+    ///
+    /// 批量取字节：返回顺序与入参一致，`None` = classpath 里没有这个类。
+    ///
+    /// 为什么要批量：启动时闭包是**按层**展开的（见 `vm::ClassStore::load_path`），
+    /// 一层的名字一次性拿到。单个文件的打开成本在这台机上 **~57 µs**（带外监视器扫每个
+    /// open），5421 个类串行读就是 300 ms —— 而并行后同样的读是 ~8 µs/文件。
+    /// 于是启动的 I/O 从 O(类数) 掉到 O(类数/线程数)。
+    ///
+    /// 语义与 `find` 一致，只有两点不同：
+    /// - **不写 `cache`**：预取的字节马上被 `parse` 吃掉，留着只是白占几十 MB 内存；
+    /// - 只有「全是目录来源」时才并行（目录来源是无状态的读盘）；jar/jimage 来源有
+    ///   内部状态，退回逐个 `find`。
+    ///
+    /// 分四步（每一步都是并行的）：
+    /// 1. 包提示（`pkg_hint`）命中的名字 → 直接算路径并行读；
+    /// 2. 没命中的 → **按包去重**，每个包只派一个代表去探「这个包在哪个来源里」；
+    ///    去重很关键：一层的 143 个新名字可能只属于 40 个包，不去重就是 3 倍白探；
+    /// 3. 包定位到了的名字 → 再并行读一轮；
+    /// 4. 剩下的（包根本不存在 / jar、jimage 来源）→ 逐个 `find`。
+    pub fn find_many(&self, names: &[String]) -> Vec<Option<Vec<u8>>> {
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; names.len()];
+        if names.is_empty() {
+            return out;
+        }
+        let all_dir = self.entries.iter().all(|(_, s)| matches!(s, ClassSource::Dir(_)));
+        if !all_dir {
+            for (i, n) in names.iter().enumerate() {
+                out[i] = self.find(n).ok().flatten();
+            }
+            return out;
+        }
+        // 线程数按**工作量**给：小层（<16 个名字）单线程，省掉线程创建
+        let threads_for = |n: usize| -> usize {
+            let hw = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1).min(16);
+            if n < 16 {
+                1
+            } else {
+                (n / 16).min(hw).max(1)
+            }
+        };
+        let use_hint = self.module_tree && pkg_hint_enabled();
+        fn pkg_of(n: &str) -> &str {
+            n.rsplit_once('/').map(|(p, _)| p).unwrap_or("")
+        }
+        let path_in = |si: usize, name: &str| -> PathBuf {
+            self.entries[si].0.join(to_entry(name).replace('/', std::path::MAIN_SEPARATOR_STR))
+        };
+
+        // ---- 1) 有提示的：并行读 ----
+        let mut unknown: Vec<usize> = Vec::new();
+        let mut jobs: Vec<(usize, PathBuf)> = Vec::new();
+        {
+            let hints = self.pkg_hint.borrow();
+            for (i, name) in names.iter().enumerate() {
+                match hints.get(pkg_of(name)).copied().filter(|_| use_hint) {
+                    Some(h) => jobs.push((i, path_in(h, name))),
+                    None => unknown.push(i),
+                }
+            }
+        }
+        read_parallel(&jobs, &mut out, threads_for(jobs.len()));
+
+        // ---- 2) 没命中的：按包去重，每个包探一次 ----
+        let mut pending: Vec<usize> = Vec::new();
+        if !unknown.is_empty() {
+            let mut rep_of: std::collections::HashMap<&str, usize> = std::collections::HashMap::new();
+            for &i in &unknown {
+                rep_of.entry(pkg_of(&names[i])).or_insert(i);
+            }
+            let reps: Vec<usize> = rep_of.values().copied().collect();
+            let nsrc = self.entries.len();
+            let roots: Vec<&Path> = self.entries.iter().map(|(p, _)| p.as_path()).collect();
+            let chunk = reps.len().div_ceil(threads_for(reps.len())).max(1);
+            let mut hit: Vec<(usize, usize)> = Vec::new(); // (name 下标, 来源下标)
+            std::thread::scope(|s| {
+                let mut hs = Vec::new();
+                for part in reps.chunks(chunk) {
+                    let roots = &roots;
+                    hs.push(s.spawn(move || {
+                        let mut got: Vec<(usize, usize)> = Vec::new();
+                        for &i in part {
+                            let ent = to_entry(&names[i]).replace('/', std::path::MAIN_SEPARATOR_STR);
+                            for si in 0..nsrc {
+                                PROBES.fetch_add(1, Ordering::Relaxed);
+                                match std::fs::metadata(roots[si].join(&ent)) {
+                                    Ok(m) if m.is_file() => {
+                                        got.push((i, si));
+                                        break;
+                                    }
+                                    _ => {}
+                                }
+                            }
+                        }
+                        got
+                    }));
+                }
+                for h in hs {
+                    if let Ok(got) = h.join() {
+                        hit.extend(got);
+                    }
+                }
+            });
+            // 回填提示 + 把这些包里剩下的名字排进第二轮读
+            {
+                let mut hints = self.pkg_hint.borrow_mut();
+                for (i, si) in &hit {
+                    hints.insert(pkg_of(&names[*i]).to_string(), *si);
+                }
+            }
+            let mut second: Vec<(usize, PathBuf)> = Vec::new();
+            for &i in &unknown {
+                match self.pkg_hint.borrow().get(pkg_of(&names[i])).copied() {
+                    Some(h) => second.push((i, path_in(h, &names[i]))),
+                    None => pending.push(i), // 包不存在（或非目录来源语义）→ 交给 `find`
+                }
+            }
+            read_parallel(&second, &mut out, threads_for(second.len()));
+        }
+
+        // ---- 3) 剩下的走正常查找（会建包提示 / 处理 jar、jimage 与多来源）----
+        for i in pending {
+            out[i] = self.find(&names[i]).ok().flatten();
+        }
+        out
     }
 
     /// 哪个来源提供的这个类（诊断用）

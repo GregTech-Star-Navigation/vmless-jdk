@@ -55,6 +55,35 @@ pub use bridge::{
 };
 pub use slot::Slot;
 pub use verify::verify_class;
+
+// ------------------------------------------------------- 启动耗时探针（VMLESS_PROF=1）
+
+
+
+static PROF_LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+static PROF_T0: Mutex<Option<std::time::Instant>> = Mutex::new(None);
+
+/// 启动耗时探针：`VMLESS_PROF=1` 时把「距上一次打点」的毫秒数打到 stderr。
+///
+/// 只用于把 950ms 拆开 —— 关掉时只多一次 `var_os`，不改变任何行为。
+pub fn prof(label: &str) {
+    if std::env::var_os("VMLESS_PROF").is_none() {
+        return;
+    }
+    let now = std::time::Instant::now();
+    let mut last = PROF_LAST.lock().unwrap_or_else(|e| e.into_inner());
+    let mut t0 = PROF_T0.lock().unwrap_or_else(|e| e.into_inner());
+    if t0.is_none() {
+        *t0 = Some(now);
+        eprintln!("[prof] {:>7.1} ms | {label}", 0.0);
+        *last = Some(now);
+        return;
+    }
+    let d = last.map(|l| (now - l).as_secs_f64() * 1000.0).unwrap_or(0.0);
+    let total = (now - t0.unwrap()).as_secs_f64() * 1000.0;
+    eprintln!("[prof] {:>7.1} ms | {label}   (累计 {total:.1})", d);
+    *last = Some(now);
+}
 pub(crate) use class::builtin_super;
 use load::ClassStore;
 use shared::Shared;
@@ -337,6 +366,7 @@ impl Vm {
         // 「owner=0 之外没人认识」的锁，紧接着 `monitorexit` 就报
         // `IllegalMonitorStateException: current thread is not owner`，
         // 于是**任何 main 类继承 AWT（或任何 `<clinit>` 里加锁的类）都挂在类初始化**。
+        prof("run_main_inner 进入（找 main 方法后）");
         thread::set_main_tid();
         self.sh.safepoint.register();
         self.thread_register(1, 0, "main", false);
@@ -379,6 +409,7 @@ impl Vm {
         // 那段被跳过 → `AccessibleObject.<clinit>` 才装 secret，但 `ReflectionFactory` 单例
         // 已经在它之前构造完并缓存了 null）。
         let _ = self.ensure_class_loaded("java/lang/reflect/ReflectAccess");
+        prof("ensure_class_loaded(ReflectAccess)");
         if self.store.has_class("java/lang/reflect/ReflectAccess") {
             let key = ("jdk/internal/access/SharedSecrets".to_string(),
                        "javaLangReflectAccess".to_string());
@@ -407,6 +438,7 @@ impl Vm {
                 .as_i32();
             eprintln!("[init] 预初始化后 javaLangReflectAccess={sec}");
         }
+        prof("pre-init AccessibleObject+ReflectionFactory");
         if self.store.resolve_method("java/lang/System", "initPhase1", "()V").is_some() {
             self.ensure_init("java/lang/System")?;
             // `System.props` 必须在 initPhase1 **之前**就位：initPhase1 一开始注册
@@ -416,6 +448,7 @@ impl Vm {
             // props 为 null 时这条路要么静默给 null、要么 NPE 把整个 initPhase1 掐断
             // （后果：`System.out` 永远是 null）。
             self.init_system_props();
+            prof("init_system_props（Properties 对象 + 7 条属性）");
             if let Some((ci, mi)) = self.store.resolve_method("java/lang/System", "initPhase1", "()V") {
                 // `initPhase1` 里 `setOut0/setErr0/setIn0` 一旦没跑到，`System.out` 就是 null ——
                 // 而 `println` 被 `exec` 按方法名拦截，所以**从 println 看不出来**，
@@ -472,7 +505,9 @@ impl Vm {
             .heap
             .new_array(argv, "[Ljava/lang/String;")
             .unwrap_or(0);
+        prof("System.initPhase1 完成");
         let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(args_arr)], false);
+        prof("main 执行完毕");
         // `VMLESS_WDN_TRACE=1`：把 main 的结局**先**打出来。`wait_non_daemon()` 可能挂死
         // （非 daemon 线程退出不了），而 main 的异常文本原本要等它返回之后才由调用方打印 ——
         // 一挂死就永远看不到「main 到底抛了什么」。这个开关就是给那种场景用的。
@@ -553,6 +588,19 @@ impl Vm {
         self.store.class_names()
     }
 
+    /// 运行期已加载的类数（诊断用）。
+    ///
+    /// 与 `loaded_classes().len()` 的区别是**不排序、不建 Vec**：5421 个名字排序一次
+    /// 在这台机上是 12 ms，调用方一句诊断打印就白付一次。
+    pub fn loaded_class_count(&self) -> usize {
+        self.store.classes.len()
+    }
+
+    /// 某个类是否已经在类表里（诊断用；不触发加载）
+    pub fn has_class_loaded(&self, name: &str) -> bool {
+        self.store.has_class(name)
+    }
+
     /// 填 `System.props`（只做一次；已经有就不动）。
     ///
     /// 走**真 `Properties.put`**：`Properties` 的键值实际存在 `Hashtable.table` 里，
@@ -620,7 +668,9 @@ impl Vm {
     /// **字符串**里的类闭包根本看不见。症状是 `java2d` 起不来
     /// （`InternalError: No RenderingEngine module found`）、`AWT` 建窗失败。
     pub(crate) fn from_cp(cp: crate::load::ClassPath, main: &str) -> Result<Self, VmError> {
+        prof("classpath 就绪");
         let mut vm = Self::from_store(ClassStore::load_path(&cp, main)?);
+        prof("ClassStore::load_path 完成");
         // classpath 留着：`Class.forName` 要在运行期按需加载闭包（见 `reflect.rs`）
         *vm.sh.cp.lock().unwrap_or_else(|e| e.into_inner()) = Some(cp);
         Ok(vm)

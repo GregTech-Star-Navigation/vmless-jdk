@@ -19,6 +19,7 @@
 const DEFAULT_JDK: &str = r"C:\Program Files\Eclipse Adoptium\jdk-25.0.4.101-hotspot\lib\modules";
 
 fn main() {
+    classfile::vm::prof("run_jdk 进入 main");
     let args: Vec<String> =
         classfile::vm::take_property_args(&std::env::args().skip(1).collect::<Vec<_>>());
     let jdk = std::env::var("VMLESS_JDK").unwrap_or_else(|_| DEFAULT_JDK.to_string());
@@ -62,6 +63,7 @@ fn main() {
     let spec = format!("{dir}");
     // 命令行参数（`run_jdk <dir> <Main> a b c` 的 a b c）
     classfile::vm::set_main_args(args.iter().skip(2).cloned().collect());
+    classfile::vm::prof("参数解析完成");
     let t_open = std::time::Instant::now();
 
     let mut vm = match classfile::vm::Vm::open(&spec, main_class) {
@@ -71,13 +73,14 @@ fn main() {
             std::process::exit(1);
         }
     };
+    classfile::vm::prof("Vm::open 返回");
     println!("java.base: {jdk}");
     // 类表是**按需**长的：这里只报「已经解析进内存」的类数，别让人误以为启动就把
     // java.base 全读进来了（以前那句话是「类表: 5421 个类」，那确实是全读了）。
     println!(
-        "类表: 已加载 {} 个类（按需加载；含 java.lang.Object = {}）",
-        vm.loaded_classes().len(),
-        vm.loaded_classes().iter().any(|c| c == "java/lang/Object")
+        "类表: 已加载 {} 个类（含 java.lang.Object = {}）",
+        vm.loaded_class_count(),
+        vm.has_class_loaded("java/lang/Object")
     );
     if std::env::var_os("VMLESS_CP_STATS").is_some() {
         eprintln!("[cp] Vm::open {} ms", t_open.elapsed().as_millis());
@@ -101,8 +104,9 @@ fn main() {
     }
     let missing = vm.missing_natives();
     if std::env::var_os("VMLESS_CP_STATS").is_some() {
-        eprintln!("[cp] 运行结束时已加载 {} 个类", vm.loaded_classes().len());
+        eprintln!("[cp] 运行结束时已加载 {} 个类", vm.loaded_class_count());
     }
+
     if missing.is_empty() {
         println!("缺 native: 0");
     } else {
