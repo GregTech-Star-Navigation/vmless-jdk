@@ -60,13 +60,25 @@ VMLESS_JDK=<jdk/lib/modules>  # 指定后，java.base 走 OpenJDK 自己的字�
 
 ### 还没做到的
 
+> 这一节 2026-11-20 重新核对过（旧版停在 11-18，五项里已有四项做完）。
+
 | 缺口 | 说明 |
 | --- | --- |
-| **帧栈模型** | 没有 → `Thread.getStackTrace` / `StackWalker` 给不出帧，死锁只能看监视器图 |
-| **`Condition.await/signal`** | `ReentrantLock`/`CountDownLatch`/`Semaphore` 已通，这一条还挂 |
-| **`drawString`** | JDK 25 走 HarfBuzz/FFM；AWT 真窗口代码写了但起不来 |
-| **自研 javac 剩 26.1%** | 144 个长尾桶，最大的是「未找到实例方法」242 次 |
-| FFM / `Continuation` / 内存映射文件 | 明确抛异常，不装能跑 |
+| **自研 javac 产出的 class 有 11% 过不了真 JVM 验证器** | 425 个抽样类里 46 个被 `-Xverify:all` 拒载（栈图/帧生成）。这是「生产级」的最后一关 |
+| **自研 javac 编 `java.base` 85.2%** | 剩 436 编译失败 + 65 解析失败，长尾：泛型返回不代回、非匿名内层类的 `this$0`、`case Type var ->`、`record` |
+| **`drawString` 与 HotSpot 逐像素不一致** | 窗口和绘制都通了（GDI 接管），但 JDK 25 的字体栈走 HarfBuzz/FFM，字形栅格化结果与 HotSpot 不同 |
+| **FFM（`java.lang.foreign`）** | 本机无 libffi，`LibFallback.doDowncall` 明确报错 |
+| **`Continuation` / 虚拟线程** | 虚拟线程用平台线程顶（语义等价），`Continuation` 明确抛 UOE |
+| **attach 服务端未接** | `jstack`/`jmap`/`jstat`/`jcmd` 对真 HotSpot 进程可用（读真 hsperfdata），对自己 `rustjava` 进程还不行 |
+
+**已经做完的**（旧版列在这里，现在全部达成）：
+
+| 原缺口 | 现状 |
+| --- | --- |
+| 帧栈模型 | ✅ `Thread.getStackTrace` / `StackWalker` / 死锁报告 / 未捕获异常栈，与 HotSpot 逐字节一致 |
+| `Condition.await/signal` | ✅ 根因是 `thread_unpark` 的 MutexGuard 自死锁，修好后全通 |
+| AWT 真窗口 | ✅ 真实 Win32 窗口，客户区能画矩形/文字/空心框（`awtE/evidence/screen_z7.png`） |
+| 内存映射文件 | ✅ `FileChannel.map` / `MappedMemoryUtils` 全通，与 java 逐字节一致 |
 
 详见 [docs/状态.md](docs/状态.md)。
 
