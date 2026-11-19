@@ -28,7 +28,7 @@ pub struct BootstrapMethod {
 /// `u2 num_bootstrap_methods` + 每项 `u2 method_ref + u2 num_args + u2 args[num_args]`。
 pub fn bootstrap_methods(cf: &ClassFile) -> Result<Vec<BootstrapMethod>> {
     let name = cf.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
-        Some(CpEntry::Utf8(b)) if b == b"BootstrapMethods" => Some(i as u16),
+        Some(CpEntry::Utf8(..)) if cf.utf8(i as u16) == Some(&b"BootstrapMethods"[..]) => Some(i as u16),
         _ => None,
     });
     let Some(name) = name else { return Ok(Vec::new()) };
@@ -163,7 +163,7 @@ fn utf8_at(cf: &ClassFile, idx: u16) -> Option<String> {
 
 fn attr_body<'a>(cf: &'a ClassFile, name: &str) -> Option<&'a [u8]> {
     let name_index = cf.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
-        Some(CpEntry::Utf8(b)) if b == name.as_bytes() => Some(i as u16),
+        Some(CpEntry::Utf8(..)) if cf.utf8(i as u16) == Some(name.as_bytes()) => Some(i as u16),
         _ => None,
     })?;
     cf.attributes.iter().find(|a| a.name_index == name_index).map(|a| a.info.as_slice())

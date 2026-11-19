@@ -1873,15 +1873,42 @@ mod tests {
     use super::*;
     use crate::CpEntry;
 
+    use std::cell::RefCell;
+    thread_local! {
+        /// 测试里 `u(b"…")` 存字面量的地方：`cf_with` 建 arena 时取走（每个测试线程各自一份）
+        static LETTERS: RefCell<Vec<&'static [u8]>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// 测试里的 Utf8 字面量：字节记在 `LETTERS`，这里只给一个**临时下标**，
+    /// `cf_with` 建好 arena 后再换成真实 `(off, len)`
+    fn u(b: &'static [u8]) -> CpEntry {
+        LETTERS.with(|l| {
+            let mut l = l.borrow_mut();
+            l.push(b);
+            CpEntry::Utf8((l.len() - 1) as u32, b.len() as u32)
+        })
+    }
+
     fn cf_with(cp: Vec<CpEntry>) -> ClassFile {
+        let mut pool = crate::classfile::Utf8Builder::new();
+        let items = LETTERS.with(|l| std::mem::take(&mut *l.borrow_mut()));
+        let offs: Vec<(u32, u32)> = items.iter().map(|b| pool.intern(b)).collect();
         let mut constant_pool: Vec<Option<CpEntry>> = vec![None];
         for e in cp {
+            let e = match e {
+                CpEntry::Utf8(i, _) => {
+                    let (o, n) = offs[i as usize];
+                    CpEntry::Utf8(o, n)
+                }
+                other => other,
+            };
             constant_pool.push(Some(e));
         }
         ClassFile {
             minor_version: 0,
             major_version: 52,
             constant_pool,
+            utf8: std::sync::Arc::new(pool.freeze()),
             access_flags: 0,
             this_class: 0,
             super_class: 0,
@@ -1947,10 +1974,10 @@ mod tests {
         // cp: 1=Utf8 "o", 2=Utf8 "Ljava/lang/Object;", 3=Utf8 "n", 4=Utf8 "I",
         //     5=NameAndType(1,2), 6=NameAndType(3,4), 7=FieldRef(0,5), 8=FieldRef(0,6)
         let cf = cf_with(vec![
-            CpEntry::Utf8(b"o".to_vec()),
-            CpEntry::Utf8(b"Ljava/lang/Object;".to_vec()),
-            CpEntry::Utf8(b"n".to_vec()),
-            CpEntry::Utf8(b"I".to_vec()),
+            u(b"o"),
+            u(b"Ljava/lang/Object;"),
+            u(b"n"),
+            u(b"I"),
             CpEntry::NameAndType(1, 2),
             CpEntry::NameAndType(3, 4),
             CpEntry::FieldRef(0, 5),
@@ -1981,9 +2008,9 @@ mod tests {
         // cp: 1=Utf8 "m", 2=Utf8 "(I)Ljava/lang/String;", 3=Utf8 "hello",
         //     4=NameAndType(1,2), 5=MethodRef(0,4), 6=String(3)
         let cf = cf_with(vec![
-            CpEntry::Utf8(b"m".to_vec()),
-            CpEntry::Utf8(b"(I)Ljava/lang/String;".to_vec()),
-            CpEntry::Utf8(b"hello".to_vec()),
+            u(b"m"),
+            u(b"(I)Ljava/lang/String;"),
+            u(b"hello"),
             CpEntry::NameAndType(1, 2),
             CpEntry::MethodRef(0, 4),
             CpEntry::String(3),
@@ -2032,8 +2059,8 @@ mod tests {
     fn bitmap_handler_entry() {
         // cp: 1=Utf8 "m", 2=Utf8 "()V", 3=NameAndType(1,2), 4=MethodRef(0,3)
         let cf = cf_with(vec![
-            CpEntry::Utf8(b"m".to_vec()),
-            CpEntry::Utf8(b"()V".to_vec()),
+            u(b"m"),
+            u(b"()V"),
             CpEntry::NameAndType(1, 2),
             CpEntry::MethodRef(0, 3),
         ]);

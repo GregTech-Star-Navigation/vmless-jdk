@@ -1404,10 +1404,7 @@ impl Vm {
     /// `getDeclaringClass0()` / `getSimpleBinaryName0()` 用的 `InnerClasses` 解析
     fn inner_class_entry(&self, class: &str) -> Option<(u16, u16, u16)> {
         let cf = self.cf_of(class)?;
-        let ic_name = cf.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
-            Some(CpEntry::Utf8(b)) if b == b"InnerClasses" => Some(i as u16),
-            _ => None,
-        })?;
+        let ic_name = cf.utf8_index(b"InnerClasses")?;
         let attr = cf.attributes.iter().find(|a| a.name_index == ic_name)?;
         let info = &attr.info;
         if info.len() < 2 {

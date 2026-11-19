@@ -624,12 +624,13 @@ pub(crate) fn compile_type(
     let bsm = cp.take_bootstrap();
     // BootstrapMethods 属性要在常量池还没被交出去之前登记它的名字
     let bsm_attr = bootstrap_attribute(&mut cp, &bsm);
-    let cp_entries = fix_self_refs(cp, &self_name);
+    let (cp_entries, utf8) = fix_self_refs(cp, &self_name);
 
     let cf = ClassFile {
         minor_version: 0,
         major_version: 69,
         constant_pool: cp_entries,
+        utf8,
         // 接口：public interface abstract，且**不能**带 ACC_SUPER
         access_flags: {
             let m = &t.modifiers;
@@ -715,19 +716,20 @@ fn bootstrap_attribute(cp: &mut CpBuilder, bsm: &[(u16, Vec<u16>)]) -> Option<cr
 }
 
 /// 做法简单：追加一个真实类名 Utf8，并把 MethodRef 的 class_index 指过去。
-pub(crate) fn fix_self_refs(cp: CpBuilder, self_name: &str) -> Vec<Option<CpEntry>> {
-    let mut entries = cp.entries();
+pub(crate) fn fix_self_refs(
+    mut cp: CpBuilder,
+    self_name: &str,
+) -> (Vec<Option<CpEntry>>, std::sync::Arc<crate::classfile::Utf8Arena>) {
+    let entries = cp.snapshot();
     // 找 <SELF> 的 Utf8 索引
     let mut self_utf8 = None;
-    for (i, e) in entries.iter().enumerate() {
-        if let Some(CpEntry::Utf8(b)) = e {
-            if b == b"<SELF>" {
-                self_utf8 = Some(i as u16);
-            }
+    for i in 1..entries.len() {
+        if cp.utf8_at(i as u16) == Some(&b"<SELF>"[..]) {
+            self_utf8 = Some(i as u16);
         }
     }
     let Some(self_utf8) = self_utf8 else {
-        return entries;
+        return cp.finish();
     };
     // 找指向它的 Class 项
     let mut self_class = None;
@@ -738,22 +740,19 @@ pub(crate) fn fix_self_refs(cp: CpBuilder, self_name: &str) -> Vec<Option<CpEntr
             }
         }
     }
-    // 追加真实类名
-    let real_utf8 = entries.len() as u16;
-    entries.push(Some(CpEntry::Utf8(self_name.as_bytes().to_vec())));
-    let real_class = entries.len() as u16;
-    entries.push(Some(CpEntry::Class(real_utf8)));
-    let _ = self_class;
+    // 追加真实类名（字节进同一个 arena，索引由 builder 给），再追加指向它的 Class 项
+    let real_utf8 = cp.push_utf8(self_name.as_bytes());
+    let real_class = cp.push(CpEntry::Class(real_utf8));
+    let (mut entries, arena) = cp.finish();
     // 所有 MethodRef 的 class 指向占位类的，改指真实类
     for e in entries.iter_mut() {
-        if let Some(CpEntry::MethodRef(c, nt)) = e {
+        if let Some(CpEntry::MethodRef(c, _nt)) = e {
             if Some(*c) == self_class {
                 *c = real_class;
             }
-            let _ = nt;
         }
     }
-    entries
+    (entries, arena)
 }
 
 

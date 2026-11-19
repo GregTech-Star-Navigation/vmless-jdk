@@ -12,7 +12,7 @@ pub fn write(cf: &ClassFile) -> Vec<u8> {
     out.extend_from_slice(&(cf.constant_pool.len() as u16).to_be_bytes());
     for entry in cf.constant_pool.iter().skip(1) {
         if let Some(e) = entry {
-            write_cp(&mut out, e);
+            write_cp(&mut out, e, &cf.utf8);
         }
     }
     out.extend_from_slice(&cf.access_flags.to_be_bytes());

@@ -2184,10 +2184,7 @@ pub(super) fn code_of<'a>(
     cf: &crate::ClassFile,
     m: &'a crate::Member,
 ) -> Result<(usize, &'a [u8], Vec<(u16, u16, u16, u16)>), VmError> {
-    let code_name = cf.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
-        Some(CpEntry::Utf8(b)) if b == b"Code" => Some(i as u16),
-        _ => None,
-    });
+    let code_name = cf.utf8_index(b"Code");
     let code_name = match code_name {
         Some(c) => c,
         None => return err("常量池里没有 Code"),

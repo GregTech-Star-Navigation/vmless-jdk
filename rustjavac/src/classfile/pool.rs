@@ -3,11 +3,12 @@
 //! 写回的一半（`write_cp`）在这里；读的一半仍是 `read::parse` 里的 tag 分派 ——
 //! 拆出函数体属于逻辑改动，本轮不动。
 
-use super::CpEntry;
+use super::{CpEntry, Utf8Arena};
 
-pub(crate) fn write_cp(out: &mut Vec<u8>, e: &CpEntry) {
+pub(crate) fn write_cp(out: &mut Vec<u8>, e: &CpEntry, arena: &Utf8Arena) {
     match e {
-        CpEntry::Utf8(b) => {
+        CpEntry::Utf8(off, len) => {
+            let b = arena.get(*off, *len);
             out.push(1);
             out.extend_from_slice(&(b.len() as u16).to_be_bytes());
             out.extend_from_slice(b);

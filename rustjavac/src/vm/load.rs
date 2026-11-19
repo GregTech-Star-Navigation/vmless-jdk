@@ -108,14 +108,177 @@ fn super_of_of(classes: &[Arc<ClassFile>], by_name: &HashMap<String, usize>, cla
     builtin_super(class).map(|s| s.to_string())
 }
 
-/// **闭包里要不要拉 `java.*`**：以前一律排除（那时 java.* 全靠 `natives` 写死）。
+/// 一个批次的产出：解析好的类（按原顺序）+ 两段耗时（诊断用）。
+struct BatchOut {
+    files: Vec<ClassFile>,
+    read_ms: f64,
+    parse_ms: f64,
+}
+
+/// **一批**的「取字节 + 解析」。`ids` 与 `names` 二选一：
+/// 前者走类表缓存（`cds`），后者走 classpath。
 ///
-/// 现在反过来 —— 只要 classpath 里真有 `java/lang/Object`（也就是把 jimage / 解包目录
-/// 放进了 classpath，见 `VMLESS_JDK`），就**整条 `java.*` 都拉进来**，让真字节码优先执行。
-/// 否则（只给了一个 .class 的独立模式）仍然只拉用户自己的类，`java.*` 继续由内建兜。
+/// 两个反直觉的取舍都在这里：
 ///
-/// 判据只能是「java.base 到底在不在」，不能是「这个类长得像不像 JDK 的」：前者是事实，
-/// 后者是猜。猜错的后果就是「真字节码被静默跳过」——那等于什么都没做。
+/// 1. **不先把整批字节读进来再解析**。老路径把 5421 个类的字节（27 MB）全读进来再统一解析，
+///    于是「字节」与「解析出来的结构」同时存活 —— 那 27 MB 就是启动峰值的一部分。
+///    这里每个类**读完立刻解析、解析完立刻丢字节**，任一时刻在飞的字节只有
+///    「线程数 × 一个类」（≈ 100 KB）。
+/// 2. **不每批重新 spawn 线程**。按批 spawn 看起来更整齐，实测解析段反而慢 10 ms
+///    （11 批 × 16 线程 ≈ 176 次线程创建）。线程只开一轮，按类交错读/解析。
+///
+/// 出错返回 `(批内下标, 原因)` —— 批内下标让调用方补上类名（id 段的名字要问缓存要）。
+fn fetch_parse_batch(
+    cds: &crate::load::cds::Cds,
+    cp: &ClassPath,
+    ids: &[u32],
+    names: &[String],
+) -> Result<BatchOut, (usize, String)> {
+    let t = std::time::Instant::now();
+    let n = ids.len() + names.len();
+    // 缓存里没有字节的（主类 / 用户自己的类）先取回来：`data_len == 0` 是纯内存判断，
+    // 不产生 I/O —— 所以这一步多数时候什么也不做，也不占内存（通常 0~1 个类）。
+    let mut pre: Vec<Option<Vec<u8>>> = vec![None; n];
+    {
+        let mut miss_names: Vec<String> = Vec::new();
+        let mut miss_at: Vec<usize> = Vec::new();
+        for (k, &id) in ids.iter().enumerate() {
+            if cds.ents[id as usize].data_len == 0 {
+                miss_at.push(k);
+                miss_names.push(cds.name_of(id as usize).to_string());
+            }
+        }
+        if !miss_names.is_empty() {
+            let got = cp.find_many(&miss_names);
+            for (j, &k) in miss_at.iter().enumerate() {
+                pre[k] = got[j].clone();
+            }
+        }
+        if !names.is_empty() {
+            let got = cp.find_many(names);
+            for (j, b) in got.into_iter().enumerate() {
+                pre[ids.len() + j] = b;
+            }
+        }
+    }
+    let read_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+    let t = std::time::Instant::now();
+    let nthreads = {
+        let hw = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1).min(16);
+        (n / 24).min(hw).max(1)
+    };
+    let mut parsed: Vec<Option<crate::Result<ClassFile>>> = (0..n).map(|_| None).collect();
+    let mut panic_err: Option<String> = None;
+    {
+        let chunk = n.div_ceil(nthreads.max(1)).max(1);
+        let pre: &[Option<Vec<u8>>] = &pre;
+        std::thread::scope(|s| {
+            let mut handles = Vec::new();
+            for start in (0..n).step_by(chunk) {
+                let end = (start + chunk).min(n);
+                handles.push(s.spawn(move || {
+                    let mut out: Vec<Option<crate::Result<ClassFile>>> = Vec::with_capacity(end - start);
+                    // 一块共享一个 Utf8 arena：块内 300+ 个类共用 16 次分配，而不是每类一次
+                    let mut pool = crate::classfile::Utf8Builder::with_capacity((end - start) * 1024);
+                    for k in start..end {
+                        // 读一个、解析一个、立刻放掉字节：任一时刻在飞的字节只有一个类
+                        let r = if let Some(b) = &pre[k] {
+                            Some(crate::parse_in(b.as_slice(), &mut pool))
+                        } else if let Some(&id) = ids.get(k) {
+                            cds.bytes(id as usize).as_deref().map(|b| crate::parse_in(b, &mut pool))
+                        } else {
+                            None
+                        };
+                        out.push(r);
+                    }
+                    // 冻结后回填给块内每个类（`Arc` 共享，读路径不变）
+                    let arena = std::sync::Arc::new(pool.freeze());
+                    for slot in out.iter_mut().flatten() {
+                        if let Ok(cf) = slot {
+                            cf.utf8 = arena.clone();
+                        }
+                    }
+                    (start, out)
+                }));
+            }
+            for h in handles {
+                let got = match h.join() {
+                    Ok(v) => v,
+                    Err(_) => {
+                        panic_err = Some("class 文件解析线程 panic".to_string());
+                        return;
+                    }
+                };
+                let (start, rows) = got;
+                for (j, r) in rows.into_iter().enumerate() {
+                    parsed[start + j] = r;
+                }
+            }
+        });
+    }
+    let parse_ms = t.elapsed().as_secs_f64() * 1000.0;
+    if let Some(msg) = panic_err {
+        return Err((0, msg));
+    }
+    let mut out = Vec::with_capacity(n);
+    for (i, slot) in parsed.into_iter().enumerate() {
+        match slot {
+            // 缓存里没有的类（`None`）跳过，与老路径一致
+            None => {}
+            Some(Ok(cf)) => out.push(cf),
+            Some(Err(e)) => return Err((i, e.to_string())),
+        }
+    }
+    Ok(BatchOut { files: out, read_ms, parse_ms })
+}
+
+/// 诊断：类表结构的**精确记账**（容量口径，不是估算）。`VMLESS_MEM_STATS=1` 时打印。
+///
+/// 为什么按 `capacity()` 记账：`Vec` 的实际占用看的是容量不是长度，而且每个 Utf8 /
+/// 属性 info 都是一次**独立的堆分配**（Windows 堆最小块 16 B、块头 8 B），
+/// 所以「条目数 × 估算长度」会低估一半 —— 这里把两者都打出来，不靠猜。
+fn stats_structures(files: &[ClassFile]) {
+    let cp_ent = std::mem::size_of::<Option<CpEntry>>();
+    let attr_sz = std::mem::size_of::<crate::classfile::Attribute>();
+    let mut cp_slots = 0usize;
+    let mut utf8_n = 0usize;
+    let mut utf8_bytes = 0usize;
+    let mut attr_n = 0usize;
+    let mut attr_info = 0usize;
+    let mut member_n = 0usize;
+    let mut iface_slots = 0usize;
+    for cf in files {
+        cp_slots += cf.constant_pool.capacity();
+        iface_slots += cf.interfaces.capacity();
+        for i in 1..cf.constant_pool.len() {
+            if let Some(b) = cf.utf8(i as u16) {
+                utf8_n += 1;
+                utf8_bytes += b.len();
+            }
+        }
+        for m in cf.methods.iter().chain(cf.fields.iter()) {
+            member_n += 1;
+            for a in &m.attributes {
+                attr_n += 1;
+                attr_info += a.info.len();
+            }
+        }
+        for a in &cf.attributes {
+            attr_n += 1;
+            attr_info += a.info.len();
+        }
+    }
+    eprintln!(
+        "[mem2] 类 {} | ClassFile {} B | CP 槽 {cp_slots} × {cp_ent} = {} KB | \
+         Utf8 {utf8_n} 条 / {utf8_bytes} B（一类一块 arena）| 成员 {member_n} | \
+         属性 {attr_n} × {attr_sz} = {} KB + info {attr_info} B | iface 槽 {iface_slots}",
+        files.len(),
+        files.len() * std::mem::size_of::<ClassFile>(),
+        cp_slots * cp_ent / 1024,
+        attr_n * attr_sz / 1024,
+    );}
+
 fn pull_jdk(jdk_present: bool, name: &str) -> bool {
     jdk_present || !name.starts_with("java/")
 }
@@ -333,8 +496,8 @@ impl ClassStore {
             let mut code_bytes = 0usize;
             for cf in &files {
                 cp_slots += cf.constant_pool.len();
-                for e in cf.constant_pool.iter().flatten() {
-                    if let CpEntry::Utf8(b) = e {
+                for i in 1..cf.constant_pool.len() {
+                    if let Some(b) = cf.utf8(i as u16) {
                         utf8s += 1;
                         utf8_bytes += b.len();
                     }
@@ -363,6 +526,9 @@ impl ClassStore {
         }
         if files.is_empty() {
             return err("没有可执行的 class");
+        }
+        if std::env::var_os("VMLESS_MEM_STATS").is_some() {
+            stats_structures(&files);
         }
         let store = Self::new(files, Some(main_class))?;
         super::prof("ClassStore::new（by_name/methods/build_metas）");
@@ -497,78 +663,44 @@ impl ClassStore {
             t_all.elapsed().as_secs_f64() * 1000.0
         ));
 
-        // ---- 一次性取字节 ----
+        // ---- 分批取字节 + 解析 ----
+        //
+        // **别一次性把 5421 个类的字节全读进来再解析**：那 27 MB 与解析出来的结构
+        // 同时存活，峰值 RSS 就多一大截（实测该步到 85.9 MB）。按批「取 → 解析 → 丢字节」
+        // 让堆复用同一批块，峰值只剩一批的字节。
+        const BATCH: usize = 512;
         let t = std::time::Instant::now();
-        let idxs: Vec<Option<usize>> = order_id.iter().map(|&k| Some(k as usize)).collect();
-        let mut all: Vec<Option<Vec<u8>>> = cds.bytes_many(&idxs);
-        let rest: Vec<usize> = (0..all.len()).filter(|&i| all[i].is_none()).collect();
-        if !rest.is_empty() {
-            let names: Vec<String> = rest.iter().map(|&i| cds.name_of(order_id[i] as usize).to_string()).collect();
-            let got = cp.find_many(&names);
-            for (k, &i) in rest.iter().enumerate() {
-                all[i] = got[k].clone();
-            }
-        }
-        if !order_str.is_empty() {
-            let got = cp.find_many(&order_str);
-            all.extend(got);
-        }
-        let wait_ms = t.elapsed().as_secs_f64() * 1000.0;
-
-        // ---- 一次性解析（一个批次） ----
-        let t = std::time::Instant::now();
-        let nthreads = {
-            let hw = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1).min(16);
-            (all.len() / 24).min(hw).max(1)
-        };
-        let mut parsed: Vec<Option<crate::Result<ClassFile>>> = (0..all.len()).map(|_| None).collect();
-        let mut panic_err: Option<String> = None;
-        {
-            let chunk = all.len().div_ceil(nthreads.max(1)).max(1);
-            std::thread::scope(|s| {
-                let mut handles = Vec::new();
-                for (base, part) in all.chunks(chunk).enumerate() {
-                    let start = base * chunk;
-                    handles.push(s.spawn(move || {
-                        part.iter().map(|b| b.as_deref().map(crate::parse)).collect::<Vec<_>>()
-                    }));
+        let mut read_ms = 0f64;
+        let mut batch_parse_ms = 0f64;
+        // 顺序与老路径逐条一致：id 段（缓存内）在前、str 段（缓存外）在后
+        let mut files: Vec<ClassFile> = Vec::with_capacity(order_id.len() + order_str.len());
+        for chunk in order_id.chunks(BATCH) {
+            match fetch_parse_batch(cds, cp, chunk, &[]) {
+                Ok(v) => {
+                    read_ms += v.read_ms;
+                    batch_parse_ms += v.parse_ms;
+                    files.extend(v.files);
                 }
-                for (k, h) in handles.into_iter().enumerate() {
-                    let got = match h.join() {
-                        Ok(v) => v,
-                        Err(_) => {
-                            panic_err = Some(format!("class 文件解析线程 panic（第 {k} 块）"));
-                            return;
-                        }
-                    };
-                    for (j, r) in got.into_iter().enumerate() {
-                        parsed[k * chunk + j] = r;
-                    }
-                }
-            });
-        }
-        if let Some(msg) = panic_err {
-            return Err(VmError { msg, exc: None });
-        }
-        drop(all); // 原始字节到此为止：别让 22 MB 陪着后面建类表，峰值 RSS 会多 22 MB
-        parse_ms += t.elapsed().as_secs_f64() * 1000.0;
-
-        // ---- 建类表 ----
-        let mut files: Vec<ClassFile> = Vec::with_capacity(parsed.len());
-        for (i, slot) in parsed.into_iter().enumerate() {
-            let Some(r) = slot else { continue };
-            match r {
-                Ok(cf) => files.push(cf),
-                Err(e) => {
-                    let name = if i < order_id.len() {
-                        cds.name_of(order_id[i] as usize).to_string()
-                    } else {
-                        order_str[i - order_id.len()].clone()
-                    };
+                Err((i, e)) => {
+                    let name = cds.name_of(chunk[i] as usize);
                     return Err(VmError { msg: format!("解析 {name} 失败: {e}"), exc: None });
                 }
             }
         }
+        for chunk in order_str.chunks(BATCH) {
+            match fetch_parse_batch(cds, cp, &[], chunk) {
+                Ok(v) => {
+                    read_ms += v.read_ms;
+                    batch_parse_ms += v.parse_ms;
+                    files.extend(v.files);
+                }
+                Err((i, e)) => {
+                    return Err(VmError { msg: format!("解析 {} 失败: {e}", chunk[i]), exc: None });
+                }
+            }
+        }
+        let wait_ms = read_ms;
+        let parse_ms = batch_parse_ms;
         if files.is_empty() {
             return err("没有可执行的 class");
         }
@@ -577,6 +709,9 @@ impl ClassStore {
             files.len(),
             t_all.elapsed().as_secs_f64() * 1000.0
         ));
+        if std::env::var_os("VMLESS_MEM_STATS").is_some() {
+            stats_structures(&files);
+        }
         let store = Self::new(files, Some(main_class))?;
         super::prof("ClassStore::new（by_name/methods/build_metas）");
         Ok(store)

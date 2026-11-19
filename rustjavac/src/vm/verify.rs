@@ -167,10 +167,7 @@ fn be4(b: &[u8], i: usize) -> Option<usize> {
 
 /// 常量池里某个名字的 Utf8 下标（属性名比较用）
 fn utf8_index(cf: &ClassFile, name: &str) -> Option<u16> {
-    cf.constant_pool.iter().enumerate().find_map(|(i, e)| match e {
-        Some(CpEntry::Utf8(b)) if b == name.as_bytes() => Some(i as u16),
-        _ => None,
-    })
+    cf.utf8_index(name.as_bytes())
 }
 
 fn code_attr<'a>(cf: &'a ClassFile, m: &'a Member) -> Option<CodeAttr<'a>> {

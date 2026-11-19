@@ -151,6 +151,7 @@ pub fn generate_in(cp: &mut CpBuilder, spec: &ClassSpec) -> Vec<u8> {
         minor_version: 0,
         major_version: 69, // Java 25
         constant_pool: cp.snapshot(),
+        utf8: cp.arena(),
         access_flags: spec.access_flags | ACC_SUPER,
         this_class,
         super_class,
@@ -204,6 +205,7 @@ pub fn simple_main(class_name: &str, message: &str) -> Vec<u8> {
     let cf = ClassFile {
         minor_version: 0,
         major_version: 69,
+        utf8: cp.arena(),
         constant_pool: cp.entries(),
         access_flags: ACC_PUBLIC | ACC_SUPER,
         this_class,

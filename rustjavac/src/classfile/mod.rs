@@ -12,7 +12,7 @@ pub mod pool;
 pub mod read;
 pub mod write;
 
-pub use read::parse;
+pub use read::{parse, parse_in};
 pub use write::write;
 
 
@@ -41,8 +41,14 @@ impl std::error::Error for Error {}
 
 #[derive(Clone, Debug, PartialEq)]
 pub enum CpEntry {
-    /// 原始 Modified UTF-8 字节，保持逐字节一致
-    Utf8(Vec<u8>),
+    /// `(off, len)`：原始 Modified UTF-8 字节在 `ClassFile::utf8_bytes()` 那块里的位置，
+    /// 保持逐字节一致。
+    ///
+    /// **为什么不是 `Vec<u8>`**：JDK 的常量池 57% 是 Utf8（433,765 条 / 5,421 个类），
+    /// 每条一个 `Vec` 就是一次独立堆分配（Windows 最小块 16 B、块头 8 B，平均 22.6 B 的串
+    /// 实占 32 B）；而 `Vec<u8>` 让 `CpEntry` 从 16 B 涨到 24 B，乘上 762,850 个槽就是 6 MB。
+    /// 改成「一个类一块 arena + 8 字节载荷」后：条目 24→16 B、433,765 次分配 → 5,421 次。
+    Utf8(u32, u32),
     Integer(u32),
     Float(u32),
     Long(u64),
@@ -59,6 +65,65 @@ pub enum CpEntry {
     InvokeDynamic(u16, u16),
     Module(u16),
     Package(u16),
+}
+
+/// 一个类的全部 Utf8 字节：一块连续内存，条目里只存 `(off, len)`。
+///
+/// 冻结后只读，所以可以 `Arc` 共享给运行时所有线程（`ClassFile` 是 `Arc<ClassFile>`）。
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct Utf8Arena {
+    buf: Box<[u8]>,
+}
+
+impl Utf8Arena {
+    #[inline]
+    pub fn get(&self, off: u32, len: u32) -> &[u8] {
+        &self.buf[off as usize..(off as usize + len as usize)]
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.buf
+    }
+}
+
+/// 建 `Utf8Arena` 的累积器：只在解析/生成期存在，`freeze()` 之后就不能再写。
+#[derive(Clone, Default)]
+pub struct Utf8Builder {
+    buf: Vec<u8>,
+}
+
+impl Utf8Builder {
+    pub fn new() -> Self {
+        Utf8Builder::default()
+    }
+
+    /// 预留下限：块级共享时一次留够，省掉反复扩容的 memcpy
+    pub fn with_capacity(n: usize) -> Self {
+        Utf8Builder { buf: Vec::with_capacity(n) }
+    }
+
+    /// 入库，返回 `(off, len)`。
+    ///
+    /// **不做去重**：同一个类里的重复串在 javac 产出的常量池里本来就不存在（javac 自己去重），
+    /// 而跨类去重要么上全局锁（实测跨类重复串只有 84,618 条 / 3.15 MB，但串行化
+    /// 433,765 次查表约 35 ms，比省下的内存还贵），要么用「每线程一个 arena」—— 后者实测
+    /// 段内去重只多省 ~4 MB。这里选最省事的一条：一个类一块。
+    pub fn intern(&mut self, s: &[u8]) -> (u32, u32) {
+        let off = self.buf.len() as u32;
+        self.buf.extend_from_slice(s);
+        (off, s.len() as u32)
+    }
+
+    /// 按 `(off, len)` 读回一段字节
+    #[inline]
+    pub fn get(&self, off: u32, len: u32) -> &[u8] {
+        &self.buf[off as usize..(off as usize + len as usize)]
+    }
+
+    /// 冻结成只读 arena（顺带把容量收到实际长度）。
+    pub fn freeze(self) -> Utf8Arena {
+        Utf8Arena { buf: self.buf.into_boxed_slice() }
+    }
 }
 
 impl CpEntry {
@@ -91,6 +156,8 @@ pub struct ClassFile {
     pub major_version: u16,
     /// 索引 0 未使用；long/double 后的槽位为 None
     pub constant_pool: Vec<Option<CpEntry>>,
+    /// 常量池里所有 `CpEntry::Utf8` 指向的字节都在这块里（见 `Utf8Arena`）
+    pub utf8: std::sync::Arc<Utf8Arena>,
     pub access_flags: u16,
     pub this_class: u16,
     pub super_class: u16,
@@ -108,9 +175,20 @@ impl ClassFile {
     /// 常量池里的 Utf8 文本（用于调试/后续符号表）
     pub fn utf8(&self, index: u16) -> Option<&[u8]> {
         match self.constant_pool.get(index as usize) {
-            Some(Some(CpEntry::Utf8(b))) => Some(b),
+            Some(Some(CpEntry::Utf8(off, len))) => Some(self.utf8.get(*off, *len)),
             _ => None,
         }
+    }
+
+    /// 常量池里第一个名字逐字节等于 `name` 的 Utf8 下标（属性名比较用）
+    pub fn utf8_index(&self, name: &[u8]) -> Option<u16> {
+        (1..self.constant_pool.len()).find_map(|i| {
+            if self.utf8(i as u16) == Some(name) {
+                Some(i as u16)
+            } else {
+                None
+            }
+        })
     }
 
     /// `module-info.class` 的模块描述符（不是模块描述符就返回 `None`）

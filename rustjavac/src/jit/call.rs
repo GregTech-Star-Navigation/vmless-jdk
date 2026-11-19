@@ -23,13 +23,7 @@ pub struct CompiledMethod {
         m: &Member,
     ) -> Result<(usize, usize, Vec<u8>, Vec<(u16, u16, u16, u16)>), JitError> {
     let code_name = cf
-        .constant_pool
-        .iter()
-        .enumerate()
-        .find_map(|(i, e)| match e {
-            Some(CpEntry::Utf8(b)) if b == b"Code" => Some(i as u16),
-            _ => None,
-        })
+        .utf8_index(b"Code")
         .ok_or_else(|| JitError("常量池里没有 Code".into()))?;
     for a in &m.attributes {
         if a.name_index == code_name && a.info.len() >= 8 {

@@ -1,5 +1,6 @@
 //! 常量池构建器：自动去重，返回从 1 开始的索引。
 
+use crate::classfile::{Utf8Arena, Utf8Builder};
 use crate::CpEntry;
 use std::collections::HashMap;
 
@@ -18,6 +19,8 @@ pub struct CpBuilder {
     /// `BootstrapMethods` 属性：每项 `(bootstrap method_ref, 静态参数...)`。
     /// `invokedynamic` 的操作数是这张表的下标，所以它必须在**整份类**里唯一编号。
     pub(crate) bsm: Vec<(u16, Vec<u16>)>,
+    /// 所有 `CpEntry::Utf8` 的字节：收尾时冻结成 arena 交给 `ClassFile`
+    pool: Utf8Builder,
 }
 
 impl CpBuilder {
@@ -39,7 +42,8 @@ impl CpBuilder {
         if let Some(i) = self.utf8_cache.get(s) {
             return *i;
         }
-        let i = self.push(CpEntry::Utf8(s.as_bytes().to_vec()));
+        let (off, len) = self.pool.intern(s.as_bytes());
+        let i = self.push(CpEntry::Utf8(off, len));
         self.utf8_cache.insert(s.to_string(), i);
         i
     }
@@ -130,8 +134,27 @@ impl CpBuilder {
         self.push(CpEntry::Float(v.to_bits()))
     }
 
+    /// 下标处的 Utf8 文本（`fix_self_refs` 用；名字和 `ClassFile::utf8` 对齐）
+    pub(crate) fn utf8_at(&self, i: u16) -> Option<&[u8]> {
+        match self.entries.get(i as usize)? {
+            Some(CpEntry::Utf8(off, len)) => Some(self.pool.get(*off, *len)),
+            _ => None,
+        }
+    }
+
     pub fn entries(self) -> Vec<Option<CpEntry>> {
         self.entries
+    }
+
+    /// 收尾：把常量池和它引用的 Utf8 arena 一起交出去（arena 之后不能再变）
+    pub(crate) fn finish(self) -> (Vec<Option<CpEntry>>, std::sync::Arc<Utf8Arena>) {
+        (self.entries, std::sync::Arc::new(self.pool.freeze()))
+    }
+
+    /// 收尾前还要追加 Utf8（`<SELF>` 补真实类名）
+    pub(crate) fn push_utf8(&mut self, s: &[u8]) -> u16 {
+        let (off, len) = self.pool.intern(s);
+        self.push(CpEntry::Utf8(off, len))
     }
 
     // ---------------------------------------------------------------- invokedynamic
@@ -181,5 +204,10 @@ impl CpBuilder {
     /// 克隆一份常量池（用于先算索引、后组装）
     pub fn snapshot(&self) -> Vec<Option<CpEntry>> {
         self.entries.clone()
+    }
+
+    /// 只需 arena、不需要常量池时用（与 `snapshot` 配套）
+    pub fn arena(&self) -> std::sync::Arc<Utf8Arena> {
+        std::sync::Arc::new(self.pool.clone().freeze())
     }
 }

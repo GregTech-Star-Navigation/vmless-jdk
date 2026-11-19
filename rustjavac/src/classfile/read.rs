@@ -1,7 +1,7 @@
 //! 读：magic、版本、常量池、字段/方法、属性。
 
 use super::attr::read_attributes;
-use super::{ClassFile, CpEntry, Error, Member, Result};
+use super::{ClassFile, CpEntry, Error, Member, Result, Utf8Builder};
 
 pub(crate) struct Reader<'a> {
     buf: &'a [u8],
@@ -55,7 +55,18 @@ impl<'a> Reader<'a> {
     }
 }
 
+/// 解析一个 class 文件（自己建一块 Utf8 arena）。
+///
+/// 装载器要一次解析很多类，用 `parse_in` 才能让一批类共享 arena。
 pub fn parse(buf: &[u8]) -> Result<ClassFile> {
+    let mut pool = Utf8Builder::new();
+    let mut cf = parse_in(buf, &mut pool)?;
+    cf.utf8 = std::sync::Arc::new(pool.freeze());
+    Ok(cf)
+}
+
+/// 解析一个 class 文件；Utf8 字节进 `pool`（调用方可以让**一批**类共享同一个）。
+pub fn parse_in(buf: &[u8], pool: &mut Utf8Builder) -> Result<ClassFile> {
     let mut r = Reader::new(buf);
     let magic = r.u32()?;
     if magic != 0xCAFE_BABE {
@@ -72,7 +83,8 @@ pub fn parse(buf: &[u8]) -> Result<ClassFile> {
         let entry = match tag {
             1 => {
                 let len = r.u16()? as usize;
-                CpEntry::Utf8(r.bytes(len)?.to_vec())
+                let (off, n) = pool.intern(r.bytes(len)?);
+                CpEntry::Utf8(off, n)
             }
             3 => CpEntry::Integer(r.u32()?),
             4 => CpEntry::Float(r.u32()?),
@@ -112,6 +124,7 @@ pub fn parse(buf: &[u8]) -> Result<ClassFile> {
     let attributes = read_attributes(&mut r)?;
 
     Ok(ClassFile {
+        utf8: std::sync::Arc::new(Utf8Builder::new().freeze()),
         minor_version,
         major_version,
         constant_pool,
