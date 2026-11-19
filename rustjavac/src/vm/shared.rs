@@ -32,7 +32,7 @@
 //! 这正是旧 `objects: Vec<Vec<Slot>>` 做不到的（扩容会让别的线程读到半搬的引用）。
 
 use std::collections::{BTreeSet, HashMap, HashSet};
-use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicPtr, AtomicU32, AtomicU64, AtomicU8, Ordering};
 use std::sync::{Arc, Mutex, RwLock};
 
 use crate::load::ClassPath;
@@ -202,136 +202,74 @@ impl RefBits {
         }
     }
 
-    /// 位图 → 对象头里的那一个 **32 位**域（头从 24 B 压到 16 B 的代价就在这）。
+    /// 位图 → 对象头里的那一个 8 字节域。
     ///
-    /// **编码约定（唯一）**：
-    /// - `0` = 一个引用槽都没有（实测负载里占绝大多数，热路径第一条短路）；
-    /// - `REF_ALL`（全 1）= 每个槽都是引用（引用数组 / 类布局未知时的保守答案）；
-    /// - 其余：bit i (i < 31) = 第 i 槽是引用（**精确**），bit31 = 「31 号槽及以后
-    ///   保守当作引用」。
-    ///
-    /// 为什么 bit31 是「保守」而不是再精确一位：≤31 槽的对象（实测是全部实例的
-    /// 绝大多数）用低 31 位就是完全精确的；>31 槽的稀疏位图在 32 位里放不下，
-    /// 而这一侧保守是**安全**的 —— GC 多扫几个槽只会多留一点垃圾，绝不会漏根。
-    fn to_word32(self, n: usize) -> u32 {
-        match self {
-            RefBits::None => 0,
-            RefBits::All => REF_ALL,
-            RefBits::Small(w) => {
-                let low = (w & REF_LOW31 as u64) as u32;
-                if n <= 31 {
-                    low
-                } else if w >> 31 != 0 {
-                    low | REF_TAIL
-                } else {
-                    low
-                }
+    /// **编码约定（唯一）**：`0` = 一个引用槽都没有；`n <= 64` 时是内联位图；
+    /// `n > 64` 时是泄漏成静态实例的 `*const RefBits`。所以 `is_ref`/`has_refs`
+    /// 两条路径都先判 0 —— 没有引用槽的对象占实测负载的绝大多数，这个判断同时是
+    /// 热路径的短路。
+    fn to_word(self, n: usize) -> u64 {
+        if matches!(self, RefBits::None) {
+            return 0;
+        }
+        if n <= 64 {
+            match self {
+                RefBits::None => 0,
+                RefBits::Small(w) => w,
+                // `All` 用全 1（槽位数 ≤ 64，多出来的位没人看）
+                RefBits::All | RefBits::Big(_) => u64::MAX,
             }
-            // n > 64 的类布局（字段数超过 64 的类）。低 31 位精确、其后保守。
-            RefBits::Big(w) => {
-                let low = (w.first().copied().unwrap_or(0) & REF_LOW31 as u64) as u32;
-                let tail = w.iter().enumerate().any(|(k, x)| {
-                    if k == 0 {
-                        x >> 31 != 0
-                    } else {
-                        *x != 0
-                    }
-                });
-                if tail {
-                    low | REF_TAIL
-                } else {
-                    low
-                }
-            }
+        } else {
+            Box::leak(Box::new(self)) as *const RefBits as usize as u64
         }
     }
 }
 
-/// `refs` 域里低 31 位的掩码（bit i = 第 i 槽是引用）
-const REF_LOW31: u32 = 0x7FFF_FFFF;
-/// `refs` 域里的「31 号槽及以后保守当作引用」标志
-const REF_TAIL: u32 = 0x8000_0000;
-/// `refs` 域里的「每个槽都是引用」
-const REF_ALL: u32 = u32::MAX;
-
 /// 一个槽位的字节数（`{tag: AtomicU8, val: AtomicU64}`，对齐到 8 → 16 字节）
 pub(crate) const CELL_SIZE: usize = 16;
 /// 对象头字节数；槽位数组紧跟在头后面，**同一次分配**
-pub(crate) const OBJ_HDR_SIZE: usize = 16;
-/// 槽位数上限：头里的 `nslots` 只占 24 位（16.7M 槽 = 268 MB 的单个数组，
-/// 本 VM 的堆规模远到不了；真到了就在分配处返回 None，不静默截断）
-pub(crate) const MAX_SLOTS: usize = (1 << 24) - 1;
-/// GC 世代在头里占的位数。8 位意味着约每 256 轮回收会回绕，回绕时必须做一次
-/// **全量回收**把所有活对象重新盖成本轮世代 —— 见 `Heap::gc_kind` 里的说明。
-const EPOCH_BITS: u32 = 8;
-const EPOCH_MASK: u32 = (1 << EPOCH_BITS) - 1;
+pub(crate) const OBJ_HDR_SIZE: usize = 24;
 
-/// 一个对象/数组在堆里的家：16 字节头 + 紧随其后的变长槽位数组（一次分配）。
+/// 一个对象/数组在堆里的家：24 字节头 + 紧随其后的变长槽位数组（一次分配）。
 ///
 /// 旧布局是 56 字节头（`Arc<str>` 16 + len/lock/epoch 12 + `Arc<RefBits>` 8 + `Box<[Cell]>` 16）
-/// **加**一次单独的槽位数组分配（再 16 字节 malloc 块头）；上一版压到 24 字节。
-/// 这一版再压到 **16 字节**，靠的是把两个 32 位域挤进一个 32 位原子字、并把
-/// 8 字节的引用位图指针换成 32 位内联位图：
+/// **加**一次单独的槽位数组分配（再 16 字节 malloc 块头）。三项改动合起来：
 ///
 /// | 项 | 旧 | 新 |
 /// | --- | --- | --- |
 /// | 类名 `Arc<str>` | 16 B | `u32` class_id（见 `Heap::class_names`） |
-/// | 引用位图 | 8 B（≤64 槽内联 / >64 槽静态指针） | 4 B（≤31 槽精确内联，其后保守） |
-/// | `nslots` + `epoch` | 4 + 4 B | 4 B（`nslots:24 | epoch:8`） |
+/// | 引用位图 `Arc<RefBits>` | 8 B | ≤64 槽内联 `u64`，>64 槽静态指针 |
 /// | 槽位数组 | 8 B 指针 + 16 B 块头 + 独立分配 | 内联，零额外开销 |
-/// | 头总大小 | 56 B → 24 B | **16 B** |
+/// | 头总大小 | 56 B | **24 B** |
 ///
-/// 16 字节是**对齐的下限**：`Cell` 要 8 字节对齐，所以头也只能是 8 的倍数；
-/// 并且 16 字节头 + 1 槽 = 32 字节，正好落在 malloc 的 32 字节档里（24+16=40 会
-/// 被圆到 48），所以每个 1~2 槽对象的真实占用是少 16 字节而不是 8。
+/// 除了 RSS，24 字节头 + 内联槽位让「标记」从「页表 → 头 → 槽位数组」三次访存
+/// 变成「页表 → 头+槽位」，这正是停下来标 80 万对象那一格的主要成本。
 ///
-/// 地址稳定（一次分配后永不搬动），并发访问只碰 `lock` / `len_age` 两个原子域。
+/// 地址稳定（一次分配后永不搬动），并发访问只碰 `lock` / `epoch` 两个原子域。
 #[repr(C)]
 pub(crate) struct ObjHdr {
     /// thin lock 字：`0` = 未锁；`tid << 8 | 重入计数` = 持有者
     pub(crate) lock: AtomicU32,
-    /// `槽位数(24 位) << 8 | GC 世代(8 位)` —— 一次 32 位原子读写两个域。
-    ///
-    /// 两个域的生命周期不重叠：槽位数**只写一次**（分配时）、之后只读；世代每轮回收
-    /// 被标记器重写。所以读的时候一次 load 就够，写世代时保持高 24 位不变即可。
-    len_age: AtomicU32,
+    /// GC 标记世代（`== Heap.gc_epoch` 就是本轮存活）。用世代号而不是清除位，
+    /// 是因为清扫要遍历所有条目，没法先来一遍 O(n) 的清零。
+    pub(crate) epoch: AtomicU32,
+    /// 槽位数（对象 = 字段数，数组 = 元素数）
+    pub(crate) nslots: u32,
     /// 运行时类 id（`Heap::class_names` 里的下标；对象是内部类名，数组是描述符）
     pub(crate) class_id: u32,
-    /// 引用槽位图（32 位）。编码见 [`RefBits::to_word32`]：`0` = 无引用，
-    /// 全 1 = 全是引用，否则 bit i (i<31) 精确 + bit31 = 其后保守。
-    refs: u32,
+    /// 引用槽位图：≤64 槽内联位图；>64 槽存 `*const RefBits`（泄漏的静态实例）
+    refs: u64,
 }
 
-/// 对象头必须是 16 字节 —— 这是 RSS 与标记停顿的关键指标，改坏了编译期就报
+/// 对象头必须是 24 字节 —— 这是 RSS 与标记停顿的关键指标，改坏了编译期就报
 const _: () = assert!(std::mem::size_of::<ObjHdr>() == OBJ_HDR_SIZE);
 /// 槽位单元必须是 16 字节（内联数组的步长靠它）
 const _: () = assert!(std::mem::size_of::<Cell>() == CELL_SIZE);
-/// 头里 `nslots` 的那 24 位装得下 `MAX_SLOTS`
-const _: () = assert!(MAX_SLOTS < (1 << (32 - EPOCH_BITS)));
 
 impl ObjHdr {
     #[inline]
     pub(crate) fn len(&self) -> usize {
-        (self.len_age.load(Ordering::Relaxed) >> EPOCH_BITS) as usize
-    }
-
-    /// 打包「槽位数 + 世代」成一个字（分配时调用）
-    #[inline]
-    fn len_age_word(n: usize, epoch: u32) -> u32 {
-        ((n as u32) << EPOCH_BITS) | (epoch & EPOCH_MASK)
-    }
-
-    /// 本轮世代是否已经把这个世界盖过（`true` = 已标记）
-    #[inline]
-    pub(crate) fn marked(&self, epoch: u32) -> bool {
-        self.len_age.load(Ordering::Acquire) & EPOCH_MASK == (epoch & EPOCH_MASK)
-    }
-
-    /// 盖上本轮世代号。**只动低 8 位**：高 24 位（槽位数）写完就不再变。
-    #[inline]
-    pub(crate) fn set_epoch(&self, epoch: u32) {
-        let w = self.len_age.load(Ordering::Relaxed) & !EPOCH_MASK;
-        self.len_age.store(w | (epoch & EPOCH_MASK), Ordering::Release);
+        self.nslots as usize
     }
 
     /// 槽位数组（紧跟对象头，长度 `nslots`）
@@ -339,7 +277,7 @@ impl ObjHdr {
     fn cells(&self) -> &[Cell] {
         unsafe {
             let p = (self as *const ObjHdr as *const u8).add(OBJ_HDR_SIZE) as *const Cell;
-            std::slice::from_raw_parts(p, self.len())
+            std::slice::from_raw_parts(p, self.nslots as usize)
         }
     }
 
@@ -357,28 +295,33 @@ impl ObjHdr {
 
     /// 第 i 槽是不是引用
     ///
-    /// 编码见 [`RefBits::to_word32`]。`i >= 31` 时靠 `REF_TAIL` 位回答 ——
-    /// 那一侧是**保守**的（宽对象里 31 号以后的槽一律当引用扫），安全的方向。
+    /// `nslots > 64` 时 `refs` 是一个**指针**（指向堆上的 `RefBits`）。
+    /// **`refs == 0` 必须当成「没有引用槽」而不是去解引用** ——
+    /// 空指针 deref 在 release 下就是 SIGSEGV，而且**没有任何 Rust panic**，
+    /// 症状是「只要分配超过 64 槽的对象（长字符串、大 `byte[]`、大数组）就崩」，
+    /// 极易被误判成别处的内存破坏。实测：`"x".repeat(200)` 必崩。
     #[inline]
     pub(crate) fn is_ref(&self, i: usize) -> bool {
-        let r = self.refs;
-        if r == 0 {
-            return false;
-        }
-        if r == REF_ALL {
-            return true;
-        }
-        if i < 31 {
-            (r >> i) & 1 != 0
+        if self.nslots <= 64 {
+            i < 64 && (self.refs >> i) & 1 != 0
+        } else if self.refs == 0 {
+            false
         } else {
-            r & REF_TAIL != 0
+            // `nslots`/`refs` 只写一次、之后不变，所以这里读到的指针永远同一个
+            (unsafe { &*(self.refs as usize as *const RefBits) }).is_ref(i)
         }
     }
 
     /// 有没有引用槽（没有的话标记时连值都不用碰 —— 少一次访存就是少一次 miss）
     #[inline]
     pub(crate) fn has_refs(&self) -> bool {
-        self.refs != 0
+        if self.nslots <= 64 {
+            self.refs != 0
+        } else if self.refs == 0 {
+            false
+        } else {
+            !matches!(unsafe { &*(self.refs as usize as *const RefBits) }, RefBits::None)
+        }
     }
 
     /// 槽位数组的首地址（GC 预取用：访问它才算把对象的"身体"拉进缓存）
@@ -406,40 +349,27 @@ impl ObjHdr {
                 out.push(v);
             }
         };
-        let r = self.refs;
-        if r == 0 {
-            return;
-        }
-        let mut bits = r & REF_LOW31;
-        if bits == REF_LOW31 && r == REF_ALL {
-            // 全是引用：逐个槽看（引用数组 / 布局未知）
-            for c in cells.iter() {
-                if let Slot::I(v) = c.get() {
+        if self.nslots <= 64 {
+            let mut bits = self.refs;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                if i >= n {
+                    break;
+                }
+                if let Slot::I(v) = cells[i].get() {
                     if v != 0 {
                         push(v);
                     }
                 }
+                bits &= bits - 1;
             }
-            return;
-        }
-        while bits != 0 {
-            let i = bits.trailing_zeros() as usize;
-            if i >= n {
-                break;
-            }
-            if let Slot::I(v) = cells[i].get() {
-                if v != 0 {
-                    push(v);
-                }
-            }
-            bits &= bits - 1;
-        }
-        // 31 号槽及以后：宽对象保守扫（`REF_TAIL`）
-        if r & REF_TAIL != 0 && n > 31 {
-            for c in cells.iter().skip(31) {
-                if let Slot::I(v) = c.get() {
-                    if v != 0 {
-                        push(v);
+        } else if self.refs != 0 {
+            for i in 0..n {
+                if self.is_ref(i) {
+                    if let Slot::I(v) = cells[i].get() {
+                        if v != 0 {
+                            push(v);
+                        }
                     }
                 }
             }
@@ -455,39 +385,27 @@ impl ObjHdr {
     pub(crate) fn scan_refs(&self, out: &mut Vec<i32>) {
         let cells = self.cells();
         let n = cells.len();
-        let r = self.refs;
-        if r == 0 {
-            return;
-        }
-        if r == REF_ALL {
-            for c in cells.iter() {
-                if let Slot::I(v) = c.get() {
+        if self.nslots <= 64 {
+            let mut bits = self.refs;
+            while bits != 0 {
+                let i = bits.trailing_zeros() as usize;
+                if i >= n {
+                    break;
+                }
+                if let Slot::I(v) = cells[i].get() {
                     if v != 0 {
                         out.push(v);
                     }
                 }
+                bits &= bits - 1;
             }
-            return;
-        }
-        let mut bits = r & REF_LOW31;
-        while bits != 0 {
-            let i = bits.trailing_zeros() as usize;
-            if i >= n {
-                break;
-            }
-            if let Slot::I(v) = cells[i].get() {
-                if v != 0 {
-                    out.push(v);
-                }
-            }
-            bits &= bits - 1;
-        }
-        // 31 号槽及以后：宽对象保守扫（`REF_TAIL`）
-        if r & REF_TAIL != 0 && n > 31 {
-            for c in cells.iter().skip(31) {
-                if let Slot::I(v) = c.get() {
-                    if v != 0 {
-                        out.push(v);
+        } else {
+            for i in 0..n {
+                if self.is_ref(i) {
+                    if let Slot::I(v) = cells[i].get() {
+                        if v != 0 {
+                            out.push(v);
+                        }
                     }
                 }
             }
@@ -501,7 +419,7 @@ impl ObjHdr {
 
     /// 这个对象在堆里占多少字节（统计用）
     pub(crate) fn bytes(&self) -> u64 {
-        (OBJ_HDR_SIZE + CELL_SIZE * self.len()) as u64
+        (OBJ_HDR_SIZE + CELL_SIZE * self.nslots as usize) as u64
     }
 }
 
@@ -526,7 +444,7 @@ pub(crate) enum Fill<'a> {
 #[derive(Clone, Copy)]
 struct ClassMeta {
     id: u32,
-    refs: u32,
+    refs: u64,
 }
 
 /// 分配对象块并**一次写完**头与槽位（清零与写头合并，省掉一次内存往返）
@@ -538,7 +456,8 @@ fn alloc_obj(n: usize, m: ClassMeta, epoch: u32, fill: Fill) -> *mut ObjHdr {
     }
     unsafe {
         std::ptr::addr_of_mut!((*p).lock).write(AtomicU32::new(0));
-        std::ptr::addr_of_mut!((*p).len_age).write(AtomicU32::new(ObjHdr::len_age_word(n, epoch)));
+        std::ptr::addr_of_mut!((*p).epoch).write(AtomicU32::new(epoch));
+        std::ptr::addr_of_mut!((*p).nslots).write(n as u32);
         std::ptr::addr_of_mut!((*p).class_id).write(m.id);
         std::ptr::addr_of_mut!((*p).refs).write(m.refs);
         let cells = (p as *mut u8).add(OBJ_HDR_SIZE) as *mut Cell;
@@ -559,10 +478,10 @@ fn alloc_obj(n: usize, m: ClassMeta, epoch: u32, fill: Fill) -> *mut ObjHdr {
     p
 }
 
-/// 释放对象块（槽位数只写一次，直接读回来算布局）
+/// 释放对象块（`nslots` 只写一次，直接读回来算布局）
 #[inline]
 unsafe fn free_obj(p: *mut ObjHdr) {
-    let n = (*p).len();
+    let n = (*p).nslots as usize;
     std::alloc::dealloc(p as *mut u8, obj_layout(n));
 }
 
@@ -574,75 +493,18 @@ const PAGE: usize = 1 << PAGE_BITS; // 512
 /// 页表根大小：`1 << 16` 页 × 512 = 3355 万对象。根占 512KB，按需提交。
 const ROOT_PAGES: usize = 1 << 16;
 
-// ---- 页表条目的 32 位压缩指针 ----
-//
-// 条目从 8 字节压到 4 字节，**省的是页表本身**：GcBench 800 万次分配 → 页表
-// 6400 万字节（实测占峰值 RSS 的 38%）。做法是存「相对进程内第一个对象的偏移」
-// 而不是绝对地址：
-//
-// - 对象块的对齐要求是 8（`obj_layout` 的 `from_size_align(…, 8)`），地址低 3 位
-//   恒为 0，丢掉不丢信息；
-// - 偏移是**有符号**的（窗口 BASE ± 8GB）：Windows 的堆段不按地址递增发放 ——
-//   实测同一个 350MB 负载里，第一批对象就落在 BASE 的**下方**几十 MB，只给正向
-//   窗口会让绝大多数条目掉进慢表（实测 +36MB RSS，比不压缩还差）；
-// - 编码 `(d + W) * 2 + 1` 全是奇数：`0` 永远空，`u32::MAX` 留作慢表哨兵，
-//   两条都不会被合法条目撞上；
-// - 真越过窗口的条目落进 `PTR_OVERFLOW` 慢表 —— 慢但正确，实测（350MB 堆）不触发。
-//
-// 复用索引这条路**没有**走：句柄就是下标，复用会让"还活在别处的陈旧句柄"指到另一台
-// 对象上，那是静默数据损坏。压缩只改存储宽度，**句柄语义一个字没变**。
-static PTR_BASE: AtomicUsize = AtomicUsize::new(0);
-static PTR_OVERFLOW: Mutex<Option<HashMap<(usize, u32), usize>>> = Mutex::new(None);
-/// 每张页表一个 id（溢出表要用它区分 `objs` / `arrs` 重叠的下标空间）
-static TABLE_SEQ: AtomicUsize = AtomicUsize::new(1);
-
-/// 有符号偏移窗口的一半（单位：槽，1 槽 = 8 字节 → ±8GB）
-const ENC_W: i64 = 1 << 30;
-/// 条目值：`0` = 空；`u32::MAX` = 在 `PTR_OVERFLOW` 里；其余 = `(d + ENC_W) * 2 + 1`
-const ENC_OVERFLOW: u32 = u32::MAX;
-
-#[inline]
-fn ptr_encode<T>(p: *mut T) -> u32 {
-    let a = p as usize;
-    let mut base = PTR_BASE.load(Ordering::Acquire);
-    if base == 0 {
-        // BASE 只能定一次：两个线程各定一次会让已写下的条目互相解释错
-        let _ = PTR_BASE.compare_exchange(0, a, Ordering::AcqRel, Ordering::Acquire);
-        base = PTR_BASE.load(Ordering::Acquire);
-    }
-    let d = ((a as i64) - (base as i64)) >> 3;
-    if d >= -ENC_W && d <= ENC_W - 2 {
-        return ((d + ENC_W) as u32) * 2 + 1;
-    }
-    ENC_OVERFLOW
+struct TablePage<T> {
+    entries: [AtomicPtr<T>; PAGE],
 }
 
-#[inline]
-fn ptr_decode<T>(v: u32, tid: usize, idx: u32) -> *mut T {
-    if v == ENC_OVERFLOW {
-        let g = PTR_OVERFLOW.lock().unwrap_or_else(|e| e.into_inner());
-        let a = g.as_ref().and_then(|m| m.get(&(tid, idx))).copied().unwrap_or(0);
-        return a as *mut T;
-    }
-    let base = PTR_BASE.load(Ordering::Acquire) as i64;
-    let d = ((v >> 1) as i64) - ENC_W;
-    (base + (d << 3)) as usize as *mut T
-}
-
-struct TablePage {
-    entries: [AtomicU32; PAGE],
-}
-
-/// 只追加的页表：`下标 → *const T`（条目是 4 字节压缩指针，见上面的说明）。
+/// 只追加的页表：`下标 → *const T`。
 ///
 /// 为什么不直接用 `Vec<Box<T>>`：`Vec` 扩容时会把元素搬走，别的线程手里的
 /// `&T` 就悬空了。页表永不搬动已发布的条目，所以 `&T` 的寿命等于进程寿命 ——
 /// 这就是「任何线程都能安全地拿到任意对象的引用」的全部秘密。
 pub(crate) struct PtrTable<T> {
-    pages: Box<[AtomicPtr<TablePage>]>,
+    pages: Box<[AtomicPtr<TablePage<T>>]>,
     count: AtomicU32,
-    /// 溢出慢表的 key 的一半（`objs` / `arrs` 的下标空间是重叠的）
-    tid: usize,
     /// 条目是**裸分配块**（对象头 + 内联槽位），释放必须由堆提供正确布局
     free: fn(*mut T),
 }
@@ -650,16 +512,11 @@ pub(crate) struct PtrTable<T> {
 impl<T> PtrTable<T> {
     fn new(free: fn(*mut T)) -> PtrTable<T> {
         let pages = (0..ROOT_PAGES).map(|_| AtomicPtr::new(std::ptr::null_mut())).collect::<Vec<_>>();
-        PtrTable {
-            pages: pages.into_boxed_slice(),
-            count: AtomicU32::new(0),
-            tid: TABLE_SEQ.fetch_add(1, Ordering::Relaxed),
-            free,
-        }
+        PtrTable { pages: pages.into_boxed_slice(), count: AtomicU32::new(0), free }
     }
 
     #[inline]
-    fn page(&self, p: usize) -> Option<&TablePage> {
+    fn page(&self, p: usize) -> Option<&TablePage<T>> {
         if p >= self.pages.len() {
             return None;
         }
@@ -676,14 +533,10 @@ impl<T> PtrTable<T> {
         let p = (i as usize) >> PAGE_BITS;
         let page = self.page(p)?;
         let e = page.entries[i as usize & (PAGE - 1)].load(Ordering::Acquire);
-        if e == 0 {
-            return None;
-        }
-        let q = ptr_decode::<T>(e, self.tid, i);
-        if q.is_null() {
+        if e.is_null() {
             None
         } else {
-            Some(unsafe { &*q })
+            Some(unsafe { &*e })
         }
     }
 
@@ -693,8 +546,7 @@ impl<T> PtrTable<T> {
     }
 
     /// 追加一个对象，返回它的下标。多线程安全（页用 CAS 建、条目用 Release 发布）。
-    fn push(&self, v: *mut T) -> Option<u32> {
-        let idx = self.count.fetch_add(1, Ordering::AcqRel);
+    fn push(&self, v: *mut T) -> Option<u32> {        let idx = self.count.fetch_add(1, Ordering::AcqRel);
         let p = (idx as usize) >> PAGE_BITS;
         if p >= self.pages.len() {
             // 页表用尽：对象数上限，明确失败（调用方报 OutOfMemoryError），不静默丢
@@ -703,8 +555,8 @@ impl<T> PtrTable<T> {
         }
         let mut page = self.pages[p].load(Ordering::Acquire);
         if page.is_null() {
-            let fresh = Box::into_raw(Box::new(TablePage {
-                entries: std::array::from_fn(|_| AtomicU32::new(0)),
+            let fresh = Box::into_raw(Box::new(TablePage::<T> {
+                entries: std::array::from_fn(|_| AtomicPtr::new(std::ptr::null_mut())),
             }));
             match self.pages[p].compare_exchange(
                 std::ptr::null_mut(),
@@ -720,13 +572,7 @@ impl<T> PtrTable<T> {
                 }
             }
         }
-        let e = ptr_encode(v);
-        if e == ENC_OVERFLOW {
-            // 慢表兜底（正确性边界，实测从不触发）：先登记地址，再发布条目
-            let mut g = PTR_OVERFLOW.lock().unwrap_or_else(|e| e.into_inner());
-            g.get_or_insert_with(HashMap::new).insert((self.tid, idx), v as usize);
-        }
-        unsafe { (*page).entries[idx as usize & (PAGE - 1)].store(e, Ordering::Release) };
+        unsafe { (*page).entries[idx as usize & (PAGE - 1)].store(v, Ordering::Release) };
         Some(idx)
     }
 
@@ -748,24 +594,17 @@ impl<T> PtrTable<T> {
             let Some(page) = self.page(p) else { continue };
             let slot = &page.entries[i as usize & (PAGE - 1)];
             let e = slot.load(Ordering::Acquire);
-            if e == 0 {
+            if e.is_null() {
                 continue;
             }
-            let q = ptr_decode::<T>(e, self.tid, i);
-            if q.is_null() {
+            if keep(i, unsafe { &*e }) {
                 continue;
             }
-            if keep(i, unsafe { &*q }) {
-                continue;
-            }
-            if slot.compare_exchange(e, 0, Ordering::AcqRel, Ordering::Acquire).is_ok() {
-                if e == ENC_OVERFLOW {
-                    let mut g = PTR_OVERFLOW.lock().unwrap_or_else(|e| e.into_inner());
-                    if let Some(m) = g.as_mut() {
-                        m.remove(&(self.tid, i));
-                    }
-                }
-                (self.free)(q);
+            if slot
+                .compare_exchange(e, std::ptr::null_mut(), Ordering::AcqRel, Ordering::Acquire)
+                .is_ok()
+            {
+                (self.free)(e);
                 freed += 1;
             }
         }
@@ -1012,7 +851,6 @@ impl Heap {
     /// 一个真引用。
     #[inline]
     fn class_meta(&self, class: &str, n: usize) -> ClassMeta {
-        debug_assert!(n <= MAX_SLOTS);
         if let Some(m) = self.layouts.read().unwrap_or_else(|e| e.into_inner()).get(class) {
             return *m;
         }
@@ -1022,7 +860,7 @@ impl Heap {
             Some(store) => class_layout(&store, class, n),
             None => RefBits::All,
         };
-        let m = ClassMeta { id, refs: bits.to_word32(n) };
+        let m = ClassMeta { id, refs: bits.to_word(n) };
         self.layouts
             .write()
             .unwrap_or_else(|e| e.into_inner())
@@ -1062,9 +900,6 @@ impl Heap {
     /// 分配一个对象，返回句柄（> 0）。类名决定字段数由调用方给。
     pub(crate) fn new_object(&self, slots: Vec<Slot>, class: &str) -> Option<i32> {
         let n = slots.len().max(1);
-        if n > MAX_SLOTS {
-            return None;
-        }
         let m = self.class_meta(class, n);
         let size = OBJ_HDR_SIZE + CELL_SIZE * n;
         self.charge(size);
@@ -1099,10 +934,6 @@ impl Heap {
     /// 数组分配的唯一实现（`vec![zero; n]` 那条老路会先分配一个 n 槽的临时 Vec ——
     /// `new int[10000]` 时那是 160KB 的纯浪费）
     fn alloc_array_fill(&self, n: usize, desc: &str, fill: Fill) -> Option<i32> {
-        // 头里的槽位数只有 24 位：装不下就当 OOM 返回，**绝不静默截断**（截断 = 越界写）
-        if n > MAX_SLOTS {
-            return None;
-        }
         // `Slot::I(0)` 的编码正好全 0 → 用 memset 一次写完，省掉 n 次逐槽 encode
         // （`new int[n]` / `new Object[n]` / 三色标记里的辅助数组都走这条）
         let fill = match fill {
@@ -1111,7 +942,15 @@ impl Heap {
         };
         // 数组元素类型由描述符决定：`[L…;` / `[[…` 是引用数组，其余是基本类型。
         // 位图只有两个常量，直接由描述符算出字，不做任何查表。
-        let refs = if n > 0 && is_ref_array_desc(desc) { REF_ALL } else { 0 };
+        let refs = if n > 0 && is_ref_array_desc(desc) {
+            if n <= 64 {
+                u64::MAX
+            } else {
+                refbits_all_static() as *const RefBits as usize as u64
+            }
+        } else {
+            0
+        };
         let id = self.intern_class_id(desc);
         let size = OBJ_HDR_SIZE + CELL_SIZE * n;
         self.charge(size);
@@ -1221,7 +1060,7 @@ impl Heap {
 
     /// 数组长度（不是数组返回 None）
     pub(crate) fn array_len(&self, h: i32) -> Option<usize> {
-        self.arr(h).map(|o| o.len())
+        self.arr(h).map(|o| o.nslots as usize)
     }
 
     /// 对象的 thin lock 字（字符串句柄没有对象头 → None，走膨胀路径）
@@ -1338,10 +1177,10 @@ impl Heap {
     #[inline]
     pub(crate) fn mark(&self, h: i32, epoch: u32) -> bool {
         let Some(o) = self.hdr(h) else { return false };
-        if o.marked(epoch) {
+        if o.epoch.load(Ordering::Acquire) == epoch {
             return false;
         }
-        o.set_epoch(epoch);
+        o.epoch.store(epoch, Ordering::Release);
         true
     }
 
@@ -1349,10 +1188,10 @@ impl Heap {
     #[inline]
     pub(crate) fn mark_ptr(&self, o: *const ObjHdr, epoch: u32) -> bool {
         let o = unsafe { &*o };
-        if o.marked(epoch) {
+        if o.epoch.load(Ordering::Acquire) == epoch {
             return false;
         }
-        o.set_epoch(epoch);
+        o.epoch.store(epoch, Ordering::Release);
         true
     }
 
@@ -1365,14 +1204,14 @@ impl Heap {
     pub(crate) fn sweep_from(&self, lo_obj: u32, lo_arr: u32, epoch: u32) -> (u32, u32, u64) {
         let mut bytes = 0u64;
         let o = self.objs.sweep_from(lo_obj, |_, obj| {
-            if obj.marked(epoch) {
+            if obj.epoch.load(Ordering::Acquire) == epoch {
                 return true;
             }
             bytes += obj.bytes();
             false
         });
         let a = self.arrs.sweep_from(lo_arr, |_, obj| {
-            if obj.marked(epoch) {
+            if obj.epoch.load(Ordering::Acquire) == epoch {
                 return true;
             }
             bytes += obj.bytes();
@@ -1501,23 +1340,7 @@ impl Heap {
     /// 1. eden 满了 → 年轻代回收（只看新生代，停顿 ∝ 新生代而不是整个活集）；
     /// 2. 页表长得比活对象多太多 → 全量回收（老年代里攒了垃圾）。
     #[inline]
-    /// 下一轮回收会让头里的 8 位世代回绕吗（回绕那一轮必须做全量，见 `gc_kind`）
-    #[inline]
-    pub(crate) fn epoch_wraps_next(&self) -> bool {
-        (self.gc_epoch.load(Ordering::Relaxed) + 1) & EPOCH_MASK == 0
-    }
-
     pub(crate) fn gc_kind(&self) -> GcKind {
-        // 头里的世代只有 8 位（见 `ObjHdr.len_age`）。回绕的那一轮**必须做全量**：
-        // 上一轮的世代号和 256 轮后的低 8 位相同，若这一轮是年轻代回收，老对象里
-        // 「上一轮标过、此后没再被标过」的那些会因为这 8 位巧合被当成**已标记**，
-        // 于是它们的子对象不再被追 —— 活对象被当垃圾扫掉 = 悬空句柄。
-        // 全量回收会把**所有**可达对象重新盖上本轮世代，回绕之后 256 轮内不可能
-        // 再出现「活对象的世代 == 本轮世代」的巧合。代价是每 256 轮多一次全量
-        // （实测 GcBench 一轮全量 7~17ms，摊到 256 轮里 <0.5%）。
-        if self.epoch_wraps_next() {
-            return GcKind::Major;
-        }
         if !self.did_major.load(Ordering::Relaxed) {
             return if self.young_bytes.load(Ordering::Relaxed) >= EDEN_BYTES_MIN {
                 GcKind::Major
@@ -1860,39 +1683,5 @@ impl Vm {
     #[inline]
     pub(crate) fn indy(&self) -> std::sync::MutexGuard<'_, IndyState> {
         lk(&self.sh.indy)
-    }
-}
-
-#[cfg(test)]
-mod ptable_tests {
-    use super::*;
-
-    /// 4 字节压缩指针的往返：push 进去的地址必须原样 get 回来
-    #[test]
-    fn compressed_entry_roundtrip() {
-        let mut vals: Vec<Box<u64>> = (0..8u64).map(Box::new).collect();
-        let t: PtrTable<u64> = PtrTable::new(|p| unsafe { drop(Box::from_raw(p)) });
-        let mut idx = Vec::new();
-        for v in vals.iter_mut() {
-            idx.push(t.push(&mut **v as *mut u64).expect("页表还空着"));
-        }
-        for (i, v) in idx.iter().zip(vals.iter()) {
-            let got = t.get(*i).expect("刚 push 的条目必须能取回") as *const u64;
-            assert_eq!(got, &**v as *const u64, "压缩-还原必须无损");
-        }
-        // 下标就是句柄：不存在的下标给 None（不是野指针）
-        assert!(t.get(9999).is_none());
-    }
-
-    /// 越过 32GB 窗口（或比 BASE 低的地址）必须走慢表，不能截断成错地址
-    #[test]
-    fn out_of_window_falls_back() {
-        // 先用一个真实地址把 BASE 钉住
-        let anchor = Box::new(1u8);
-        let _ = ptr_encode(&*anchor as *const u8 as *mut u8);
-        // 地址 1 必然低于 BASE → 只能是慢表，**绝不能**被当成一个合法偏移
-        assert_eq!(ptr_encode(1usize as *mut u8), ENC_OVERFLOW);
-        // 没登记过的慢表条目 → null（而不是野指针）
-        assert!(ptr_decode::<u8>(ENC_OVERFLOW, usize::MAX, 0).is_null());
     }
 }

@@ -1650,11 +1650,6 @@ impl Shared {
             if self.heap.young_bytes() == 0 {
                 return GcKind::None;
             }
-            // 世代回绕那一轮固定做全量（理由见 `Heap::gc_kind`）：压力模式也必须守
-            // 这条不变式，否则漏根检测自己就会漏根。
-            if self.heap.epoch_wraps_next() {
-                return GcKind::Major;
-            }
             return if self.heap.minor_count.load(Ordering::Relaxed) % 2 == 0 {
                 GcKind::Minor
             } else {
