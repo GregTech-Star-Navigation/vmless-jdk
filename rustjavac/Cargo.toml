@@ -1,6 +1,6 @@
 [package]
 name = "rustjavac"
-version = "0.71.0"
+version = "0.70.0"
 edition = "2021"
 
 [lib]
@@ -9,6 +9,9 @@ path = "src/lib.rs"
 
 [dependencies]
 librustjrt = { path = "../librustjrt" }
+# attach 协议服务端（jps / jstack / jstat / jcmd 的 VM 侧）。零外部依赖的纯 Rust crate，
+# 见 `src/vm/attach.rs` 的说明：挂不上就静默跳过，绝不影响执行。
+vmless-attach = { path = "../repo/jdk-attach" }
 
 [dependencies.cranelift-jit]
 version = "0.115"
