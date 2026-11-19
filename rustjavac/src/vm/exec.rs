@@ -9,7 +9,7 @@ static HANG_TICKS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::
 use super::call::count_args;
 use super::class::class_name_of;
 use super::err;
-use super::heap::{RefKind, STR_BASE};
+use super::heap::STR_BASE;
 use super::exception::thrown;
 use super::frame::Frame;
 use super::native_reg;
@@ -71,7 +71,8 @@ struct NewSite {
     /// 泄漏成 `'static str`：快路要把它取出来（Copy）之后再去调 `ensure_init`，
     /// 不能借着一个 `RefCell` 的借用跨过 `&mut self` 的调用。
     name: &'static str,
-    nslots: usize,
+    /// `<clinit>` 已经跑过（初始化单调、永不回退）
+    inited: std::cell::Cell<bool>,
 }
 
 /// 一个 native 方法的派发缓存（键：`(ClassFile 指针, 方法下标)`）。
@@ -139,7 +140,7 @@ thread_local! {
     static NAT_SITE: std::cell::RefCell<
         std::collections::HashMap<(usize, u32), std::rc::Rc<NatSite>>,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
-    static SITE_NEW: std::cell::RefCell<std::collections::HashMap<(usize, u16), NewSite>> =
+    static SITE_NEW: std::cell::RefCell<std::collections::HashMap<(usize, u16), std::rc::Rc<NewSite>>> =
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
@@ -158,6 +159,95 @@ impl Vm {
         let r = std::rc::Rc::new(self.method_ref(cf, index)?);
         SITE_REFS.with(|c| c.borrow_mut().insert(key, (std::sync::Arc::clone(cf), std::rc::Rc::clone(&r))));
         Ok(r)
+    }
+
+    /// 静态/特殊调用的方法解析：成功一次就永久缓存（JVMS 5.4.3.3 明确要求缓存解析结果）。
+    ///
+    /// 为什么要缓存：`resolve_method` 每次都要 `chain()`（沿着继承链克隆类名 —— 每层两次
+    /// `String` 分配）、再对每层做一次 `method_matches`（又一次 `this_class_name()` 分配）。
+    /// 实测这一步单独占 **907 ns**，是每次 Java 调用固定开销的 45%。解析结果对同一个常量池
+    /// 引用是固定的：类的父类链在加载后不再变化，方法只会「解析到」或「解析不到」，
+    /// 不会先解析到一个再换成另一个。
+    #[inline]
+    fn resolved_target(&self, info: &MethodRefInfo) -> Option<(usize, usize)> {
+        let c = info.target.get();
+        if c != 0 {
+            let v = c - 1;
+            return Some(((v >> 32) as usize, (v & 0xffff_ffff) as usize));
+        }
+        let t = self.store.resolve_method(&info.class, &info.name, &info.desc)?;
+        info.target.set((((t.0 as u64) << 32) | t.1 as u64) + 1);
+        Some(t)
+    }
+
+    /// 虚分派目标（单态内联缓存）。
+    ///
+    /// 为什么要它：`invokevirtual` 每次都要按**接收者的运行时类**解析：
+    /// `ref_kind` → 拿到类名 `String`（分配），`resolve_method` 再 `chain()` + 逐层
+    /// `method_matches`（又一次 `this_class_name()` 分配）—— rdtsc 实测整条虚调用 1.3 μs，
+    /// `String.length()` 这种一个 getfield 的方法要 1 μs，`Integer.toString` 里十几条
+    /// 虚调用就是这么堆成 30 μs 的。
+    ///
+    /// 单态缓存以「类名的 `Arc<str>` 指针」为键：`class_names` 表持有那些 `Arc` 直到进程结束，
+    /// 同一个类恒得同一个指针，不同类必不同（`intern_class_id` 保证 id 不复用）。
+    /// 命中就跳过 `ref_kind` + `resolve_method`，只剩「取类名 + 指针比较」。
+    #[inline]
+    fn vtarget(
+        &self,
+        info: &MethodRefInfo,
+        cname: Option<&std::sync::Arc<str>>,
+        ckey: usize,
+    ) -> Option<(usize, usize)> {
+        if ckey != 0 {
+            let m = info.mono.borrow();
+            if m.0 == ckey && m.1 != 0 {
+                let v = m.1 - 1;
+                return Some(((v >> 32) as usize, (v & 0xffff_ffff) as usize));
+            }
+        }
+        let t = cname
+            .map(|a| a.as_ref())
+            .and_then(|c| self.store.resolve_method(c, &info.name, &info.desc))
+            .or_else(|| self.store.resolve_method(&info.class, &info.name, &info.desc))?;
+        if ckey != 0 {
+            info.mono
+                .replace((ckey, (((t.0 as u64) << 32) | t.1 as u64) + 1, cname.cloned()));
+        }
+        Some(t)
+    }
+
+    /// 字段偏移（按调用点缓存 + **类表代数守卫**）。
+    ///
+    /// 为什么要缓存：`store.field_index(owner, name)` 第一件事就是 `chain(owner)` ——
+    /// 每层一个 `String` 克隆 + 一个 `Vec`，再对每层做一次 `HashMap<String, _>` 查找。
+    /// rdtsc 实测一次 `getfield` 里它占 **477 ns**（`pt.x` 这种单字段读取整条指令 929 ns）。
+    ///
+    /// 为什么带代数：`own_fields` 的下标是 `build_meta_one` 在**类加载那一刻**按当时的
+    /// 继承链算出来的，父类后加载会改变答案（#147 那次 `System.out` 变 null 就是
+    /// 「类在表里 ≠ 布局定稿」）。所以缓存只在「类表没变过」的窗口内有效：
+    /// `classes.len()` 一变，所有旧条目自动作废，退回逐次解析。只缓存**解析成功**的。
+    #[inline]
+    fn field_off_cached(&self, info: &MethodRefInfo) -> Option<usize> {
+        let gen = self.store.classes.len() as u32;
+        let (g, off) = info.field.get();
+        if g == gen && off != 0 {
+            return Some(off as usize - 1);
+        }
+        let ix = self.store.field_index(&info.class, &info.name)?;
+        info.field.set((gen, ix as u32 + 1));
+        Some(ix)
+    }
+
+    /// 字符串句柄的字段槽下标（`value`/`coder`/`hash`/`hashIsZero`，名字表固定）
+    #[inline]
+    fn str_slot_cached(&self, info: &MethodRefInfo) -> Result<usize, VmError> {
+        let c = info.str_slot.get();
+        if c != 0 {
+            return Ok(c as usize - 1);
+        }
+        let i = self.str_field_slot(&info.name)?;
+        info.str_slot.set(i as u32 + 1);
+        Ok(i)
     }
 
     /// 这个方法的引用位图（按 `(ClassFile 地址, 方法下标)` 缓存，第一次执行时算）。
@@ -1221,11 +1311,32 @@ impl Vm {
                 0xbb => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let cls = class_name_of(&cf, idx)?;
+                    // 调用点缓存（见 `NewSite`）：类名不再每次分配、`<clinit>` 不再每次查
+                    let nkey = (std::sync::Arc::as_ptr(&cf) as usize, idx);
+                    let cached_new = SITE_NEW.with(|c| c.borrow().get(&nkey).map(std::rc::Rc::clone));
+                    let site = match cached_new {
+                        Some(s) => s,
+                        None => {
+                            let name: &'static str =
+                                Box::leak(class_name_of(&cf, idx)?.into_boxed_str());
+                            let s = std::rc::Rc::new(NewSite {
+                                _cf: std::sync::Arc::clone(&cf),
+                                name,
+                                inited: std::cell::Cell::new(false),
+                            });
+                            SITE_NEW.with(|c| c.borrow_mut().insert(nkey, std::rc::Rc::clone(&s)));
+                            s
+                        }
+                    };
+                    let cls = site.name;
                     // 首次 new 这个类时先跑它的 <clinit>
-                    self.ensure_init(&cls)?;
-                    let n = self.store.field_count(&cls);
-                    match self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], &cls) {
+                    if !site.inited.get() {
+                        self.ensure_init(cls)?;
+                        site.inited.set(true);
+                    }
+                    // 槽数**不能**按调用点缓存（并行加载下「类在表里」不等于「布局定稿」）
+                    let n = self.store.field_count(cls);
+                    match self.sh.heap.new_object(vec![Slot::I(0); n.max(1)], cls) {
                         Some(h) => frame.push(Slot::I(h)),
                         None => return err("OutOfMemoryError: 对象堆用尽"),
                     }
@@ -1238,12 +1349,16 @@ impl Vm {
                     let obj = frame.pop_i()?;
                     let v = if is_str_handle(obj) {
                         // 字符串堆句柄的字段视图（`ldc "abc"` 的 `value`/`coder`/`hash`）
-                        let f = self.str_field_slot(&info.name)?;
+                        let f = self.str_slot_cached(&info)?;
                         let slots = self.str_field_slots(obj);
                         slots.get(f).copied().unwrap_or(Slot::I(0))
                     } else {
                         // 偏移沿引用类的继承链解析；布局是「父类在前」，子类偏移与父类一致
-                        let f = self.field_offset(obj, &info.class, &info.name)?;
+                        let f = match self.field_off_cached(&info) {
+                            Some(f) => f,
+                            // 没解析到（或类表刚变过）→ 走原路，语义（含 Err）完全一致
+                            None => self.field_offset(obj, &info.class, &info.name)?,
+                        };
                         self.sh.heap.get(obj, f).unwrap_or(Slot::I(0))
                     };
                     frame.push(v);
@@ -1257,10 +1372,13 @@ impl Vm {
                     let obj = frame.pop_i()?;
                     if is_str_handle(obj) {
                         // 只有缓存字段（hash/hashIsZero）会被真字节码写；写 value/coder 不影响文本
-                        let f = self.str_field_slot(&info.name)?;
+                        let f = self.str_slot_cached(&info)?;
                         self.str_field_write(obj, f, value);
                     } else {
-                        let f = self.field_offset(obj, &info.class, &info.name)?;
+                        let f = match self.field_off_cached(&info) {
+                            Some(f) => f,
+                            None => self.field_offset(obj, &info.class, &info.name)?,
+                        };
                         if is_ref_desc(&info.desc) {
                             self.sh.heap.set_ref(obj, f, value);
                         } else {
@@ -1524,15 +1642,26 @@ impl Vm {
                             });
                         }
                     } else {
-                        let argc = count_args(&info.desc)?;
-                        let mut args = Vec::with_capacity(argc + 1);
-                        for _ in 0..argc {
-                            args.push(frame.pop()?);
-                        }
-                        let recv = frame.pop()?;
-                        args.reverse();
-                        let mut all = vec![recv];
-                        all.extend(args);
+                        // 参数与接收者直接从操作数栈上取：`argc + 1 <= 8` 时不分配任何 Vec。
+                        // （原来这里 `Vec::with_capacity` + `vec![recv]` + `extend` 是三次分配。）
+                        let argc = info.argc()?;
+                        let nargs = argc + 1;
+                        let mut sbuf = [Slot::I(0); 8];
+                        let mut vbuf: Vec<Slot> = Vec::new();
+                        let all: &[Slot] = if nargs <= sbuf.len() {
+                            for i in (0..nargs).rev() {
+                                sbuf[i] = frame.pop()?;
+                            }
+                            &sbuf[..nargs]
+                        } else {
+                            vbuf.reserve(nargs);
+                            for _ in 0..nargs {
+                                vbuf.push(frame.pop()?);
+                            }
+                            vbuf.reverse();
+                            &vbuf
+                        };
+                        let recv = all[0];
                         // 注解代理对象：运行时类 = 注解接口、成员值在 `Vm::ann_objs` 里。
                         // 接口方法都是抽象的，所以必须在方法解析之前分流（与 lambda 同一层）。
                         if !lk(&self.sh.ann_objs).is_empty() {
@@ -1572,17 +1701,29 @@ impl Vm {
                         // 从对象的**实际类**开始解析（这就是覆写的分派点）；
                         // 拿不到运行时类才退回引用类。**真字节码优先**：
                         // `VMLESS_PREFER_BUILTIN=1` 只是「先问内建表」，内建表没有的还能走字节码。
-                        let actual = match self.ref_kind(recv.as_i32()) {
-                            RefKind::Obj(c) => Some(c),
+                        // 接收者的运行时类：`heap.class_of` 只克隆 `Arc<str>`（不复制字符串），
+                        // 顺带把它的**指针**当类身份喂给单态内联缓存。
+                        let rv = recv.as_i32();
+                        let cname: Option<std::sync::Arc<str>> = if rv == 0 {
+                            None
+                        } else if rv >= STR_BASE {
                             // 字符串句柄（`ldc "abc"` 给的那一坨）的运行时类**就是**
                             // `java/lang/String`。少了这一条，`CharSequence.toString()`
                             // 这种按接口声明的调用会解析到 `Object.toString` 上 ——
                             // `String.contains` 的字节码正是 `indexOf(s.toString())`，
                             // 于是它静默给出 false。
-                            RefKind::Str => Some("java/lang/String".to_string()),
-                            // 数组没有自己的方法，全部继承自 Object
-                            RefKind::Arr(_) => Some("java/lang/Object".to_string()),
-                            RefKind::Null => None,
+                            Some(arc_jlstring())
+                        } else {
+                            match self.sh.heap.class_of(rv) {
+                                // 数组没有自己的方法，全部继承自 Object
+                                Some(a) if a.starts_with(0x5b as char) => Some(arc_jlobject()),
+                                Some(a) => Some(a),
+                                None => None,
+                            }
+                        };
+                        let ckey = match &cname {
+                            Some(a) if rv != 0 => std::sync::Arc::as_ptr(a) as *const u8 as usize,
+                            _ => 0,
                         };
                         // 打在 null 上的 invokevirtual/invokeinterface = **NullPointerException**
                         // （JVMS 6.5）。以前这里直接掉进内建兜底：「内建方法 remove 未实现
@@ -1616,10 +1757,7 @@ impl Vm {
                                 }
                             }
                         }
-                        let target = actual
-                            .as_deref()
-                            .and_then(|c| self.store.resolve_method(c, &info.name, &info.desc))
-                            .or_else(|| self.store.resolve_method(&info.class, &info.name, &info.desc));
+                        let target = self.vtarget(&info, cname.as_ref(), ckey);
                         if self.sh.prefer_builtin {
                             // 只有内建实现**真给出值**才用它；给不出（或者这种接收者内建压根不支持）
                             // 就落到真字节码 —— 这个开关是「优先」不是「覆盖」，绝不能把路走死。
@@ -1733,7 +1871,7 @@ impl Vm {
                         continue;
                     }
                     self.last_caller = class;
-                    match self.store.resolve_method(&info.class, &info.name, &info.desc) {
+                    match self.resolved_target(&info) {
                         Some((ci, mi)) => {
                             let op_pc = pc - 3;
                             super::stacktrace::set_pc(op_pc);
@@ -1811,7 +1949,10 @@ impl Vm {
                         continue;
                     }
                     // 首次调用这个类的静态方法时先跑它的 <clinit>
-                    self.ensure_init(&info.class)?;
+                    if !info.inited.get() {
+                        self.ensure_init(&info.class)?;
+                        info.inited.set(true);
+                    }
                     let argc = count_args(&info.desc)?;
                     let mut args = Vec::with_capacity(argc);
                     for _ in 0..argc {
@@ -1829,7 +1970,7 @@ impl Vm {
                             continue;
                         }
                     }
-                    let target = self.store.resolve_method(&info.class, &info.name, &info.desc);
+                    let target = self.resolved_target(&info);
                     let Some(target) = target else {
                         // 兜底：这个类**没有字节码**时的内建替身（`Integer.parseInt` / `System.arraycopy` …）
                         let Some(v) = self.builtin_static(&info.class, &info.name, &info.desc, &args) else {
@@ -2076,4 +2217,17 @@ pub(super) fn code_of<'a>(
         }
     }
     err("方法没有 Code 属性（抽象方法？）")
+}
+
+/// 字符串句柄的运行时类名（共享 `Arc<str>`：`Arc::as_ptr` 就是单态缓存的键，
+/// 每次现造一个 `Arc::from` 会多一次分配，键也不稳定）
+fn arc_jlstring() -> std::sync::Arc<str> {
+    static S: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(S.get_or_init(|| std::sync::Arc::from("java/lang/String")))
+}
+
+/// 数组的运行时类（数组不声明方法，全部继承自 `Object`）
+fn arc_jlobject() -> std::sync::Arc<str> {
+    static S: std::sync::OnceLock<std::sync::Arc<str>> = std::sync::OnceLock::new();
+    std::sync::Arc::clone(S.get_or_init(|| std::sync::Arc::from("java/lang/Object")))
 }

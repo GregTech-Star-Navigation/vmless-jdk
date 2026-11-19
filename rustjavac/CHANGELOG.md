@@ -2,6 +2,48 @@
 
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
+## 0.78.0
+
+**为什么**：每次 Java 调用的固定开销是 1486 ns —— 这是真实程序比 HotSpot 慢 6.5 倍的唯一来源
+（native 体优化只值 5%，因为一次 `Integer.toString` 有 25 次调用）。
+
+**先拆分**（rdtsc，`VMLESS_CALLPROF=1`）：
+
+| 段 | ns | 占比 |
+| --- | --- | --- |
+| **`resolve_method`** | **907** | **61%** ← 每次 `chain()` 都做「每层 2 次 String 分配 + `method_matches` 再一次 `this_class_name()`」 |
+| `Frame::new` | 136 | 9% |
+| 返回路径 + Drop | ≈250 | 17%（2 次 free + Rc/Arc 析构） |
+| `ensure_init` | 66 | 4% |
+| 其余（site_ref / st-enter / CODE_SITE / ARG_SITE / Arc clone …） | ≈230 | 15% |
+
+**改了什么**
+
+- **方法解析按调用点缓存**（JVMS 5.4.3.3 允许）：`resolve_method` **907 → 16 ns**。
+- **虚调用用 `heap.class_of` 取代 `ref_kind`**（后者每次分配 String 类名）+ 单态缓存
+  （键是类名 `Arc` 指针，并攥住该 Arc 防地址复用）：虚调用 1.3 μs → **0.44 μs**；
+  `s.length()` 5187 → 1686 ns、`toString` 267 → 177 ns。
+- **`Frame` 的槽位改内联 8 槽 + 溢出堆**（`frame.rs::Slots`）：**不池化**，每帧自己清零。
+  `Frame::new` 136 → ~0，析构零 free。
+- **`getfield`/`putfield` 偏移按调用点缓存**，带**「类表代数」守卫**（`classes.len()` 一变全部作废），
+  只缓存解析成功的；**槽数绝不缓存**：`pt.x` 929 → **145 ns**。
+- **`NewSite` 接上**（类名 `Box::leak` 成 `&'static str` + 每站点 inited 标志；**槽数仍每次查**）：
+  `new Object()` 1750 → **905 ns**。
+- **invoke 参数改栈上小缓冲**（`argc+1 ≤ 8`）：虚调用从 3 次分配降到 0。
+
+**结果**：空静态方法 **1486 → 333 ns**、带参 1663 → 502、native 1576 → 300。
+Mb4：`toString` 431 → **170 ms**、`concat` 1437 → **481 ms**、`newStr` 181 → 68。
+
+真程序（同 harness，含启动）：R1 2238 → **1073**、R2 633 → **515**、R3 2406 → **1187**、R5 431 → **401**；
+扣掉启动后 R1 **902** / R2 **344** / R3 **1016** / R5 **230** ms。
+
+**验证**：真程序 5/5、`verify.sh` 103/0、**GC_STRESS 10 样例 × 15 次 = 150/150**、
+`cargo test` 124、Cas1/Mt1/Mx 各 20/20、JIT 持平（P1 17–18 / P2 64–65 / R4-JIT 22.7）。
+
+**剩下的**：`getstatic` 355 ns / `putstatic` 1150 ns（要改 `shared.rs` 的表的键类型才根治）、
+`verify` 的 thread-local 缓存只有 1 项（两种方法交替就每次掉全局锁）、
+解释器本身 ~28 ns/字节码（再上一档要动主循环里每条指令一次的 `frame.pc = pc`）。
+
 ## 0.77.0
 
 **为什么**：rdtsc 打点实测出四条 native/分配热点，其中 `Unsafe.putByte` 的 native 体要 678 ns。

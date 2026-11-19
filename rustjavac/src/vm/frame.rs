@@ -6,55 +6,189 @@ use super::gc::MethodRefs;
 use super::slot::Slot;
 use super::VmError;
 
-/// 每线程的 `Vec<Slot>` 缓冲池。
+/// 内联槽数：`max_locals` / 操作数栈在 8 以内时**一次堆分配都不需要**。
 ///
-/// 为什么要它：`Frame::new` 每次 Java 调用要 2 次 `malloc`（locals + stack），
-/// 帧析构再 2 次 `free` —— 本机实测固定开销里 `Frame::new` 一个人就占 **119 ns**
-/// （占解释器每次调用固定开销的 19%）。槽内容是「清零 + 写参数」，没有身份，
-/// 所以按**栈序**回收复用是安全的：帧是严格嵌套的，`Drop` 一定发生在
-/// 「同一个槽的下一帧被创建」之前。
+/// 取 8 的依据：JDK 热路径上的小方法（`Integer.toString` 的 `getChars`、`StringBuilder.append`
+/// 的那些重载、`String.<init>`）`max_locals` 与 `max_stack` 都在 5~7；用户代码里的 getter /
+/// 算术方法更小。超过 8 的按老样子分配到堆上（一次，容量按需增长）。
+const INLINE: usize = 8;
+
+/// 一列槽位：定长内联区 + 溢出到堆。
 ///
-/// 为什么池化缓冲区、而不是池化整个 `Frame`：`Frame` 的地址会被登记进
-/// GC 的根集（`FrameGuard` 存的是 `*const Frame`），池化 Frame 本身就要保证
-/// 「同一时刻只有一个活帧用这块内存」，那是另一件需要证明的事。缓冲区没有这个问题 ——
-/// `gc` 扫的是 `frame.locals`/`frame.stack` 的内容，而 `Drop` 只在帧已经不再被任何
-/// 根集引用之后才跑（`_frame_guard` 在 `frame` **之后**声明，所以先析构）。
+/// 为什么要它：`Frame` 每次调用要分配 locals + stack 两块、返回时再 `free` 两块 ——
+/// rdtsc 实测这段是每次调用固定开销里最贵的一格（`Frame::new` 135 ns + 析构回收 ~120 ns）。
+/// 内联之后小方法这两块都在帧自己身上，**零分配零释放**。
 ///
-/// 池只在线程内、只在 `Frame::new`/`Drop` 上各碰一次 `Vec` 的头指针，不加锁。
-thread_local! {
-    static BUF_POOL: std::cell::UnsafeCell<Vec<Vec<Slot>>> =
-        const { std::cell::UnsafeCell::new(Vec::new()) };
+/// 为什么不是「线程本地缓冲池」：池化会让不同调用的帧复用同一块内存，GC 的保守扫描
+/// 看到的根集随复用历史变化（实测 `Str1` 20 次里偶发 1 次丢根）。内联区跟着 Rust 栈帧走，
+/// 每帧构造时自己清零，根集与「每帧新分配」逐字节一致。
+///
+/// `ptr` 不能存绝对地址：`Frame` 是按值返回的，内联区会跟着搬家。所以堆/内联由
+/// `spilled` 区分，内联时每次现算 `inline.as_ptr()`（一次可预测分支）。
+pub(super) struct Slots {
+    /// true = 数据在 `heap`（容量超过内联区）
+    spilled: bool,
+    len: usize,
+    /// 总容量（含内联部分）：`cap > INLINE` 意味着有堆块
+    cap: usize,
+    heap: *mut Slot,
+    inline: [Slot; INLINE],
 }
 
-/// 池的深度上限：递归能有 8000 层，池跟着涨没意义（每层一个缓冲区本来就够用）
-const POOL_MAX: usize = 512;
-
-#[inline(always)]
-fn take_buf() -> Vec<Slot> {
-    // SAFETY: 只在 `Frame::new` 里短借用，不做跨调用持有；单线程访问，无别名
-    BUF_POOL.with(|c| unsafe { (*c.get()).pop().unwrap_or_default() })
-}
-
-#[inline(always)]
-fn give_buf(v: Vec<Slot>) {
-    if v.capacity() == 0 {
-        return; // 没分配过的空 Vec 直接丢，不占池
+impl Slots {
+    /// 长度 `n`、内容全 `I(0)` 的一列（局部变量表用：GC 会把整段当潜在引用扫）
+    pub(super) fn zeros(n: usize) -> Slots {
+        let mut s = Slots::empty();
+        s.resize(n, Slot::I(0));
+        s
     }
-    // SAFETY: 同上
-    BUF_POOL.with(|c| unsafe {
-        let p = &mut *c.get();
-        if p.len() < POOL_MAX {
-            p.push(v);
+
+    /// 空的一列（操作数栈用）
+    pub(super) fn empty() -> Slots {
+        Slots {
+            spilled: false,
+            len: 0,
+            cap: INLINE,
+            heap: std::ptr::null_mut(),
+            inline: [Slot::I(0); INLINE],
         }
-    });
+    }
+
+    #[inline(always)]
+    fn base(&self) -> *const Slot {
+        if self.spilled {
+            self.heap
+        } else {
+            self.inline.as_ptr()
+        }
+    }
+
+    #[inline(always)]
+    pub(super) fn as_slice(&self) -> &[Slot] {
+        // SAFETY: `base()` 指向至少 `len` 个已初始化槽；内联区随 self 存活，堆块由 Drop 释放
+        unsafe { std::slice::from_raw_parts(self.base(), self.len) }
+    }
+
+    #[inline(always)]
+    fn as_mut_slice(&mut self) -> &mut [Slot] {
+        // SAFETY: 同上，且 &mut self 保证独占
+        unsafe { std::slice::from_raw_parts_mut(self.base() as *mut Slot, self.len) }
+    }
+
+    #[inline(always)]
+    pub(super) fn push(&mut self, v: Slot) {
+        if self.len == self.cap {
+            self.grow(1);
+        }
+        // SAFETY: 容量够（上面刚保证），写入后立刻把 len 提到 n+1
+        unsafe {
+            (self.base() as *mut Slot).add(self.len).write(v);
+        }
+        self.len += 1;
+    }
+
+    #[inline(always)]
+    pub(super) fn pop(&mut self) -> Option<Slot> {
+        if self.len == 0 {
+            return None;
+        }
+        // SAFETY: len > 0，读已初始化区间的最后一个槽
+        let v = unsafe { *(self.base().add(self.len - 1)) };
+        self.len -= 1;
+        Some(v)
+    }
+
+    pub(super) fn insert(&mut self, at: usize, v: Slot) {
+        if self.len == self.cap {
+            self.grow(1);
+        }
+        // SAFETY: 容量够；`at <= len` 由调用方（字节码语义）保证，越界按 len 截断
+        unsafe {
+            let p = self.base() as *mut Slot;
+            let at = at.min(self.len);
+            std::ptr::copy(p.add(at), p.add(at + 1), self.len - at);
+            p.add(at).write(v);
+        }
+        self.len += 1;
+    }
+
+    pub(super) fn clear(&mut self) {
+        self.len = 0;
+    }
+
+    pub(super) fn resize(&mut self, n: usize, v: Slot) {
+        if n > self.cap {
+            self.grow(n - self.len);
+        }
+        // SAFETY: 容量 >= n，写入后长度设为 n
+        unsafe {
+            let p = self.base() as *mut Slot;
+            for i in self.len..n {
+                p.add(i).write(v);
+            }
+        }
+        self.len = n;
+    }
+
+    #[cold]
+    fn grow(&mut self, need: usize) {
+        let newcap = (self.cap * 2).max(self.len + need).max(INLINE + 1);
+        let mut v: Vec<Slot> = Vec::with_capacity(newcap);
+        v.extend_from_slice(self.as_slice());
+        let len = v.len();
+        let (p, c) = (v.as_mut_ptr(), v.capacity());
+        std::mem::forget(v);
+        if self.spilled {
+            // SAFETY: 这块是上次 `grow` 里 forget 掉的 Vec，长度/容量一致
+            unsafe {
+                drop(Vec::from_raw_parts(self.heap, self.len, self.cap));
+            }
+        }
+        self.spilled = true;
+        self.heap = p;
+        self.cap = c;
+        self.len = len;
+    }
+}
+
+impl std::fmt::Debug for Slots {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        self.as_slice().fmt(f)
+    }
+}
+
+impl std::ops::Deref for Slots {
+    type Target = [Slot];
+    #[inline(always)]
+    fn deref(&self) -> &[Slot] {
+        self.as_slice()
+    }
+}
+
+impl std::ops::DerefMut for Slots {
+    #[inline(always)]
+    fn deref_mut(&mut self) -> &mut [Slot] {
+        self.as_mut_slice()
+    }
+}
+
+impl Drop for Slots {
+    fn drop(&mut self) {
+        if self.spilled {
+            // SAFETY: 堆块来自 `grow` 里 forget 的 Vec，长度/容量与当时一致
+            unsafe {
+                drop(Vec::from_raw_parts(self.heap, self.len, self.cap));
+            }
+        }
+    }
 }
 
 pub(super) struct Frame {
     /// 局部变量表：按**JVM 槽**编号。long/double 占两槽，第 2 槽写 `I(0)` 当无效占位
     /// （与 max_locals、与 JIT 的 locals 布局保持一致）。
-    pub(super) locals: Vec<Slot>,
+    pub(super) locals: Slots,
     /// 操作数栈：一个宽值只占**一个**条目（解释器按值而不是按槽建模）。
-    pub(super) stack: Vec<Slot>,
+    pub(super) stack: Slots,
     /// 参数槽位表（`crate::jit::param_slots(desc)`）：第 i 个**声明的参数**起始槽
     pub(super) arg_slots: Vec<usize>,
     /// 参数从哪个槽开始（实例方法 1 = this 占槽 0；静态方法 0）
@@ -71,20 +205,11 @@ pub(super) struct Frame {
 
 impl Frame {
     pub(super) fn new(max_locals: usize) -> Self {
-        // 缓冲区从线程池拿（见 `BUF_POOL`）：命中时只剩「清空 + 清零」，
-        // 没有 malloc/free。`clear` + `resize` 保证 locals 全长都是 `I(0)` ——
-        // GC 会把 `locals` 里**所有**槽当潜在引用扫（复用来的残留句柄必须是 0）。
-        let mut locals = Vec::new();
-        locals.clear();
-        locals.resize(max_locals.max(1), Slot::I(0));
-        let mut stack = Vec::new();
-        stack.clear();
-        if stack.capacity() < 16 {
-            stack.reserve(16);
-        }
         Frame {
-            locals,
-            stack,
+            // locals 必须**全长都是 `I(0)`**：GC 把 locals 里所有槽当潜在引用扫，
+            // 残留的旧句柄会被当成根。
+            locals: Slots::zeros(max_locals),
+            stack: Slots::empty(),
             arg_slots: Vec::new(),
             arg_base: 0,
             pc: usize::MAX,
@@ -94,30 +219,13 @@ impl Frame {
     }
     #[inline(always)]
     pub(super) fn push(&mut self, v: Slot) {
-        // 快路径：容量够就直接写进去（解释器每条指令都在走这条）。
-        // 慢路径（扩容）交给 `Vec::push`，它一年也走不到几次。
-        let n = self.stack.len();
-        if n < self.stack.capacity() {
-            // SAFETY: `n < capacity`，写入后立刻把 len 提到 n+1。
-            unsafe {
-                self.stack.as_mut_ptr().add(n).write(v);
-                self.stack.set_len(n + 1);
-            }
-        } else {
-            self.stack.push(v);
-        }
+        self.stack.push(v);
     }
     #[inline(always)]
     pub(super) fn pop(&mut self) -> Result<Slot, VmError> {
-        let n = self.stack.len();
-        if n == 0 {
-            return Err(VmError { msg: "操作数栈下溢".into(), exc: None });
-        }
-        // SAFETY: `n > 0`，读的是已初始化区间的最后一个元素，读完立刻缩短 len。
-        unsafe {
-            let v = *self.stack.as_ptr().add(n - 1);
-            self.stack.set_len(n - 1);
-            Ok(v)
+        match self.stack.pop() {
+            Some(v) => Ok(v),
+            None => Err(VmError { msg: "操作数栈下溢".into(), exc: None }),
         }
     }
     #[inline(always)]
@@ -154,7 +262,9 @@ impl Frame {
             self.store(slot, *a);
         }
     }
+}
 
+impl Frame {
     /// 第 `i` 个**声明的参数**（0 起，不含 `this`）所在的槽。
     ///
     /// native 实现一律走这里 —— 手写槽位下标必然算错（`Unsafe.getX(Object,long)`
@@ -181,9 +291,4 @@ impl Frame {
     pub(super) fn this(&self) -> i32 {
         self.load(0).as_i32()
     }
-}
-
-impl Drop for Frame {
-    /// 把两个缓冲区还给线程池（见 `BUF_POOL` 的说明：这时帧已经不在任何根集里）。
-    fn drop(&mut self) {}
 }
