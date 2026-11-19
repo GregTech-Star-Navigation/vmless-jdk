@@ -31,6 +31,7 @@ fn main() {
             std::process::exit(2);
         };
         println!("java.base: {jdk}");
+        classfile::vm::set_main_args(args.iter().skip(2).cloned().collect());
         match classfile::vm::run_jar(jar, None) {
             Ok(r) => {
                 for line in &r.output {
@@ -59,6 +60,9 @@ fn main() {
     let dir = &args[0];
     let main_class = &args[1];
     let spec = format!("{dir}");
+    // 命令行参数（`run_jdk <dir> <Main> a b c` 的 a b c）
+    classfile::vm::set_main_args(args.iter().skip(2).cloned().collect());
+    let t_open = std::time::Instant::now();
 
     let mut vm = match classfile::vm::Vm::open(&spec, main_class) {
         Ok(vm) => vm,
@@ -68,12 +72,21 @@ fn main() {
         }
     };
     println!("java.base: {jdk}");
+    // 类表是**按需**长的：这里只报「已经解析进内存」的类数，别让人误以为启动就把
+    // java.base 全读进来了（以前那句话是「类表: 5421 个类」，那确实是全读了）。
     println!(
-        "类表: {} 个类（含 java.lang.Object = {}）",
+        "类表: 已加载 {} 个类（按需加载；含 java.lang.Object = {}）",
         vm.loaded_classes().len(),
         vm.loaded_classes().iter().any(|c| c == "java/lang/Object")
     );
+    if std::env::var_os("VMLESS_CP_STATS").is_some() {
+        eprintln!("[cp] Vm::open {} ms", t_open.elapsed().as_millis());
+    }
+    let t_run = std::time::Instant::now();
     let r = vm.run_main();
+    if std::env::var_os("VMLESS_CP_STATS").is_some() {
+        eprintln!("[cp] run_main {} ms", t_run.elapsed().as_millis());
+    }
     match r {
         Ok(r) => {
             for line in &r.output {
@@ -87,6 +100,9 @@ fn main() {
         Err(e) => println!("执行失败: {}", e.msg),
     }
     let missing = vm.missing_natives();
+    if std::env::var_os("VMLESS_CP_STATS").is_some() {
+        eprintln!("[cp] 运行结束时已加载 {} 个类", vm.loaded_classes().len());
+    }
     if missing.is_empty() {
         println!("缺 native: 0");
     } else {

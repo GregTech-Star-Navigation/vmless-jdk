@@ -460,7 +460,19 @@ impl Vm {
             let main_name = self.store.classes[main_class].this_class_name().unwrap_or_default();
             self.ensure_init(&main_name)?;
         }
-        let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(0)], false);
+        // `main(String[])` 的实参：真 JVM 传的是**命令行参数**，不是 null。
+        // 以前这里固定传 `Slot::I(0)`（null），于是任何读 `args.length` 的程序
+        // 要么 NPE、要么永远看到 0 个参数 —— `java -jar app.jar a b c` 等于白传。
+        let argv: Vec<Slot> = main_args()
+            .iter()
+            .map(|s| Slot::I(self.sh.heap.new_string(s.clone())))
+            .collect();
+        let args_arr = self
+            .sh
+            .heap
+            .new_array(argv, "[Ljava/lang/String;")
+            .unwrap_or(0);
+        let r = self.execute(main_class, mi, "([Ljava/lang/String;)V", &[Slot::I(args_arr)], false);
         // `VMLESS_WDN_TRACE=1`：把 main 的结局**先**打出来。`wait_non_daemon()` 可能挂死
         // （非 daemon 线程退出不了），而 main 的异常文本原本要等它返回之后才由调用方打印 ——
         // 一挂死就永远看不到「main 到底抛了什么」。这个开关就是给那种场景用的。
@@ -631,6 +643,22 @@ fn push_jdk(cp: &mut crate::load::ClassPath) {
     if let Err(e) = r {
         eprintln!("VMLESS_JDK 挂载失败（{spec}）: {e}");
     }
+}
+
+/// `main(String[])` 的命令行实参。
+///
+/// 为什么是进程级 `static` 而不是 `Vm` 的字段：`run_main` 会把整个 `Vm` 搬进
+/// 一个大栈线程再搬回来（`std::mem::swap`），字段式的实参在搬运中容易丢；
+/// 而且一个进程只有一个 main。调用方（`examples/run_jdk.rs`）在 `run_main` 之前设。
+static MAIN_ARGS: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+
+/// 设置 `main` 收到的命令行参数（必须在 `run_main` 之前调，只有第一次生效）
+pub fn set_main_args(args: Vec<String>) {
+    let _ = MAIN_ARGS.set(args);
+}
+
+fn main_args() -> &'static [String] {
+    MAIN_ARGS.get().map(|v| v.as_slice()).unwrap_or(&[])
 }
 
 /// 从字节加载并执行 main（只有这一个类，父类找不到就是运行时错误）
