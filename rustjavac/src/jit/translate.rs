@@ -667,8 +667,17 @@ impl Jit {
                                 // 目标要收/发引用，或构造器：整个方法只能一起回退
                                 Err(e) => return Err(e),
                             }
+                        } else if !crate::vm::has_ref(&info.2) {
+                            // 目标不在 JIT 的类集里（`java.*` 之类），但**签名全是基本类型**
+                            // → 发解释器桩。这是「编不了就回退解释器」的最小可用形态，
+                            // 而且必须做：以前这里直接跳过，等到调用点才发现既不是内建、
+                            // 也没编译 → 报「调用目标未编译」→ **整个方法**回退。
+                            // 一个 `Integer.sum(II)I` 就能让整程序掉进解释器（实测 177× 的悬崖：
+                            // L2 里 2M 次 `P::sal` 调用，JIT 136ms、解释器 24063ms）。
+                            let id = crate::vm::register_interp(&info.0, &info.1, &info.2);
+                            interp_targets.insert(idx, (id, info.2.clone()));
                         }
-                        // 找不到（java.* 的方法 / 构造器）就当作外部调用，按空操作处理
+                        // 剩下的是「找不到且签名带引用」：构造器之类，调用点再判
                     }
                 }
                 q += len;
@@ -1222,7 +1231,11 @@ impl Jit {
                     } else {
                     let (fid, callee_max_locals, argc) = *call_targets
                         .get(&idx)
-                        .ok_or_else(|| JitError("调用目标未编译".into()))?;
+                        .ok_or_else(|| {
+                        let (o, n, d) = super::call::method_ref_of(&cf, idx)
+                            .unwrap_or_else(|_| ("?".into(), "?".into(), "?".into()));
+                        JitError(format!("调用目标未编译: {o}.{n}{d}"))
+                    })?;
                     // <clinit> 与调用本身都可能分配对象：先把操作数栈上的引用写进根区并登记
                     let op_pc = pc - 3;
                     let refs_pc = refs.at.get(&op_pc).cloned().unwrap_or_default();
