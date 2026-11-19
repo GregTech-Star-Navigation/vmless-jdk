@@ -8,6 +8,7 @@
 //! jimage 的索引解码在 `jimage.rs` 里按 `jdk.internal.jimage.ImageLocation` 的
 //! 位压缩格式解（`kind << 3 | (len-1)`）。
 
+pub mod cds;
 pub mod cli;
 pub mod dir;
 pub mod jar;
@@ -128,6 +129,13 @@ pub struct ClassPath {
     module_tree: bool,
     /// 包 → 上次命中的来源下标（只在 `module_tree` 下用，省掉冷启动的文件探测）
     pkg_hint: RefCell<HashMap<String, usize>>,
+    /// 类表缓存（CDS）。只对「模块镜像 + 没有 JPMS 访问检查」的启动生效，见 `attach_cds`。
+    cds: Option<Arc<cds::Cds>>,
+    /// 模块镜像开始的下标：`entries[0..module_from]` 是用户自己的扁平来源（它们**优先**）
+    module_from: usize,
+    /// 每个 `module_from` 之前的来源「顶层目录名」清单（懒建）：用来**一眼否掉**整片包，
+    /// 不必为 5421 个类挨个去 stat 用户目录
+    flat_top: RefCell<Vec<Option<std::collections::HashSet<std::ffi::OsString>>>>,
 }
 
 /// 内部类名 → 条目路径：`java/lang/Object` / `java/lang/Object.class` → `java/lang/Object.class`
@@ -182,6 +190,7 @@ impl ClassPath {
         if !root.is_dir() {
             return Err(format!("{} 不是目录", root.display()));
         }
+        self.module_from = self.entries.len();
         self.push(root)?;
         let mut mods: Vec<PathBuf> = std::fs::read_dir(root)
             .map_err(|e| format!("读目录 {} 失败: {e}", root.display()))?
@@ -195,7 +204,130 @@ impl ClassPath {
         }
         self.module_tree = true;
         self.pkg_hint.borrow_mut().clear();
+        self.flat_top.borrow_mut().clear();
         Ok(())
+    }
+
+    /// 挂上类表缓存（CDS）。`fp` 是来源指纹，不符就当没有。
+    ///
+    /// **只在「模块镜像 + 没有 JPMS 访问检查」时挂**：JPMS 通道要走 `check_reference`
+    /// 与模块封装，那条路和「按名字给字节」的语义不一致，宁可不省这点时间。
+    /// 返回是否挂上了。
+    pub fn attach_cds(&mut self, fp: &str) -> bool {
+        if !self.module_tree || self.modules.is_some() {
+            return false;
+        }
+        if std::env::var_os("VMLESS_CDS").map(|v| v == "0" || v == "false").unwrap_or(false) {
+            return false;
+        }
+        let Some(path) = cds::Cds::path_for(fp) else { return false };
+        match cds::Cds::open(&path, fp) {
+            Some(c) => {
+                self.cds = Some(Arc::new(c));
+                true
+            }
+            None => false,
+        }
+    }
+
+    pub fn cds(&self) -> Option<&Arc<cds::Cds>> {
+        self.cds.as_ref()
+    }
+
+    /// 这个来源集合值不值得建缓存：只有模块镜像（大、稳定、每次一样）值得
+    pub fn wants_cds(&self) -> bool {
+        self.module_tree && self.modules.is_none()
+    }
+
+    /// 这个类是不是「模块镜像里的类」（缓存只收这些；用户自己的类随程序变）
+    pub fn is_module_class(&self, class: &str) -> bool {
+        self.module_tree && !self.flat_may_have(class)
+    }
+
+    /// 来源指纹：VM 版本 + 缓存格式版本 + 每个来源的（路径, mtime, 字节数）。
+    ///
+    /// jimage（`lib/modules`）是单文件，`size+mtime` 就是内容指纹；解包目录树只能看
+    /// 到目录自身的 mtime —— **就地覆写某个 .class 不改变目录 mtime**，那种情况下请
+    /// 用 `VMLESS_CDS=0` 或删掉缓存文件（见 `load/cds.rs` 的说明）。
+    pub fn fingerprint(&self) -> String {
+        let mut s = format!("vm{}|fmt{}", crate::load::cds::VM_EPOCH, cds::FMT);
+        for (p, src) in &self.entries {
+            let (mt, len) = std::fs::metadata(p)
+                .map(|m| {
+                    let mt = m
+                        .modified()
+                        .ok()
+                        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+                        .map(|d| d.as_nanos())
+                        .unwrap_or(0);
+                    (mt, m.len())
+                })
+                .unwrap_or((0, 0));
+            s.push_str(&format!("|{}:{}:{}:{}", src.kind(), p.display(), mt, len));
+        }
+        s
+    }
+
+    /// 这个类名有没有可能落在「用户自己的扁平来源」里（用户目录优先于模块镜像）。
+    ///
+    /// 判据是**顶层目录名**：`java/lang/Object` 只可能在 `<根>/java/...` 下，而 `<根>` 里
+    /// 的顶层条目是一次 `read_dir` 就拿到的一小撮名字。所以「模块镜像里 5421 个类的
+    /// 名字，一个 stat 都不用」—— 这是 CDS 快路径能真正省下时间的前提。
+    pub fn flat_may_have(&self, class: &str) -> bool {
+        let first = match class.split_once('/') {
+            Some((a, _)) => a,
+            None => return true, // 默认包里的类，老老实实去查
+        };
+        for i in 0..self.module_from {
+            match &self.entries[i].1 {
+                ClassSource::Dir(_) => {
+                    if self.dir_has_top(i, first) {
+                        return true;
+                    }
+                }
+                // jar / jimage：没有廉价判据，保守地当「可能有」
+                _ => return true,
+            }
+        }
+        false
+    }
+
+    fn dir_has_top(&self, si: usize, first: &str) -> bool {
+        let mut tops = self.flat_top.borrow_mut();
+        if tops.len() < self.module_from {
+            tops.resize(self.module_from, None);
+        }
+        if tops[si].is_none() {
+            let mut set = std::collections::HashSet::new();
+            if let Some((p, _)) = self.entries.get(si) {
+                if let Ok(rd) = std::fs::read_dir(p) {
+                    for e in rd.flatten() {
+                        set.insert(e.file_name());
+                    }
+                }
+            }
+            tops[si] = Some(set);
+        }
+        tops[si]
+            .as_ref()
+            .map(|s| s.contains(std::ffi::OsStr::new(first)))
+            .unwrap_or(true)
+    }
+
+    /// CDS 里能直接给出的类（且用户来源里没有同名类时才算数）
+    fn cds_idx(&self, class: &str) -> Option<usize> {
+        let cds = self.cds.as_ref()?;
+        if self.modules.is_some() || self.flat_may_have(class) {
+            return None;
+        }
+        cds.idx(class)
+    }
+
+    /// 一批名字的缓存下标（`None` = 不在缓存 / 用户来源里可能有，要走正常查找）。
+    ///
+    /// 闭包展开要用它来决定「这个类的引用表能不能直接从缓存拿」。
+    pub fn cds_indexes(&self, names: &[String]) -> Vec<Option<usize>> {
+        names.iter().map(|n| self.cds_idx(n)).collect()
     }
 
     pub fn is_empty(&self) -> bool {
@@ -210,6 +342,12 @@ impl ClassPath {
     pub fn find(&self, class: &str) -> Result<Option<Vec<u8>>, String> {
         if let Some(hit) = self.cache.borrow().get(class) {
             return Ok(hit.clone());
+        }
+        // ---- 类表缓存快路径：用户来源里没有这个包 → 直接按名字取 ----
+        if let Some(i) = self.cds_idx(class) {
+            if let Some(b) = self.cds.as_ref().and_then(|c| c.bytes(i)) {
+                return Ok(Some(b));
+            }
         }
         let entry = to_entry(class);
         let mut got = None;
@@ -350,6 +488,44 @@ impl ClassPath {
     /// 3. 包定位到了的名字 → 再并行读一轮；
     /// 4. 剩下的（包根本不存在 / jar、jimage 来源）→ 逐个 `find`。
     pub fn find_many(&self, names: &[String]) -> Vec<Option<Vec<u8>>> {
+        let mut out: Vec<Option<Vec<u8>>> = vec![None; names.len()];
+        if names.is_empty() {
+            return out;
+        }
+        // ---- 类表缓存：命中名单先并行取字节，剩下的再走老路径 ----
+        //
+        // 老路径（下面那套按包去重 + 并行读盘）在 5421 个类的闭包上要 ~90 ms，主要花在
+        // 「每个类一次 open」上（带外监视器逐个扫）。缓存把这一步换成「同一个文件句柄上
+        // 定位读」，一次 open 都不发生。
+        if self.cds.is_some() && self.modules.is_none() {
+            let mut rest: Vec<usize> = Vec::new();
+            let mut hit: Vec<Option<usize>> = vec![None; names.len()];
+            for (i, n) in names.iter().enumerate() {
+                match self.cds_idx(n) {
+                    Some(k) => hit[i] = Some(k),
+                    None => rest.push(i),
+                }
+            }
+            if hit.iter().any(|h| h.is_some()) {
+                let cds = self.cds.as_ref().unwrap();
+                let got = cds.bytes_many(&hit);
+                for (i, g) in got.into_iter().enumerate() {
+                    out[i] = g;
+                }
+                if !rest.is_empty() {
+                    let sub: Vec<String> = rest.iter().map(|&i| names[i].clone()).collect();
+                    let got = self.find_many_slow(&sub);
+                    for (k, &i) in rest.iter().enumerate() {
+                        out[i] = got[k].clone();
+                    }
+                }
+                return out;
+            }
+        }
+        self.find_many_slow(names)
+    }
+
+    fn find_many_slow(&self, names: &[String]) -> Vec<Option<Vec<u8>>> {
         let mut out: Vec<Option<Vec<u8>>> = vec![None; names.len()];
         if names.is_empty() {
             return out;

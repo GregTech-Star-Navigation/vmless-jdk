@@ -24,7 +24,7 @@ use self::shared::lk;
 use crate::{parse, ClassFile};
 use std::collections::HashMap;
 use std::sync::atomic::Ordering;
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 
 mod bridge;
 mod call;
@@ -63,9 +63,75 @@ pub use verify::verify_class;
 static PROF_LAST: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 static PROF_T0: Mutex<Option<std::time::Instant>> = Mutex::new(None);
 
+/// 本进程的（当前工作集, 峰值工作集），单位 MB。
+///
+/// 为什么要写在进程**里面**：外部采样（PowerShell / .NET 的 `WorkingSet64`）有两个坑 ——
+/// 20 ms 级的短进程只采得到一两次，而且 .NET 的 `Process` 属性会**缓存第一次快照**、
+/// 不 `Refresh()` 就永远返回同一个数（实测同一条命令一会儿 3.4 MB 一会儿 105 MB）。
+/// 只有 `K32GetProcessMemoryInfo` 里的 `PeakWorkingSetSize` 是内核记账的真值。
+///
+/// 非 Windows 返回 `(0.0, 0.0)`（本 VM 只跑 Windows）。
+pub fn rss_mb() -> (f64, f64) {
+    #[cfg(windows)]
+    {
+        #[repr(C)]
+        struct Pmc {
+            cb: u32,
+            page_fault: u32,
+            peak_ws: usize,
+            ws: usize,
+            qpeak_paged: usize,
+            qpaged: usize,
+            qpeak_nonpaged: usize,
+            qnonpaged: usize,
+            pagefile: usize,
+            peak_pagefile: usize,
+        }
+        extern "system" {
+            fn GetCurrentProcess() -> *mut std::ffi::c_void;
+            fn K32GetProcessMemoryInfo(
+                p: *mut std::ffi::c_void,
+                pmc: *mut Pmc,
+                cb: u32,
+            ) -> i32;
+        }
+        let mut pmc = Pmc {
+            cb: std::mem::size_of::<Pmc>() as u32,
+            page_fault: 0,
+            peak_ws: 0,
+            ws: 0,
+            qpeak_paged: 0,
+            qpaged: 0,
+            qpeak_nonpaged: 0,
+            qnonpaged: 0,
+            pagefile: 0,
+            peak_pagefile: 0,
+        };
+        // SAFETY: 句柄是本进程的伪句柄；pmc 由我们按 PROCESS_MEMORY_COUNTERS 的布局给出、
+        // cb 填的是它的真实大小，函数要么写满要么失败，不会越界。
+        let ok = unsafe { K32GetProcessMemoryInfo(GetCurrentProcess(), &mut pmc, pmc.cb) };
+        if ok == 0 {
+            return (0.0, 0.0);
+        }
+        const MB: f64 = 1024.0 * 1024.0;
+        (pmc.ws as f64 / MB, pmc.peak_ws as f64 / MB)
+    }
+    #[cfg(not(windows))]
+    {
+        (0.0, 0.0)
+    }
+}
+
+fn rss_on() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VMLESS_RSS").is_some())
+}
+
 /// 启动耗时探针：`VMLESS_PROF=1` 时把「距上一次打点」的毫秒数打到 stderr。
 ///
 /// 只用于把 950ms 拆开 —— 关掉时只多一次 `var_os`，不改变任何行为。
+/// 另加 `VMLESS_RSS=1` 时每行后面带上「当前 / 峰值」工作集：峰值 RSS 是内存那条线的
+/// **唯一**判据（GC 记账的字节数换不到物理占用，见 2026-11-19 的对象头实测）。
 pub fn prof(label: &str) {
     if std::env::var_os("VMLESS_PROF").is_none() {
         return;
@@ -73,15 +139,21 @@ pub fn prof(label: &str) {
     let now = std::time::Instant::now();
     let mut last = PROF_LAST.lock().unwrap_or_else(|e| e.into_inner());
     let mut t0 = PROF_T0.lock().unwrap_or_else(|e| e.into_inner());
+    let rss = if rss_on() {
+        let (cur, peak) = rss_mb();
+        format!("  [rss {cur:.1} / peak {peak:.1} MB]")
+    } else {
+        String::new()
+    };
     if t0.is_none() {
         *t0 = Some(now);
-        eprintln!("[prof] {:>7.1} ms | {label}", 0.0);
+        eprintln!("[prof] {:>7.1} ms | {label}{rss}", 0.0);
         *last = Some(now);
         return;
     }
     let d = last.map(|l| (now - l).as_secs_f64() * 1000.0).unwrap_or(0.0);
     let total = (now - t0.unwrap()).as_secs_f64() * 1000.0;
-    eprintln!("[prof] {:>7.1} ms | {label}   (累计 {total:.1})", d);
+    eprintln!("[prof] {:>7.1} ms | {label}   (累计 {total:.1}){rss}", d);
     *last = Some(now);
 }
 pub(crate) use class::builtin_super;
@@ -692,6 +764,12 @@ fn push_jdk(cp: &mut crate::load::ClassPath) {
     let r = if p.is_dir() { cp.push_module_tree(p) } else { cp.push(p) };
     if let Err(e) = r {
         eprintln!("VMLESS_JDK 挂载失败（{spec}）: {e}");
+        return;
+    }
+    // 挂类表缓存（CDS）：模块镜像的类每次都一样，缓存把它们变成「按名字取字节」。
+    // 指纹不符 / 文件坏了都只是「没挂上」，不影响任何行为；`VMLESS_CDS=0` 可关掉。
+    if cp.attach_cds(&cp.fingerprint()) {
+        prof("类表缓存挂上（CDS）");
     }
 }
 

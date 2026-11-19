@@ -254,9 +254,8 @@ impl Vm {
         if has_ref(desc) {
             return err(format!("{class}.{name}{desc} 含引用类型，不能跨 JIT/解释器边界"));
         }
-        let (ci, mi) = match self.store.methods.get(&(class.to_string(), name.to_string(), desc.to_string())) {
-            Some(v) => *v,
-            None => return err(format!("解释器里找不到 {class}.{name}{desc}")),
+        let Some((ci, mi)) = self.store.method_in_class(class, name, desc) else {
+            return err(format!("解释器里找不到 {class}.{name}{desc}"));
         };
         let params = crate::jit::param_descs(desc);
         let mut slots = Vec::with_capacity(args.len());

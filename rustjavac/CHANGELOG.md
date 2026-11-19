@@ -2,109 +2,39 @@
 
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
-## 0.73.0
+## 0.74.0
 
-**为什么**：每个程序有 950 ms 的固定启动开销 —— 空程序实测 946/938/963 ms。
-R2 总 1240 ms 里 950 是启动、真实工作只有 290；R5 真实工作约 45 ms。
-启动是现在所有真实程序的最大成本。
-
-**先拆分（`VMLESS_PROF=1`）**
-
-| 项 | 改前 |
-| --- | --- |
-| jimage/目录索引 | 10.7 ms |
-| 类加载+解析 | 627 ms（其中 `find` 474 —— 5421 次文件 open，每次 57–87 µs） |
-| ClassStore 元数据 | 79 ms |
-| `<clinit>`（`initPhase1` 123 + 其余 5） | 128 ms |
-| 测量地板 + 诊断打印 | 94 + 26 ms |
+**为什么**：启动还要再压一档（上一版 462 ms），并且把「每个方法调用都读环境变量」这个纯浪费去掉。
 
 **改了什么**
 
-- **并行加载**（`load/mod.rs::find_many`+`read_parallel`、`vm/load.rs::load_path`）：
-  BFS 改成「按层展开、每层 16 线程并行取字节 + 并行 parse」，新包按包去重只探一次。
-- **并行算元数据**（`vm/load.rs::layout_of` + `ClassStore::new`）：方法表/字段布局按类并行算再顺序插表（79 → 31 ms）。
-- 诊断打印不再每次排序 5421 个类名（省 26 ms）。
+- **类表二进制缓存（CDS 思路）**：`src/load/cds.rs`（新）。缓存 `%TEMP%/vmless-cds/<指纹>.bin`，
+  存**原始类字节** + 每类的「被引用类下标」表。装载改成「纯 id 图走完闭包 → 一次性取字节 →
+  一次性解析」，闭包阶段零字符串分配、不扫常量池。指纹 = VM 版本 + 格式版本 + 每个来源的
+  (path, mtime, len)；坏/不符/读失败一律**静默重建**；写临时文件再 rename。
+  `VMLESS_CDS=0` 可关。
+  **故意不存解析后的结构**：它是字节的 2.5 倍（27MB→60MB），反序列化要逐字段重建
+  String/Vec，与重新 parse 同量级，还会多一种「漏字段 = 静默语义错」的风险。
+- **方法表键 `(String,String,String)` → u64 散列 + 命中后逐字节验**（碰撞退化本类线性扫）：
+  建表快一半、省 10 MB。
+- **解析完立刻 drop 原始字节**（峰值 −22 MB）。
+- **`VMLESS_TRACE` / `VMLESS_HANG_DUMP` 用 `OnceLock` 缓存**：Windows 上 `var_os` 是
+  全局 Mutex + 哈希 + OsString 比较，约 **295 ns/次**，而它们在 `execute_body` 序言里、
+  每次 Java 调用都读一次（`System.initPhase1` 一项就有 9823 次调用）。
 
-**结果**：内部 VM 工作 778 → **339 ms**；含进程创建的总启动 897 → **462 ms**（n=7，[449..468]）。
+**结果**：hello 启动 **479 → 343 ms**（n=5，[343..356]）；hello 峰值 RSS 105.6 → **86.4 MB**。
 
-**两条被证否的假设（重要，省得后人重做）**
+**一条被修正的判断**（推翻上一版 CHANGELOG 里的说法）：85 MB 的 RSS **确实是类表** ——
+进程内探针实测「进 main 4.8 → 解析完 64.8 → 建表完 89.6 → initPhase1 完 105.2」，
+eden 只占 ~15 MB。上一版「独立模式 111.9 MB 所以不是类表」的结论是因为那次
+`VMLESS_JDK=` 空值仍然落回了默认 jimage。再往下压需要「按需解析」或改 `CpEntry` 表示。
 
-1. **95 MB 峰值 RSS 不是类表造成的。** 独立模式（`VMLESS_JDK=` 空，只装 2 个类）实测
-   **111.9 MB**，比 jimage 模式（5421 个类）95.6 MB 还高 ⇒ RSS 来自 GC 堆/eden。
-   「靠按需加载把 RSS 压到 50 MB」这条路不成立。
-2. **≤100 ms 在这台机上物理不可达**：`/bin/true` 用同一套 harness 量就是 94 ms
-   （进程创建 + MSYS fork）。只剩 6 ms 给 VM，而 `initPhase1` 一项就 128 ms。
-
-## 0.72.0
-
-**为什么**：降堆内存。GcBench（8M 分配 / 100 万存活）峰值 169 MB，HotSpot G1 是 135 MB。
-
-**改了什么**
-
-- **对象头 24 B → 16 B**（`shared.rs:290`，`const assert` 钉住）：`lock:AtomicU32` +
-  `len_age:AtomicU32`（槽数 24 位 | GC 世代 8 位）+ `class_id:u32` + `refs:u32`
-  （≤30 槽精确位图，31 号槽以后保守 + 全 1 表示全引用）。
-  **实测这条对峰值 RSS 没有影响** —— Windows 堆的 size class 让 `24+16n` 与 `16+16n`
-  落在同一个桶（4M 活对象 349.8 → 349.0 MB，噪声内）。要在 Windows 上换到 RSS，
-  得让请求跨过桶边界，而 16 B 已经是对齐下限。留下是因为 GC 记账确实从 56 降到 48 B/对象，
-  而且为后面省页表腾了空间。
-- **页表条目 8 B → 4 B 压缩指针**（`shared.rs:592`）：`BASE` = 进程内第一个对象地址，
-  条目 = `(d + 2^30) * 2 + 1`，`d = (addr - BASE) >> 3`，**有符号窗口 ±8 GB**；
-  `0` = 空，`u32::MAX` = 溢出慢表。句柄语义与「索引不复用」一个字没改，只改存储宽度。
-  **RSS 的降幅全在这里**：GcBench 169.1 → **129.5 MB（−23.4%）**。
-- 踩到并修掉的坑：先写成「BASE + 32 GB 正向窗口」→ Windows 的堆段不按地址递增发放，
-  实测首批对象就落在 BASE **下方**几十 MB，几乎全部条目掉进慢表，Mem5 从 122 MB 涨到 159 MB
-  （比不压缩还差）。改成有符号窗口才正常。
-
-**验证**：`verify.sh` 103/0、`VMLESS_GC_STRESS=1` 103/0、`cargo test` 126 passed、
-真程序样张 5/5、Cas1/Mt1(20/20)/Mx(20/20)。额外用 `WideTail`（唯一引用在 31 号槽之后）
-和 `LoopA`（581 轮 GC，跨过 8 位世代回绕）逐字对过 HotSpot。停顿没退：med 3.43 → 3.27 ms。
-
-**已知边界**：世代 8 位 → 约每 256 轮强制一次全量（否则旧世代号撞车会漏追子对象）；
->30 槽对象 31 号以后保守当引用（多留垃圾、不漏根）；±8 GB 窗口外走慢表（正确但慢）。
+**踩到的坑**（写进注释）：Windows 上**同步句柄的 `ReadFile` 会忽略 `OVERLAPPED` 偏移**，
+`seek_read` 会静默退化成「从当前游标读」，症状是「索引读出来全是 `ca fe ba be`」——
+定位读必须用 `FILE_FLAG_OVERLAPPED` 打开。
 
 
-## 0.71.0
-
-**为什么**：这一轮补「能编真 Java、能跑真程序」的最后几块硬骨头 —— jar 全链路、
-JDK 工具集去掉桩、并发原子性、以及三个「产物合法但语义错」的编译器 bug。
-
-**改了什么**
-
-- **jar 全链路**：classpath 认 jar（含 `import p.*;` 通配）、新增 `jar` 命令
-  （cf/cfm/tf/xf/uf）、`run_jdk -jar` 读 `Main-Class`。与真 jar **双向互通**实测：
-  真 `javac -cp` 用我们打的包编过，我们 `tf/xf/uf` 真 jar 逐字节一致。
-- **JDK 工具集**：删掉 17 个「本 crate 不提供」的桩（keytool/jarsigner/jstack/jmap/
-  jstat/jcmd/jinfo/jfr/jconsole/kinit/klist/ktab/jhsdb/jabswitch/jaccess*），接上
-  jdk-attach / jdk-crypto / jdk-krb / jdk-jfr / jdk-gui 里的真实现。
-  jfr / keytool / jarsigner / ktab 都与真 JDK 25 **双向互通**。
-- **`main(String[])` 收命令行参数**：以前固定传 null，`java -jar app.jar a b c` 的参数全丢。
-- **并发真原子**：`Unsafe` 的 CAS 是 read-then-write（`AtomicInteger` 丢 ~10% 更新）。
-  改成 64 桶分桶锁，覆盖全部 `compareAndSet*` / `getAndAdd*` / `getAndSet*`。
-  同时补 `VarHandle` 的**数组形态**（`Atomic*Array` 之前一调用就 BootstrapMethodError、线程直接死）。
-- **JIT「编不了就回退解释器」**：以前签名全是基本类型的 `java.*` 静态调用（如 `Integer.sum`）
-  会让**整个方法**回退；现在只那一处发解释器桩。同构负载实测 JIT 136ms / 解释器 24063ms（177×）。
-- **lambda 站点编号**按「类 + 常量池下标」唯一（原来只按 cp 下标，跨编译单元会撞）。
-- **编译器三个「产物合法、语义错」的 bug**：
-  1. 变参打包漏装箱 —— `String.format("%d", 42)` 编出 VerifyError；
-  2. lexer 完全不解码转义 —— `'\n'` 存成 `\` + `n` 两个字符，javap 看不出、三路一致也没覆盖；
-  3. `synchronized` 整段被 parser 丢掉 —— 多线程程序编出来不互斥且**数据静默丢失**。
-- **字节码验证器在岗后暴露的误杀**：`Object → X` 的 LUB 退化结果不该判死。
-
-**当前实测**（同机，HotSpot 25 对照）
-
-| 项 | vmless | HotSpot |
-| --- | --- | --- |
-| 真程序样张 R1–R5 | 5/5 逐字节一致 | — |
-| P1 4线程×800万（JIT） | 17–18 ms | 43–51 ms |
-| R4 算法负载（JIT） | 794 ms | 281 ms |
-| R4 算法负载（解释器） | 2268 ms | 281 ms |
-| 真程序 R1–R3/R5（解释器） | 1.0–4.8 s | 0.24–0.32 s |
-| verify.sh / GC_STRESS | 103/0 · 103/0 | — |
-
-**已知短板**：JIT 的 `java.util` 是 Rust 侧模拟，非纯数值程序反而比解释器慢
-（R1：解释器 3.9s / JIT 31s）—— JIT 目前只适合数值/数组密集的代码。这条是下一轮的主目标。
-
+## 0.70.0
 
 **为什么**：VM 一直没有**字节码验证器**（`src/vm/` 下 30 个模块全是执行/GC/native），
 于是我们自己编译器产出的**非法 class 会被我们自己的 VM 照跑**：

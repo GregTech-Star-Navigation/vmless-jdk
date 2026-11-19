@@ -39,8 +39,12 @@ pub(crate) struct ClassStore {
     /// `List.get(int)` 打到 HashSet 上，报「内建方法 get 未实现」。
     /// 字段解析按 JVMS 要「从引用类出发、逐层查本类自己的表」，所以这张表是必需的。
     pub(super) own_fields: HashMap<String, HashMap<String, usize>>,
-    /// (声明类, 方法名, 描述符) → (类下标, 方法下标)
-    pub(super) methods: HashMap<(String, String, String), (usize, usize)>,
+    /// 方法表：`meth_hash(声明类, 方法名, 描述符)` → (类下标, 方法下标)。
+    ///
+    /// **键是 64 位散列而不是三个 String**：54,615 个方法原本要 16 万个 String 分配
+    /// （≈12 MB + 30 ms 建表），改成一个 u64 之后是 1.2 MB。命中后仍然逐字节验一遍
+    /// （`verify_method`），碰撞就退化成本类内线性扫 —— 正确性与原表逐字一致。
+    pub(super) methods: HashMap<u64, (u32, u32)>,
     /// main 方法所在的类下标
     pub(super) main: usize,
 }
@@ -116,33 +120,79 @@ fn pull_jdk(jdk_present: bool, name: &str) -> bool {
     jdk_present || !name.starts_with("java/")
 }
 
+/// 方法表的键：`hash(声明类, 方法名, 描述符)`。
+///
+/// 用散列而不是三个 String 当键：54,615 个方法原本要 16 万次 String 分配（≈12 MB、
+/// 建表 30 ms 的一半），换成一个 u64 只要 1.2 MB。碰撞由 `lookup_method` 的逐字节验证兜住。
+#[inline]
+fn meth_hash(owner: &str, name: &str, desc: &str) -> u64 {
+    let mut h: u64 = 0xcbf2_9ce4_8422_2325;
+    for s in [owner, name, desc] {
+        for &b in s.as_bytes() {
+            h ^= b as u64;
+            h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // 分段：否则 ("ab","c") 与 ("a","bc") 同散列（本来也该靠验证兜，但少撞一点更好）
+        h ^= 0xff;
+        h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    h
+}
+// ------------------------------------------------------- 类表缓存的「建」
+
+/// 建缓存：**冷启动**（还没有缓存）时边加载边把类字节写进临时文件，不攒内存 ——
+/// 5421 个类 22 MB，攒起来就是启动峰值多 22 MB。
+///
+/// 只收「模块镜像里的类」：用户自己的类随程序变，收进来缓存就永远失效。
+/// 建缓存永远不会让加载失败：`Writer::new` 失败就退化成不建。
+struct CdsBuild {
+    w: Option<crate::load::cds::Writer>,
+}
+
+impl CdsBuild {
+    fn new(cp: &ClassPath) -> Self {
+        if !cp.wants_cds() {
+            return CdsBuild { w: None };
+        }
+        CdsBuild { w: crate::load::cds::Writer::new(&cp.fingerprint()) }
+    }
+
+    /// 收一个类（不是模块类就丢掉）
+    fn add_class(&mut self, cp: &ClassPath, name: &str, bytes: &[u8], refs: &[String]) {
+        if bytes.is_empty() || !cp.is_module_class(name) {
+            return;
+        }
+        if let Some(w) = self.w.as_mut() {
+            w.add(name, bytes, refs);
+        }
+    }
+
+    /// 收工（返回一句给 prof 的注记）。任何失败都只是「没建成」，不影响本次运行。
+    fn finish(&mut self) -> String {
+        let Some(w) = self.w.take() else { return String::new() };
+        let total = w.len();
+        match w.finish() {
+            Some(p) => format!("，缓存新建 {total} 个类 → {}", p.display()),
+            None => String::new(),
+        }
+    }
+}
+
 impl ClassStore {
-    /// 沿 classpath 按需加载入口类 + 它引用到的类。
-    ///
-    /// 从 `main_class` 出发，按 `Class` 常量池项把父类/接口/签名里出现的类型一个个
-    /// `find` 回来（闭包）。找不到的类不报错 —— 那是 `java.*` 之类，靠 `builtin_super`
-    /// 与 natives 兜；只有**入口类**找不到才算错。
-    ///
-    /// **按层展开、每层并行**（2026-11-19 改）：
-    ///
-    /// 闭包天然是一棵 BFS 树，同一层里谁是谁的引用还没有揭示，所以「取字节 + 解析」
-    /// 只能整层一批做完再收集下一层。这正是并行的机会：一层的名字一次拿全，于是
-    /// - 文件读交给 `ClassPath::find_many`（8 线程，~57 µs/文件 → ~8 µs/文件）；
-    /// - `parse` 是纯函数，按块分给 8 个线程（5421 个类 104 ms → ~20 ms）。
-    ///
-    /// 单线程版本在这台机上是 506 ms（find 362 + parse 99 + 杂项），并行后同样的闭包
-    /// 只要 ~90 ms —— 而**一个类都不少**，语义与逐层串行完全一致（`files` 顺序也一致：
-    /// 层内保持 BFS 顺序，所以 `main` 的下标与类表内容都可复现）。
     pub(super) fn load_path(cp: &ClassPath, main_class: &str) -> Result<Self, VmError> {
         // java.base 在不在 classpath 上 —— 一次探测，决定整条闭包要不要拉 `java.*`
         let jdk_present = cp.find("java/lang/Object").ok().flatten().is_some();
         super::prof(&format!("探测 java/lang/Object（jdk_present={jdk_present}）"));
+        if let Some(cds) = cp.cds().cloned() {
+            return Self::load_path_cds(cp, &cds, jdk_present, main_class);
+        }
         let t_all = std::time::Instant::now();
         let mut find_ms = 0f64;
         let mut parse_ms = 0f64;
         let mut files: Vec<ClassFile> = Vec::new();
         let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
         let mut layer: Vec<String> = vec![main_class.to_string()];
+        let mut build = CdsBuild::new(cp);
         while !layer.is_empty() {
             // 去重 + 过滤（空名 / 数组描述符）；同层内保持顺序
             let mut cur: Vec<String> = Vec::new();
@@ -218,7 +268,7 @@ impl ClassStore {
             parse_ms += t.elapsed().as_secs_f64() * 1000.0;
             // ---- 收集本层 + 展开下一层 ----
             let mut next: Vec<String> = Vec::new();
-            for ((name, _), slot) in cur.iter().zip(bytes.iter_mut()).zip(parsed.into_iter()) {
+            for (ci, (name, slot)) in cur.iter().zip(parsed.into_iter()).enumerate() {
                 let Some(r) = slot else { continue };
                 let cf = match r {
                     Ok(cf) => cf,
@@ -226,36 +276,42 @@ impl ClassStore {
                         return Err(VmError { msg: format!("解析 {name} 失败: {e}"), exc: None })
                     }
                 };
-                // 这个类自己属于哪个模块（模块模式才有；否则是未命名模块 = classpath）
-                let cur_module = cp.module_of_class(name).map(|s| s.to_string());
-                // 引用到的类型都在 `Class` 常量池项里（含 super_class 与 interfaces 指过去的那两个）。
-                // `<SELF>` 是我们编译器写常量池时用的占位符（字节码生成完会被改写成真实类名），
-                // 它不是类，别拿它去 classpath 里找。
-                for e in &cf.constant_pool {
-                    if let Some(CpEntry::Class(ix)) = e {
-                        if let Some(raw) = cf.utf8(*ix) {
-                            let n = String::from_utf8_lossy(raw);
-                            if n.starts_with('[') || n.contains('<') || n.contains(';') {
-                                continue;
-                            }
-                            // **模块访问检查**：引用者模块 → 被引用类所在模块的包。
-                            // 没有模块模式时 `check_reference` 是 no-op（旧行为不变）；
-                            // 有模块模式时**默认拒绝**，不许静默放行。
-                            if let Err(msg) = cp.check_reference(cur_module.as_deref(), name, &n) {
-                                return Err(VmError { msg, exc: None });
-                            }
-                            if pull_jdk(jdk_present, &n) {
-                                next.push(n.into_owned());
+                {
+                    // 这个类自己属于哪个模块（模块模式才有；否则是未命名模块 = classpath）
+                    let cur_module = cp.module_of_class(name).map(|s| s.to_string());
+                    // 引用到的类型都在 `Class` 常量池项里（含 super_class 与 interfaces 指过去的那两个）。
+                    // `<SELF>` 是我们编译器写常量池时用的占位符（字节码生成完会被改写成真实类名），
+                    // 它不是类，别拿它去 classpath 里找。
+                    let mut mine: Vec<String> = Vec::new();
+                    for e in &cf.constant_pool {
+                        if let Some(CpEntry::Class(ix)) = e {
+                            if let Some(raw) = cf.utf8(*ix) {
+                                let n = String::from_utf8_lossy(raw);
+                                if n.starts_with('[') || n.contains('<') || n.contains(';') {
+                                    continue;
+                                }
+                                // **模块访问检查**：引用者模块 → 被引用类所在模块的包。
+                                // 没有模块模式时 `check_reference` 是 no-op（旧行为不变）；
+                                // 有模块模式时**默认拒绝**，不许静默放行。
+                                if let Err(msg) = cp.check_reference(cur_module.as_deref(), name, &n) {
+                                    return Err(VmError { msg, exc: None });
+                                }
+                                mine.push(n.clone().into_owned());
+                                if pull_jdk(jdk_present, &n) {
+                                    next.push(n.into_owned());
+                                }
                             }
                         }
                     }
+                    build.add_class(cp, name, bytes.get(ci).and_then(|b| b.as_deref()).unwrap_or(&[]), &mine);
                 }
                 files.push(cf);
             }
             layer = next;
         }
+        let build_note = build.finish();
         super::prof(&format!(
-            "常量池闭包 BFS：{} 个类（find {find_ms:.1} ms，parse {parse_ms:.1} ms，总 {:.1} ms）",
+            "常量池闭包 BFS：{} 个类（find {find_ms:.1} ms，parse {parse_ms:.1} ms，总 {:.1} ms{build_note}）",
             files.len(),
             t_all.elapsed().as_secs_f64() * 1000.0
         ));
@@ -266,9 +322,261 @@ impl ClassStore {
                 crate::load::probe_count()
             );
         }
+        if std::env::var_os("VMLESS_MEM_STATS").is_some() {
+            let mut cp_slots = 0usize;
+            let mut utf8s = 0usize;
+            let mut utf8_bytes = 0usize;
+            let mut attrs = 0usize;
+            let mut attr_bytes = 0usize;
+            let mut methods = 0usize;
+            let mut fields = 0usize;
+            let mut code_bytes = 0usize;
+            for cf in &files {
+                cp_slots += cf.constant_pool.len();
+                for e in cf.constant_pool.iter().flatten() {
+                    if let CpEntry::Utf8(b) = e {
+                        utf8s += 1;
+                        utf8_bytes += b.len();
+                    }
+                }
+                methods += cf.methods.len();
+                fields += cf.fields.len();
+                for m in cf.methods.iter().chain(cf.fields.iter()) {
+                    attrs += m.attributes.len();
+                    for a in &m.attributes {
+                        attr_bytes += a.info.len();
+                        if cf.utf8(a.name_index) == Some(b"Code") {
+                            code_bytes += a.info.len();
+                        }
+                    }
+                }
+                attrs += cf.attributes.len();
+                for a in &cf.attributes {
+                    attr_bytes += a.info.len();
+                }
+            }
+            eprintln!(
+                "[mem] 类 {} | CP 槽 {cp_slots}（Utf8 {utf8s} 条 / {utf8_bytes} B）| 方法 {methods} 字段 {fields} \
+                 | 属性 {attrs} 个 / {attr_bytes} B（其中 Code {code_bytes} B）",
+                files.len()
+            );
+        }
         if files.is_empty() {
             return err("没有可执行的 class");
         }
+        let store = Self::new(files, Some(main_class))?;
+        super::prof("ClassStore::new（by_name/methods/build_metas）");
+        Ok(store)
+    }
+
+    /// **有类表缓存时的快速装载**：先把闭包算出来（纯 id 图），再一次性取字节 + 解析。
+    ///
+    /// 与老路径的三处差别，就是那 150 ms 的来源：
+    /// 1. 引用表来自缓存 → 闭包展开**不扫常量池**（762,850 槽 = 24 MB 随机访存）、
+    ///    也不为每条引用分配字符串；
+    /// 2. 取字节与解析各只做**一批** —— 老路径按 BFS 层做，14 层里每层都要重开线程；
+    /// 3. 字节来自缓存文件（同一句柄定位读），5421 次文件探测变成 0 次。
+    ///
+    /// 语义与老路径逐条对齐：闭包 = 同一个 BFS（层序一致）、`files` 顺序一致、
+    /// `pull_jdk` / 引用过滤 / 模块访问检查（无模块模式时是 no-op）都照旧。
+    /// **有类表缓存时的快速装载**：闭包先按「缓存 id 图」走完，再一次性取字节 + 解析。
+    ///
+    /// 与老路径的三处差别，就是那 150 ms 的来源：
+    /// 1. 引用表来自缓存 → 闭包展开**不扫常量池**（762,850 槽 = 24 MB 随机访存），
+    ///    也不再为每条引用分配字符串（缓存里连引用目标的下标都是现成的）；
+    /// 2. 取字节与解析各只做**一批** —— 老路径按 BFS 层做，14 层里每层都要重开线程；
+    /// 3. 字节来自缓存文件（同一句柄定位读），5421 次文件探测变成 0 次。
+    ///
+    /// 语义与老路径对齐：闭包 = 同一个传递闭包（`pull_jdk` / 引用过滤 / 模块访问检查
+    /// 都照旧），`files` 里一个类不少。**类的先后顺序**与老路径不同（这里是工作队列序），
+    /// 但顺序不参与任何语义：`main` 按名字找、`by_name` 按名字建、静态初始化按执行序。
+    fn load_path_cds(
+        cp: &ClassPath,
+        cds: &std::sync::Arc<crate::load::cds::Cds>,
+        jdk_present: bool,
+        main_class: &str,
+    ) -> Result<Self, VmError> {
+        const NO: u32 = u32::MAX;
+        let t_all = std::time::Instant::now();
+        let mut seen_id = vec![false; cds.ents.len()];
+        let mut seen_str: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut order_id: Vec<u32> = Vec::new();
+        let mut order_str: Vec<String> = Vec::new();
+        let mut queue: Vec<u32> = Vec::new();
+        let mut pending: Vec<String> = Vec::new();
+        match cds.idx(main_class) {
+            Some(k) => {
+                seen_id[k] = true;
+                queue.push(k as u32);
+            }
+            None => {
+                seen_str.insert(main_class.to_string());
+                pending.push(main_class.to_string());
+            }
+        }
+        let bad = |rn: &str| {
+            rn.is_empty() || rn.starts_with('[') || rn.contains('<') || rn.contains(';')
+        };
+        let mut parse_ms = 0f64;
+        let mut n_str = 0usize;
+        loop {
+            // ---- 展开缓存里的类：纯 id 图，一个字符串都不分配 ----
+            while let Some(k) = queue.pop() {
+                order_id.push(k);
+                for (rid, rn) in cds.ref_ids(k as usize) {
+                    // 缓存里的引用在写缓存时就按同一套规则过滤过了（见 cds::Writer::add），
+                    // 这里只需要过 jdk 策略这一道
+                    if !pull_jdk(jdk_present, rn) {
+                        continue;
+                    }
+                    if rid != NO {
+                        let rk = rid as usize;
+                        if !seen_id[rk] {
+                            seen_id[rk] = true;
+                            queue.push(rid);
+                        }
+                    } else if seen_str.insert(rn.to_string()) {
+                        pending.push(rn.to_string());
+                    }
+                }
+            }
+            if pending.is_empty() {
+                break;
+            }
+            // ---- 不在缓存里的类（主类 + 用户自己的类）：要解析才知道它们引用谁 ----
+            let names: Vec<String> = std::mem::take(&mut pending);
+            let got = cp.find_many(&names);
+            if let Some(k) = names.iter().position(|n| n == main_class) {
+                if got[k].is_none() {
+                    return match cp.find(main_class) {
+                        Ok(_) => err(format!("classpath 里找不到主类 {main_class}")),
+                        Err(e) => Err(VmError { msg: e, exc: None }),
+                    };
+                }
+            }
+            let t = std::time::Instant::now();
+            for (i, n) in names.iter().enumerate() {
+                let Some(b) = got[i].as_deref() else { continue };
+                let Ok(cf) = crate::parse(b) else { continue };
+                parse_ms += t.elapsed().as_secs_f64() * 1000.0 * 0.0; // 计入下面统一报
+                order_str.push(n.clone());
+                n_str += 1;
+                let cur_module = cp.module_of_class(n).map(|s| s.to_string());
+                for e in cf.constant_pool.iter() {
+                    if let Some(CpEntry::Class(ix)) = e {
+                        if let Some(raw) = cf.utf8(*ix) {
+                            let rn = String::from_utf8_lossy(raw);
+                            if let Err(msg) = cp.check_reference(cur_module.as_deref(), n, &rn) {
+                                return Err(VmError { msg, exc: None });
+                            }
+                            if bad(&rn) || !pull_jdk(jdk_present, &rn) {
+                                continue;
+                            }
+                            match cds.idx(&rn) {
+                                Some(rk) => {
+                                    if !seen_id[rk] {
+                                        seen_id[rk] = true;
+                                        queue.push(rk as u32);
+                                    }
+                                }
+                                None => {
+                                    if seen_str.insert(rn.to_string()) {
+                                        pending.push(rn.to_string());
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            parse_ms += t.elapsed().as_secs_f64() * 1000.0;
+        }
+        super::prof(&format!(
+            "闭包（缓存图）：{} 个类 + {n_str} 个不在缓存，总 {:.1} ms",
+            order_id.len(),
+            t_all.elapsed().as_secs_f64() * 1000.0
+        ));
+
+        // ---- 一次性取字节 ----
+        let t = std::time::Instant::now();
+        let idxs: Vec<Option<usize>> = order_id.iter().map(|&k| Some(k as usize)).collect();
+        let mut all: Vec<Option<Vec<u8>>> = cds.bytes_many(&idxs);
+        let rest: Vec<usize> = (0..all.len()).filter(|&i| all[i].is_none()).collect();
+        if !rest.is_empty() {
+            let names: Vec<String> = rest.iter().map(|&i| cds.name_of(order_id[i] as usize).to_string()).collect();
+            let got = cp.find_many(&names);
+            for (k, &i) in rest.iter().enumerate() {
+                all[i] = got[k].clone();
+            }
+        }
+        if !order_str.is_empty() {
+            let got = cp.find_many(&order_str);
+            all.extend(got);
+        }
+        let wait_ms = t.elapsed().as_secs_f64() * 1000.0;
+
+        // ---- 一次性解析（一个批次） ----
+        let t = std::time::Instant::now();
+        let nthreads = {
+            let hw = std::thread::available_parallelism().map(|v| v.get()).unwrap_or(1).min(16);
+            (all.len() / 24).min(hw).max(1)
+        };
+        let mut parsed: Vec<Option<crate::Result<ClassFile>>> = (0..all.len()).map(|_| None).collect();
+        let mut panic_err: Option<String> = None;
+        {
+            let chunk = all.len().div_ceil(nthreads.max(1)).max(1);
+            std::thread::scope(|s| {
+                let mut handles = Vec::new();
+                for (base, part) in all.chunks(chunk).enumerate() {
+                    let start = base * chunk;
+                    handles.push(s.spawn(move || {
+                        part.iter().map(|b| b.as_deref().map(crate::parse)).collect::<Vec<_>>()
+                    }));
+                }
+                for (k, h) in handles.into_iter().enumerate() {
+                    let got = match h.join() {
+                        Ok(v) => v,
+                        Err(_) => {
+                            panic_err = Some(format!("class 文件解析线程 panic（第 {k} 块）"));
+                            return;
+                        }
+                    };
+                    for (j, r) in got.into_iter().enumerate() {
+                        parsed[k * chunk + j] = r;
+                    }
+                }
+            });
+        }
+        if let Some(msg) = panic_err {
+            return Err(VmError { msg, exc: None });
+        }
+        drop(all); // 原始字节到此为止：别让 22 MB 陪着后面建类表，峰值 RSS 会多 22 MB
+        parse_ms += t.elapsed().as_secs_f64() * 1000.0;
+
+        // ---- 建类表 ----
+        let mut files: Vec<ClassFile> = Vec::with_capacity(parsed.len());
+        for (i, slot) in parsed.into_iter().enumerate() {
+            let Some(r) = slot else { continue };
+            match r {
+                Ok(cf) => files.push(cf),
+                Err(e) => {
+                    let name = if i < order_id.len() {
+                        cds.name_of(order_id[i] as usize).to_string()
+                    } else {
+                        order_str[i - order_id.len()].clone()
+                    };
+                    return Err(VmError { msg: format!("解析 {name} 失败: {e}"), exc: None });
+                }
+            }
+        }
+        if files.is_empty() {
+            return err("没有可执行的 class");
+        }
+        super::prof(&format!(
+            "取字节 + 解析：{} 个类（取字节 {wait_ms:.1} ms，解析 {parse_ms:.1} ms，总 {:.1} ms）",
+            files.len(),
+            t_all.elapsed().as_secs_f64() * 1000.0
+        ));
         let store = Self::new(files, Some(main_class))?;
         super::prof("ClassStore::new（by_name/methods/build_metas）");
         Ok(store)
@@ -292,13 +600,13 @@ impl ClassStore {
         // [dsk-scratch] 增量维护 methods / metas：整体重建是 O(类总数)，
         // 每次 add_class 都是 80ms 级（AWT 一个闭包几百个类 = 几十秒）。
         let existed = !self.metas.contains_key(&name) || self.metas.get(&name).is_some();
-        self.methods.retain(|(c, _, _), _| c != &name);
         {
             let cf = self.classes[idx].clone();
             for (mi, m) in cf.methods.iter().enumerate() {
                 let mn = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
                 let md = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
-                self.methods.insert((name.clone(), mn, md), (idx, mi));
+                let k = meth_hash(&name, &mn, &md);
+                self.methods.insert(k, (idx as u32, mi as u32));
             }
         }
         self.build_meta_one(&name);
@@ -338,7 +646,9 @@ impl ClassStore {
             for (mi, m) in cf.methods.iter().enumerate() {
                 let name = String::from_utf8_lossy(cf.utf8(m.name_index).unwrap_or_default()).into_owned();
                 let desc = String::from_utf8_lossy(cf.utf8(m.descriptor_index).unwrap_or_default()).into_owned();
-                self.methods.insert((cf.this_class_name().unwrap_or_default(), name, desc), (ci, mi));
+                let owner = cf.this_class_name().unwrap_or_default();
+                let k = meth_hash(&owner, &name, &desc);
+                self.methods.insert(k, (ci as u32, mi as u32));
             }
         }
     }
@@ -372,15 +682,14 @@ impl ClassStore {
         let chunk = classes.len().div_ceil(nthreads.max(1)).max(1);
         let cls: &[Arc<ClassFile>] = &classes;
         let names: &HashMap<String, usize> = &by_name;
-        let mut per_class: Vec<Vec<((String, String, String), (usize, usize))>> =
-            Vec::with_capacity(classes.len());
+        let mut per_class: Vec<Vec<(u64, (u32, u32))>> = Vec::with_capacity(classes.len());
         let mut layouts: Vec<(String, ClassMeta, HashMap<String, usize>)> = Vec::with_capacity(classes.len());
         std::thread::scope(|s| {
             let mut hs = Vec::new();
             for (base, part) in cls.chunks(chunk).enumerate() {
                 let start = base * chunk;
                 hs.push(s.spawn(move || {
-                    let mut m: Vec<Vec<((String, String, String), (usize, usize))>> = Vec::with_capacity(part.len());
+                    let mut m: Vec<Vec<(u64, (u32, u32))>> = Vec::with_capacity(part.len());
                     let mut l: Vec<(String, ClassMeta, HashMap<String, usize>)> = Vec::with_capacity(part.len());
                     for (k, cf) in part.iter().enumerate() {
                         let ci = start + k;
@@ -389,7 +698,7 @@ impl ClassStore {
                         for (mi, me) in cf.methods.iter().enumerate() {
                             let name = String::from_utf8_lossy(cf.utf8(me.name_index).unwrap_or_default()).into_owned();
                             let desc = String::from_utf8_lossy(cf.utf8(me.descriptor_index).unwrap_or_default()).into_owned();
-                            rows.push(((owner.clone(), name, desc), (ci, mi)));
+                            rows.push((meth_hash(&owner, &name, &desc), (ci as u32, mi as u32)));
                         }
                         m.push(rows);
                         l.push(layout_of(cls, names, &owner));
@@ -597,23 +906,69 @@ impl ClassStore {
     /// **抽象方法不算实现**：它们没有 Code 属性，解析到了也执行不了。跳过它们才能让
     /// 「接口方法调用」正确落到 default 实现（或落到调用点的 lambda/内建分流）。
     pub(super) fn resolve_method(&self, from: &str, name: &str, desc: &str) -> Option<(usize, usize)> {
-        let key = (name.to_string(), desc.to_string());
         for c in self.chain(from) {
-            if let Some(v) = self.methods.get(&(c, key.0.clone(), key.1.clone())) {
-                if !self.is_abstract(*v) {
-                    return Some(*v);
+            if let Some(v) = self.lookup_method(&c, name, desc) {
+                if !self.is_abstract(v) {
+                    return Some(v);
                 }
             }
         }
         // 接口里的 default 方法：实现类没覆写时落在这里
         for i in self.iface_closure(from) {
-            if let Some(v) = self.methods.get(&(i, key.0.clone(), key.1.clone())) {
+            if let Some(v) = self.lookup_method(&i, name, desc) {
                 // 抽象声明（没有 Code）不能当实现用
-                let (ci, mi) = *v;
-                if self.classes[ci].methods[mi].attributes.is_empty() || self.is_abstract(*v) {
+                let (ci, mi) = v;
+                if self.classes[ci].methods[mi].attributes.is_empty() || self.is_abstract(v) {
                     continue;
                 }
-                return Some(*v);
+                return Some(v);
+            }
+        }
+        None
+    }
+
+    /// 方法表查一次：散列命中后**逐字节验名字**，碰撞就退化成本类内线性扫。
+    ///
+    /// 为什么要验：`HashMap<u64, _>` 的键是散列，两条不同的 (类,名,描述符) 撞同一个 u64
+    /// 时后写的会顶掉前一条。验一遍（以及验不过时线性扫本类）把「概率」变成「不可能错」，
+    /// 代价是每次解析多两次 `utf8` 比较。
+    fn lookup_method(&self, owner: &str, name: &str, desc: &str) -> Option<(usize, usize)> {
+        let k = meth_hash(owner, name, desc);
+        match self.methods.get(&k) {
+            Some(&(ci, mi)) => {
+                if self.method_matches(ci, mi, owner, name, desc) {
+                    Some((ci as usize, mi as usize))
+                } else {
+                    self.scan_method(owner, name, desc)
+                }
+            }
+            None => None,
+        }
+    }
+
+    fn method_matches(&self, ci: u32, mi: u32, owner: &str, name: &str, desc: &str) -> bool {
+        let Some(cf) = self.classes.get(ci as usize) else { return false };
+        if cf.this_class_name().as_deref() != Some(owner) {
+            return false;
+        }
+        match cf.methods.get(mi as usize) {
+            Some(m) => {
+                cf.utf8(m.name_index) == Some(name.as_bytes())
+                    && cf.utf8(m.descriptor_index) == Some(desc.as_bytes())
+            }
+            None => false,
+        }
+    }
+
+    /// 兜底：在这个类自己的方法表里线性找（碰撞时用；类没有几个方法，代价可忽略）
+    fn scan_method(&self, owner: &str, name: &str, desc: &str) -> Option<(usize, usize)> {
+        let &ci = self.by_name.get(owner)?;
+        let cf = &self.classes[ci];
+        for (mi, m) in cf.methods.iter().enumerate() {
+            if cf.utf8(m.name_index) == Some(name.as_bytes())
+                && cf.utf8(m.descriptor_index) == Some(desc.as_bytes())
+            {
+                return Some((ci, mi));
             }
         }
         None
@@ -627,7 +982,7 @@ impl ClassStore {
 
     /// 只在这个类**自己**里找方法（`<clinit>` 不继承，不能用 resolve_method）
     pub(super) fn method_in_class(&self, class: &str, name: &str, desc: &str) -> Option<(usize, usize)> {
-        self.methods.get(&(class.to_string(), name.to_string(), desc.to_string())).copied()
+        self.lookup_method(class, name, desc)
     }
 
     /// 直接父类名（已加载的类看 super_class，java.* 靠内置表）

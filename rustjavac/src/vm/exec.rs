@@ -344,14 +344,17 @@ impl Vm {
             }};
         }
 
-        let trace = std::env::var_os("VMLESS_TRACE").is_some();
+        // **环境变量每个方法调用都读一次**在 Windows 上要 295 ns（全局 Mutex + 哈希 + OsString 比较），
+        // 而 `execute_body` 是解释器最热的函数 —— `System.initPhase1` 一项就有 9823 次调用。
+        // 缓存成进程级 `OnceLock`，热路径上只剩一次原子读。
+        let trace = *TRACE_ON.get_or_init(|| std::env::var_os("VMLESS_TRACE").is_some());
         // 「卡住时它在哪个方法里」的探针：设了 `VMLESS_HANG_DUMP=<秒>` 后，
         // 解释器每跑约 1600 万条指令就往 stderr 打一次当前 类.方法 描述符@pc。
         // 排查死循环时的唯一入口 —— `VMLESS_TRACE` 打的是每条指令，几秒就把屏刷爆了。
-        let hang_n: u64 = std::env::var_os("VMLESS_HANG_DUMP")
+        let hang_n: u64 = *HANG_US.get_or_init(|| std::env::var_os("VMLESS_HANG_DUMP")
             .and_then(|v| v.to_string_lossy().parse().ok())
             .map(|s: f64| (s * 25_000_000.0) as u64)
-            .unwrap_or(0);
+            .unwrap_or(0));
         // 计数器**必须是进程级**的：方法体内是局部量的话，「方法进→native→返回」这种
         // 循环每次调用只有几十条指令，永远到不了阈值 —— 探针就永远不打印。
 
@@ -364,6 +367,8 @@ impl Vm {
         } else {
             None
         };
+        static TRACE_ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        static HANG_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
         let mut pc = 0usize;
         while pc < body.len() {
             // 让 GC 知道「当前执行到哪条指令」：栈上只多一个 usize，换来的是任何时刻

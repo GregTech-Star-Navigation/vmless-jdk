@@ -61,6 +61,7 @@ pub fn capture_unit(cu: &mut CompilationUnit) -> Result<(), String> {
         fields: &mut fields,
         type_names: &type_names,
         scopes: Vec::new(),
+        da: HashMap::new(),
         assigned: HashSet::new(),
         pending: Vec::new(),
         next_id: 0,
@@ -139,7 +140,13 @@ struct Cap<'a> {
     type_names: &'a HashSet<String>,
     /// 作用域栈：每个元素是一层作用域里声明的局部变量
     scopes: Vec<Vec<Local>>,
-    /// 被重新赋值过的声明 id
+    /// 声明 id → **当前点是否已确定赋值**（JLS 16 的 DA）。effectively final 的判据是
+    /// javac 那一条：**对「已确定赋值」的变量再赋值**才算重赋值。所以
+    /// `int x; if (c) x = 1; else x = 2;`（每条路径只赋一次）仍然是 effectively final，
+    /// 而 `int x = 1; x = 2;` / `x = 1; x = 2;` 不是。分支处按「任一路径有值即视为有值」
+    /// 合并 —— 这一点的保守方向是**多报错**，不会把重赋值放过去。
+    da: HashMap<u32, bool>,
+    /// 「对已确定赋值的变量又赋了一次值」的声明 id
     assigned: HashSet<u32>,
     /// 本方法里被捕获的变量 (声明 id, 变量名, 合成类名) —— 方法走完统一验 effectively final
     pending: Vec<(u32, String, String)>,
@@ -156,10 +163,13 @@ impl<'a> Cap<'a> {
         self.scopes.pop();
     }
 
-    /// 在当前作用域声明一个局部变量，返回它的声明 id
-    fn declare(&mut self, name: &str, ty: Type) -> u32 {
+    /// 在当前作用域声明一个局部变量，返回它的声明 id。
+    /// `has_init`：声明处带初始化式（`int x = 1`）或本来就有值（形参 / catch / foreach）
+    /// —— 这种变量一出生就是「已确定赋值」。
+    fn declare(&mut self, name: &str, ty: Type, has_init: bool) -> u32 {
         let id = self.next_id;
         self.next_id += 1;
+        self.da.insert(id, has_init);
         let l = Local { name: name.to_string(), ty, id };
         match self.scopes.last_mut() {
             Some(top) => top.push(l),
@@ -179,10 +189,35 @@ impl<'a> Cap<'a> {
         None
     }
 
-    /// 标记「这个名字被重新赋值」。只认活跃的声明：字段/类名不算。
+    /// 一次赋值。只认活跃的声明：字段/类名不算。
+    /// 对「已经确定赋值」的变量再赋值 → 它不是 final / effectively final。
     fn mark(&mut self, name: &str) {
         if let Some(id) = self.lookup(name).map(|l| l.id) {
-            self.assigned.insert(id);
+            if *self.da.get(&id).unwrap_or(&false) {
+                self.assigned.insert(id);
+            } else {
+                self.da.insert(id, true);
+            }
+        }
+    }
+
+    /// 在一份「当前 DA 状态」的副本上走一段代码，返回走完之后的状态（自己那份复原）。
+    /// 分支 / 循环 / try / switch 靠它做 DA 合并。
+    fn branch(
+        &mut self,
+        f: impl FnOnce(&mut Self) -> Result<(), String>,
+    ) -> Result<HashMap<u32, bool>, String> {
+        let snap = self.da.clone();
+        f(self)?;
+        Ok(std::mem::replace(&mut self.da, snap))
+    }
+
+    /// 把分支走完的 DA 状态并回当前状态：任一路径赋过值就算「有值」
+    fn merge_da(&mut self, after: HashMap<u32, bool>) {
+        for (k, v) in after {
+            if v {
+                self.da.insert(k, true);
+            }
         }
     }
 
@@ -257,7 +292,7 @@ impl<'a> Cap<'a> {
         let saved_pending = std::mem::take(&mut self.pending);
         self.scopes.push(Vec::new());
         for (n, t) in params {
-            self.declare(n, t.clone());
+            self.declare(n, t.clone(), true);
         }
         let r = self.stmt(body).and_then(|_| self.check_pending());
         self.scopes = saved_scopes;
@@ -294,7 +329,7 @@ impl<'a> Cap<'a> {
                 // 字段类型要按初值把 `var` 补出来；但**不改 AST 里的声明类型**
                 // （codegen 会自己推，换成 Object 反而更差）
                 let t = cap_ty(ty, init.as_ref());
-                self.declare(name, t);
+                self.declare(name, t, init.is_some());
                 if let Some(e) = init {
                     self.expr(e)?;
                 }
@@ -307,18 +342,23 @@ impl<'a> Cap<'a> {
             }
             Stmt::If { cond, then, els } => {
                 self.expr(cond)?;
-                self.stmt(then)?;
-                if let Some(e) = els {
-                    self.stmt(e)?;
-                }
+                let a = self.branch(|s| s.stmt(then))?;
+                let b = match els {
+                    Some(e) => self.branch(|s| s.stmt(e))?,
+                    None => self.da.clone(),
+                };
+                self.merge_da(a);
+                self.merge_da(b);
             }
             Stmt::While { cond, body } => {
                 self.expr(cond)?;
-                self.stmt(body)?;
+                let after = self.branch(|s| s.stmt(body))?;
+                self.merge_da(after);
             }
             Stmt::DoWhile { body, cond } => {
-                self.stmt(body)?;
+                let after = self.branch(|s| s.stmt(body))?;
                 self.expr(cond)?;
+                self.merge_da(after);
             }
             Stmt::For { init, cond, update, body } => {
                 self.push_scope();
@@ -331,15 +371,17 @@ impl<'a> Cap<'a> {
                 for u in update.iter_mut() {
                     self.expr(u)?;
                 }
-                self.stmt(body)?;
+                let after = self.branch(|s| s.stmt(body))?;
+                self.merge_da(after);
                 self.pop_scope();
             }
             Stmt::ForEach { ty, name, iter, body } => {
                 self.expr(iter)?;
                 self.push_scope();
                 let t = cap_ty(ty, Some(iter));
-                self.declare(name, t);
-                self.stmt(body)?;
+                self.declare(name, t, true);
+                let after = self.branch(|s| s.stmt(body))?;
+                self.merge_da(after);
                 self.pop_scope();
             }
             Stmt::Switch { selector, cases } => {
@@ -349,9 +391,14 @@ impl<'a> Cap<'a> {
                     for l in c.labels.iter_mut().flatten() {
                         self.expr(l)?;
                     }
-                    for s in c.body.iter_mut() {
-                        self.stmt(s)?;
-                    }
+                    let body = &mut c.body;
+                    let after = self.branch(|s| {
+                        for it in body.iter_mut() {
+                            s.stmt(it)?;
+                        }
+                        Ok(())
+                    })?;
+                    self.merge_da(after);
                 }
                 self.pop_scope();
             }
@@ -361,13 +408,16 @@ impl<'a> Cap<'a> {
                 self.stmt(body)?;
             }
             Stmt::Try { body, catches, finally } => {
-                self.stmt(body)?;
+                let after = self.branch(|s| s.stmt(body))?;
+                self.merge_da(after);
                 for c in catches.iter_mut() {
                     self.push_scope();
                     let t = c.types.first().cloned().unwrap_or_else(object_ty);
                     let name = c.name.clone();
-                    self.declare(&name, t);
-                    self.stmt(&mut c.body)?;
+                    self.declare(&name, t, true);
+                    let cb = &mut c.body;
+                    let after = self.branch(|s| s.stmt(cb))?;
+                    self.merge_da(after);
                     self.pop_scope();
                 }
                 if let Some(f) = finally {
@@ -466,14 +516,14 @@ impl<'a> Cap<'a> {
                 if let Some(b) = binding {
                     let t = cap_ty(ty, None);
                     let b = b.clone();
-                    self.declare(&b, t);
+                    self.declare(&b, t, true);
                 }
             }
             Expr::Lambda { params, body } => {
                 let ps = params.clone();
                 self.push_scope();
                 for p in ps {
-                    self.declare(&p, object_ty());
+                    self.declare(&p, object_ty(), true);
                 }
                 self.expr(body)?;
                 self.pop_scope();
@@ -482,7 +532,7 @@ impl<'a> Cap<'a> {
                 let ps = params.clone();
                 self.push_scope();
                 for p in ps {
-                    self.declare(&p, object_ty());
+                    self.declare(&p, object_ty(), true);
                 }
                 self.stmt(body)?;
                 self.pop_scope();
@@ -967,6 +1017,65 @@ mod tests {
         "#,
         )
         .expect_err("应报错");
+        assert!(err.contains("effectively final"), "{err}");
+    }
+
+    /// `int x; if (c) x = 1; else x = 2;` —— 无初始化式、每条路径只赋一次：
+    /// javac 认它是 effectively final（JLS 4.12.4），这里必须放行。
+    #[test]
+    fn allows_blank_local_assigned_once_per_path() {
+        run(
+            r#"
+            class A {
+                interface I { int f(); }
+                void m(boolean c) {
+                    int x;
+                    if (c) x = 1; else x = 2;
+                    I i = new I() { public int f() { return x; } };
+                    System.out.println(i.f());
+                }
+            }
+        "#,
+        )
+        .expect("无初始化式 + 分支各赋一次应当放行");
+    }
+
+    /// 但有初始化式之后再赋值就不是 effectively final 了
+    #[test]
+    fn rejects_init_then_assign() {
+        let err = run(
+            r#"
+            class A {
+                void m(boolean c) {
+                    int x = 1;
+                    if (c) x = 2;
+                    Runnable r = new Runnable() { public void run() { System.out.println(x); } };
+                    r.run();
+                }
+            }
+        "#,
+        )
+        .expect_err("有初始化式再赋值应报错");
+        assert!(err.contains("effectively final"), "{err}");
+    }
+
+    /// 依次赋两次（不是分支）也不是 effectively final
+    #[test]
+    fn rejects_two_assignments_in_sequence() {
+        let err = run(
+            r#"
+            class A {
+                void m() {
+                    int x;
+                    x = 1;
+                    x = 2;
+                    Runnable r = new Runnable() { public void run() { System.out.println(x); } };
+                    r.run();
+                }
+            }
+        "#,
+        )
+        .expect_err("顺序赋两次应报错");
         assert!(err.contains("effectively final"), "{err}");
     }
 
