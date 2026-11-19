@@ -3,7 +3,47 @@
 格式：`## <版本>` + 「为什么 / 改了什么」。修 bug → patch，加能力或改默认行为 → minor，
 不兼容的配置/接口变更 → major。纯文档/测试/重构不动版本号。
 
-## 0.70.0
+## 0.71.0
+
+**为什么**：这一轮补「能编真 Java、能跑真程序」的最后几块硬骨头 —— jar 全链路、
+JDK 工具集去掉桩、并发原子性、以及三个「产物合法但语义错」的编译器 bug。
+
+**改了什么**
+
+- **jar 全链路**：classpath 认 jar（含 `import p.*;` 通配）、新增 `jar` 命令
+  （cf/cfm/tf/xf/uf）、`run_jdk -jar` 读 `Main-Class`。与真 jar **双向互通**实测：
+  真 `javac -cp` 用我们打的包编过，我们 `tf/xf/uf` 真 jar 逐字节一致。
+- **JDK 工具集**：删掉 17 个「本 crate 不提供」的桩（keytool/jarsigner/jstack/jmap/
+  jstat/jcmd/jinfo/jfr/jconsole/kinit/klist/ktab/jhsdb/jabswitch/jaccess*），接上
+  jdk-attach / jdk-crypto / jdk-krb / jdk-jfr / jdk-gui 里的真实现。
+  jfr / keytool / jarsigner / ktab 都与真 JDK 25 **双向互通**。
+- **`main(String[])` 收命令行参数**：以前固定传 null，`java -jar app.jar a b c` 的参数全丢。
+- **并发真原子**：`Unsafe` 的 CAS 是 read-then-write（`AtomicInteger` 丢 ~10% 更新）。
+  改成 64 桶分桶锁，覆盖全部 `compareAndSet*` / `getAndAdd*` / `getAndSet*`。
+  同时补 `VarHandle` 的**数组形态**（`Atomic*Array` 之前一调用就 BootstrapMethodError、线程直接死）。
+- **JIT「编不了就回退解释器」**：以前签名全是基本类型的 `java.*` 静态调用（如 `Integer.sum`）
+  会让**整个方法**回退；现在只那一处发解释器桩。同构负载实测 JIT 136ms / 解释器 24063ms（177×）。
+- **lambda 站点编号**按「类 + 常量池下标」唯一（原来只按 cp 下标，跨编译单元会撞）。
+- **编译器三个「产物合法、语义错」的 bug**：
+  1. 变参打包漏装箱 —— `String.format("%d", 42)` 编出 VerifyError；
+  2. lexer 完全不解码转义 —— `'\n'` 存成 `\` + `n` 两个字符，javap 看不出、三路一致也没覆盖；
+  3. `synchronized` 整段被 parser 丢掉 —— 多线程程序编出来不互斥且**数据静默丢失**。
+- **字节码验证器在岗后暴露的误杀**：`Object → X` 的 LUB 退化结果不该判死。
+
+**当前实测**（同机，HotSpot 25 对照）
+
+| 项 | vmless | HotSpot |
+| --- | --- | --- |
+| 真程序样张 R1–R5 | 5/5 逐字节一致 | — |
+| P1 4线程×800万（JIT） | 17–18 ms | 43–51 ms |
+| R4 算法负载（JIT） | 794 ms | 281 ms |
+| R4 算法负载（解释器） | 2268 ms | 281 ms |
+| 真程序 R1–R3/R5（解释器） | 1.0–4.8 s | 0.24–0.32 s |
+| verify.sh / GC_STRESS | 103/0 · 103/0 | — |
+
+**已知短板**：JIT 的 `java.util` 是 Rust 侧模拟，非纯数值程序反而比解释器慢
+（R1：解释器 3.9s / JIT 31s）—— JIT 目前只适合数值/数组密集的代码。这条是下一轮的主目标。
+
 
 **为什么**：VM 一直没有**字节码验证器**（`src/vm/` 下 30 个模块全是执行/GC/native），
 于是我们自己编译器产出的**非法 class 会被我们自己的 VM 照跑**：
