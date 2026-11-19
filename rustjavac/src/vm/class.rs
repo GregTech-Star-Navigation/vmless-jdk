@@ -133,6 +133,14 @@ impl Vm {
         if r.is_ok() {
             // **完成之后**才记进 initialized：先记会让别的线程看到「已完成」却读到默认值
             lk(&self.sh.initialized).insert(class.to_string());
+            // 调用点缓存的共享快路标志：必须排在 `initialized` \*之后\*（Release），
+            // 否则别的线程的 `getstatic` 会看到「已完成」却读到静态字段的默认值 0
+            // —— 那正是 JVMS 5.5 要求阻塞等待的那个坑。
+            // 只在**本线程真的把它初始化完**时置位；`<clinit>` 里自引用的重入路径
+            // （上面的 `Some(_) => return Ok(())`）不会走到这里。
+            if let Some(&flag) = lk(&self.sh.init_flags).get(class) {
+                flag.store(2, std::sync::atomic::Ordering::Release);
+            }
         }
         let waiters: Vec<u64> = lk(&self.sh.init_waiters).remove(class).unwrap_or_default();
         for w in waiters {

@@ -1527,6 +1527,102 @@ impl IndyState {
     }
 }
 
+// ---------------------------------------------------------------- 静态字段表
+
+/// 静态字段表：**两条访问路径**。
+///
+/// - **名字键** `(声明类, 字段名)`：反射 / Unsafe / native / 系统属性走这条，冷，形状与
+///   原来的 `HashMap<(String, String), Slot>` 一样（`get` / `insert` / `values`），
+///   所以外部调用点一行都不用改。
+/// - **槽号**：解释器 `getstatic` / `putstatic` 走这条。槽号就是 `vals` 的下标，
+///   读到值只要一次下标 + 一次拷贝 —— **零分配、零哈希**。槽号按 `(类, 名)` 分配、
+///   **永不复用**（复用会让调用点缓存指向别的字段）。
+///
+/// 为什么把值搬出哈希表：解释器每条 `getstatic` 都要 `clone` 两个 `String` 再哈希一遍
+/// （exec.rs 的快路），实测 305 ns；`putstatic` 还要再走一遍继承链解析（每次约 800 ns
+/// 的 `chain()` 分配），1122 ns。键换成整数下标后这两笔固定开销直接消失。
+///
+/// 语义不变：名字键与槽号**指向同一份值**（`insert` 先拿槽号再写），
+/// 所以 native 按名字写进去的值，解释器按槽号读得到（`System.setOut` 就靠这个）。
+pub(crate) struct StaticStore {
+    /// `(类, 字段名)` → 槽号
+    by_name: HashMap<(String, String), u32>,
+    /// 槽号 → 值。下标 0 是空槽（用 `0` 表示「调用点还没解析」），真实槽号从 1 开始。
+    vals: Vec<Slot>,
+}
+
+impl StaticStore {
+    fn new() -> StaticStore {
+        StaticStore {
+            by_name: HashMap::new(),
+            vals: vec![Slot::I(0)],
+        }
+    }
+
+    /// 冷路径：按名字读
+    pub(crate) fn get(&self, k: &(String, String)) -> Option<&Slot> {
+        self.by_name.get(k).map(|&i| &self.vals[i as usize])
+    }
+
+    /// 冷路径：按名字写（没有就建槽）。返回旧值，形状与 `HashMap::insert` 一致
+    pub(crate) fn insert(&mut self, k: (String, String), v: Slot) -> Option<Slot> {
+        let i = self.slot_or_new(k.0.as_str(), k.1.as_str());
+        Some(std::mem::replace(&mut self.vals[i as usize], v))
+    }
+
+    /// `(类, 字段名)` 的槽号，没有就分配一个（**永不复用**）
+    pub(crate) fn slot_of(&mut self, class: &str, name: &str) -> u32 {
+        self.slot_or_new(class, name)
+    }
+
+    fn slot_or_new(&mut self, class: &str, name: &str) -> u32 {
+        // 这次临时元组只在首次解析一个字段时出现一次（调用点会缓存槽号），不在热路径上
+        if let Some(&i) = self.by_name.get(&(class.to_string(), name.to_string())) {
+            return i;
+        }
+        let i = self.vals.len() as u32;
+        self.by_name.insert((class.to_string(), name.to_string()), i);
+        self.vals.push(Slot::I(0));
+        i
+    }
+
+    /// 热路径：按槽号读
+    #[inline]
+    pub(crate) fn value(&self, id: u32) -> Slot {
+        self.vals[id as usize]
+    }
+
+    /// 热路径：按槽号写
+    #[inline]
+    pub(crate) fn set(&mut self, id: u32, v: Slot) {
+        self.vals[id as usize] = v;
+    }
+
+    /// GC 扫根：表里的每个 `Slot::I(h)` 都是候选句柄
+    pub(crate) fn values(&self) -> std::slice::Iter<'_, Slot> {
+        self.vals.iter()
+    }
+}
+
+impl Shared {
+    /// 取（必要时建）某个类的「`<clinit>` 已完成」原子标志。
+    ///
+    /// 泄漏成 `'static`：类不会卸载，一个类一个字节，调用点缓存直接存引用、不做引用计数
+    /// （热路径上不能有 `Arc` 的原子增减）。
+    pub(crate) fn init_flag(&self, class: &str) -> &'static AtomicU8 {
+        if let Some(&p) = lk(&self.init_flags).get(class) {
+            return p;
+        }
+        let mut g = lk(&self.init_flags);
+        if let Some(&p) = g.get(class) {
+            return p;
+        }
+        let p: &'static AtomicU8 = Box::leak(Box::new(AtomicU8::new(0)));
+        g.insert(class.to_string(), p);
+        p
+    }
+}
+
 // ---------------------------------------------------------------- 共享根
 
 /// 所有跨线程可变状态的根。每个 Java 线程的 `Vm` 持有同一个 `Arc<Shared>`。
@@ -1543,7 +1639,14 @@ pub(crate) struct Shared {
     pub(crate) store_ver: AtomicU64,
 
     // ---- 冷数据：一把锁一组 ----
-    pub(crate) statics: Mutex<HashMap<(String, String), Slot>>,
+    pub(crate) statics: Mutex<StaticStore>,
+    /// 类名 → 「`<clinit>` 已完成」的共享原子标志（`ensure_init` 完成时置 2）。
+    ///
+    /// 给**调用点缓存**用：`getstatic`/`putstatic` 第一次执行时拿到这里那个 `&'static`
+    /// 原子量的地址，之后每次只剩一次 `load`，不再拿 `initialized` 的全局锁。
+    /// 权威仍然是 `initialized` + `initializing` 那套状态机（含阻塞等待）——
+    /// 这个原子量只是它的**观测快照**，不改任何一次「恰好执行一次」的判定。
+    pub(crate) init_flags: Mutex<HashMap<String, &'static AtomicU8>>,
     pub(crate) output: Mutex<Vec<String>>,
     pub(crate) initialized: Mutex<HashSet<String>>,
     pub(crate) initializing: Mutex<HashMap<String, u64>>,
@@ -1611,7 +1714,8 @@ impl Shared {
             monitors: MonitorTable::new(),
             store: RwLock::new(store),
             store_ver: AtomicU64::new(0),
-            statics: Mutex::new(HashMap::new()),
+            statics: Mutex::new(StaticStore::new()),
+            init_flags: Mutex::new(HashMap::new()),
             output: Mutex::new(Vec::new()),
             initialized: Mutex::new(HashSet::new()),
             initializing: Mutex::new(HashMap::new()),

@@ -10,6 +10,27 @@
 >
 > 历史注记：0.70.0 → 0.79.0 这十个 minor 里大部分其实是 perf/fix，按这条规则只该有 2–3 个 minor。
 
+## 0.79.1
+
+**为什么**：解释器每条 `getstatic`/`putstatic` 都要克隆两个 String 再哈希，`putstatic` 还要每次重走
+继承链；交替调用还会让 1 项 verify 缓存次次掉全局锁。
+
+**改了什么**
+
+- 静态字段的值搬进 `Vec<Slot>`（`shared.rs` 的 `StaticStore`），**名字键保留** —— 反射 / Unsafe /
+  native 一行没改；槽号=下标、永不复用。槽缓存挂在**永不淘汰**的 `SITE_REFS` 调用点表里
+  （本来就要查它拿 `MethodRefInfo`，等于零额外查表）。
+- `<clinit>` 完成时 Release 置一个共享的 `AtomicU8`；权威仍是 initialized/initializing 状态机。
+- `verify` 的 thread-local 缓存 1 项 → **8 槽直接映射**。
+
+**结果**：`putstatic` 1123 → **55 ns（20×）**、`getstatic` 306 → **63 ns（4.9×）**、
+交替调用下的 verify 61 → 噪声内。真程序四格 **−2% 到 −13%**（负载下），GC_STRESS 150/150、
+`verify.sh` 103/0、`cargo test` 124、JIT 持平（P1 16 / P2 64 / R4-JIT 22.7）。
+
+**中途踩到自己坑的修正**：第一版用 64 槽直接映射缓存静态调用点，R2 反而变慢 —— 类表里的静态
+调用点几百个，撞车就重走 `static_owner`（继承链 + 每层 String 分配）。挂到永不淘汰的 `SITE_REFS`
+之后转正。单看单点微基准，两个版本都是 65 ns —— **这就是「先量再改」的价值**。
+
 ## 0.79.0
 
 **为什么**：hello 的峰值 RSS 里 85 MB 是类表（进程内探针实测：进 main 4.8 → 解析完 64.8 →

@@ -125,10 +125,21 @@ struct ArgsSite {
 }
 
 thread_local! {
+    /// `(ClassFile 指针, 常量池下标)` → 引用解析结果 + **静态字段槽缓存**（两格：get / put）。
+    ///
+    /// 静态字段的槽号挂在这个**永不淘汰**的表里，而不是另开一个直接映射数组：
+    /// 程序里静态字段调用点轻松上百个（JDK 自身就一堆），64 槽直接映射会撞车，
+    /// 撞一次就要重走 `static_owner()`（继承链 + 每层一次 String 分配）—— 实测
+    /// 这会让 R2 这种 I/O 密集程序比改前还慢。挂在这张表里等于**零额外查表**：
+    /// `getstatic`/`putstatic` 本来就要取这里的 `MethodRefInfo`。
     static SITE_REFS: std::cell::RefCell<
         std::collections::HashMap<
             (usize, u16),
-            (std::sync::Arc<crate::ClassFile>, std::rc::Rc<MethodRefInfo>),
+            (
+                std::sync::Arc<crate::ClassFile>,
+                std::rc::Rc<MethodRefInfo>,
+                [std::cell::Cell<StaticSite>; 2],
+            ),
         >,
     > = std::cell::RefCell::new(std::collections::HashMap::new());
     static CODE_SITE: std::cell::RefCell<
@@ -144,6 +155,58 @@ thread_local! {
         std::cell::RefCell::new(std::collections::HashMap::new());
 }
 
+/// `getstatic` / `putstatic` 一个调用点的静态字段槽缓存。
+///
+/// JVMS 5.4.3.2 明确允许「字段解析结果按调用点缓存」。这里缓存的只有**整数槽号**
+/// （`sh.statics` 里永不复用的下标）与**声明类的初始化标志**，不缓存任何布局/槽数
+/// —— 后者在并行类加载下会把 `System.out` 变成 null（GC_STRESS 下 20/20 全红）。
+///
+// 命中成本：一次 `Cell` 读 + 一次原子读 —— 调用点表本来就要查（取 `MethodRefInfo`），
+// 所以静态字段这层是**零额外查表**。
+#[derive(Clone, Copy)]
+struct StaticSite {
+    /// `ClassFile` 地址（`0` = 空槽）
+    cf: usize,
+    /// 解析时用的类表**快照身份**（`Arc` 地址）：快照一换，`static_owner` 的答案就可能变
+    /// （并行加载下「类在表里」≠「继承链定稿」）。
+    ///
+    /// 用快照身份而不是「类表版本号」：版本号在多 `Vm` 复用同一个 thread-local 时可能撞
+    /// （每个 `Vm` 建的时候都从 0 开始），撞了就会把一个快照的解析结果用到另一个快照上。
+    store: usize,
+    /// 引用类名下的槽（读路径用，写路径当镜像）
+    self_id: u32,
+    /// 声明类名下的槽（写路径用）
+    owner_id: u32,
+    /// 声明类的「`<clinit>` 已完成」共享原子标志（`None` = 这个调用点不需要等初始化）
+    init: Option<&'static std::sync::atomic::AtomicU8>,
+}
+
+impl StaticSite {
+    const EMPTY: StaticSite = StaticSite {
+        cf: 0,
+        store: 0,
+        self_id: 0,
+        owner_id: 0,
+        init: None,
+    };
+    /// `<clinit>` 是否已经确认跑完（别的线程已经做过也算）
+    #[inline(always)]
+    fn ready(&self) -> bool {
+        match self.init {
+            None => true,
+            Some(f) => f.load(std::sync::atomic::Ordering::Acquire) == 2,
+        }
+    }
+}
+
+/// 静态字段调用点缓存的槽位：`0` = getstatic，`1` = putstatic。
+///
+/// 同一条 Fieldref 被两者共用是合法的（`X.f = X.f + 1`），但两者的初始化语义不同
+/// （getstatic 的老快路不碰 `ensure_init`，putstatic 一定要走），不能共用一格。
+const SITE_GET: usize = 0;
+const SITE_PUT: usize = 1;
+
+
 impl Vm {
     /// 取（或建）这个调用点的引用解析结果（见 `SITE_REFS`）。
     #[inline]
@@ -153,12 +216,74 @@ impl Vm {
         index: u16,
     ) -> Result<std::rc::Rc<MethodRefInfo>, VmError> {
         let key = (std::sync::Arc::as_ptr(cf) as usize, index);
-        if let Some(r) = SITE_REFS.with(|c| c.borrow().get(&key).map(|&(_, ref r)| std::rc::Rc::clone(r))) {
+        if let Some(r) = SITE_REFS.with(|c| c.borrow().get(&key).map(|e| std::rc::Rc::clone(&e.1))) {
             return Ok(r);
         }
         let r = std::rc::Rc::new(self.method_ref(cf, index)?);
-        SITE_REFS.with(|c| c.borrow_mut().insert(key, (std::sync::Arc::clone(cf), std::rc::Rc::clone(&r))));
+        SITE_REFS.with(|c| {
+            c.borrow_mut().insert(
+                key,
+                (
+                    std::sync::Arc::clone(cf),
+                    std::rc::Rc::clone(&r),
+                    [const { std::cell::Cell::new(StaticSite::EMPTY) }; 2],
+                ),
+            )
+        });
         Ok(r)
+    }
+
+    /// 一次查表同时拿「引用解析结果」+「静态字段槽缓存」（`getstatic`/`putstatic` 用）。
+    ///
+    /// 静态字段的槽号挂在这张**永不淘汰**的表里，而不是另开一个直接映射数组：
+    /// 程序里静态字段调用点轻松上百个（JDK 自身就一堆），几十槽的直接映射会撞车，
+    /// 撞一次就要重走 `static_owner()`（继承链 + 每层一次 `String` 分配）—— 实测
+    /// 这会让 R2 这种 I/O 密集程序比改前还慢。挂在这里等于**零额外查表**：
+    /// 这两个 arm 本来就要取这里的 `MethodRefInfo`。
+    #[inline]
+    fn site_ref_static(
+        &self,
+        cf: &std::sync::Arc<crate::ClassFile>,
+        index: u16,
+        slot: usize,
+    ) -> Result<(std::rc::Rc<MethodRefInfo>, StaticSite), VmError> {
+        let key = (std::sync::Arc::as_ptr(cf) as usize, index);
+        if let Some(v) = SITE_REFS.with(|c| {
+            c.borrow()
+                .get(&key)
+                .map(|e| (std::rc::Rc::clone(&e.1), e.2[slot].get()))
+        }) {
+            return Ok(v);
+        }
+        let r = std::rc::Rc::new(self.method_ref(cf, index)?);
+        SITE_REFS.with(|c| {
+            c.borrow_mut().insert(
+                key,
+                (
+                    std::sync::Arc::clone(cf),
+                    std::rc::Rc::clone(&r),
+                    [const { std::cell::Cell::new(StaticSite::EMPTY) }; 2],
+                ),
+            )
+        });
+        Ok((r, StaticSite::EMPTY))
+    }
+
+    /// 把解析结果写回调用点缓存
+    #[inline]
+    fn set_static_site(
+        &self,
+        cf: &std::sync::Arc<crate::ClassFile>,
+        index: u16,
+        slot: usize,
+        site: StaticSite,
+    ) {
+        let key = (std::sync::Arc::as_ptr(cf) as usize, index);
+        SITE_REFS.with(|c| {
+            if let Some(e) = c.borrow().get(&key) {
+                e.2[slot].set(site);
+            }
+        });
     }
 
     /// 静态/特殊调用的方法解析：成功一次就永久缓存（JVMS 5.4.3.3 明确要求缓存解析结果）。
@@ -440,6 +565,72 @@ impl Vm {
             }
         }
         class.to_string()
+    }
+
+    /// `getstatic` / `putstatic` 一个调用点的槽号（首次顺便解析声明类 + 跑 `<clinit>`）。
+    ///
+    /// 热路径命中时只做：一次下标、一次键比较、一次原子读。缓存的是**整数槽号**
+    /// （`sh.statics` 里永不复用）和**共享的初始化标志**，不是布局/槽数（红线）。
+    ///
+    /// 失效条件：类表**快照**变了（并行加载下 `static_owner` 的答案可能变）或者
+    /// `<clinit>` 还没确认跑完。两种都只是**重新解析一次**，解析本身幂等。
+    fn static_site(
+        &mut self,
+        cf: &std::sync::Arc<crate::ClassFile>,
+        idx: u16,
+        info: &MethodRefInfo,
+        cached: StaticSite,
+        put: bool,
+        slot: usize,
+    ) -> Result<StaticSite, VmError> {
+        // 本线程类表快照的身份（`Arc` 地址）：变了说明合并过新类，解析结果要重算
+        let store_id = std::sync::Arc::as_ptr(&self.store) as usize;
+        if cached.cf != 0 && cached.store == store_id && cached.ready() {
+            return Ok(cached);
+        }
+        // ---- 首次解析（每个调用点一次）----
+        //
+        // `getstatic` 的老快路是「引用类的键已经在表里就直接读，不碰 ensure_init」：
+        // 那个键只可能由 putstatic / native 先写过（那时初始化已经发生过），
+        // 所以这里保留同样的判据 —— 「键在不在」在解析时看一次就定下来。
+        let (existed, self_id) = {
+            let mut g = lk(&self.sh.statics);
+            // putstatic 用不到这个判据（它一定要走初始化 + 声明类槽），别白分配两个 String
+            let existed = !put && g.get(&(info.class.clone(), info.name.clone())).is_some();
+            (existed, g.slot_of(&info.class, &info.name))
+        };
+        let (owner_id, init) = if !put && existed {
+            // 读路径且值已经在表里：不需要再等 `<clinit>`（与老快路一致）
+            (self_id, None)
+        } else {
+            let owner = self.static_owner(&info.class, &info.name);
+            let flag = self.sh.init_flag(&owner);
+            if flag.load(std::sync::atomic::Ordering::Acquire) != 2 {
+                // 权威路径：JVMS 5.5 的「恰好一次 + 别的线程阻塞等」
+                self.ensure_init(&owner)?;
+                // `ensure_init` 只在**本线程真的跑完**它时置位；已经初始化过的类要在这里补
+                if lk(&self.sh.initialized).contains(&owner) {
+                    flag.store(2, std::sync::atomic::Ordering::Release);
+                }
+            }
+            let mut g = lk(&self.sh.statics);
+            let owner_id = g.slot_of(&owner, &info.name);
+            if !put && owner_id != self_id {
+                // 老代码的 `entry(self_key).or_insert(owner 的值)`：把声明类的值镜像到引用类
+                let v = g.value(owner_id);
+                g.set(self_id, v);
+            }
+            (owner_id, Some(flag))
+        };
+        let site = StaticSite {
+            cf: std::sync::Arc::as_ptr(cf) as usize,
+            store: store_id,
+            self_id,
+            owner_id,
+            init,
+        };
+        self.set_static_site(cf, idx, slot, site);
+        Ok(site)
     }
 
     fn execute_body(
@@ -1503,7 +1694,7 @@ impl Vm {
                 0xb2 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.site_ref(&cf, idx)?;
+                    let (info, cached) = self.site_ref_static(&cf, idx, SITE_GET)?;
                     if info.class == "java/lang/System" && info.name == "out" {
                         // 先把 `System` 自己初始化好：`SharedSecrets` 的 `JavaLangAccess`
                         // 就是它 `<clinit>` 里挂上去的（`StringJoiner.toString` 要用）
@@ -1526,40 +1717,24 @@ impl Vm {
                         // `info.class` 建表会读到 0，然后拿 null 当接收者去调
                         // `JavaLangInvokeAccess.getDeclaringClass` → 运行时找不到方法。
                         //
-                        // 快路径：键在表里就直接读（绝大多数读是已初始化/已镜像过的）。
-                        let direct = lk(&self.sh.statics)
-                            .get(&(info.class.clone(), info.name.clone()))
-                            .copied();
-                        match direct {
-                            Some(v) => frame.push(v),
-                            None => {
-                                let owner = self.static_owner(&info.class, &info.name);
-                                self.ensure_init(&owner)?;
-                                let v = lk(&self.sh.statics)
-                                    .get(&(owner.clone(), info.name.clone()))
-                                    .copied()
-                                    .unwrap_or(Slot::I(0));
-                                // 零值静态字段也要留个槽：否则每次读都要走一遍继承链解析
-                                lk(&self.sh.statics)
-                                    .entry((info.class.clone(), info.name.clone()))
-                                    .or_insert(v);
-                                frame.push(v);
-                            }
-                        }
+                        // 解析结果（槽号 + 声明类）**按调用点缓存**：之后每次只剩
+                        // 「一次下标 + 一次原子读」。缓存失效条件见 `StaticSite`。
+                        let site = self.static_site(&cf, idx, &info, cached, false, SITE_GET)?;
+                        frame.push(lk(&self.sh.statics).value(site.self_id));
                     }
                 }
                 // putstatic
                 0xb3 => {
                     let idx = u16::from_be_bytes([body[pc], body[pc + 1]]);
                     pc += 2;
-                    let info = self.site_ref(&cf, idx)?;
+                    let (info, cached) = self.site_ref_static(&cf, idx, SITE_PUT)?;
                     let value = frame.pop()?;
                     // 写也要落到**声明类**上，并给「用子类名引用」的那把键留镜像
-                    let owner = self.static_owner(&info.class, &info.name);
-                    self.ensure_init(&owner)?;
-                    lk(&self.sh.statics).insert((owner.clone(), info.name.clone()), value);
-                    if owner != info.class {
-                        lk(&self.sh.statics).insert((info.class.clone(), info.name.clone()), value);
+                    let site = self.static_site(&cf, idx, &info, cached, true, SITE_PUT)?;
+                    let mut g = lk(&self.sh.statics);
+                    g.set(site.owner_id, value);
+                    if site.owner_id != site.self_id {
+                        g.set(site.self_id, value);
                     }
                 }
                 // invokevirtual / invokeinterface：println 走内建；

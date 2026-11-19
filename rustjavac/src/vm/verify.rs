@@ -460,21 +460,31 @@ fn cache() -> &'static Mutex<HashMap<Key, Arc<ClassFile>>> {
     OK.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-/// 最近一次验证成功的方法（线程本地，**热路径**用）。
+/// 最近验证成功的方法（线程本地，**热路径**用）：**8 槽直接映射**。
 ///
-/// `execute` 每次调用都会问一次「这个方法验过吗」。真的每次都去抢全局表的锁 + 哈希，
-/// 在「16M 次虚调用」这种极端调用密集的负载上能量出 2~7% 的退化。这里只存一个
-/// `(ClassFile 指针, 方法下标)`：同一方法被反复调用时命中率极高，命中的成本是
-/// 一次 thread-local 读 + 一次比较。
+/// `execute` 每次调用都会问一次「这个方法验过吗」。原来这里是**只有 1 项**的缓存：
+/// 两个方法交替调用就每次都不命中，于是每次都去抢全局表的锁 + 哈希（实测交替调用
+/// 比单个方法多花 ~120 ns/次）。按 `(类指针 >> 4) ^ 方法下标` 做 8 槽直接映射后，
+/// 交替的 2~8 个方法全部命中在 thread-local 里，命中成本是一次下标 + 一次比较。
 ///
-/// 指针不会失效：全局表里那份 `Arc<ClassFile>` 是**永久的**，地址不会被别的类复用。
+/// 指针不会失效：全局表里那份 `Arc<ClassFile>` 是**永久的**，地址不会被别的类复用
+/// （与原来只存裸指针的口径一致；类不卸载）。
+const VSLOTS: usize = 8;
+
 thread_local! {
-    static LAST: std::cell::Cell<(usize, usize)> = const { std::cell::Cell::new((0, usize::MAX)) };
+    static LAST: std::cell::Cell<[(usize, usize); VSLOTS]> =
+        const { std::cell::Cell::new([(0, usize::MAX); VSLOTS]) };
+}
+
+#[inline(always)]
+fn vslot(ptr: usize, method: usize) -> usize {
+    ((ptr >> 4) ^ method) & (VSLOTS - 1)
 }
 
 fn cached(cf: &Arc<ClassFile>, method: usize) -> bool {
     let ptr = Arc::as_ptr(cf) as usize;
-    if LAST.with(|c| c.get()) == (ptr, method) {
+    let i = vslot(ptr, method);
+    if LAST.with(|c| c.get()[i]) == (ptr, method) {
         return true;
     }
     let key = (ptr, method);
@@ -483,7 +493,11 @@ fn cached(cf: &Arc<ClassFile>, method: usize) -> bool {
         Err(_) => false,
     };
     if ok {
-        LAST.with(|c| c.set((ptr, method)));
+        LAST.with(|c| {
+            let mut slots = c.get();
+            slots[i] = key;
+            c.set(slots);
+        });
     }
     ok
 }
@@ -493,7 +507,12 @@ fn mark_ok(cf: &Arc<ClassFile>, method: usize) {
     if let Ok(mut g) = cache().lock() {
         g.insert(key, Arc::clone(cf));
     }
-    LAST.with(|c| c.set(key));
+    let i = vslot(key.0, method);
+    LAST.with(|c| {
+        let mut slots = c.get();
+        slots[i] = key;
+        c.set(slots);
+    });
 }
 
 /// 这个方法验证过了吗；没验证过就现在验证一次（结果缓存）。
