@@ -865,6 +865,17 @@ impl<'a> Vf<'a> {
         if &**to == "java/lang/Object" {
             return Some(true);
         }
+        // `Object` 是**最宽的上界**，也是 `lub_ref` 在「类层次没加载」时的退化结果。
+        // 对它向下的赋值判定必须放过，否则会误杀合法的 java.base 代码：
+        // 实测 `LocaleProviderAdapter.forType` 的多重 catch
+        // （`NoSuchMethodException | InvocationTargetException | ClassNotFoundException | …`）
+        // 因为那几个异常类没被加载、LUB 退化成 Object，就被判成
+        // 「Object 不能赋给 Throwable」——那是验证器错，不是字节码错。
+        // 代价是漏检「真的是 Object 却当 String 用」，但那条 HotSpot 会抓，
+        // 而这个误杀的代价是**整个 java.base 跑不起来**。
+        if &**from == "java/lang/Object" {
+            return None;
+        }
         let (fa, ta) = (from.starts_with('['), to.starts_with('['));
         match (fa, ta) {
             (true, true) => {

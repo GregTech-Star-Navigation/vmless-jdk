@@ -511,6 +511,11 @@ fn pack_tail(
         em.insn(0x59, 0, 1); // dup
         em.const_int(i as i32);
         emit_val(a, &sp[i], em, ctx, cp)?;
+        // **必须按元素类型做一次转换** —— 变参是 `Object[]` 时，基本类型实参要装箱：
+        // `String.format("%d", 42)` 打包成 `new Object[]{42}`，少了这一步栈上留一个 int
+        // 交给 `aastore`，真 JVM 报 `VerifyError: Type integer is not assignable to
+        // 'java/lang/Object'`。之前这条只在 `emit_array_init` 里有，变参这条漏了。
+        coerce_to(elem, a, ctx, em, cp)?;
         em.op(store);
         em.pop(3);
     }
